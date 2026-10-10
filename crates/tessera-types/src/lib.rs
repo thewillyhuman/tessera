@@ -8,9 +8,11 @@
 
 pub mod env;
 pub mod event;
+pub mod file;
 pub mod hash;
 pub mod id;
 pub mod kind;
+pub mod partition;
 pub mod position;
 pub mod random;
 pub mod time;
@@ -18,9 +20,11 @@ pub mod work;
 
 pub use env::Env;
 pub use event::{Attributes, EventBatch, InvalidBatch, LogRow, Scalar};
+pub use file::{ColumnStats, FileMeta, FileSource, Level};
 pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
 pub use kind::Kind;
+pub use partition::{InvalidWindow, PartitionId, Window};
 pub use position::{Epoch, Seq, Version};
 pub use random::{OsRandom, Random, SeededRandom, SharedRandom};
 pub use time::{Clock, ManualClock, SystemClock, Timestamp};
