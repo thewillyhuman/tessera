@@ -91,6 +91,35 @@ pub async fn list(
     Ok(registrations)
 }
 
+/// The datasets of a tenant that have at least one registered writer, in
+/// name order. Found by listing the tenant's prefix, which is adequate
+/// while tenants are small; a dedicated index can replace it later.
+///
+/// # Errors
+///
+/// `Store` if the prefix cannot be listed.
+pub async fn datasets(
+    store: &dyn ObjectStore,
+    tenant: &TenantId,
+) -> Result<Vec<DatasetName>, ManifestError> {
+    let prefix = tessera_object::Key::new(tenant.as_str())
+        .unwrap_or_else(|e| unreachable!("a tenant id is a valid key: {e}"));
+    let mut datasets: Vec<DatasetName> = Vec::new();
+    let mut listing = store.list(&prefix);
+    while let Some(meta) = listing.try_next().await? {
+        let components: Vec<&str> = meta.key.as_str().split('/').collect();
+        if let [_, dataset, "_writers", _] = components.as_slice() {
+            if let Ok(dataset) = DatasetName::new(*dataset) {
+                if !datasets.contains(&dataset) {
+                    datasets.push(dataset);
+                }
+            }
+        }
+    }
+    datasets.sort();
+    Ok(datasets)
+}
+
 /// Removes a writer from a dataset's registry (IT-3). Removing an absent
 /// writer is harmless.
 ///
@@ -145,6 +174,62 @@ mod tests {
             .expect("removing twice is harmless");
         let listed = list(&store, &TenantId::DEFAULT, &dataset()).await.unwrap();
         assert_eq!(listed.iter().map(|r| r.writer).collect::<Vec<_>>(), [b]);
+    }
+
+    #[tokio::test]
+    async fn lists_the_datasets_that_have_writers() {
+        let store = MemoryStore::new();
+        let env = Env::simulated(1, Timestamp::UNIX_EPOCH);
+        register(
+            &store,
+            &env,
+            &TenantId::DEFAULT,
+            &DatasetName::new("staging").unwrap(),
+            WriterId::from_u128(1),
+        )
+        .await
+        .unwrap();
+        register(
+            &store,
+            &env,
+            &TenantId::DEFAULT,
+            &DatasetName::new("prod").unwrap(),
+            WriterId::from_u128(2),
+        )
+        .await
+        .unwrap();
+        register(
+            &store,
+            &env,
+            &TenantId::DEFAULT,
+            &DatasetName::new("prod").unwrap(),
+            WriterId::from_u128(3),
+        )
+        .await
+        .unwrap();
+        register(
+            &store,
+            &env,
+            &TenantId::SYSTEM,
+            &DatasetName::new("audit").unwrap(),
+            WriterId::from_u128(4),
+        )
+        .await
+        .unwrap();
+        let found = datasets(&store, &TenantId::DEFAULT).await.unwrap();
+        assert_eq!(
+            found,
+            [
+                DatasetName::new("prod").unwrap(),
+                DatasetName::new("staging").unwrap()
+            ]
+        );
+        assert!(
+            datasets(&store, &TenantId::new("nobody").unwrap())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
