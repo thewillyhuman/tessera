@@ -1635,6 +1635,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-opt"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "tessera-format",
+ "tessera-ir",
+ "tessera-types",
+ "thiserror",
+]
+
+[[package]]
 name = "tessera-server"
 version = "0.1.0"
 dependencies = [
