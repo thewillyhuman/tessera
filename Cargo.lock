@@ -1545,6 +1545,7 @@ dependencies = [
  "tessera-kernels",
  "tessera-types",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

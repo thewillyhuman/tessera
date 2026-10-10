@@ -8,17 +8,20 @@
 //! materialized only where an operator needs them whole. Every blocking
 //! operator accounts its memory against a [`MemoryPool`] (QE-11, RS-3)
 //! and fails by itself when its grant runs out, never taking the node
-//! down (QE-18).
+//! down (QE-18). CPU work runs on the [`CpuPool`], never on the async
+//! runtime (RS-4).
 
 pub mod batch;
 pub mod memory;
 pub mod operator;
 pub mod pipeline;
+pub mod scheduler;
 
 pub use batch::Batch;
 pub use memory::{MemoryPool, OutOfMemory};
 pub use operator::{CollectSink, Flow, Operator, Sink};
 pub use pipeline::Pipeline;
+pub use scheduler::{CpuPool, Task, TaskError};
 
 /// Why execution failed.
 #[derive(Debug, thiserror::Error)]
