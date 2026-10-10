@@ -11,6 +11,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use tessera_catalog::CatalogError;
+use tessera_exec::{EngineError, QueryError};
 use tessera_ingest::IngestError;
 use tessera_manifest::ManifestError;
 
@@ -51,6 +52,30 @@ impl ApiError {
         ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
+        }
+    }
+
+    /// A failed query: syntax and planning errors are the client's, with
+    /// the position described against `text`; storage failures may be
+    /// retried; anything else failed in the engine.
+    #[must_use]
+    pub fn query(error: QueryError, text: &str) -> Self {
+        match error {
+            QueryError::Syntax(diagnostic) => ApiError::bad_request(diagnostic.describe(text)),
+            QueryError::Plan(error) => ApiError::bad_request(error.to_string()),
+            QueryError::Engine(
+                error @ (EngineError::Manifest(_) | EngineError::Format(_) | EngineError::Pool(_)),
+            ) => {
+                tracing::warn!(error = %error, "query storage read failed");
+                ApiError::unavailable(error.to_string())
+            }
+            QueryError::Engine(error) => {
+                tracing::warn!(error = %error, "query failed");
+                ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: error.to_string(),
+                }
+            }
         }
     }
 }

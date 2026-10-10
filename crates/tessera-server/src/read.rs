@@ -146,45 +146,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
-    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
-    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
-    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use tower::ServiceExt;
 
-    fn export(bodies: &[&str]) -> ExportLogsServiceRequest {
-        ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                resource: None,
-                scope_logs: vec![ScopeLogs {
-                    scope: None,
-                    log_records: bodies
-                        .iter()
-                        .enumerate()
-                        .map(|(i, body)| LogRecord {
-                            time_unix_nano: 1_700_000_000_000_000_000 + i as u64,
-                            severity_text: "INFO".into(),
-                            body: Some(AnyValue {
-                                value: Some(any_value::Value::StringValue((*body).into())),
-                            }),
-                            attributes: vec![KeyValue {
-                                key: "n".into(),
-                                value: Some(AnyValue {
-                                    value: Some(any_value::Value::IntValue(
-                                        i64::try_from(i).unwrap(),
-                                    )),
-                                }),
-                                ..Default::default()
-                            }],
-                            trace_id: vec![1; 16],
-                            ..Default::default()
-                        })
-                        .collect(),
-                    schema_url: String::new(),
-                }],
-                schema_url: String::new(),
-            }],
-        }
-    }
+    use crate::otlp::testing::export;
 
     #[tokio::test]
     async fn reads_back_what_was_ingested_newest_first() {

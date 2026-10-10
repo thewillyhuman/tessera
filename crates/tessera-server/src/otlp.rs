@@ -98,6 +98,51 @@ fn dataset(headers: &HeaderMap) -> Result<DatasetName, ApiError> {
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+    /// An export of `bodies` as INFO logs one nanosecond apart from
+    /// 2023-11-14T22:13:20Z, each with `attr.n` set to its index and a
+    /// trace id of ones.
+    pub fn export(bodies: &[&str]) -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: bodies
+                        .iter()
+                        .enumerate()
+                        .map(|(i, body)| LogRecord {
+                            time_unix_nano: 1_700_000_000_000_000_000 + i as u64,
+                            severity_text: "INFO".into(),
+                            body: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue((*body).into())),
+                            }),
+                            attributes: vec![KeyValue {
+                                key: "n".into(),
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::IntValue(
+                                        i64::try_from(i).unwrap(),
+                                    )),
+                                }),
+                                ..Default::default()
+                            }],
+                            trace_id: vec![1; 16],
+                            ..Default::default()
+                        })
+                        .collect(),
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use axum::body::Body;
     use axum::http::Request;

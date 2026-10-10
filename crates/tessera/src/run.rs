@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! `tessera run`: opens the root pool, the catalog, the ingest service and
-//! the HTTP API, keeps the catalog fresh and checkpointed, runs intake and
-//! recovery in the background, and stops cleanly on Ctrl-C.
+//! `tessera run`: opens the root pool, the catalog, the ingest service,
+//! the query engine and the HTTP API, keeps the catalog fresh and
+//! checkpointed, runs intake and recovery in the background, and stops
+//! cleanly on Ctrl-C.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, PoolConfig};
+use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, Ingester};
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools};
@@ -121,11 +123,19 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             source,
         })?;
     tracing::info!(address = %config.listen, "http api listening");
+    let engine = Engine::new(
+        Arc::clone(&pools),
+        Arc::clone(&format),
+        env.clone(),
+        CpuPool::for_host(),
+        QueryLimits::default(),
+    );
     let app = tessera_server::router(AppState {
         catalog: Arc::clone(&catalog),
         ingest: ingest.clone(),
         pools,
         format,
+        engine: Arc::new(engine),
         env,
     });
     axum::serve(listener, app)

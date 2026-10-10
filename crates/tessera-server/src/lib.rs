@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! Tessera's network front ends (spec section 16): the HTTP
-//! administration API, OTLP ingest over HTTP and a plain read of a
-//! dataset. The query languages and the compatibility APIs arrive with
-//! their milestones.
+//! administration API, OTLP ingest over HTTP, SQL queries over HTTP and
+//! a plain read of a dataset. The other query languages and the
+//! compatibility APIs arrive with their milestones.
 //!
 //! This crate is transport only: it decodes requests, calls the catalog,
 //! the ingest service and the consistent view, and encodes responses. No
 //! rule about tenants or data lives here.
 
 pub mod admin;
+pub mod encode;
 mod error;
 pub mod otlp;
+pub mod query;
 pub mod read;
 
 use std::sync::Arc;
 
 use axum::Router;
 use tessera_catalog::Catalog;
+use tessera_exec::Engine;
 use tessera_format::FileFormat;
 use tessera_ingest::IngestHandle;
 use tessera_object::Pools;
@@ -36,6 +39,8 @@ pub struct AppState {
     pub pools: Arc<Pools>,
     /// The data file format.
     pub format: Arc<dyn FileFormat>,
+    /// The query engine.
+    pub engine: Arc<Engine>,
     /// The node's environment.
     pub env: Env,
 }
@@ -44,6 +49,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     admin::router(state.clone())
         .merge(otlp::router(state.clone()))
+        .merge(query::router(state.clone()))
         .merge(read::router(state))
 }
 
@@ -53,6 +59,7 @@ pub(crate) mod testing {
     use std::time::Duration;
 
     use tessera_catalog::{Catalog, PoolConfig};
+    use tessera_exec::{CpuPool, Engine, QueryLimits};
     use tessera_format::ParquetFormat;
     use tessera_ingest::{IngestConfig, Ingester};
     use tessera_object::{MemoryStore, PoolState, Pools};
@@ -86,11 +93,20 @@ pub(crate) mod testing {
             Arc::new(ParquetFormat),
         );
         let ingest = tessera_ingest::spawn(ingester, Duration::from_millis(1));
+        let pools = Arc::new(Pools::new(pool, Arc::new(store)));
+        let engine = Engine::new(
+            Arc::clone(&pools),
+            Arc::new(ParquetFormat),
+            env.clone(),
+            CpuPool::new(2),
+            QueryLimits::default(),
+        );
         AppState {
             catalog: Arc::new(catalog),
             ingest,
-            pools: Arc::new(Pools::new(pool, Arc::new(store))),
+            pools,
             format: Arc::new(ParquetFormat),
+            engine: Arc::new(engine),
             env,
         }
     }
