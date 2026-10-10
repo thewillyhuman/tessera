@@ -13,8 +13,10 @@ pub mod parquet;
 mod prune;
 pub mod reader;
 pub mod scan;
+pub mod sidecar;
 mod sparse;
 pub mod stats;
+pub mod text;
 
 use std::sync::Arc;
 
@@ -26,6 +28,7 @@ use tessera_types::{ColumnStats, Timestamp};
 pub use crate::parquet::ParquetFormat;
 pub use crate::reader::ParquetReader;
 pub use crate::scan::{Bound, Fetched, FileReader, RowPredicate, ScanRequest, ScanStats};
+pub use crate::sidecar::{Bloom, IndexSpec, RowGroups, Sidecar};
 
 /// Why a file could not be written or read.
 #[derive(Debug, thiserror::Error)]
