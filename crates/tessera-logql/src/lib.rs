@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+
+//! The `LogQL` front end (spec section 9.4): a hand-written lexer and
+//! parser with positioned errors (QL-2) and lowering into the shared
+//! plan (QL-1).
+//!
+//! A stream selector matches any attribute of a log event under the
+//! label-name mapping of section 9.8 (QL-8); line filters become the
+//! text predicates the term and trigram indexes serve (QL-9); parser
+//! stages become `Extract` nodes and formatting stages `Format` nodes;
+//! metric queries wrap the log plan in a `RangeVector`.
+//!
+//! Not supported yet: `offset`, `stddev`, `stdvar`, `topk`, `bottomk`,
+//! binary operations between two vectors, and `ip()` filters.
+
+pub mod ast;
+pub mod lexer;
+pub mod lower;
+pub mod parser;
+
+use tessera_ir::{BindContext, Diagnostic, Frontend, Statement};
+
+pub use lower::{Lowered, RangeParams, ResultKind, lower};
+pub use parser::parse;
+
+/// The `LogQL` front end for one query's time parameters.
+#[derive(Clone, Copy, Debug)]
+pub struct LogqlFrontend {
+    /// The query's time range and step.
+    pub params: RangeParams,
+}
+
+impl LogqlFrontend {
+    /// Lowers `text` and says what its rows mean.
+    ///
+    /// # Errors
+    ///
+    /// A syntax error or an unsupported construct, with its position.
+    pub fn lower_query(&self, text: &str, ctx: &BindContext) -> Result<Lowered, Diagnostic> {
+        lower(&parse(text)?, ctx, self.params)
+    }
+}
+
+impl Frontend for LogqlFrontend {
+    fn lower(&self, text: &str, ctx: &BindContext) -> Result<Statement, Diagnostic> {
+        Ok(Statement::Query(self.lower_query(text, ctx)?.plan))
+    }
+}

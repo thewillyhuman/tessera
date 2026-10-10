@@ -2136,6 +2136,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-logql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "tessera-ir",
+ "tessera-types",
+]
+
+[[package]]
 name = "tessera-manifest"
 version = "0.1.0"
 dependencies = [
