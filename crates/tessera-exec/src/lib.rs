@@ -12,15 +12,19 @@
 //! runtime (RS-4).
 
 pub mod batch;
+pub mod engine;
 pub mod memory;
 pub mod operator;
 pub mod pipeline;
+pub mod scan;
 pub mod scheduler;
 
 pub use batch::Batch;
+pub use engine::{Analysis, Engine, EngineError, QueryLimits, QueryOutput};
 pub use memory::{MemoryPool, OutOfMemory};
 pub use operator::{CollectSink, Flow, Operator, Sink};
 pub use pipeline::Pipeline;
+pub use scan::ScanAnalysis;
 pub use scheduler::{CpuPool, Task, TaskError};
 
 /// Why execution failed.

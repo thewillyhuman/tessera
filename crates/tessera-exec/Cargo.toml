@@ -8,15 +8,21 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+tessera-format.workspace = true
 tessera-ir.workspace = true
 tessera-kernels.workspace = true
+tessera-manifest.workspace = true
+tessera-object.workspace = true
+tessera-opt.workspace = true
 tessera-types.workspace = true
 
 arrow = { version = "60", default-features = false }
+futures = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
+tessera-wal.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

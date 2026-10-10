@@ -1541,9 +1541,15 @@ name = "tessera-exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "futures",
+ "tessera-format",
  "tessera-ir",
  "tessera-kernels",
+ "tessera-manifest",
+ "tessera-object",
+ "tessera-opt",
  "tessera-types",
+ "tessera-wal",
  "thiserror",
  "tokio",
 ]
