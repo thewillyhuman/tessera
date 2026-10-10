@@ -6,6 +6,7 @@
 //! under deterministic simulation with a [`ManualClock`].
 
 use std::fmt;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -91,6 +92,104 @@ impl fmt::Display for Timestamp {
         }
         f.write_str("Z")
     }
+}
+
+/// A timestamp that could not be parsed.
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
+#[error("invalid timestamp {0:?}: expected RFC 3339 such as 2024-01-31T12:00:00Z")]
+pub struct InvalidTimestamp(String);
+
+impl FromStr for Timestamp {
+    type Err = InvalidTimestamp;
+
+    /// Parses RFC 3339 in the forms `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM:SS`
+    /// with an optional fraction and an optional `Z` or `±HH:MM` offset;
+    /// a space may replace the `T`, as `PostgreSQL` accepts.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidTimestamp(text.to_owned());
+        let (date, rest) = text.split_at(text.len().min(10));
+        let mut parts = date.split('-');
+        let year: i64 = parts
+            .next()
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(invalid)?;
+        let month: i64 = parts
+            .next()
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(invalid)?;
+        let day: i64 = parts
+            .next()
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(invalid)?;
+        if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return Err(invalid());
+        }
+        let (mut seconds, mut nanos, mut offset) = (0i64, 0i64, 0i64);
+        let rest =
+            rest.strip_prefix(['T', 't', ' '])
+                .or(if rest.is_empty() { Some("") } else { None });
+        let rest = rest.ok_or_else(invalid)?;
+        if !rest.is_empty() {
+            let (clock, zone) = match rest.find(['Z', 'z', '+', '-']) {
+                Some(i) => rest.split_at(i),
+                None => (rest, ""),
+            };
+            let (hms, fraction) = clock.split_once('.').unwrap_or((clock, ""));
+            let mut fields = hms.split(':');
+            let hour: i64 = fields
+                .next()
+                .and_then(|p| p.parse().ok())
+                .ok_or_else(invalid)?;
+            let minute: i64 = fields
+                .next()
+                .and_then(|p| p.parse().ok())
+                .ok_or_else(invalid)?;
+            let second: i64 = fields
+                .next()
+                .map_or(Some(0), |p| p.parse().ok())
+                .ok_or_else(invalid)?;
+            if fields.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+                return Err(invalid());
+            }
+            seconds = hour * 3600 + minute * 60 + second;
+            if !fraction.is_empty() {
+                if fraction.len() > 9 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(invalid());
+                }
+                let digits = u32::try_from(fraction.len()).map_err(|_| invalid())?;
+                let scale = 10i64.pow(9 - digits);
+                nanos = fraction.parse::<i64>().map_err(|_| invalid())? * scale;
+            }
+            offset = match zone {
+                "" | "Z" | "z" => 0,
+                signed => {
+                    let sign = if signed.starts_with('-') { -1 } else { 1 };
+                    let (h, m) = signed[1..].split_once(':').ok_or_else(invalid)?;
+                    let h: i64 = h.parse().map_err(|_| invalid())?;
+                    let m: i64 = m.parse().map_err(|_| invalid())?;
+                    sign * (h * 3600 + m * 60)
+                }
+            };
+        }
+        let days = days_from_civil(year, month, day);
+        let total = (days * SECONDS_PER_DAY + seconds - offset)
+            .checked_mul(NANOS_PER_SECOND)
+            .and_then(|n| n.checked_add(nanos))
+            .ok_or_else(invalid)?;
+        Ok(Timestamp(total))
+    }
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date: the inverse of
+/// [`civil_from_days`], from the same source.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// Proleptic Gregorian date for a count of days since 1970-01-01.
@@ -356,5 +455,52 @@ mod tests {
         assert_eq!(TimeRange::ALL.to_string(), "[all time)");
         let until = TimeRange::new(Timestamp::MIN, Timestamp::UNIX_EPOCH);
         assert_eq!(until.to_string(), "[.., 1970-01-01T00:00:00Z)");
+    }
+
+    #[test]
+    fn parses_what_it_formats() {
+        for nanos in [0, 1, -1, 1_700_000_000_123_456_789, 951_782_400_000_000_000] {
+            let ts = Timestamp::from_nanos(nanos);
+            assert_eq!(ts.to_string().parse::<Timestamp>().unwrap(), ts);
+        }
+    }
+
+    #[test]
+    fn parses_dates_spaces_fractions_and_offsets() {
+        assert_eq!(
+            "1970-01-02".parse::<Timestamp>().unwrap(),
+            Timestamp::from_nanos(86_400 * 1_000_000_000)
+        );
+        assert_eq!(
+            "1970-01-01 00:00:01.5".parse::<Timestamp>().unwrap(),
+            Timestamp::from_nanos(1_500_000_000)
+        );
+        assert_eq!(
+            "1970-01-01T01:00:00+01:00".parse::<Timestamp>().unwrap(),
+            Timestamp::UNIX_EPOCH
+        );
+        assert_eq!(
+            "1969-12-31T23:00:00-01:00".parse::<Timestamp>().unwrap(),
+            Timestamp::UNIX_EPOCH
+        );
+        assert_eq!(
+            "2023-11-14T22:13".parse::<Timestamp>().unwrap(),
+            Timestamp::from_nanos(1_699_999_980_000_000_000)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_timestamps() {
+        for text in [
+            "",
+            "2024",
+            "2024-13-01",
+            "2024-01-01X10:00",
+            "2024-01-01T25:00:00",
+            "2024-01-01T10:00:00.1234567890",
+            "not a date",
+        ] {
+            assert!(text.parse::<Timestamp>().is_err(), "{text:?} parsed");
+        }
     }
 }
