@@ -1985,6 +1985,7 @@ dependencies = [
  "axum",
  "clap",
  "tessera-catalog",
+ "tessera-compact",
  "tessera-exec",
  "tessera-format",
  "tessera-ingest",

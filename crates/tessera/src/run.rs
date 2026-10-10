@@ -2,8 +2,8 @@
 
 //! `tessera run`: opens the root pool, the catalog, the ingest service,
 //! the query engine and the HTTP API, keeps the catalog fresh and
-//! checkpointed, runs intake and recovery in the background, and stops
-//! cleanly on Ctrl-C.
+//! checkpointed, runs intake, recovery, compaction and garbage
+//! collection in the background, and stops cleanly on Ctrl-C.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -107,6 +107,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         catalog: Arc::clone(&catalog),
         format: Arc::clone(&format),
         pool: pool.clone(),
+        pools: Arc::clone(&pools),
     }));
     let ingester = Ingester::start(
         Arc::clone(&store),

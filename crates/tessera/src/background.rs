@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! The `compact` role's background work in a single node: intake for every
-//! registered writer (section 6.7) and recovery of writers that are dead
-//! (ST-9, ST-10).
+//! registered writer (section 6.7), recovery of writers that are dead
+//! (ST-9, ST-10), compaction of every partition that is due (section 6.9)
+//! and garbage collection of replaced files and adopted segments (section
+//! 6.10).
 //!
 //! Without cluster membership (M6), a dead writer is recognised by its
 //! registration: a writer registered by another node process whose log
@@ -13,16 +15,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::Catalog;
+use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
+use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, plan};
 use tessera_format::FileFormat;
-use tessera_manifest::{intake, registry};
-use tessera_object::ObjectStore;
-use tessera_types::{Env, PoolId, TenantId, Window, WriterId};
+use tessera_manifest::{Manifest, intake, list_partitions, registry};
+use tessera_object::{ObjectStore, Pools};
+use tessera_types::{DatasetName, Env, Kind, PoolId, TenantId, Window, WriterId};
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
-/// How often intake and recovery run.
+/// How often the background work runs.
 const INTERVAL: Duration = Duration::from_secs(5);
 /// How long a foreign writer may be quiet before it is recovered.
 const RECOVER_AFTER: Duration = Duration::from_secs(300);
+
+type Failure = Box<dyn std::error::Error + Send + Sync>;
 
 /// What the loop needs.
 pub struct Background {
@@ -36,11 +42,18 @@ pub struct Background {
     pub format: Arc<dyn FileFormat>,
     /// The pool recovery places files in.
     pub pool: PoolId,
+    /// Every pool, for compaction and collection.
+    pub pools: Arc<Pools>,
 }
 
-/// Runs intake and recovery forever. Failures are logged and retried on
+/// Runs the background work forever. Failures are logged and retried on
 /// the next round.
 pub async fn run(background: Background) {
+    let compactor = Compactor::new(
+        Arc::clone(&background.pools),
+        Arc::clone(&background.format),
+        background.env.clone(),
+    );
     let mut ticks = tokio::time::interval(INTERVAL);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -53,17 +66,21 @@ pub async fn run(background: Background) {
             .map(|t| t.id.clone())
             .collect();
         for tenant in tenants {
-            if let Err(error) = round(&background, &tenant).await {
+            if let Err(error) = round(&background, &compactor, &tenant).await {
                 tracing::warn!(tenant = %tenant, error = %error, "background round failed");
             }
+        }
+        if let Err(error) = collect_logs(&background).await {
+            tracing::warn!(error = %error, "segment collection failed");
         }
     }
 }
 
 async fn round(
     background: &Background,
+    compactor: &Compactor,
     tenant: &TenantId,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Failure> {
     for dataset in registry::datasets(&*background.store, tenant).await? {
         for registration in registry::list(&*background.store, tenant, &dataset).await? {
             let writer = registration.writer;
@@ -92,15 +109,76 @@ async fn round(
                 tracing::info!(%tenant, %dataset, %writer, ?recovered, "recovery");
             }
         }
+        for kind in Kind::ALL {
+            compact_and_collect(background, compactor, tenant, &dataset, kind).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Compacts every partition of a dataset and kind that is due and
+/// collects its replaced files.
+async fn compact_and_collect(
+    background: &Background,
+    compactor: &Compactor,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    kind: Kind,
+) -> Result<(), Failure> {
+    let now = background.env.clock.now();
+    for partition in list_partitions(&*background.store, tenant, dataset, kind).await? {
+        let manifest = Manifest::open(
+            Arc::clone(&background.store),
+            partition.clone(),
+            background.env.clone(),
+        );
+        let snapshot = manifest.snapshot().await?;
+        if let Some(job) = plan(&partition, snapshot.state(), now, &Policy::default()) {
+            let inputs = job.inputs.len();
+            match compactor.run(&manifest, &job).await? {
+                Outcome::Replaced {
+                    output,
+                    rows,
+                    duplicates,
+                } => {
+                    tracing::info!(%tenant, %dataset, %kind, window = %partition.window, inputs, %output, rows, duplicates, "compacted");
+                }
+                Outcome::Superseded => {
+                    tracing::info!(%tenant, %dataset, %kind, window = %partition.window, "compaction superseded");
+                }
+            }
+        }
+        let collected =
+            collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION).await?;
+        if collected > 0 {
+            tracing::info!(%tenant, %dataset, %kind, window = %partition.window, collected, "files collected");
+        }
+    }
+    Ok(())
+}
+
+/// Collects adopted segments of every writer log in the store.
+async fn collect_logs(background: &Background) -> Result<(), Failure> {
+    let now = background.env.clock.now();
+    for writer in reader::writers(&*background.store).await? {
+        let collected = collect_log(
+            &background.store,
+            &background.env,
+            writer,
+            now,
+            DEFAULT_SEGMENT_GRACE,
+            Window::DEFAULT_LENGTH,
+        )
+        .await?;
+        if collected.deleted > 0 {
+            tracing::info!(%writer, deleted = collected.deleted, gone = collected.log_gone, "segments collected");
+        }
     }
     Ok(())
 }
 
 /// Whether a writer's log has been quiet for longer than `RECOVER_AFTER`.
-async fn is_quiet(
-    background: &Background,
-    writer: WriterId,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+async fn is_quiet(background: &Background, writer: WriterId) -> Result<bool, Failure> {
     let Some(last) = reader::last(&*background.store, writer).await? else {
         return Ok(true);
     };
