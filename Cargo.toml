@@ -12,6 +12,7 @@ repository = "https://github.com/thewillyhuman/tessera"
 [workspace.dependencies]
 # Internal crates. Dependencies point downward only (spec section 18.1).
 tessera-types = { path = "crates/tessera-types" }
+tessera-object = { path = "crates/tessera-object" }
 
 [workspace.lints.rust]
 # RS-1: `unsafe` is confined to named modules with documented invariants.
