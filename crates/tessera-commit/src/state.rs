@@ -4,6 +4,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tessera_types::Version;
 
 use crate::{Action, KvMutation};
@@ -22,8 +24,9 @@ impl ApplyError {
     }
 }
 
-/// The state a log's actions fold into. Each kind of log has one.
-pub trait State: Clone + Default + Send + Sync + 'static {
+/// The state a log's actions fold into. Each kind of log has one. States
+/// serialize so that they can be checkpointed.
+pub trait State: Clone + Default + Serialize + DeserializeOwned + Send + Sync + 'static {
     /// Applies one action, in commit order.
     ///
     /// # Errors
@@ -70,7 +73,8 @@ impl<S> Snapshot<S> {
 }
 
 /// The state of a key-value log: an ordered map from key to text value.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct KvState {
     entries: BTreeMap<String, String>,
 }

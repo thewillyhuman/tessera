@@ -21,6 +21,7 @@ use futures::stream::{self, BoxStream};
 use tessera_object::{BoxError, Key, ObjectError, ObjectStore};
 use tessera_types::{Env, Version};
 
+use crate::checkpoint::CheckpointRecord;
 use crate::{Action, Commit, CommitId, FORMAT, Snapshot, State};
 
 /// How many times a lost write is read back before giving up.
@@ -126,9 +127,10 @@ impl<S: State> CommitLog<S> {
     /// `Store` if the log cannot be read; `Corrupt` if an object cannot be
     /// decoded or applied.
     pub async fn snapshot(&self) -> Result<Arc<Snapshot<S>>, CommitError> {
-        let base = self
-            .cached()
-            .unwrap_or_else(|| Arc::new(Snapshot::initial()));
+        let base = match self.cached() {
+            Some(cached) => cached,
+            None => Arc::new(self.load_checkpoint().await?),
+        };
         let mut version = base.version();
         let mut state = base.state().clone();
         let mut tail = self.tail(version);
@@ -230,6 +232,120 @@ impl<S: State> CommitLog<S> {
         })
     }
 
+    /// Writes `snapshot` as a checkpoint, points the hint at it and removes
+    /// all but the two newest checkpoints.
+    ///
+    /// Checkpointing a version that is already checkpointed is harmless:
+    /// the state at a version is the same whoever folds it.
+    ///
+    /// # Errors
+    ///
+    /// `Store` if the checkpoint cannot be written. Failures to update the
+    /// hint or to remove old checkpoints are not reported: both are
+    /// recoverable by listing.
+    pub async fn checkpoint(&self, snapshot: &Snapshot<S>) -> Result<(), CommitError> {
+        let version = snapshot.version();
+        let record = CheckpointRecord::new(version, snapshot.state().clone());
+        match self
+            .store
+            .put_if_absent(&self.checkpoint_key(version), record.encode().into())
+            .await
+        {
+            Ok(()) | Err(ObjectError::AlreadyExists { .. }) => {}
+            Err(error) => return Err(CommitError::Store(error)),
+        }
+        let _ = self
+            .store
+            .put(&self.hint_key(), version.to_string().into())
+            .await;
+        self.remove_old_checkpoints(version).await;
+        Ok(())
+    }
+
+    /// The newest checkpoint, or the initial snapshot if there is none.
+    async fn load_checkpoint(&self) -> Result<Snapshot<S>, CommitError> {
+        let version = match self.hinted_checkpoint().await {
+            Some(version) => Some(version),
+            None => self.newest_listed_checkpoint().await?,
+        };
+        let Some(version) = version else {
+            return Ok(Snapshot::initial());
+        };
+        let key = self.checkpoint_key(version);
+        let bytes = self.store.get(&key).await?;
+        let (found, state) = CheckpointRecord::<S>::decode(&bytes).map_err(|e| corrupt(&key, e))?;
+        if found != version {
+            let reason = CorruptReason(format!("checkpoint claims version {found}"));
+            return Err(corrupt(&key, reason));
+        }
+        Ok(Snapshot::new(version, state))
+    }
+
+    /// The checkpoint the hint names, if the hint is readable and the
+    /// checkpoint exists.
+    async fn hinted_checkpoint(&self) -> Option<Version> {
+        let bytes = self.store.get(&self.hint_key()).await.ok()?;
+        let version: Version = std::str::from_utf8(&bytes).ok()?.trim().parse().ok()?;
+        self.store
+            .head(&self.checkpoint_key(version))
+            .await
+            .ok()
+            .map(|_| version)
+    }
+
+    async fn newest_listed_checkpoint(&self) -> Result<Option<Version>, CommitError> {
+        let versions = self.listed_checkpoints().await?;
+        Ok(versions.last().copied())
+    }
+
+    /// Every checkpoint version, ascending.
+    async fn listed_checkpoints(&self) -> Result<Vec<Version>, CommitError> {
+        let mut versions = Vec::new();
+        let mut listing = self.store.list(&self.checkpoint_prefix());
+        while let Some(meta) = listing.try_next().await? {
+            if let Ok(version) = meta.key.name().parse::<Version>() {
+                versions.push(version);
+            }
+        }
+        versions.sort_unstable();
+        Ok(versions)
+    }
+
+    /// Deletes every checkpoint older than the two newest.
+    async fn remove_old_checkpoints(&self, newest: Version) {
+        let Ok(versions) = self.listed_checkpoints().await else {
+            return;
+        };
+        let keep_from = versions
+            .iter()
+            .rev()
+            .take(2)
+            .copied()
+            .min()
+            .unwrap_or(newest);
+        for version in versions.into_iter().filter(|v| *v < keep_from) {
+            let _ = self.store.delete(&self.checkpoint_key(version)).await;
+        }
+    }
+
+    fn checkpoint_prefix(&self) -> Key {
+        self.prefix
+            .join("_checkpoint")
+            .expect("log key components are valid")
+    }
+
+    fn checkpoint_key(&self, version: Version) -> Key {
+        self.checkpoint_prefix()
+            .join(&version.to_string())
+            .expect("log key components are valid")
+    }
+
+    fn hint_key(&self) -> Key {
+        self.prefix
+            .join("_hint")
+            .expect("log key components are valid")
+    }
+
     fn commit_key(&self, version: Version) -> Key {
         self.prefix
             .join("_log")
@@ -297,6 +413,11 @@ fn apply_all<S: State>(state: &mut S, commit: &Commit, key: &Key) -> Result<(), 
     }
     Ok(())
 }
+
+/// A plain-text reason for a corrupt object.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct CorruptReason(String);
 
 fn corrupt(key: &Key, source: impl std::error::Error + Send + Sync + 'static) -> CommitError {
     CommitError::Corrupt {

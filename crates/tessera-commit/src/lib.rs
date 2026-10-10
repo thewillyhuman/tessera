@@ -6,6 +6,7 @@
 //! all share this one implementation.
 
 pub mod action;
+mod checkpoint;
 pub mod log;
 pub mod record;
 pub mod state;
