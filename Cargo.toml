@@ -14,6 +14,7 @@ repository = "https://github.com/thewillyhuman/tessera"
 tessera-types = { path = "crates/tessera-types" }
 tessera-object = { path = "crates/tessera-object" }
 tessera-commit = { path = "crates/tessera-commit" }
+tessera-catalog = { path = "crates/tessera-catalog" }
 
 [workspace.lints.rust]
 # RS-1: `unsafe` is confined to named modules with documented invariants.
