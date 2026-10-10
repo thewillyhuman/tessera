@@ -8,6 +8,11 @@
 //! is not ours, recovery has sealed the log (ST-9) and the writer must
 //! stop; if the response is lost, the object is read back and recognised
 //! by its entry id.
+//!
+//! When neither the write nor the read-back gets an answer, the write is
+//! *in doubt*: it may or may not have landed. The writer remembers it and
+//! resolves it before the next append, so that a landed write is counted
+//! and a later entry never mistakes it for a fence.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +41,8 @@ pub struct WriterLog {
     writer: WriterId,
     next: Seq,
     state: State,
+    /// A write at `next` whose outcome is unknown.
+    in_doubt: Option<EntryId>,
 }
 
 impl WriterLog {
@@ -49,6 +56,7 @@ impl WriterLog {
             writer,
             next: Seq::new(1),
             state: State::Open,
+            in_doubt: None,
         }
     }
 
@@ -63,6 +71,7 @@ impl WriterLog {
             writer,
             next,
             state: State::Open,
+            in_doubt: None,
         }
     }
 
@@ -141,6 +150,7 @@ impl WriterLog {
                 });
             }
         }
+        self.resolve_doubt().await?;
         let seq = self.next;
         let id = EntryId::random(&mut self.env.random.clone());
         let entry = make(self.writer, seq, id, self.env.clock.now())?;
@@ -162,7 +172,11 @@ impl WriterLog {
                             return self.resolve_found(seq, id, &found);
                         }
                         Err(ObjectError::NotFound { .. }) => last = Some(error),
-                        Err(other) if other.is_retryable() => last = Some(other),
+                        Err(other) if other.is_retryable() => {
+                            // The write may have landed and we cannot tell.
+                            self.in_doubt = Some(id);
+                            last = Some(other);
+                        }
                         Err(other) => return Err(WalError::Store(other)),
                     }
                     tokio::time::sleep(backoff).await;
@@ -179,6 +193,43 @@ impl WriterLog {
         })))
     }
 
+    /// Whether the last append's outcome is unknown.
+    #[must_use]
+    pub fn has_doubt(&self) -> bool {
+        self.in_doubt.is_some()
+    }
+
+    /// Settles a write in doubt: `Some(seq)` if it landed, in which case
+    /// the position has moved past it; `None` if it did not land or there
+    /// was no doubt.
+    ///
+    /// # Errors
+    ///
+    /// `Store` if the store still cannot be read, in which case the doubt
+    /// remains; `Fenced` if a seal sits at the position.
+    pub async fn settle(&mut self) -> Result<Option<Seq>, WalError> {
+        let Some(id) = self.in_doubt else {
+            return Ok(None);
+        };
+        let key = layout::writer_log_entry(self.writer, self.next);
+        match self.store.get(&key).await {
+            Ok(found) => {
+                let found = Entry::decode(&found).map_err(|e| corrupt(&key, e))?;
+                self.in_doubt = None;
+                self.resolve_found(self.next, id, &found).map(Some)
+            }
+            Err(ObjectError::NotFound { .. }) => {
+                self.in_doubt = None;
+                Ok(None)
+            }
+            Err(error) => Err(WalError::Store(error)),
+        }
+    }
+
+    async fn resolve_doubt(&mut self) -> Result<(), WalError> {
+        self.settle().await.map(|_| ())
+    }
+
     async fn resolve_existing(&mut self, seq: Seq, id: EntryId) -> Result<Seq, WalError> {
         let key = layout::writer_log_entry(self.writer, seq);
         let found = self.store.get(&key).await?;
@@ -190,6 +241,7 @@ impl WriterLog {
     /// earlier write, or a fence.
     fn resolve_found(&mut self, seq: Seq, id: EntryId, found: &Entry) -> Result<Seq, WalError> {
         if found.header().id == id {
+            self.in_doubt = None;
             return Ok(self.advance());
         }
         self.state = State::Fenced;
@@ -230,7 +282,9 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream::BoxStream;
-    use tessera_object::{FaultPolicy, FaultyStore, Key, MemoryStore, ObjectMeta};
+    use tessera_object::{
+        FaultPolicy, FaultyStore, Key, LostResponseStore, MemoryStore, ObjectMeta,
+    };
     use tessera_types::{DatasetName, LogRow, NodeId, TenantId};
 
     use super::*;
@@ -364,6 +418,33 @@ mod tests {
         async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
             self.0.delete(key).await
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_in_doubt_is_settled_before_the_next_append() {
+        let inner = MemoryStore::new();
+        let store = Arc::new(LostResponseStore::new(
+            Arc::new(inner.clone()),
+            Key::new("_wal").unwrap(),
+        ));
+        store.set_blind(true);
+        let mut log = WriterLog::start(Arc::clone(&store) as Arc<dyn ObjectStore>, env(1));
+        let error = log.append_segment(&[batch()]).await.unwrap_err();
+        assert!(
+            matches!(error, WalError::Store(ref e) if e.is_retryable()),
+            "{error}"
+        );
+        assert_eq!(log.next_seq(), Seq::new(1), "the outcome is unknown");
+        assert!(log.has_doubt());
+        store.set_blind(false);
+        // The first write did land; the next append must go after it, not
+        // mistake it for a fence.
+        assert_eq!(log.append_segment(&[batch()]).await.unwrap(), Seq::new(2));
+        assert!(!log.is_fenced());
+        assert_eq!(
+            reader::list(&inner, log.writer_id()).await.unwrap(),
+            [Seq::new(1), Seq::new(2)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
