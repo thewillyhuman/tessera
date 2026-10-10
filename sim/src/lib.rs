@@ -13,6 +13,7 @@
 pub mod catalog;
 pub mod commit_log;
 pub mod lease;
+pub mod write_path;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -143,7 +144,7 @@ impl Sim {
         run(async move {
             use futures::TryStreamExt;
             let mut objects = Vec::new();
-            let roots = ["_cluster", "sim"];
+            let roots = ["_cluster", "sim", "_wal", "default"];
             for root in roots {
                 let prefix = tessera_object::Key::new(root).unwrap_or_else(|_| unreachable!());
                 let listed: Vec<_> = store.list(&prefix).try_collect().await.unwrap_or_default();
@@ -220,5 +221,8 @@ pub fn run_all(
     reports.push(("lease", lease));
     let catalog = run(catalog::tenants(&Sim::new(config))).map_err(|v| ("catalog", v))?;
     reports.push(("catalog", catalog));
+    let write_path =
+        run(write_path::write_path(&Sim::new(config))).map_err(|v| ("write-path", v))?;
+    reports.push(("write-path", write_path));
     Ok(reports)
 }

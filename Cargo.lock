@@ -1497,9 +1497,11 @@ dependencies = [
  "tessera-catalog",
  "tessera-format",
  "tessera-ingest",
+ "tessera-manifest",
  "tessera-object",
  "tessera-server",
  "tessera-types",
+ "tessera-wal",
  "thiserror",
  "tokio",
  "tracing",
@@ -1624,12 +1626,17 @@ dependencies = [
 name = "tessera-sim"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "clap",
  "futures",
  "tessera-catalog",
  "tessera-commit",
+ "tessera-format",
+ "tessera-ingest",
+ "tessera-manifest",
  "tessera-object",
  "tessera-types",
+ "tessera-wal",
  "thiserror",
  "tokio",
 ]
