@@ -11,10 +11,12 @@
 pub mod entry;
 pub mod flush;
 pub mod reader;
+pub mod recovery;
 pub mod writer;
 
 pub use entry::{BlockMeta, Entry, EntryBody, EntryId, FORMAT};
 pub use flush::{FlushTarget, write_l1_files};
+pub use recovery::{Recovery, recover};
 pub use writer::WriterLog;
 
 /// Why a writer-log operation failed.

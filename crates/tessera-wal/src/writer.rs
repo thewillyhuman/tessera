@@ -52,6 +52,20 @@ impl WriterLog {
         }
     }
 
+    /// A handle that appends to an existing log from `next` on. Only
+    /// recovery uses this, after sealing the log (ST-10); a live writer
+    /// never resumes a log, it starts a new one (ST-8).
+    #[must_use]
+    pub fn resume(store: Arc<dyn ObjectStore>, env: Env, writer: WriterId, next: Seq) -> Self {
+        WriterLog {
+            store,
+            env,
+            writer,
+            next,
+            state: State::Open,
+        }
+    }
+
     /// The log's identity.
     #[must_use]
     pub fn writer_id(&self) -> WriterId {
