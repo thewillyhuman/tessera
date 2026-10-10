@@ -11,18 +11,21 @@
 //! across stages; that arrives with distributed execution (M6), where
 //! stages and exchanges are introduced.
 
+use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampNanosecondArray, new_null_array,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch,
+    StringArray, TimestampNanosecondArray, new_null_array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
-use tessera_ir::{Literal, Plan, PlanError, Registry};
+use tessera_ir::{Expr, Literal, Plan, PlanError, Registry};
 use tessera_manifest::ManifestError;
 use tessera_object::{PoolError, Pools};
+use tessera_types::event::TRACE_ID;
 use tessera_types::{Env, Window};
 
 use crate::ExecError;
@@ -30,7 +33,7 @@ use crate::batch::Batch;
 use crate::memory::MemoryPool;
 use crate::operator::{
     CollectSink, Extract, Filter, Format, HashAggregate, Limit, Operator, Project, RangeVector,
-    Sort, Steps, TopK,
+    Sort, Steps, TopK, TraceGroup,
 };
 use crate::pipeline::Pipeline;
 use crate::scan::{self, ScanAnalysis};
@@ -189,6 +192,28 @@ impl Engine {
                     }
                     Ok(batches)
                 }
+                Plan::TraceGroup {
+                    candidates,
+                    spans,
+                    spanset,
+                } => {
+                    // Two phases (QL-13): the candidates' trace ids, then
+                    // every span of those traces.
+                    let ids = match candidates {
+                        Some(candidates) => Some(trace_ids(
+                            &self.execute(candidates, memory, analysis).await?,
+                        )),
+                        None => None,
+                    };
+                    let spans = match ids {
+                        Some(ids) if ids.is_empty() => return Ok(Vec::new()),
+                        Some(ids) => Cow::Owned(with_trace_ids(spans.as_ref().clone(), ids)),
+                        None => Cow::Borrowed(spans.as_ref()),
+                    };
+                    let batches = self.execute(&spans, memory, analysis).await?;
+                    let operator = Box::new(TraceGroup::new(spanset.clone(), Arc::clone(memory)));
+                    self.pipe(operator, batches).await
+                }
                 other => {
                     let input = other.inputs()[0];
                     let operator = self.operator(other, input, memory)?;
@@ -301,6 +326,38 @@ impl Engine {
 }
 
 /// A batch of constant rows.
+/// The distinct trace ids of `batches`, as byte literals.
+fn trace_ids(batches: &[RecordBatch]) -> Vec<Literal> {
+    let mut ids = BTreeSet::new();
+    for batch in batches {
+        let Some(column) = batch
+            .column_by_name(TRACE_ID)
+            .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+        else {
+            continue;
+        };
+        ids.extend(column.iter().flatten().map(<[u8]>::to_vec));
+    }
+    ids.into_iter().map(Literal::Bytes).collect()
+}
+
+/// `plan` restricted to the traces in `ids`: a predicate on the scan
+/// when the plan is one, so that pruning sees it; a filter otherwise.
+fn with_trace_ids(plan: Plan, ids: Vec<Literal>) -> Plan {
+    let in_list = Expr::InList {
+        expr: Box::new(Expr::column(TRACE_ID)),
+        list: ids,
+        negated: false,
+    };
+    match plan {
+        Plan::Scan(mut scan) => {
+            scan.predicates.push(in_list);
+            Plan::Scan(scan)
+        }
+        other => other.filter(in_list),
+    }
+}
+
 fn values(schema: &SchemaRef, rows: &[Vec<Literal>]) -> Result<RecordBatch, EngineError> {
     let columns = schema
         .fields()

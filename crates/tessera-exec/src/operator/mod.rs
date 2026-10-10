@@ -17,6 +17,7 @@ mod project;
 mod range;
 mod sort;
 mod topk;
+mod trace;
 
 use arrow::array::RecordBatch;
 
@@ -31,6 +32,7 @@ pub use project::Project;
 pub use range::{RangeVector, Steps};
 pub use sort::Sort;
 pub use topk::TopK;
+pub use trace::TraceGroup;
 
 /// Whether a consumer wants more input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
