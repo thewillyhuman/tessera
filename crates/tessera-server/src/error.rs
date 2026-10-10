@@ -13,7 +13,6 @@ use serde::Serialize;
 use tessera_catalog::CatalogError;
 use tessera_exec::{EngineError, QueryError};
 use tessera_ingest::IngestError;
-use tessera_manifest::ManifestError;
 
 #[derive(Serialize)]
 struct ErrorBody {
@@ -109,13 +108,6 @@ impl From<CatalogError> for ApiError {
 impl From<IngestError> for ApiError {
     fn from(error: IngestError) -> Self {
         tracing::warn!(error = %error, "write rejected");
-        ApiError::unavailable(error.to_string())
-    }
-}
-
-impl From<ManifestError> for ApiError {
-    fn from(error: ManifestError) -> Self {
-        tracing::warn!(error = %error, "read failed");
         ApiError::unavailable(error.to_string())
     }
 }

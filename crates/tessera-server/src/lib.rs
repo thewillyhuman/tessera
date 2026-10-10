@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! Tessera's network front ends (spec section 16): the HTTP
-//! administration API, OTLP ingest over HTTP, SQL over HTTP and over the
-//! `PostgreSQL` wire protocol, and a plain read of a dataset. The other
-//! query languages and the compatibility APIs arrive with their
-//! milestones.
+//! administration API, OTLP ingest over HTTP, and SQL over HTTP and over
+//! the `PostgreSQL` wire protocol. The other query languages and the
+//! compatibility APIs arrive with their milestones.
 //!
 //! This crate is transport only: it decodes requests, calls the catalog,
-//! the ingest service and the consistent view, and encodes responses. No
+//! the ingest service and the query engine, and encodes responses. No
 //! rule about tenants or data lives here.
 
 pub mod admin;
@@ -16,7 +15,6 @@ mod error;
 pub mod otlp;
 pub mod pg;
 pub mod query;
-pub mod read;
 
 use std::sync::Arc;
 
@@ -51,8 +49,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     admin::router(state.clone())
         .merge(otlp::router(state.clone()))
-        .merge(query::router(state.clone()))
-        .merge(read::router(state))
+        .merge(query::router(state))
 }
 
 #[cfg(test)]

@@ -2179,7 +2179,6 @@ dependencies = [
  "tessera-format",
  "tessera-ingest",
  "tessera-ir",
- "tessera-manifest",
  "tessera-object",
  "tessera-opt",
  "tessera-sql",

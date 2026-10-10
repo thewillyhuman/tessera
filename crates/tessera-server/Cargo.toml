@@ -13,7 +13,6 @@ tessera-exec.workspace = true
 tessera-format.workspace = true
 tessera-ingest.workspace = true
 tessera-ir.workspace = true
-tessera-manifest.workspace = true
 tessera-object.workspace = true
 tessera-sql.workspace = true
 tessera-types.workspace = true
