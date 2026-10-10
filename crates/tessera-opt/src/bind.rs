@@ -45,13 +45,7 @@ fn bind_plan(plan: Plan) -> Plan {
         } => Plan::Aggregate {
             input: Box::new(bind_plan(*input)),
             group_by: group_by.into_iter().map(bind_named).collect(),
-            aggregates: aggregates
-                .into_iter()
-                .map(|a| AggregateExpr {
-                    args: a.args.into_iter().map(bind_expr).collect(),
-                    ..a
-                })
-                .collect(),
+            aggregates: aggregates.into_iter().map(bind_aggregate).collect(),
         },
         Plan::Sort { input, keys } => Plan::Sort {
             input: Box::new(bind_plan(*input)),
@@ -74,6 +68,30 @@ fn bind_plan(plan: Plan) -> Plan {
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs.into_iter().map(bind_plan).collect(),
         },
+    }
+}
+
+/// Numeric aggregates read an attribute path as a number; the others
+/// leave it as its context typed it.
+fn bind_aggregate(aggregate: AggregateExpr) -> AggregateExpr {
+    let numeric = matches!(
+        aggregate.function.as_str(),
+        "sum" | "sum_raw" | "avg" | "avg_raw"
+    );
+    AggregateExpr {
+        args: aggregate
+            .args
+            .into_iter()
+            .map(|arg| {
+                let bound = bind_expr(arg);
+                if numeric {
+                    retype(bound, Some(DataType::Float64))
+                } else {
+                    bound
+                }
+            })
+            .collect(),
+        ..aggregate
     }
 }
 
@@ -257,6 +275,36 @@ mod tests {
             panic!()
         };
         assert_eq!(typed(&expr), &DataType::Int64);
+    }
+
+    #[test]
+    fn numeric_aggregates_read_paths_as_numbers() {
+        let plan = Plan::Aggregate {
+            input: Box::new(Plan::Scan(Scan::all(
+                TenantId::DEFAULT,
+                DatasetName::new("prod").unwrap(),
+                Kind::Log,
+            ))),
+            group_by: vec![],
+            aggregates: vec![
+                AggregateExpr {
+                    function: "sum_raw".into(),
+                    args: vec![path("attr.n")],
+                    name: "total".into(),
+                },
+                AggregateExpr {
+                    function: "max".into(),
+                    args: vec![path("attr.host")],
+                    name: "host".into(),
+                },
+            ],
+        };
+        let bound = bind(plan, &Registry::builtin()).unwrap();
+        let Plan::Aggregate { aggregates, .. } = bound else {
+            panic!()
+        };
+        assert_eq!(typed(&aggregates[0].args[0]), &DataType::Float64);
+        assert_eq!(typed(&aggregates[1].args[0]), &DataType::Utf8);
     }
 
     #[test]
