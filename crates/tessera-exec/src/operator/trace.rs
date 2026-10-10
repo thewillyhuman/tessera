@@ -73,7 +73,8 @@ impl TraceGroup {
                 end += 1;
             }
             let trace = Trace::new(&spans.slice(start, end - start))?;
-            for (index, group) in evaluate_spanset(&self.spanset, &trace)?
+            let every_span: BTreeSet<usize> = (0..trace.rows.num_rows()).collect();
+            for (index, group) in evaluate_spanset(&self.spanset, &trace, &every_span)?
                 .into_iter()
                 .enumerate()
             {
@@ -316,22 +317,45 @@ fn single(spans: BTreeSet<usize>) -> Vec<Group> {
     }
 }
 
-/// The spansets `spanset` yields on `trace`.
-fn evaluate_spanset(spanset: &Spanset, trace: &Trace) -> Result<Vec<Group>, ExecError> {
+/// The spansets `spanset` yields on `trace`, from the spans in `input`:
+/// every span of the trace at the top, the spans of one spanset of the
+/// left side under a pipe.
+fn evaluate_spanset(
+    spanset: &Spanset,
+    trace: &Trace,
+    input: &BTreeSet<usize>,
+) -> Result<Vec<Group>, ExecError> {
     Ok(match spanset {
-        Spanset::Filter(None) => single((0..trace.rows.num_rows()).collect()),
+        Spanset::Filter(None) => single(input.clone()),
         Spanset::Filter(Some(condition)) => {
             let keep = evaluate_predicate(condition, &trace.rows)?;
             single(
-                (0..keep.len())
+                input
+                    .iter()
+                    .copied()
                     .filter(|&i| keep.is_valid(i) && keep.value(i))
                     .collect(),
             )
         }
+        Spanset::Pipe(left, right) => {
+            let mut piped = Vec::new();
+            for group in evaluate_spanset(left, trace, input)? {
+                for mut inner in evaluate_spanset(right, trace, &group.spans)? {
+                    for (label, value) in &group.labels {
+                        inner
+                            .labels
+                            .entry(label.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                    piped.push(inner);
+                }
+            }
+            piped
+        }
         Spanset::And(left, right) => {
             let (l, r) = (
-                evaluate_spanset(left, trace)?,
-                evaluate_spanset(right, trace)?,
+                evaluate_spanset(left, trace, input)?,
+                evaluate_spanset(right, trace, input)?,
             );
             if l.is_empty() || r.is_empty() {
                 Vec::new()
@@ -341,15 +365,15 @@ fn evaluate_spanset(spanset: &Spanset, trace: &Trace) -> Result<Vec<Group>, Exec
         }
         Spanset::Or(left, right) => {
             let (l, r) = (
-                evaluate_spanset(left, trace)?,
-                evaluate_spanset(right, trace)?,
+                evaluate_spanset(left, trace, input)?,
+                evaluate_spanset(right, trace, input)?,
             );
             single(all_spans(&l).union(&all_spans(&r)).copied().collect())
         }
         Spanset::Structural { left, op, right } => {
             let (l, r) = (
-                evaluate_spanset(left, trace)?,
-                evaluate_spanset(right, trace)?,
+                evaluate_spanset(left, trace, input)?,
+                evaluate_spanset(right, trace, input)?,
             );
             if l.is_empty() || r.is_empty() {
                 Vec::new()
@@ -358,13 +382,13 @@ fn evaluate_spanset(spanset: &Spanset, trace: &Trace) -> Result<Vec<Group>, Exec
             }
         }
         Spanset::AggregateFilter {
-            input,
+            input: inner,
             function,
             arg,
             op,
             value,
         } => {
-            let groups = evaluate_spanset(input, trace)?;
+            let groups = evaluate_spanset(inner, trace, input)?;
             let values = match arg {
                 Some(arg) => Some(floats(arg, &trace.rows)?),
                 None => None,
@@ -378,8 +402,12 @@ fn evaluate_spanset(spanset: &Spanset, trace: &Trace) -> Result<Vec<Group>, Exec
                 })
                 .collect()
         }
-        Spanset::By { input, key, label } => {
-            let groups = evaluate_spanset(input, trace)?;
+        Spanset::By {
+            input: inner,
+            key,
+            label,
+        } => {
+            let groups = evaluate_spanset(inner, trace, input)?;
             let keys = cast(&evaluate(key, &trace.rows)?, &DataType::Utf8)?;
             let keys = keys
                 .as_any()
@@ -390,7 +418,7 @@ fn evaluate_spanset(spanset: &Spanset, trace: &Trace) -> Result<Vec<Group>, Exec
                 .flat_map(|group| split_by(&group, keys, label))
                 .collect()
         }
-        Spanset::Coalesce(input) => single(all_spans(&evaluate_spanset(input, trace)?)),
+        Spanset::Coalesce(inner) => single(all_spans(&evaluate_spanset(inner, trace, input)?)),
     })
 }
 
@@ -909,6 +937,54 @@ mod tests {
             .unwrap();
         assert_eq!(matched_counts.value(2), 2, "the db spanset has two spans");
         assert_eq!(matched(Spanset::Coalesce(Box::new(by))).len(), 6);
+    }
+
+    #[test]
+    fn a_pipe_filters_the_spans_of_each_spanset() {
+        let error = filter(Expr::column(STATUS_CODE).binary(BinaryOp::Eq, Expr::literal("error")));
+        assert_eq!(
+            matched(Spanset::Pipe(
+                Box::new(name_is("db")),
+                Box::new(error.clone())
+            )),
+            vec![(1, 2, 0)]
+        );
+        let by_service = Spanset::By {
+            input: Box::new(Spanset::Filter(None)),
+            key: Expr::Path {
+                path: "resource.service.name".into(),
+                data_type: DataType::Utf8,
+            },
+            label: "by(resource.service.name)".into(),
+        };
+        let mut operator = TraceGroup::new(
+            Spanset::Pipe(Box::new(by_service), Box::new(name_is("cache"))),
+            MemoryPool::unbounded(),
+        );
+        let out = run(&mut operator, vec![spans()]);
+        let batch = concat_batches(&trace_group_schema(), &out).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            text(&batch, SPANSET_LABELS).unwrap().value(0),
+            r#"{"by(resource.service.name)":"db"}"#,
+            "the labels of the piped spanset survive"
+        );
+        assert!(
+            matched(Spanset::Pipe(
+                Box::new(name_is("auth")),
+                Box::new(Spanset::Structural {
+                    left: Box::new(Spanset::Filter(None)),
+                    op: Structural {
+                        relation: Relation::Child,
+                        negated: false,
+                        union: false,
+                    },
+                    right: Box::new(Spanset::Filter(None)),
+                })
+            ))
+            .is_empty(),
+            "a lone span has no child among the piped spans"
+        );
     }
 
     #[test]

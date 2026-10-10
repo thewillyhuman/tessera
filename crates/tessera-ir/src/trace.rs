@@ -217,6 +217,8 @@ pub enum Spanset {
     },
     /// `A | coalesce()`: every spanset of `A` merged into one.
     Coalesce(Box<Spanset>),
+    /// `A | B`: `B` evaluated over the spans of each spanset of `A`.
+    Pipe(Box<Spanset>, Box<Spanset>),
 }
 
 impl Spanset {
@@ -256,6 +258,7 @@ impl Spanset {
             }
             Spanset::And(left, right)
             | Spanset::Or(left, right)
+            | Spanset::Pipe(left, right)
             | Spanset::Structural { left, right, .. } => {
                 left.collect_leaves(leaves) && right.collect_leaves(leaves)
             }
@@ -275,6 +278,7 @@ impl Spanset {
             }
             Spanset::And(left, right)
             | Spanset::Or(left, right)
+            | Spanset::Pipe(left, right)
             | Spanset::Structural { left, right, .. } => {
                 left.visit(f);
                 right.visit(f);
@@ -326,6 +330,9 @@ impl Spanset {
                 label,
             },
             Spanset::Coalesce(input) => Spanset::Coalesce(Box::new(input.map(f))),
+            Spanset::Pipe(left, right) => {
+                Spanset::Pipe(Box::new(left.map(f)), Box::new(right.map(f)))
+            }
         }
     }
 }
@@ -355,6 +362,7 @@ impl fmt::Display for Spanset {
             }
             Spanset::By { input, label, .. } => write!(f, "{input} | {label}"),
             Spanset::Coalesce(input) => write!(f, "{input} | coalesce()"),
+            Spanset::Pipe(left, right) => write!(f, "{left} | {right}"),
         }
     }
 }
@@ -409,6 +417,12 @@ mod tests {
                 .to_string(),
             "(name = 'a')"
         );
+        let piped = Spanset::Pipe(Box::new(filter(NAME, "a")), Box::new(filter(NAME, "b")));
+        assert_eq!(
+            piped.candidates().unwrap().to_string(),
+            "((name = 'a') OR (name = 'b'))"
+        );
+        assert_eq!(piped.to_string(), "{ (name = 'a') } | { (name = 'b') }");
     }
 
     #[test]
