@@ -7,6 +7,12 @@
 //! The ingester is driven explicitly: `write` buffers, `tick` does the
 //! time-based work. That keeps it deterministic under simulation; the
 //! node runtime ticks it from a timer.
+//!
+//! A writer log is replaced by a fresh one when it reaches its age or
+//! entry limit (ST-8), and when recovery fences it (ST-9): a fenced log
+//! is left to recovery, whose flush covers every row the log holds, and
+//! the ingester carries on with a new writer id. Rows that were pending
+//! are retried on the new log; nothing acknowledged is lost either way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -32,6 +38,11 @@ pub struct IngestConfig {
     pub flush_age: Duration,
     /// The partition window length (MF-1).
     pub window: Duration,
+    /// How long a writer log is used before a new one is started (ST-8).
+    pub max_log_age: Duration,
+    /// How many entries a writer log holds before a new one is started
+    /// (ST-8).
+    pub max_log_entries: u64,
 }
 
 impl Default for IngestConfig {
@@ -42,6 +53,8 @@ impl Default for IngestConfig {
             flush_bytes: 64 << 20,
             flush_age: Duration::from_secs(120),
             window: Window::DEFAULT_LENGTH,
+            max_log_age: Duration::from_secs(3600),
+            max_log_entries: 1_000_000,
         }
     }
 }
@@ -116,6 +129,7 @@ pub struct Ingester {
     pending_bytes: usize,
     pending_since: Option<Timestamp>,
     memtables: BTreeMap<(TenantId, DatasetName), Memtable>,
+    log_started: Timestamp,
     stopped: bool,
 }
 
@@ -135,6 +149,7 @@ impl Ingester {
             pool,
             format,
         };
+        let log_started = env.clock.now();
         Ingester {
             store,
             env,
@@ -146,6 +161,7 @@ impl Ingester {
             pending_bytes: 0,
             pending_since: None,
             memtables: BTreeMap::new(),
+            log_started,
             stopped: false,
         }
     }
@@ -159,7 +175,7 @@ impl Ingester {
     /// Whether the ingester can still accept writes.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        !self.stopped && !self.log.is_fenced()
+        !self.stopped
     }
 
     /// Buffers a batch. The returned [`Ack`] resolves once the segment
@@ -167,10 +183,6 @@ impl Ingester {
     /// full and otherwise on a later [`tick`](Self::tick).
     pub async fn write(&mut self, batch: EventBatch) -> Ack {
         let (sender, receiver) = oneshot::channel();
-        if self.log.is_fenced() {
-            let _ = sender.send(Err(IngestError::Fenced));
-            return Ack(receiver);
-        }
         if self.stopped {
             let _ = sender.send(Err(IngestError::Stopped));
             return Ack(receiver);
@@ -196,6 +208,15 @@ impl Ingester {
         });
         if linger_elapsed {
             self.write_segment().await;
+        }
+        let aged = now
+            .duration_since(self.log_started)
+            .is_some_and(|age| age >= self.config.max_log_age);
+        let full = self.log.next_seq().get() > self.config.max_log_entries;
+        if aged || full {
+            if let Err(error) = self.rotate().await {
+                tracing::warn!(error = %error, "writer log rotation failed; will retry");
+            }
         }
         let due: Vec<(TenantId, DatasetName)> = self
             .memtables
@@ -248,17 +269,12 @@ impl Ingester {
         self.pending_bytes = 0;
         self.pending_since = None;
         let batches: Vec<EventBatch> = pending.iter().map(|(b, _)| b.clone()).collect();
-        let result = match self.register_all(&batches).await {
-            Ok(()) => self
-                .log
-                .append_segment(&batches)
-                .await
-                .map_err(|e| match e {
-                    WalError::Fenced { .. } => IngestError::Fenced,
-                    other => IngestError::NotStored(other.to_string()),
-                }),
-            Err(error) => Err(IngestError::NotStored(error.to_string())),
-        };
+        let mut result = self.append(&batches).await;
+        if matches!(result, Err(IngestError::Fenced)) {
+            tracing::warn!(writer = %self.log.writer_id(), "writer log fenced by recovery; starting a new one");
+            self.replace_log();
+            result = self.append(&batches).await;
+        }
         match result {
             Ok(seq) => {
                 for (batch, sender) in pending {
@@ -277,6 +293,41 @@ impl Ingester {
                 }
             }
         }
+    }
+
+    /// Registers and appends one segment.
+    async fn append(&mut self, batches: &[EventBatch]) -> Result<Seq, IngestError> {
+        self.register_all(batches)
+            .await
+            .map_err(|e| IngestError::NotStored(e.to_string()))?;
+        self.log.append_segment(batches).await.map_err(|e| match e {
+            WalError::Fenced { .. } => IngestError::Fenced,
+            other => IngestError::NotStored(other.to_string()),
+        })
+    }
+
+    /// Starts a fresh writer log. The old log's unflushed rows are left to
+    /// recovery, which is what fenced the old log in the first place.
+    fn replace_log(&mut self) {
+        self.log = WriterLog::start(Arc::clone(&self.store), self.env.clone());
+        self.log_started = self.env.clock.now();
+        self.registered.clear();
+        self.memtables.clear();
+    }
+
+    /// Ends the current log cleanly, with everything flushed, and starts
+    /// a new one (ST-8).
+    async fn rotate(&mut self) -> Result<(), IngestError> {
+        let keys: Vec<_> = self.memtables.keys().cloned().collect();
+        for key in keys {
+            self.flush(&key).await?;
+        }
+        if !self.log.is_fenced() {
+            self.log.end().await?;
+        }
+        tracing::info!(writer = %self.log.writer_id(), "writer log rotated");
+        self.replace_log();
+        Ok(())
     }
 
     /// Registers this writer with every dataset in `batches` it has not
@@ -476,6 +527,8 @@ mod tests {
             flush_bytes: 1 << 30,
             flush_age: Duration::from_secs(120),
             window: Window::DEFAULT_LENGTH,
+            max_log_age: Duration::from_secs(3600),
+            max_log_entries: 1_000_000,
         }
     }
 
@@ -634,7 +687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fenced_ingester_refuses_writes() {
+    async fn a_fenced_ingester_starts_a_new_log_and_loses_nothing() {
         let h = Harness::new();
         let mut ingester = h.ingester(IngestConfig {
             segment_bytes: 1,
@@ -646,8 +699,9 @@ mod tests {
             .wait()
             .await
             .unwrap();
+        let first = ingester.writer_id();
         let seal = Entry::new(
-            ingester.writer_id(),
+            first,
             Seq::new(2),
             EntryId::random(&mut SeededRandom::new(9)),
             Timestamp::UNIX_EPOCH,
@@ -656,17 +710,62 @@ mod tests {
             },
         );
         h.store
-            .put(
-                &layout::writer_log_entry(ingester.writer_id(), Seq::new(2)),
-                seal.encode(),
-            )
+            .put(&layout::writer_log_entry(first, Seq::new(2)), seal.encode())
             .await
             .unwrap();
         let mut ack = ingester.write(batch("prod", 1..2)).await;
-        assert!(matches!(ack.try_now(), Some(Err(IngestError::Fenced))));
-        assert!(!ingester.is_open());
-        let mut refused = ingester.write(batch("prod", 2..3)).await;
-        assert!(matches!(refused.try_now(), Some(Err(IngestError::Fenced))));
+        assert!(
+            matches!(ack.try_now(), Some(Ok(seq)) if seq == Seq::new(1)),
+            "first segment of the new log"
+        );
+        assert_ne!(ingester.writer_id(), first);
+        assert!(ingester.is_open());
+        assert_eq!(
+            h.view_ids("prod").await,
+            [0, 1],
+            "the old log is still registered and readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aged_log_is_ended_and_replaced() {
+        let h = Harness::new();
+        let mut ingester = h.ingester(IngestConfig {
+            segment_bytes: 1,
+            max_log_age: Duration::from_secs(60),
+            ..config()
+        });
+        ingester
+            .write(batch("prod", 0..1))
+            .await
+            .wait()
+            .await
+            .unwrap();
+        let first = ingester.writer_id();
+        h.clock.advance(Duration::from_secs(60));
+        ingester.tick().await;
+        assert_ne!(ingester.writer_id(), first);
+        let entries: Vec<Entry> = reader::entries(Arc::new(h.store.clone()), first, Seq::ZERO)
+            .try_collect()
+            .await
+            .unwrap();
+        let kinds: Vec<&str> = entries
+            .iter()
+            .map(|e| match e.body() {
+                EntryBody::Segment { .. } => "segment",
+                EntryBody::Flush { .. } => "flush",
+                EntryBody::Seal { .. } => "seal",
+                EntryBody::End => "end",
+            })
+            .collect();
+        assert_eq!(kinds, ["segment", "flush", "end"]);
+        ingester
+            .write(batch("prod", 1..2))
+            .await
+            .wait()
+            .await
+            .unwrap();
+        assert_eq!(h.view_ids("prod").await, [0, 1]);
     }
 
     #[tokio::test(start_paused = true)]
