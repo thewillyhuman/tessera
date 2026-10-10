@@ -50,7 +50,26 @@ run one plan node at a time rather than fused across stages; a bare
 attribute reads as text until the advisor promotes it (M8); `now()` is
 the node's clock and there is no result cache.
 
-**M3, logs complete: next.**
+**M3, logs complete: done, with gaps listed below.** Compaction of L1
+files into L2 files with deduplication, the default layouts of section
+8.5 as far as stored columns allow, term and trigram indexes on the
+body and a Bloom filter on trace ids in a sidecar per file, index-driven
+pruning of files and row groups, garbage collection of replaced files
+and adopted segments, the search syntax (also as `search('...')` in
+SQL), LogQL with a hand-written parser, parser stages, label filters,
+formatting and metric queries, and the Loki HTTP API. The LogQL
+differential suite agrees with Loki 3.3.2 on every case in both
+directions; the deviations found are documented in the `tessera-logql`
+crate.
+
+Gaps left in M3: push over protobuf (JSON only); `offset`, `stddev`,
+`stdvar`, `topk`, `bottomk`, binary operations between two vectors and
+`ip()` filters in LogQL; sort keys on attribute columns and ingest-time
+grouping of compaction inputs (CP-2) wait for column promotion (M8);
+L3, retention sampling and log patterns wait for M9; Grafana itself has
+not been run against the API yet.
+
+**M4, traces: next.**
 
 ## Layout
 
@@ -64,15 +83,19 @@ crates/
   tessera-wal       writer logs: entries, segments, L1 flush, recovery
   tessera-manifest  partition manifests, writer registry, intake, consistent view
   tessera-ingest    ingester, ingest service, OTLP decoder
+  tessera-compact   compaction jobs, deduplication, garbage collection of files and segments
   tessera-ir        plan representation: expressions, plan nodes, typing, function registry, Frontend trait
-  tessera-kernels   expression evaluation, variant access, grouping, aggregation, time bucketing
-  tessera-opt       binder, rewrite rules, manifest-level pruning
+  tessera-kernels   expression evaluation, variant access, extraction, templates, windows, aggregation
+  tessera-opt       binder, rewrite rules, manifest-level and index-level pruning
   tessera-exec      operators, pipelines, CPU pool, scans, the engine, end-to-end query runner
   tessera-sql       SQL lexer, parser and lowering
-  tessera-server    HTTP administration and OTLP ingest, SQL over HTTP, PostgreSQL wire protocol
+  tessera-search    the search syntax, lowered to a predicate
+  tessera-logql     LogQL lexer, parser and lowering
+  tessera-server    HTTP administration, OTLP ingest, SQL over HTTP, PostgreSQL wire protocol, Loki API
   tessera           the binary
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
 compat/sql/         SQL differential tests against SQLite
+compat/logql/       LogQL differential tests against a Loki instance
 ```
 
 Dependencies between crates point downward only (spec section 18.1).
@@ -125,6 +148,25 @@ psql 'host=127.0.0.1 port=5432 dbname=prod' \
 The database a PostgreSQL client connects to is the dataset. `EXPLAIN`
 shows the plan and `EXPLAIN ANALYZE` what each scan read and pruned.
 
+The Loki API lives under `/loki/api/v1`: push JSON streams, query with
+LogQL, list labels and values, and tail. Point Grafana's Loki data
+source at `http://localhost:8080`. The tenant comes from
+`X-Scope-OrgID` and the dataset from `x-tessera-dataset`, both
+`default` when absent:
+
+```
+curl -X POST localhost:8080/loki/api/v1/push -H 'content-type: application/json' \
+     -d '{"streams":[{"stream":{"app":"checkout","level":"error"},"values":[["1700000000000000000","payment timeout"]]}]}'
+curl -G localhost:8080/loki/api/v1/query_range \
+     --data-urlencode 'query={app="checkout"} |= "timeout" | logfmt' --data-urlencode 'since=1h'
+curl -G localhost:8080/loki/api/v1/query_range \
+     --data-urlencode 'query=sum by (app) (rate({app=~".+"}[5m]))' --data-urlencode 'since=1h' --data-urlencode 'step=1m'
+```
+
+Compaction, index building and garbage collection run in the
+background: a partition's L1 files become one indexed L2 file once
+there are four of them or a lone one is an hour old.
+
 The routes are listed in the modules of `crates/tessera-server/src`.
 Logging is controlled by `TESSERA_LOG` (for example `TESSERA_LOG=debug`).
 
@@ -141,7 +183,15 @@ A simulation is reproducible from its seed; a violation is reported with
 the command line that replays it. The scenarios cover the commit log,
 leases, the catalog and the write path (ingest, recovery, intake and
 the consistent view). The SQL differential suite in `compat/sql` runs
-the same questions against SQLite and is part of `cargo test`.
+the same questions against SQLite and is part of `cargo test`. The
+LogQL suite in `compat/logql` pushes the same lines to a Loki instance
+and to an in-process node and compares the answers; it runs when
+`TESSERA_LOKI_URL` names a Loki (CI starts one) and reports a skip
+otherwise:
+
+```
+TESSERA_LOKI_URL=http://127.0.0.1:3100 cargo test -p tessera-compat-logql
+```
 
 Every commit passes `cargo fmt --check`, `cargo clippy --all-targets`
 with zero findings, `cargo test --workspace` and `cargo deny check`.
