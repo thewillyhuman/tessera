@@ -53,6 +53,15 @@ fn bind_plan(plan: Plan) -> Plan {
             input: Box::new(bind_plan(*input)),
             predicate: bind_expr(predicate),
         },
+        Plan::TraceGroup {
+            candidates,
+            spans,
+            spanset,
+        } => Plan::TraceGroup {
+            candidates: candidates.map(|c| Box::new(bind_plan(*c))),
+            spans: Box::new(bind_plan(*spans)),
+            spanset: spanset.map(&mut bind_expr),
+        },
         Plan::Extract {
             input,
             source,

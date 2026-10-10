@@ -17,6 +17,7 @@ use tessera_types::{DatasetName, Kind, TenantId, TimeRange, Timestamp, event};
 
 use crate::expr::{Expr, Literal};
 use crate::function::Registry;
+use crate::trace::{Spanset, trace_group_schema};
 use crate::typing::{TypeError, expr_type};
 
 /// Why a plan is not well formed.
@@ -397,6 +398,18 @@ pub enum Plan {
         /// The rows, one literal per column.
         rows: Vec<Vec<Literal>>,
     },
+    /// Group spans by trace and evaluate a spanset expression on each
+    /// trace (QL-13). The engine reads the trace ids of `candidates`,
+    /// then every span of those traces from `spans`.
+    TraceGroup {
+        /// The spans that make their trace a candidate; every trace is
+        /// one when `None`.
+        candidates: Option<Box<Plan>>,
+        /// Every span of the candidate traces.
+        spans: Box<Plan>,
+        /// The expression evaluated on each trace.
+        spanset: Spanset,
+    },
 }
 
 impl Plan {
@@ -452,6 +465,13 @@ impl Plan {
             | Plan::Format { input, .. }
             | Plan::RangeVector { input, .. } => vec![input],
             Plan::Union { inputs } => inputs.iter().collect(),
+            Plan::TraceGroup {
+                candidates, spans, ..
+            } => candidates
+                .iter()
+                .map(AsRef::as_ref)
+                .chain(std::iter::once(spans.as_ref()))
+                .collect(),
         }
     }
 
@@ -467,6 +487,7 @@ impl Plan {
                 .map(Plan::time_range)
                 .reduce(|a, b| TimeRange::new(a.start.min(b.start), a.end.max(b.end)))
                 .unwrap_or(TimeRange::ALL),
+            Plan::TraceGroup { spans, .. } => spans.time_range(),
             other => other.inputs()[0].time_range(),
         }
     }
@@ -499,7 +520,8 @@ impl Plan {
             Plan::Aggregate { .. }
             | Plan::Union { .. }
             | Plan::Values { .. }
-            | Plan::RangeVector { .. } => Vec::new(),
+            | Plan::RangeVector { .. }
+            | Plan::TraceGroup { .. } => Vec::new(),
         }
     }
 
@@ -528,6 +550,7 @@ impl Plan {
             | Plan::TopK { input, .. } => input.schema(registry),
             Plan::Extract { input, .. } => Ok(with_extracted(&input.schema(registry)?)),
             Plan::RangeVector { .. } => Ok(range_vector_schema()),
+            Plan::TraceGroup { .. } => Ok(trace_group_schema()),
             Plan::Format { input, labels, .. } => {
                 let input = input.schema(registry)?;
                 Ok(if labels.is_empty() {
@@ -590,11 +613,7 @@ impl Plan {
                 input.fmt_tree(f, depth + 1)
             }
             Plan::Project { input, exprs } => {
-                let shown: Vec<String> = exprs
-                    .iter()
-                    .map(|e| format!("{} AS {}", e.expr, e.name))
-                    .collect();
-                writeln!(f, "{pad}Project: {}", shown.join(", "))?;
+                fmt_project(f, &pad, exprs)?;
                 input.fmt_tree(f, depth + 1)
             }
             Plan::Aggregate {
@@ -677,8 +696,41 @@ impl Plan {
                 input.fmt_tree(f, depth + 1)
             }
             Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
+            Plan::TraceGroup {
+                candidates,
+                spans,
+                spanset,
+            } => fmt_trace_group(f, depth, candidates.as_deref(), spans, spanset),
         }
     }
+}
+
+/// The `TraceGroup` lines of `EXPLAIN`: the expression, then each scan
+/// under its role.
+fn fmt_trace_group(
+    f: &mut fmt::Formatter<'_>,
+    depth: usize,
+    candidates: Option<&Plan>,
+    spans: &Plan,
+    spanset: &Spanset,
+) -> fmt::Result {
+    let pad = "  ".repeat(depth);
+    writeln!(f, "{pad}TraceGroup: {spanset}")?;
+    if let Some(candidates) = candidates {
+        writeln!(f, "{pad}  candidates:")?;
+        candidates.fmt_tree(f, depth + 2)?;
+    }
+    writeln!(f, "{pad}  spans:")?;
+    spans.fmt_tree(f, depth + 2)
+}
+
+/// The `Project` line of `EXPLAIN`.
+fn fmt_project(f: &mut fmt::Formatter<'_>, pad: &str, exprs: &[NamedExpr]) -> fmt::Result {
+    let shown: Vec<String> = exprs
+        .iter()
+        .map(|e| format!("{} AS {}", e.expr, e.name))
+        .collect();
+    writeln!(f, "{pad}Project: {}", shown.join(", "))
 }
 
 /// The `Scan` line of `EXPLAIN`.

@@ -170,6 +170,15 @@ fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs.into_iter().map(f).collect(),
         },
+        Plan::TraceGroup {
+            candidates,
+            spans,
+            spanset,
+        } => Plan::TraceGroup {
+            candidates: candidates.map(|c| Box::new(f(*c))),
+            spans: Box::new(f(*spans)),
+            spanset,
+        },
     }
 }
 
