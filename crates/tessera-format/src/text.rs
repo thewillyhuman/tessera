@@ -37,6 +37,23 @@ pub fn tokenize(text: &str) -> BTreeSet<String> {
     tokens
 }
 
+/// Whether `text` has the token `token` (lowercase), by the rules of
+/// [`tokenize`], without building the whole set.
+#[must_use]
+pub fn has_token(text: &str, token: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower
+        .split(|c: char| !(c.is_alphanumeric() || JOINERS.contains(&c)))
+        .map(|run| run.trim_matches(|c: char| JOINERS.contains(&c)))
+        .filter(|run| !run.is_empty())
+        .any(|run| {
+            run == token
+                || run
+                    .split(|c: char| JOINERS.contains(&c))
+                    .any(|p| p == token)
+        })
+}
+
 /// The distinct trigrams of `text`, lowercased: every three consecutive
 /// characters. Text shorter than three characters has none.
 #[must_use]
@@ -89,5 +106,16 @@ mod tests {
         assert_eq!(trigrams("Abcd"), set(&["abc", "bcd"]));
         assert!(trigrams("ab").is_empty());
         assert_eq!(trigrams("ñaña"), set(&["ñañ", "aña"]));
+    }
+
+    #[test]
+    fn has_token_agrees_with_tokenize() {
+        let text = "GET http.request.method user-id=42";
+        for token in tokenize(text) {
+            assert!(has_token(text, &token), "{token}");
+        }
+        assert!(!has_token(text, "http.request"));
+        assert!(!has_token(text, "ge"));
+        assert!(has_token("Connection Reset", "reset"));
     }
 }
