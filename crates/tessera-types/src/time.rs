@@ -1,0 +1,237 @@
+// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+
+//! Event time and the injected clock.
+//!
+//! Every component reads time through a [`Clock`] (RS-2) so that it can run
+//! under deterministic simulation with a [`ManualClock`].
+
+use std::fmt;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+const SECONDS_PER_DAY: i64 = 86_400;
+
+/// A point in time with nanosecond precision, as nanoseconds since the Unix
+/// epoch. This is the type of the `timestamp` column (spec section 4.2).
+///
+/// Formats as RFC 3339 in UTC, with a nine-digit fraction when it is not
+/// zero.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct Timestamp(i64);
+
+impl Timestamp {
+    /// 1970-01-01T00:00:00Z.
+    pub const UNIX_EPOCH: Timestamp = Timestamp(0);
+
+    /// Wraps a count of nanoseconds since the Unix epoch.
+    #[must_use]
+    pub const fn from_nanos(nanos: i64) -> Self {
+        Timestamp(nanos)
+    }
+
+    /// Nanoseconds since the Unix epoch.
+    #[must_use]
+    pub const fn as_nanos(self) -> i64 {
+        self.0
+    }
+
+    /// `self + duration`, or `None` if the result does not fit.
+    #[must_use]
+    pub fn checked_add(self, duration: Duration) -> Option<Self> {
+        let nanos = i64::try_from(duration.as_nanos()).ok()?;
+        self.0.checked_add(nanos).map(Timestamp)
+    }
+
+    /// `self - earlier`, or `None` if `earlier` is later than `self`.
+    #[must_use]
+    pub fn duration_since(self, earlier: Timestamp) -> Option<Duration> {
+        let nanos = self.0.checked_sub(earlier.0)?;
+        u64::try_from(nanos).ok().map(Duration::from_nanos)
+    }
+
+    /// Converts a system time, saturating at the representable range.
+    #[must_use]
+    pub fn from_system_time(time: SystemTime) -> Self {
+        match time.duration_since(UNIX_EPOCH) {
+            Ok(after) => Timestamp(i64::try_from(after.as_nanos()).unwrap_or(i64::MAX)),
+            Err(before) => {
+                let nanos = i64::try_from(before.duration().as_nanos()).unwrap_or(i64::MAX);
+                Timestamp(-nanos)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let seconds = self.0.div_euclid(NANOS_PER_SECOND);
+        let nanos = self.0.rem_euclid(NANOS_PER_SECOND);
+        let days = seconds.div_euclid(SECONDS_PER_DAY);
+        let second_of_day = seconds.rem_euclid(SECONDS_PER_DAY);
+        let (year, month, day) = civil_from_days(days);
+        write!(
+            f,
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+            second_of_day / 3600,
+            second_of_day % 3600 / 60,
+            second_of_day % 60
+        )?;
+        if nanos != 0 {
+            write!(f, ".{nanos:09}")?;
+        }
+        f.write_str("Z")
+    }
+}
+
+/// Proleptic Gregorian date for a count of days since 1970-01-01.
+///
+/// This is the `civil_from_days` algorithm of Howard Hinnant [1], valid for
+/// the whole `i64` range of days used here.
+///
+/// [1] <https://howardhinnant.github.io/date_algorithms.html>
+fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153; // March = 0
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    // Month and day are bounded by the algorithm; the casts cannot truncate.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    (year, month as u8, day as u8)
+}
+
+/// A source of the current time.
+///
+/// Production code uses [`SystemClock`]; tests and the simulation harness
+/// inject a [`ManualClock`] so that time only moves when the test says so.
+pub trait Clock: Send + Sync {
+    /// The current time.
+    fn now(&self) -> Timestamp;
+}
+
+/// The operating system clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::from_system_time(SystemTime::now())
+    }
+}
+
+/// A clock that only moves when [`advance`](Self::advance) or
+/// [`set`](Self::set) is called. Shared between threads by reference.
+#[derive(Debug)]
+pub struct ManualClock {
+    now: AtomicI64,
+}
+
+impl ManualClock {
+    /// A clock stopped at `start`.
+    #[must_use]
+    pub fn new(start: Timestamp) -> Self {
+        ManualClock {
+            now: AtomicI64::new(start.0),
+        }
+    }
+
+    /// Moves the clock forward by `by`, saturating at the representable range.
+    pub fn advance(&self, by: Duration) {
+        let nanos = i64::try_from(by.as_nanos()).unwrap_or(i64::MAX);
+        // The closure always returns `Some`, so the update cannot fail.
+        let _ = self
+            .now
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                Some(now.saturating_add(nanos))
+            });
+    }
+
+    /// Sets the clock to `to`, which may be earlier than now.
+    pub fn set(&self, to: Timestamp) {
+        self.now.store(to.0, Ordering::SeqCst);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Timestamp {
+        Timestamp(self.now.load(Ordering::SeqCst))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn formats_unix_epoch_as_rfc3339() {
+        assert_eq!(Timestamp::UNIX_EPOCH.to_string(), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn formats_nanoseconds_when_present() {
+        let ts = Timestamp::from_nanos(1_700_000_000_123_456_789);
+        assert_eq!(ts.to_string(), "2023-11-14T22:13:20.123456789Z");
+    }
+
+    #[test]
+    fn formats_times_before_the_epoch() {
+        let ts = Timestamp::from_nanos(-1);
+        assert_eq!(ts.to_string(), "1969-12-31T23:59:59.999999999Z");
+    }
+
+    #[test]
+    fn formats_leap_day() {
+        let ts = Timestamp::from_nanos(951_782_400_000_000_000); // 2000-02-29
+        assert_eq!(ts.to_string(), "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn adds_a_duration() {
+        let ts = Timestamp::from_nanos(10).checked_add(Duration::from_nanos(5));
+        assert_eq!(ts, Some(Timestamp::from_nanos(15)));
+    }
+
+    #[test]
+    fn addition_overflow_is_detected() {
+        let ts = Timestamp::from_nanos(i64::MAX).checked_add(Duration::from_nanos(1));
+        assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn measures_duration_since_an_earlier_time() {
+        let earlier = Timestamp::from_nanos(100);
+        let later = Timestamp::from_nanos(250);
+        assert_eq!(
+            later.duration_since(earlier),
+            Some(Duration::from_nanos(150))
+        );
+        assert_eq!(earlier.duration_since(later), None);
+    }
+
+    #[test]
+    fn manual_clock_only_moves_when_told() {
+        let clock = ManualClock::new(Timestamp::from_nanos(1_000));
+        assert_eq!(clock.now(), Timestamp::from_nanos(1_000));
+        clock.advance(Duration::from_nanos(500));
+        assert_eq!(clock.now(), Timestamp::from_nanos(1_500));
+        clock.set(Timestamp::from_nanos(7));
+        assert_eq!(clock.now(), Timestamp::from_nanos(7));
+    }
+
+    #[test]
+    fn system_clock_is_after_2020() {
+        let year_2020 = Timestamp::from_nanos(1_577_836_800_000_000_000);
+        assert!(SystemClock.now() > year_2020);
+    }
+}
