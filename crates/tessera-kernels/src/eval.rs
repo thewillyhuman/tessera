@@ -11,15 +11,17 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Datum, DurationNanosecondArray, Float64Array, Int64Array,
-    RecordBatch, Scalar, StringArray, TimestampNanosecondArray, UInt32Array, new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Datum, DurationNanosecondArray, Float64Array,
+    Int64Array, RecordBatch, Scalar, StringArray, TimestampNanosecondArray, UInt32Array,
+    new_null_array,
 };
+use arrow::compute::kernels::regexp::regexp_is_match_scalar;
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::kernels::{cmp, comparison, numeric};
 use arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene, take};
 use arrow::datatypes::{DataType, TimeUnit};
 use tessera_ir::{BinaryOp, Expr, Literal};
-use tessera_types::event::OVERFLOW;
+use tessera_types::event::{OVERFLOW, SEVERITY_TEXT};
 
 use crate::{KernelError, time, variant};
 
@@ -125,6 +127,7 @@ fn literal(value: &Literal) -> ArrayRef {
         Literal::Duration(d) => Arc::new(DurationNanosecondArray::from(vec![
             i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
         ])),
+        Literal::Bytes(b) => Arc::new(BinaryArray::from(vec![b.as_slice()])),
     }
 }
 
@@ -140,6 +143,21 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>())
                 .ok_or_else(|| KernelError::MissingColumn(OVERFLOW.to_owned()))?;
             Ok(Value::Column(variant::extract(overflow, path, data_type)?))
+        }
+        Expr::Label { name, data_type } => {
+            let overflow = batch
+                .column_by_name(OVERFLOW)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let severity = batch
+                .column_by_name(SEVERITY_TEXT)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            Ok(Value::Column(variant::label(
+                overflow,
+                severity,
+                name,
+                data_type,
+                batch.num_rows(),
+            )?))
         }
         Expr::Literal(lit) => Ok(Value::Constant(literal(lit))),
         Expr::Binary { op, left, right } => {
@@ -255,8 +273,27 @@ fn common_type(left: &DataType, right: &DataType) -> Option<DataType> {
             DataType::Timestamp(TimeUnit::Nanosecond, _),
             DataType::Timestamp(TimeUnit::Nanosecond, _),
         ) => Some(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        (DataType::FixedSizeBinary(n), DataType::Binary)
+        | (DataType::Binary, DataType::FixedSizeBinary(n)) => Some(DataType::FixedSizeBinary(*n)),
         _ => None,
     }
+}
+
+/// Whether a comparison of these operands is decided by their types: a
+/// fixed-width binary column against bytes of another width never
+/// matches.
+fn width_mismatch(left: &Value, right: &Value) -> bool {
+    let width = |v: &Value| match v.data_type() {
+        DataType::FixedSizeBinary(n) => Some(usize::try_from(*n).unwrap_or(0)),
+        DataType::Binary => v
+            .array()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .filter(|a| a.len() == 1 && !a.is_null(0))
+            .map(|a| a.value(0).len()),
+        _ => None,
+    };
+    matches!((width(left), width(right)), (Some(a), Some(b)) if a != b)
 }
 
 fn binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, KernelError> {
@@ -281,6 +318,11 @@ fn binary(op: BinaryOp, left: &Value, right: &Value) -> Result<Value, KernelErro
         return Ok(wrap(Arc::new(result)));
     }
     if op.is_comparison() {
+        if width_mismatch(left, right) {
+            let rows = left.array().len().max(right.array().len());
+            let equal = op == BinaryOp::Eq;
+            return Ok(wrap(Arc::new(BooleanArray::from(vec![!equal; rows]))));
+        }
         let target = common_type(left.data_type(), right.data_type()).ok_or_else(|| {
             KernelError::Unsupported(format!(
                 "cannot compare {} with {}",
@@ -355,6 +397,37 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
             let lengths = arrow::compute::kernels::length::length(text.array())?;
             Ok(text.with_array(cast(&lengths, &DataType::Int64)?))
         }
+        ("contains", [text, needle]) => {
+            let text = text.cast(&DataType::Utf8)?;
+            let needle = needle.cast(&DataType::Utf8)?;
+            let matched = comparison::contains(text.datum().as_ref(), needle.datum().as_ref())?;
+            Ok(text.with_array(Arc::new(matched)))
+        }
+        ("has_token", [text, token]) => {
+            let token = constant_text(token, "has_token")?.to_lowercase();
+            let text = text.cast(&DataType::Utf8)?;
+            let strings = text
+                .array()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| KernelError::Unsupported("has_token needs text".into()))?;
+            let matched: BooleanArray = strings
+                .iter()
+                .map(|s| s.map(|s| tessera_format::text::has_token(s, &token)))
+                .collect();
+            Ok(text.with_array(Arc::new(matched)))
+        }
+        ("regexp_match", [text, pattern]) => {
+            let pattern = constant_text(pattern, "regexp_match")?;
+            let text = text.cast(&DataType::Utf8)?;
+            let strings = text
+                .array()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| KernelError::Unsupported("regexp_match needs text".into()))?;
+            let matched = regexp_is_match_scalar(strings, &pattern, None)?;
+            Ok(text.with_array(Arc::new(matched)))
+        }
         ("coalesce", [first, rest @ ..]) => {
             let mut acc = first.clone();
             for next in rest {
@@ -371,6 +444,19 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
             values.len()
         ))),
     }
+}
+
+/// The text of a constant argument.
+fn constant_text(value: &Value, function: &str) -> Result<String, KernelError> {
+    value
+        .array()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .filter(|a| value.is_constant() && a.len() == 1 && !a.is_null(0))
+        .map(|a| a.value(0).to_owned())
+        .ok_or_else(|| {
+            KernelError::Unsupported(format!("{function} needs a constant text pattern"))
+        })
 }
 
 fn map_text(text: &Value, f: impl Fn(&str) -> String) -> Result<Value, KernelError> {
@@ -612,5 +698,73 @@ mod tests {
             evaluate(&call, &batch()),
             Err(KernelError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn text_predicates_and_labels() {
+        let contains = Expr::Call {
+            name: "contains".into(),
+            args: vec![Expr::column("body"), Expr::literal("ime")],
+        };
+        assert_eq!(booleans(&contains), vec![false, true, false]);
+        let token = Expr::Call {
+            name: "has_token".into(),
+            args: vec![Expr::column("body"), Expr::literal("Hello")],
+        };
+        assert_eq!(booleans(&token), vec![true, false, false]);
+        let partial = Expr::Call {
+            name: "has_token".into(),
+            args: vec![Expr::column("body"), Expr::literal("hell")],
+        };
+        assert_eq!(booleans(&partial), vec![false, false, false]);
+        let regex = Expr::Call {
+            name: "regexp_match".into(),
+            args: vec![Expr::column("body"), Expr::literal("^t.*t$")],
+        };
+        assert_eq!(booleans(&regex), vec![false, true, false]);
+        let label = Expr::Label {
+            name: "m".into(),
+            data_type: DataType::Utf8,
+        }
+        .binary(BinaryOp::Eq, Expr::literal("GET"));
+        assert_eq!(booleans(&label), vec![true, false, false]);
+        let number = Expr::Label {
+            name: "n".into(),
+            data_type: DataType::Int64,
+        }
+        .binary(BinaryOp::GtEq, Expr::literal(2));
+        assert_eq!(booleans(&number), vec![false, true, false]);
+    }
+
+    #[test]
+    fn byte_literals_compare_with_fixed_binary_columns() {
+        let schema = Schema::new(vec![Field::new("id", DataType::FixedSizeBinary(2), true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(
+                arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some(vec![1u8, 2]), Some(vec![3u8, 4]), None].into_iter(),
+                    2,
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let hit =
+            Expr::column("id").binary(BinaryOp::Eq, Expr::Literal(Literal::Bytes(vec![3, 4])));
+        let keep: Vec<bool> = evaluate_predicate(&hit, &batch)
+            .unwrap()
+            .iter()
+            .map(|b| b.unwrap_or(false))
+            .collect();
+        assert_eq!(keep, vec![false, true, false]);
+        let wrong_width =
+            Expr::column("id").binary(BinaryOp::Eq, Expr::Literal(Literal::Bytes(vec![3])));
+        let keep: Vec<bool> = evaluate_predicate(&wrong_width, &batch)
+            .unwrap()
+            .iter()
+            .map(|b| b.unwrap_or(false))
+            .collect();
+        assert_eq!(keep, vec![false, false, false]);
     }
 }

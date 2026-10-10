@@ -120,6 +120,7 @@ fn type_from(other: &Expr) -> Option<DataType> {
 fn retype(expr: Expr, to: Option<DataType>) -> Expr {
     match (expr, to) {
         (Expr::Path { path, .. }, Some(data_type)) => Expr::Path { path, data_type },
+        (Expr::Label { name, .. }, Some(data_type)) => Expr::Label { name, data_type },
         (expr, _) => expr,
     }
 }
@@ -189,8 +190,8 @@ pub fn bind_expr(expr: Expr) -> Expr {
         Expr::Cast { expr, to } => {
             let inner = retype(bind_expr(*expr), Some(to.clone()));
             match inner {
-                // A cast of a path is the path read as that type.
-                Expr::Path { .. } => inner,
+                // A cast of a path or label is the value read as that type.
+                Expr::Path { .. } | Expr::Label { .. } => inner,
                 inner => Expr::Cast {
                     expr: Box::new(inner),
                     to,

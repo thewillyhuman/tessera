@@ -127,6 +127,13 @@ fn text_to_int(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+fn text_predicate(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [DataType::Utf8, DataType::Utf8] => Some(DataType::Boolean),
+        _ => None,
+    }
+}
+
 fn coalesce(args: &[DataType]) -> Option<DataType> {
     let first = args.first()?;
     args.iter().all(|t| t == first).then(|| first.clone())
@@ -161,6 +168,20 @@ impl Registry {
             ScalarFunction {
                 name: "coalesce",
                 return_type: coalesce,
+            },
+            // Text predicates (section 9.7): a substring, a token by the
+            // rules of QL-18, and a regular expression.
+            ScalarFunction {
+                name: "contains",
+                return_type: text_predicate,
+            },
+            ScalarFunction {
+                name: "has_token",
+                return_type: text_predicate,
+            },
+            ScalarFunction {
+                name: "regexp_match",
+                return_type: text_predicate,
             },
         ] {
             registry.scalars.insert(scalar.name, scalar);
@@ -274,5 +295,13 @@ mod tests {
         );
         assert_eq!((bucket.return_type)(&[DataType::Int64]), None);
         assert!(registry.scalar("nope").is_none());
+        let contains = registry.scalar("contains").unwrap();
+        assert_eq!(
+            (contains.return_type)(&[DataType::Utf8, DataType::Utf8]),
+            Some(DataType::Boolean)
+        );
+        assert_eq!((contains.return_type)(&[DataType::Utf8]), None);
+        assert!(registry.scalar("has_token").is_some());
+        assert!(registry.scalar("regexp_match").is_some());
     }
 }

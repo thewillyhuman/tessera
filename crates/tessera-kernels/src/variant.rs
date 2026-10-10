@@ -16,6 +16,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use serde_json::Value;
+use tessera_types::event::{SCOPES, label_name};
 
 use crate::KernelError;
 
@@ -37,6 +38,53 @@ pub fn extract(
             .ok()
             .and_then(|object| object.get(path).cloned())
     });
+    typed(values, data_type, &format!("attribute {path}"))
+}
+
+/// Reads the label `name` of each row (QL-19): the attribute whose path
+/// maps to the name, the more specific scope first (QL-20), and `level`
+/// for the severity text when no attribute claims it. `rows` is the
+/// batch length, for batches without an overflow column.
+///
+/// # Errors
+///
+/// `Unsupported` for a type a label cannot be read as.
+pub fn label(
+    overflow: Option<&StringArray>,
+    severity_text: Option<&StringArray>,
+    name: &str,
+    data_type: &DataType,
+    rows: usize,
+) -> Result<ArrayRef, KernelError> {
+    let values = (0..rows).map(|i| {
+        let from_attributes = overflow
+            .filter(|o| !o.is_null(i))
+            .and_then(|o| serde_json::from_str::<Value>(o.value(i)).ok())
+            .and_then(|object| {
+                let object = object.as_object()?;
+                SCOPES.iter().find_map(|scope| {
+                    object
+                        .iter()
+                        .find(|(path, _)| path.starts_with(scope) && label_name(path) == name)
+                        .map(|(_, v)| v.clone())
+                })
+            });
+        from_attributes.or_else(|| match name {
+            "level" => severity_text
+                .filter(|s| !s.is_null(i))
+                .map(|s| Value::String(s.value(i).to_owned())),
+            _ => None,
+        })
+    });
+    typed(values, data_type, name)
+}
+
+/// `values` as an array of `data_type`.
+fn typed(
+    values: impl Iterator<Item = Option<Value>>,
+    data_type: &DataType,
+    what: &str,
+) -> Result<ArrayRef, KernelError> {
     Ok(match data_type {
         DataType::Utf8 => Arc::new(values.map(|v| v.and_then(as_text)).collect::<StringArray>()),
         DataType::Int64 => Arc::new(values.map(|v| v.and_then(as_int)).collect::<Int64Array>()),
@@ -57,7 +105,7 @@ pub fn extract(
         ),
         other => {
             return Err(KernelError::Unsupported(format!(
-                "cannot read attribute {path} as {other}"
+                "cannot read {what} as {other}"
             )));
         }
     })
@@ -139,5 +187,56 @@ mod tests {
             extract(&overflow(), "attr.ok", &DataType::Binary),
             Err(KernelError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn labels_resolve_by_scope_then_well_known_columns() {
+        let overflow = StringArray::from(vec![
+            Some(
+                r#"{"resource.service.name":"api","attr.service.name":"shadow","attr.http.method":"GET"}"#,
+            ),
+            Some(r#"{"scope.service.name":"lib"}"#),
+            None,
+        ]);
+        let severity = StringArray::from(vec![Some("ERROR"), None, Some("INFO")]);
+        let service = label(
+            Some(&overflow),
+            Some(&severity),
+            "service_name",
+            &DataType::Utf8,
+            3,
+        )
+        .unwrap();
+        let service = service.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            service.value(0),
+            "shadow",
+            "attr wins over resource (QL-20)"
+        );
+        assert_eq!(service.value(1), "lib");
+        assert!(service.is_null(2));
+        let method = label(Some(&overflow), None, "http_method", &DataType::Utf8, 3).unwrap();
+        assert_eq!(
+            method
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "GET"
+        );
+        let level = label(
+            Some(&overflow),
+            Some(&severity),
+            "level",
+            &DataType::Utf8,
+            3,
+        )
+        .unwrap();
+        let level = level.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(level.value(0), "ERROR");
+        assert!(level.is_null(1));
+        assert_eq!(level.value(2), "INFO");
+        let none = label(None, None, "x", &DataType::Int64, 2).unwrap();
+        assert_eq!(none.null_count(), 2);
     }
 }

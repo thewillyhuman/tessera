@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use tessera_types::Timestamp;
-use tessera_types::event::OVERFLOW;
+use tessera_types::event::{OVERFLOW, SEVERITY_TEXT};
 
 /// A constant.
 #[derive(Clone, PartialEq, Debug)]
@@ -33,6 +33,8 @@ pub enum Literal {
     Timestamp(Timestamp),
     /// A length of time.
     Duration(Duration),
+    /// Raw bytes, such as a trace id.
+    Bytes(Vec<u8>),
 }
 
 impl Literal {
@@ -47,6 +49,7 @@ impl Literal {
             Literal::Text(_) => Some(DataType::Utf8),
             Literal::Timestamp(_) => Some(DataType::Timestamp(TimeUnit::Nanosecond, None)),
             Literal::Duration(_) => Some(DataType::Duration(TimeUnit::Nanosecond)),
+            Literal::Bytes(_) => Some(DataType::Binary),
         }
     }
 }
@@ -61,6 +64,13 @@ impl fmt::Display for Literal {
             Literal::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
             Literal::Timestamp(t) => write!(f, "TIMESTAMP '{t}'"),
             Literal::Duration(d) => write!(f, "INTERVAL '{} ns'", d.as_nanos()),
+            Literal::Bytes(b) => {
+                write!(f, "X'")?;
+                for byte in b {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(f, "'")
+            }
         }
     }
 }
@@ -160,6 +170,15 @@ pub enum Expr {
         /// The dotted path, with its scope prefix (`attr.`, `resource.`,
         /// `scope.`).
         path: String,
+        /// The type the value is read as.
+        data_type: DataType,
+    },
+    /// A Prometheus or Loki label (QL-19): the attribute whose path maps
+    /// to `name`, the more specific scope first (QL-20), or a well-known
+    /// column under its label name (`level` for the severity text).
+    Label {
+        /// The label name.
+        name: String,
         /// The type the value is read as.
         data_type: DataType,
     },
@@ -297,6 +316,10 @@ impl Expr {
             Expr::Path { .. } => {
                 into.insert(OVERFLOW.to_owned());
             }
+            Expr::Label { .. } => {
+                into.insert(OVERFLOW.to_owned());
+                into.insert(SEVERITY_TEXT.to_owned());
+            }
             Expr::Literal(_) => {}
             Expr::Binary { left, right, .. } => {
                 left.collect_references(into);
@@ -370,6 +393,7 @@ impl fmt::Display for Expr {
         match self {
             Expr::Column(name) => write!(f, "{name}"),
             Expr::Path { path, .. } => write!(f, "{path}"),
+            Expr::Label { name, .. } => write!(f, "label({name})"),
             Expr::Literal(value) => write!(f, "{value}"),
             Expr::Binary { op, left, right } => {
                 write!(f, "({left} {} {right})", op.symbol())
@@ -485,5 +509,18 @@ mod tests {
         assert_eq!(BinaryOp::Eq.flipped(), BinaryOp::Eq);
         assert!(BinaryOp::Eq.is_comparison());
         assert!(BinaryOp::And.is_logical());
+    }
+
+    #[test]
+    fn labels_read_the_overflow_and_the_severity_text() {
+        let label = Expr::Label {
+            name: "level".into(),
+            data_type: DataType::Utf8,
+        };
+        let refs: Vec<String> = label.references().into_iter().collect();
+        assert_eq!(refs, vec!["_overflow", "severity_text"]);
+        assert_eq!(label.to_string(), "label(level)");
+        assert_eq!(Literal::Bytes(vec![0xab, 1]).to_string(), "X'ab01'");
+        assert_eq!(Literal::Bytes(vec![]).data_type(), Some(DataType::Binary));
     }
 }

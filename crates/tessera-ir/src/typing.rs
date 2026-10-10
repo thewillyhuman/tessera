@@ -48,10 +48,12 @@ fn is_integer(t: &DataType) -> bool {
 /// Whether values of the two types can be compared.
 #[must_use]
 pub fn comparable(left: &DataType, right: &DataType) -> bool {
+    let binary = |t: &DataType| matches!(t, DataType::Binary | DataType::FixedSizeBinary(_));
     left == right
         || *left == DataType::Null
         || *right == DataType::Null
         || (is_numeric(left) && is_numeric(right))
+        || (binary(left) && binary(right))
 }
 
 /// The type of `expr` over `input`.
@@ -65,7 +67,7 @@ pub fn expr_type(expr: &Expr, input: &Schema, registry: &Registry) -> Result<Dat
             .field_with_name(name)
             .map(|f| f.data_type().clone())
             .map_err(|_| TypeError::UnknownColumn(name.clone())),
-        Expr::Path { data_type, .. } => Ok(data_type.clone()),
+        Expr::Path { data_type, .. } | Expr::Label { data_type, .. } => Ok(data_type.clone()),
         Expr::Literal(value) => Ok(value.data_type().unwrap_or(DataType::Null)),
         Expr::Binary { op, left, right } => {
             let left = expr_type(left, input, registry)?;
@@ -194,6 +196,15 @@ mod tests {
 
     fn typed(expr: &Expr) -> Result<DataType, TypeError> {
         expr_type(expr, &input(), &Registry::builtin())
+    }
+
+    #[test]
+    fn binary_columns_compare_with_byte_literals() {
+        assert!(comparable(
+            &DataType::FixedSizeBinary(16),
+            &DataType::Binary
+        ));
+        assert!(!comparable(&DataType::FixedSizeBinary(16), &DataType::Utf8));
     }
 
     #[test]

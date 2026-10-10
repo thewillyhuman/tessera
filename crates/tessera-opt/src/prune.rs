@@ -128,7 +128,7 @@ fn scalar(literal: &Literal) -> Option<Scalar> {
         Literal::Float(f) => Some(Scalar::Float(*f)),
         Literal::Text(s) => Some(Scalar::Text(s.clone())),
         Literal::Timestamp(t) => Some(Scalar::Int(t.as_nanos())),
-        Literal::Null | Literal::Duration(_) => None,
+        Literal::Null | Literal::Duration(_) | Literal::Bytes(_) => None,
     }
 }
 
