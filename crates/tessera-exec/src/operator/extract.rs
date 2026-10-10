@@ -173,6 +173,11 @@ impl Operator for Format {
                     BODY => Arc::new(StringArray::from(new_lines.clone())),
                     EXTRACTED => Arc::new(StringArray::from(new_extracted.clone())),
                     OVERFLOW => Arc::new(StringArray::from(new_overflow.clone())),
+                    // The severity text is the `level` label: dropping the
+                    // label drops the column's values.
+                    SEVERITY_TEXT if !self.kept("level") => {
+                        Arc::new(StringArray::from(vec![None::<&str>; rows.num_rows()]))
+                    }
                     name => Arc::clone(rows.column_by_name(name).ok_or_else(|| {
                         ExecError::Unsupported(format!("input lacks column {name}"))
                     })?),
@@ -230,7 +235,10 @@ mod tests {
         let extracted = run(&mut extract, vec![input]);
         let labels = text_column(&extracted[0], EXTRACTED).unwrap();
         assert_eq!(labels.value(0), r#"{"path":"/a","status":"500"}"#);
-        assert!(labels.is_null(1));
+        assert!(
+            labels.value(1).contains(r#""__error__":"JSONParserErr""#),
+            "unparsable lines keep an error label"
+        );
 
         let mut format = Format::new(
             Some("{{.app}} {{.status}}: {{__line__}}".into()),
@@ -245,7 +253,12 @@ mod tests {
         assert_eq!(body.value(1), "web : plain");
         let labels = text_column(&formatted[0], EXTRACTED).unwrap();
         assert_eq!(labels.value(0), r#"{"code":"s500","status":"500"}"#);
-        assert_eq!(labels.value(1), r#"{"code":"s"}"#);
+        assert!(
+            labels.value(1).contains(r#""code":"s""#),
+            "{}",
+            labels.value(1)
+        );
+        assert!(labels.value(1).contains("__error__"), "{}", labels.value(1));
         let attributes = text_column(&formatted[0], OVERFLOW).unwrap();
         assert_eq!(
             attributes.value(0),

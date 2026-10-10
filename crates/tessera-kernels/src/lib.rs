@@ -28,7 +28,7 @@ use arrow::error::ArrowError;
 
 pub use aggregate::{Accumulator, accumulator};
 pub use eval::{evaluate, evaluate_predicate};
-pub use extract::{Extracted, extract};
+pub use extract::{ERROR_DETAILS_LABEL, ERROR_LABEL, Extracted, extract};
 pub use group::Grouper;
 pub use variant::row_labels;
 

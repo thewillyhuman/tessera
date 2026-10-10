@@ -134,12 +134,32 @@ impl Parser {
     }
 }
 
+/// The error labels Loki sets on a line a parser could not read, so that
+/// such lines stay and can be selected or dropped with `__error__`.
+pub const ERROR_LABEL: &str = "__error__";
+/// The detail of a parser error.
+pub const ERROR_DETAILS_LABEL: &str = "__error_details__";
+
+fn parser_error(kind: &str, details: impl std::fmt::Display) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (ERROR_LABEL.to_owned(), kind.to_owned()),
+        (ERROR_DETAILS_LABEL.to_owned(), details.to_string()),
+    ])
+}
+
 /// The labels of a JSON object line; with `unpack`, `_entry` is the new
-/// line. Non-object lines yield nothing.
+/// line. A line that is not a JSON object yields the error labels.
 fn json_labels(line: &str, unpack: bool) -> (BTreeMap<String, String>, Option<String>) {
     let mut labels = BTreeMap::new();
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line) else {
-        return (labels, None);
+    let object = match serde_json::from_str::<Value>(line) {
+        Ok(Value::Object(object)) => object,
+        Ok(_) => {
+            return (
+                parser_error("JSONParserErr", "Value is not an object"),
+                None,
+            );
+        }
+        Err(error) => return (parser_error("JSONParserErr", error), None),
     };
     let mut entry = None;
     for (key, value) in object {
@@ -169,9 +189,13 @@ fn flatten(prefix: &str, value: Value, into: &mut BTreeMap<String, String>) {
     }
 }
 
-/// `key=value` pairs; values may be double-quoted with `\"` escapes.
+/// `key=value` pairs; values may be double-quoted with `\"` escapes. A
+/// line without any pair yields the error labels.
 fn logfmt_labels(line: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
+    if !line.contains('=') {
+        return parser_error("LogfmtParserErr", "no key=value pair");
+    }
     let mut rest = line.trim_start();
     while !rest.is_empty() {
         let key_end = rest
@@ -322,7 +346,12 @@ mod tests {
             out[0].as_deref(),
             Some(r#"{"ok":"false","request_method":"GET","status":"500"}"#)
         );
-        assert_eq!(out[1], None);
+        assert!(
+            out[1]
+                .as_deref()
+                .unwrap()
+                .contains(r#""__error__":"JSONParserErr""#)
+        );
     }
 
     #[test]
@@ -384,5 +413,9 @@ mod tests {
         let line = out.line.unwrap();
         assert_eq!(line.value(0), "real line");
         assert_eq!(line.value(1), "plain");
+        assert!(
+            out.labels.value(1).contains("LogfmtParserErr")
+                || out.labels.value(1).contains("JSONParserErr")
+        );
     }
 }
