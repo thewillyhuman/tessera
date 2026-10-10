@@ -1,0 +1,6 @@
+Tessera is source-available software. The license text is not final: it
+will be one of the candidates in section 20 of tessera-spec.md, chosen and
+reviewed before the first public release (LI-4).
+
+Until then, source files carry the SPDX identifier
+`LicenseRef-Tessera-Pending` (LI-7), and all rights are reserved.

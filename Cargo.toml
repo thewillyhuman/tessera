@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+repository = "https://github.com/thewillyhuman/tessera"
+
+[workspace.dependencies]
+# Internal crates. Dependencies point downward only (spec section 18.1).
+tessera-types = { path = "crates/tessera-types" }
+
+[workspace.lints.rust]
+# RS-1: `unsafe` is confined to named modules with documented invariants.
+# `deny` (not `forbid`) so such a module can opt in with an `allow` and a
+# SAFETY comment.
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# A type named after its module (`object::ObjectStore`) is the idiom in this
+# code base and reads well at the call site.
+module_name_repetitions = "allow"
+
+[profile.release]
+debug = 1
