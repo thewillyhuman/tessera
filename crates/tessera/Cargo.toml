@@ -15,9 +15,11 @@ path = "src/main.rs"
 tessera-catalog.workspace = true
 tessera-format.workspace = true
 tessera-ingest.workspace = true
+tessera-manifest.workspace = true
 tessera-object.workspace = true
 tessera-server.workspace = true
 tessera-types.workspace = true
+tessera-wal.workspace = true
 
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }

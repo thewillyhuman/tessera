@@ -6,6 +6,7 @@
 //! starts those against a local directory. Roles, listeners and the rest
 //! of the start-up configuration of OP-11 arrive with their milestones.
 
+mod background;
 mod run;
 
 use std::net::SocketAddr;

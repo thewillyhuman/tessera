@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! `tessera run`: opens the root pool, the catalog and the HTTP API, keeps
-//! the catalog fresh and checkpointed, and stops cleanly on Ctrl-C.
+//! `tessera run`: opens the root pool, the catalog, the ingest service and
+//! the HTTP API, keeps the catalog fresh and checkpointed, runs intake and
+//! recovery in the background, and stops cleanly on Ctrl-C.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -96,6 +97,13 @@ pub async fn run(config: Config) -> Result<(), RunError> {
 
     let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat);
     let pools = Arc::new(Pools::new(pool.clone(), Arc::clone(&store)));
+    let compactor = tokio::spawn(crate::background::run(crate::background::Background {
+        store: Arc::clone(&store),
+        env: env.clone(),
+        catalog: Arc::clone(&catalog),
+        format: Arc::clone(&format),
+        pool: pool.clone(),
+    }));
     let ingester = Ingester::start(
         Arc::clone(&store),
         env.clone(),
@@ -129,6 +137,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         })?;
 
     keeper.abort();
+    compactor.abort();
     if let Err(error) = ingest.shutdown().await {
         tracing::warn!(error = %error, "ingest shutdown left work for recovery");
     }
