@@ -18,6 +18,7 @@ tessera-catalog = { path = "crates/tessera-catalog" }
 tessera-format = { path = "crates/tessera-format" }
 tessera-wal = { path = "crates/tessera-wal" }
 tessera-manifest = { path = "crates/tessera-manifest" }
+tessera-ingest = { path = "crates/tessera-ingest" }
 tessera-server = { path = "crates/tessera-server" }
 
 [workspace.lints.rust]

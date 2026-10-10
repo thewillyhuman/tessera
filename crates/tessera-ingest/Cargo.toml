@@ -1,0 +1,28 @@
+[package]
+name = "tessera-ingest"
+description = "Tessera ingest: protocol decoders, normalization, memtable, flush"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-format.workspace = true
+tessera-manifest.workspace = true
+tessera-object.workspace = true
+tessera-types.workspace = true
+tessera-wal.workspace = true
+
+arrow = { version = "60", default-features = false }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

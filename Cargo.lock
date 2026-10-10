@@ -1369,6 +1369,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-ingest"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "futures",
+ "serde_json",
+ "tessera-format",
+ "tessera-manifest",
+ "tessera-object",
+ "tessera-types",
+ "tessera-wal",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tessera-manifest"
 version = "0.1.0"
 dependencies = [
