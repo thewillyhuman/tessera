@@ -1,0 +1,19 @@
+[package]
+name = "tessera-kernels"
+description = "Tessera vectorized kernels: expression evaluation, variant access, grouping, aggregation and time bucketing over Arrow batches"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-ir.workspace = true
+tessera-types.workspace = true
+
+arrow = { version = "60", default-features = false }
+serde_json = "1"
+thiserror = "2"
+
+[lints]
+workspace = true

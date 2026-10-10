@@ -1576,6 +1576,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-kernels"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "serde_json",
+ "tessera-ir",
+ "tessera-types",
+ "thiserror",
+]
+
+[[package]]
 name = "tessera-manifest"
 version = "0.1.0"
 dependencies = [
