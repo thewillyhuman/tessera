@@ -12,6 +12,17 @@
 //!
 //! Not supported yet: `offset`, `stddev`, `stdvar`, `topk`, `bottomk`,
 //! binary operations between two vectors, and `ip()` filters.
+//!
+//! Deviations from Loki found by the differential suite (QL-4):
+//!
+//! - A double-quoted string keeps an unknown escape such as `\d` as the
+//!   escaped character; Loki rejects it. Regular expressions are best
+//!   written as raw strings in backticks, which both accept.
+//! - A line a parser stage cannot read keeps the `__error__` label with
+//!   Loki's error names (`JSONParserErr`, `LogfmtParserErr`), but the
+//!   text of `__error_details__` is this implementation's own.
+//! - Loki may add `detected_level` and `service_name` labels at ingest
+//!   when configured to; Tessera adds no labels of its own.
 
 pub mod ast;
 pub mod lexer;
