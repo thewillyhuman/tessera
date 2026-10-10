@@ -27,6 +27,7 @@ tessera-exec = { path = "crates/tessera-exec" }
 tessera-sql = { path = "crates/tessera-sql" }
 tessera-search = { path = "crates/tessera-search" }
 tessera-logql = { path = "crates/tessera-logql" }
+tessera-traceql = { path = "crates/tessera-traceql" }
 tessera-server = { path = "crates/tessera-server" }
 
 [workspace.lints.rust]
