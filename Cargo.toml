@@ -16,6 +16,7 @@ tessera-object = { path = "crates/tessera-object" }
 tessera-commit = { path = "crates/tessera-commit" }
 tessera-catalog = { path = "crates/tessera-catalog" }
 tessera-format = { path = "crates/tessera-format" }
+tessera-wal = { path = "crates/tessera-wal" }
 tessera-server = { path = "crates/tessera-server" }
 
 [workspace.lints.rust]
