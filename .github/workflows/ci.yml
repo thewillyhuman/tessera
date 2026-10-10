@@ -40,3 +40,27 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources
+
+  logql:
+    name: logql differential suite against loki
+    runs-on: ubuntu-latest
+    services:
+      loki:
+        image: grafana/loki:3.3.2
+        ports:
+          - 3100:3100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: wait for loki
+        run: |
+          for i in $(seq 1 90); do
+            if [ "$(curl -s http://127.0.0.1:3100/ready)" = "ready" ]; then exit 0; fi
+            sleep 1
+          done
+          echo "loki did not become ready" >&2
+          exit 1
+      - run: cargo test -p tessera-compat-logql -- --nocapture
+        env:
+          TESSERA_LOKI_URL: http://127.0.0.1:3100
