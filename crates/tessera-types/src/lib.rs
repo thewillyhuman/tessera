@@ -6,6 +6,7 @@
 //! This crate depends on nothing else in the workspace (spec section
 //! 18.1), so any crate may use it without creating a cycle.
 
+pub mod env;
 pub mod hash;
 pub mod id;
 pub mod kind;
@@ -14,6 +15,7 @@ pub mod random;
 pub mod time;
 pub mod work;
 
+pub use env::Env;
 pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
 pub use kind::Kind;
