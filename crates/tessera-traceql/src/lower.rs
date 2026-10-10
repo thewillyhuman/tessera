@@ -465,21 +465,24 @@ fn metrics_plan(
     input: Plan,
     params: RangeParams,
 ) -> Result<(Plan, Vec<String>), Diagnostic> {
-    let step = if params.step.is_zero() {
-        Duration::from_nanos(
+    // One bucket over the whole range for an instant query; the whole
+    // range is then also the step `rate` divides by.
+    let (bucket, step) = if params.step.is_zero() {
+        let whole = Duration::from_nanos(
             u64::try_from(next(params.end).as_nanos() - params.start.as_nanos()).unwrap_or(1),
-        )
+        );
+        (Expr::literal(params.start), whole)
     } else {
-        params.step
+        (
+            Expr::Call {
+                name: "time_bucket".into(),
+                args: vec![Expr::literal(params.step), Expr::column(TIMESTAMP)],
+            },
+            params.step,
+        )
     };
     let mut shown = Vec::new();
-    let mut group_by = vec![NamedExpr::new(
-        Expr::Call {
-            name: "time_bucket".into(),
-            args: vec![Expr::literal(step), Expr::column(TIMESTAMP)],
-        },
-        TIMESTAMP,
-    )];
+    let mut group_by = vec![NamedExpr::new(bucket, TIMESTAMP)];
     let mut labels = Vec::new();
     for key in &metrics.by {
         let name = key.to_string();
@@ -519,10 +522,15 @@ fn metrics_plan(
     for label in &labels {
         exprs.push(NamedExpr::new(Expr::column(label.as_str()), label.as_str()));
     }
+    // Every value is a float, whatever the aggregate's own type.
+    let value = Expr::Cast {
+        expr: Box::new(Expr::column(VALUE)),
+        to: DataType::Float64,
+    };
     let value = if metrics.function == "rate" {
-        Expr::column(VALUE).binary(BinaryOp::Div, Expr::literal(step.as_secs_f64()))
+        value.binary(BinaryOp::Div, Expr::literal(step.as_secs_f64()))
     } else {
-        Expr::column(VALUE)
+        value
     };
     exprs.push(NamedExpr::new(value, VALUE));
     let plan = aggregated
@@ -668,7 +676,7 @@ mod tests {
             vec!["resource.service.name", "span.http.method"]
         );
         let text = lowered.plan.to_string();
-        assert!(text.starts_with("Sort: timestamp ASC\n  Project: timestamp AS timestamp, resource.service.name AS resource.service.name, span.http.method AS span.http.method, (value / 1e-6) AS value\n    Aggregate:"), "{text}");
+        assert!(text.starts_with("Sort: timestamp ASC\n  Project: timestamp AS timestamp, resource.service.name AS resource.service.name, span.http.method AS span.http.method, (CAST(value AS Float64) / 1e-6) AS value\n    Aggregate:"), "{text}");
         assert!(
             text.contains("time_bucket(INTERVAL '1000 ns', timestamp) AS timestamp"),
             "{text}"
@@ -690,7 +698,7 @@ mod tests {
         assert!(text.contains("TraceGroup"), "{text}");
         assert!(text.contains("max(duration_ns) AS value"), "{text}");
         assert!(
-            text.contains("INTERVAL '9000 ns'"),
+            text.contains("group_by=[TIMESTAMP '1970-01-01T00:00:00.000001000Z' AS timestamp]"),
             "one bucket over the range: {text}"
         );
     }
