@@ -6,6 +6,8 @@
 //! This crate depends on nothing else in the workspace (spec section
 //! 18.1), so any crate may use it without creating a cycle.
 
+pub mod random;
 pub mod time;
 
+pub use random::{OsRandom, Random, SeededRandom, SharedRandom};
 pub use time::{Clock, ManualClock, SystemClock, Timestamp};
