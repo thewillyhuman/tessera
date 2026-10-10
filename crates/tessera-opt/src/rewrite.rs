@@ -14,8 +14,9 @@
 
 use std::collections::BTreeSet;
 
-use tessera_ir::{BinaryOp, Expr, Literal, Plan, Scan, SortKey};
-use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SAMPLE_RATE, TIMESTAMP};
+use tessera_ir::trace::SPAN_COLUMNS;
+use tessera_ir::{BinaryOp, Expr, Literal, Plan, Scan, SortKey, Spanset};
+use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
 use tessera_types::{TimeRange, Timestamp};
 
 /// Applies every rewrite to `plan`.
@@ -394,7 +395,27 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
                 .map(|i| push_projection(i, needed.clone()))
                 .collect(),
         },
+        Plan::TraceGroup {
+            candidates,
+            spans,
+            spanset,
+        } => push_projection_trace(candidates, *spans, spanset),
         other => push_projection_text(other, needed),
+    }
+}
+
+/// The trace group of [`push_projection`]: candidates contribute only
+/// their trace id; the spans carry the span columns through and feed
+/// the expressions.
+fn push_projection_trace(candidates: Option<Box<Plan>>, spans: Plan, spanset: Spanset) -> Plan {
+    let ids = BTreeSet::from([TRACE_ID.to_owned()]);
+    let mut needed: BTreeSet<String> = SPAN_COLUMNS.map(str::to_owned).into();
+    needed.insert(OVERFLOW.to_owned());
+    needed.extend(spanset.references());
+    Plan::TraceGroup {
+        candidates: candidates.map(|c| Box::new(push_projection(*c, Some(ids)))),
+        spans: Box::new(push_projection(spans, Some(needed))),
+        spanset,
     }
 }
 
@@ -576,6 +597,50 @@ mod tests {
         let plan = scan().filter(Expr::column(BODY).binary(BinaryOp::Eq, Expr::literal("x")));
         let rewritten = rewrite(plan);
         assert_eq!(only_scan(&rewritten).projection, None);
+    }
+
+    #[test]
+    fn trace_groups_narrow_their_scans() {
+        use tessera_types::event::{DURATION_NS, NAME};
+
+        let spans = Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Span,
+        );
+        let condition = Expr::column(NAME).binary(BinaryOp::Eq, Expr::literal("a"));
+        let mut candidates = spans.clone();
+        candidates.predicates = vec![condition.clone()];
+        let plan = rewrite(Plan::TraceGroup {
+            candidates: Some(Box::new(Plan::Scan(candidates))),
+            spans: Box::new(Plan::Scan(spans)),
+            spanset: Spanset::AggregateFilter {
+                input: Box::new(Spanset::Filter(Some(condition))),
+                function: tessera_ir::SpanAggregate::Max,
+                arg: Some(Expr::column(DURATION_NS)),
+                op: BinaryOp::Gt,
+                value: Literal::Int(1),
+            },
+        });
+        let Plan::TraceGroup {
+            candidates: Some(candidates),
+            spans,
+            ..
+        } = plan
+        else {
+            panic!("not a trace group");
+        };
+        assert_eq!(
+            only_scan(&candidates).projection,
+            Some(vec![TRACE_ID.to_owned(), NAME.to_owned()]),
+            "the id, plus what the predicate reads"
+        );
+        let projection = only_scan(&spans).projection.clone().unwrap();
+        for column in SPAN_COLUMNS {
+            assert!(projection.contains(&column.to_owned()), "{column}");
+        }
+        assert!(projection.contains(&OVERFLOW.to_owned()));
+        assert!(!projection.contains(&SAMPLE_RATE.to_owned()));
     }
 
     #[test]

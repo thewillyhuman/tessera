@@ -114,6 +114,25 @@ fn row_groups_for(file: &FileMeta, sidecar: &Sidecar, predicate: &Expr) -> Optio
                 _ => None,
             }
         }
+        Expr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            // A list of ids (the traces a trace group reads): the file is
+            // skipped only when the filter rules out every one of them.
+            let Expr::Column(column) = expr.as_ref() else {
+                return None;
+            };
+            if list.is_empty() || !file.has_index(IndexKind::Bloom, column) {
+                return None;
+            }
+            let all_absent = list.iter().all(|item| match item {
+                Literal::Bytes(bytes) => sidecar.may_contain(column, bytes) == Some(false),
+                _ => false,
+            });
+            all_absent.then_some(Decision::SkipFile)
+        }
         _ => None,
     }
 }
@@ -392,6 +411,32 @@ mod tests {
         let absent = Expr::column(TRACE_ID)
             .binary(BinaryOp::Eq, Expr::Literal(Literal::Bytes(vec![9u8; 16])));
         assert_eq!(decide(&file, &sidecar, &[absent]), Decision::SkipFile);
+    }
+
+    #[test]
+    fn bloom_filters_skip_files_for_id_lists() {
+        let (file, sidecar) = (file(), sidecar());
+        let list = |ids: Vec<u8>| Expr::InList {
+            expr: Box::new(Expr::column(TRACE_ID)),
+            list: ids
+                .into_iter()
+                .map(|b| Literal::Bytes(vec![b; 16]))
+                .collect(),
+            negated: false,
+        };
+        assert_eq!(
+            decide(&file, &sidecar, &[list(vec![9, 2])]),
+            Decision::RowGroups(None),
+            "one id may be present"
+        );
+        assert_eq!(
+            decide(&file, &sidecar, &[list(vec![9, 10])]),
+            Decision::SkipFile
+        );
+        assert_eq!(
+            decide(&file, &sidecar, &[list(vec![])]),
+            Decision::RowGroups(None)
+        );
     }
 
     #[test]
