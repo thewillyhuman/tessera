@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+
+//! Commit logs (spec section 6.5): totally ordered, durable logs of
+//! commits backed by create-if-absent writes. The cluster catalog, tenant
+//! control stores, dataset logs, partition manifests and rule-state logs
+//! all share this one implementation.
+
+pub mod action;
+pub mod log;
+pub mod record;
+pub mod state;
+
+pub use action::{Action, KvMutation};
+pub use log::{CommitError, CommitLog, UpdateError};
+pub use record::{Commit, CommitId, DecodeError, FORMAT};
+pub use state::{ApplyError, KvState, Snapshot, State};

@@ -1,0 +1,26 @@
+[package]
+name = "tessera-commit"
+description = "Tessera commit logs over create-if-absent writes, checkpoints, leases and slots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-object.workspace = true
+tessera-types.workspace = true
+
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true
