@@ -9,8 +9,11 @@
 //! writer by creating the next entry itself (ST-9).
 
 pub mod entry;
+pub mod reader;
+pub mod writer;
 
 pub use entry::{BlockMeta, Entry, EntryBody, EntryId, FORMAT};
+pub use writer::WriterLog;
 
 /// Why a writer-log operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -38,4 +41,30 @@ pub enum WalError {
     /// A decoded block is not a valid batch.
     #[error("invalid block: {0}")]
     Batch(#[from] tessera_types::InvalidBatch),
+    /// Recovery sealed the log: the writer must stop (ST-9).
+    #[error("writer {writer} is fenced at seq {seq}")]
+    Fenced {
+        /// The writer.
+        writer: tessera_types::WriterId,
+        /// The position the foreign entry was found at.
+        seq: tessera_types::Seq,
+    },
+    /// The log was ended; nothing more can be appended.
+    #[error("writer {writer} has ended its log")]
+    Ended {
+        /// The writer.
+        writer: tessera_types::WriterId,
+    },
+    /// An entry object cannot be read.
+    #[error("writer log object {key} is corrupt: {source}")]
+    Corrupt {
+        /// The offending object.
+        key: tessera_object::Key,
+        /// What is wrong with it.
+        #[source]
+        source: Box<WalError>,
+    },
+    /// The object store failed.
+    #[error(transparent)]
+    Store(#[from] tessera_object::ObjectError),
 }
