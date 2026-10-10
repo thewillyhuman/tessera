@@ -42,6 +42,7 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
 struct Scope {
     schema: SchemaRef,
     table: Option<String>,
+    kind: Option<Kind>,
 }
 
 impl Scope {
@@ -85,6 +86,7 @@ fn lower_query(
         scope: Scope {
             schema: event::schema(kind),
             table: Some(from.table.clone()),
+            kind: Some(kind),
         },
         substitution: None,
     };
@@ -115,6 +117,7 @@ fn lower_constant_query(
         scope: Scope {
             schema: std::sync::Arc::new(Schema::empty()),
             table: None,
+            kind: None,
         },
         substitution: None,
     };
@@ -570,6 +573,9 @@ impl Lowerer<'_> {
         if name == "now" {
             return Ok(Expr::literal(self.ctx.now));
         }
+        if name == "search" {
+            return self.search(args, span);
+        }
         if self.registry.scalar(name).is_none() {
             return Err(Diagnostic::at(span, format!("unknown function {name}")));
         }
@@ -580,6 +586,33 @@ impl Lowerer<'_> {
         Ok(Expr::Call {
             name: name.to_owned(),
             args,
+        })
+    }
+}
+
+impl Lowerer<'_> {
+    /// `search('...')` (QL-3): the search syntax as a predicate over the
+    /// table's kind.
+    fn search(&self, args: &[ast::Expr], span: Span) -> Result<Expr, Diagnostic> {
+        let [
+            ast::Expr {
+                kind: ast::ExprKind::String(text),
+                ..
+            },
+        ] = args
+        else {
+            return Err(Diagnostic::at(
+                span,
+                "search() takes one string of search syntax",
+            ));
+        };
+        let kind = self
+            .scope
+            .kind
+            .ok_or_else(|| Diagnostic::at(span, "search() needs a table"))?;
+        tessera_search::parse(text, kind).map_err(|inner| {
+            // The inner position is within the string: report the call.
+            Diagnostic::at(span, format!("in search(): {}", inner.message))
         })
     }
 }
@@ -785,6 +818,28 @@ mod tests {
         assert!(text.contains("trace_id IS NULL"));
         assert!(text.contains("CAST(attr.n AS Int64) = 2"));
         assert!(text.contains("(-severity_number < -1)"));
+    }
+
+    #[test]
+    fn search_lowers_to_a_predicate_over_the_table() {
+        let plan =
+            lowered("SELECT body FROM logs WHERE search('timeout -healthcheck service:checkout')");
+        let Plan::Project { input, .. } = plan else {
+            panic!()
+        };
+        let Plan::Filter { predicate, .. } = *input else {
+            panic!()
+        };
+        assert_eq!(
+            predicate.to_string(),
+            "((has_token(body, 'timeout') AND NOT has_token(body, 'healthcheck')) AND (resource.service.name = 'checkout'))"
+        );
+        let e = error("SELECT search('x')");
+        assert!(e.message.contains("needs a table"));
+        let e = error("SELECT body FROM logs WHERE search(body)");
+        assert!(e.message.contains("takes one string"));
+        let e = error("SELECT body FROM logs WHERE search('severity:loud')");
+        assert_eq!(e.message, "in search(): unknown severity loud");
     }
 
     #[test]
