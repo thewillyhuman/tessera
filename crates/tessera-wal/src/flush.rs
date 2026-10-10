@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use arrow::array::{BooleanArray, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
-use tessera_format::FileFormat;
+use tessera_format::{FileFormat, Layout};
 use tessera_object::{ObjectStore, layout};
 use tessera_types::event::TIMESTAMP;
 use tessera_types::{
@@ -64,7 +64,7 @@ pub async fn write_l1_files(
     let mut files = Vec::new();
     for (partition, rows) in split_by_partition(batches, window)? {
         let format = Arc::clone(&target.format);
-        let written = tokio::task::spawn_blocking(move || format.write(&rows))
+        let written = tokio::task::spawn_blocking(move || format.write(&rows, &Layout::l1()))
             .await
             .map_err(|e| WalError::Flush(format!("file encoding task failed: {e}")))??;
         let file_id = FileId::random(&mut env.random.clone());

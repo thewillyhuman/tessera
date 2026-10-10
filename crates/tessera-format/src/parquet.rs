@@ -2,13 +2,13 @@
 
 //! The Parquet implementation of [`FileFormat`].
 //!
-//! Rows are sorted by `timestamp` before writing: the default sort keys of
-//! section 8.5 put attribute columns first, but those have no dedicated
-//! column until the advisor promotes them (M8), so event time is the key
-//! every file can be sorted by now. Pages are compressed with zstd.
+//! Rows are sorted by the layout's key, written in its row groups (one
+//! batch per row group, so that the sidecar's postings line up with the
+//! file's), and indexed into a sidecar when the layout asks for one.
+//! Pages are compressed with zstd.
 
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
-use arrow::compute::{concat_batches, sort_to_indices, take};
+use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -21,10 +21,13 @@ use std::sync::Arc;
 
 use tessera_object::{Key, ObjectStore};
 
+use crate::layout::Layout;
 use crate::reader::ParquetReader;
 use crate::scan::FileReader;
+use crate::sidecar::Sidecar;
 use crate::stats::column_stats;
 use crate::{FileFormat, FormatError, Written};
+use tessera_types::{IndexKind, IndexRef};
 
 /// Parquet with zstd page compression.
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,7 +42,7 @@ impl ParquetFormat {
 }
 
 impl FileFormat for ParquetFormat {
-    fn write(&self, batches: &[RecordBatch]) -> Result<Written, FormatError> {
+    fn write(&self, batches: &[RecordBatch], layout: &Layout) -> Result<Written, FormatError> {
         let first = batches.first().ok_or(FormatError::Empty)?;
         let schema = first.schema();
         if batches.iter().any(|b| b.schema() != schema) {
@@ -49,21 +52,36 @@ impl FileFormat for ParquetFormat {
         if rows.num_rows() == 0 {
             return Err(FormatError::Empty);
         }
-        let sorted = sort_by_timestamp(&rows)?;
+        timestamp_column(&rows)?;
+        let sort_key = layout.full_sort_key();
+        let sorted = sort_by(&rows, &sort_key)?;
         let timestamps = timestamp_column(&sorted)?;
-        let min_timestamp = Timestamp::from_nanos(timestamps.value(0));
-        let max_timestamp = Timestamp::from_nanos(timestamps.value(timestamps.len() - 1));
+        let min_timestamp =
+            Timestamp::from_nanos(arrow::compute::min(timestamps).ok_or(FormatError::NoTimestamp)?);
+        let max_timestamp =
+            Timestamp::from_nanos(arrow::compute::max(timestamps).ok_or(FormatError::NoTimestamp)?);
 
+        let rows_per_group = layout.row_group_rows.max(1);
+        let groups: Vec<RecordBatch> = (0..sorted.num_rows())
+            .step_by(rows_per_group)
+            .map(|offset| sorted.slice(offset, rows_per_group.min(sorted.num_rows() - offset)))
+            .collect();
         let mut bytes = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut bytes, schema.clone(), Some(Self::properties()))
             .map_err(|e| FormatError::Unreadable(e.to_string()))?;
-        writer
-            .write(&sorted)
-            .map_err(|e| FormatError::Unreadable(e.to_string()))?;
+        for group in &groups {
+            writer
+                .write(group)
+                .map_err(|e| FormatError::Unreadable(e.to_string()))?;
+            writer
+                .flush()
+                .map_err(|e| FormatError::Unreadable(e.to_string()))?;
+        }
         writer
             .close()
             .map_err(|e| FormatError::Unreadable(e.to_string()))?;
 
+        let (sidecar, indexes) = build_sidecar(layout, &groups)?;
         let columns = schema
             .fields()
             .iter()
@@ -75,8 +93,11 @@ impl FileFormat for ParquetFormat {
             row_count: sorted.num_rows() as u64,
             min_timestamp,
             max_timestamp,
-            sort_key: vec![TIMESTAMP.to_owned()],
+            sort_key,
             columns,
+            row_groups: groups.len(),
+            sidecar,
+            indexes,
         })
     }
 
@@ -102,15 +123,82 @@ fn timestamp_column(rows: &RecordBatch) -> Result<&TimestampNanosecondArray, For
         .ok_or(FormatError::NoTimestamp)
 }
 
-fn sort_by_timestamp(rows: &RecordBatch) -> Result<RecordBatch, FormatError> {
-    let timestamps = timestamp_column(rows)?;
-    let indices = sort_to_indices(timestamps, None, None)?;
+fn sort_by(rows: &RecordBatch, sort_key: &[String]) -> Result<RecordBatch, FormatError> {
+    let columns = sort_key
+        .iter()
+        .map(|name| {
+            rows.column_by_name(name)
+                .map(|values| SortColumn {
+                    values: Arc::clone(values),
+                    options: Some(SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    }),
+                })
+                .ok_or_else(|| FormatError::UnknownColumn(name.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let indices = lexsort_to_indices(&columns, None)?;
     let columns = rows
         .columns()
         .iter()
         .map(|c| take(c.as_ref(), &indices, None))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RecordBatch::try_new(rows.schema(), columns)?)
+}
+
+/// The sidecar of `layout`'s indexes over `groups`, and what it holds.
+/// Index columns the rows lack are skipped: a file describes itself.
+fn build_sidecar(
+    layout: &Layout,
+    groups: &[RecordBatch],
+) -> Result<(Option<Bytes>, Vec<IndexRef>), FormatError> {
+    let present = |name: &String| {
+        groups
+            .first()
+            .is_some_and(|g| g.column_by_name(name).is_some())
+    };
+    let spec = crate::sidecar::IndexSpec {
+        term: layout
+            .indexes
+            .term
+            .iter()
+            .filter(|c| present(c))
+            .cloned()
+            .collect(),
+        trigram: layout
+            .indexes
+            .trigram
+            .iter()
+            .filter(|c| present(c))
+            .cloned()
+            .collect(),
+        bloom: layout
+            .indexes
+            .bloom
+            .iter()
+            .filter(|c| present(c))
+            .cloned()
+            .collect(),
+    };
+    let mut indexes: Vec<IndexRef> = Vec::new();
+    for (kind, columns) in [
+        (IndexKind::Term, &spec.term),
+        (IndexKind::Trigram, &spec.trigram),
+        (IndexKind::Bloom, &spec.bloom),
+    ] {
+        indexes.extend(columns.iter().map(|c| IndexRef {
+            kind,
+            column: c.clone(),
+        }));
+    }
+    if indexes.is_empty() {
+        return Ok((None, indexes));
+    }
+    let sidecar = Sidecar::build(&spec, groups.len(), |name, rg| {
+        groups.get(rg).and_then(|g| g.column_by_name(name).cloned())
+    })?;
+    Ok((Some(sidecar.encode()), indexes))
 }
 
 #[cfg(test)]
@@ -150,7 +238,10 @@ mod tests {
     #[test]
     fn a_file_round_trips_sorted_by_time() {
         let written = ParquetFormat
-            .write(&[batch(&[log(30, "c"), log(10, "a")]), batch(&[log(20, "b")])])
+            .write(
+                &[batch(&[log(30, "c"), log(10, "a")]), batch(&[log(20, "b")])],
+                &Layout::l1(),
+            )
             .unwrap();
         assert_eq!(written.row_count, 3);
         assert_eq!(
@@ -178,7 +269,7 @@ mod tests {
     #[test]
     fn statistics_cover_every_column() {
         let written = ParquetFormat
-            .write(&[batch(&[log(5, "zzz"), log(1, "aaa")])])
+            .write(&[batch(&[log(5, "zzz"), log(1, "aaa")])], &Layout::l1())
             .unwrap();
         let body = written.columns.iter().find(|c| c.name == BODY).unwrap();
         assert_eq!(body.min, Some(Scalar::Text("aaa".into())));
@@ -201,7 +292,7 @@ mod tests {
             .map(|i| log(i, "the same body every time"))
             .collect();
         let raw: usize = batch(&rows).get_array_memory_size();
-        let written = ParquetFormat.write(&[batch(&rows)]).unwrap();
+        let written = ParquetFormat.write(&[batch(&rows)], &Layout::l1()).unwrap();
         assert!(
             written.bytes.len() * 4 < raw,
             "{} bytes for {raw} in memory",
@@ -211,7 +302,10 @@ mod tests {
 
     #[test]
     fn empty_and_mixed_inputs_are_rejected() {
-        assert!(matches!(ParquetFormat.write(&[]), Err(FormatError::Empty)));
+        assert!(matches!(
+            ParquetFormat.write(&[], &Layout::l1()),
+            Err(FormatError::Empty)
+        ));
         let log = batch(&[log(1, "x")]);
         let other = RecordBatch::try_new(
             std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
@@ -221,11 +315,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ParquetFormat.write(&[log, other.clone()]),
+            ParquetFormat.write(&[log, other.clone()], &Layout::l1()),
             Err(FormatError::MixedSchemas)
         ));
         assert!(matches!(
-            ParquetFormat.write(&[other]),
+            ParquetFormat.write(&[other], &Layout::l1()),
             Err(FormatError::NoTimestamp)
         ));
     }
@@ -239,6 +333,61 @@ mod tests {
         assert!(matches!(
             ParquetFormat.read(Bytes::new()),
             Err(FormatError::Unreadable(_))
+        ));
+    }
+
+    #[test]
+    fn a_layout_sorts_splits_and_indexes() {
+        let mut rows: Vec<LogRow> = (0..10)
+            .map(|i| {
+                let mut row = log(100 - i, if i % 2 == 0 { "even checkout" } else { "odd" });
+                row.severity_number = Some(if i < 5 { 17 } else { 9 });
+                row.trace_id = Some([u8::try_from(i).unwrap(); 16]);
+                row
+            })
+            .collect();
+        rows.reverse();
+        let layout = Layout {
+            sort_key: vec!["severity_number".into()],
+            row_group_rows: 4,
+            indexes: crate::sidecar::IndexSpec {
+                term: vec!["body".into()],
+                trigram: vec!["body".into()],
+                bloom: vec!["trace_id".into(), "absent".into()],
+            },
+        };
+        let written = ParquetFormat.write(&[batch(&rows)], &layout).unwrap();
+        assert_eq!(written.sort_key, vec!["severity_number", "timestamp"]);
+        assert_eq!(written.row_groups, 3);
+        assert_eq!(written.min_timestamp, Timestamp::from_nanos(91));
+        assert_eq!(written.max_timestamp, Timestamp::from_nanos(100));
+        assert_eq!(written.indexes.len(), 3, "the absent column is skipped");
+        let read = ParquetFormat.read(written.bytes.clone()).unwrap();
+        let all = concat_batches(&read[0].schema(), &read).unwrap();
+        let severities = all
+            .column_by_name("severity_number")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert!(severities.values().windows(2).all(|w| w[0] <= w[1]));
+        let sidecar = Sidecar::decode(written.sidecar.unwrap()).unwrap();
+        assert_eq!(sidecar.row_groups(), 3);
+        let with_checkout = sidecar.row_groups_with_tokens("body", "checkout").unwrap();
+        assert!(!with_checkout.to_vec().is_empty());
+        assert_eq!(sidecar.may_contain("trace_id", &[3u8; 16]), Some(true));
+        assert_eq!(sidecar.may_contain("trace_id", &[42u8; 16]), Some(false));
+    }
+
+    #[test]
+    fn unknown_sort_keys_are_rejected() {
+        let layout = Layout {
+            sort_key: vec!["nope".into()],
+            ..Layout::l1()
+        };
+        assert!(matches!(
+            ParquetFormat.write(&[batch(&[log(1, "a")])], &layout),
+            Err(FormatError::UnknownColumn(c)) if c == "nope"
         ));
     }
 }
