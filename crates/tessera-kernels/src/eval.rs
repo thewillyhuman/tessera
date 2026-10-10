@@ -23,7 +23,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use tessera_ir::{BinaryOp, Expr, Literal};
 use tessera_types::event::{EXTRACTED, OVERFLOW, SEVERITY_TEXT};
 
-use crate::{KernelError, time, variant};
+use crate::{KernelError, time, units, variant};
 
 /// A value during evaluation: a column of the batch's length, or one
 /// value standing for every row.
@@ -403,6 +403,9 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
             Ok(timestamps.with_array(time::time_bucket(interval, array)?))
         }
         ("lower", [text]) => map_text(text, str::to_lowercase),
+        ("decolorize", [text]) => map_text(text, units::decolorize),
+        ("parse_duration", [text]) => map_text_to_float(text, units::parse_duration),
+        ("parse_bytes", [text]) => map_text_to_float(text, units::parse_bytes),
         ("upper", [text]) => map_text(text, str::to_uppercase),
         ("length", [text]) => {
             let text = text.cast(&DataType::Utf8)?;
@@ -469,6 +472,17 @@ fn constant_text(value: &Value, function: &str) -> Result<String, KernelError> {
         .ok_or_else(|| {
             KernelError::Unsupported(format!("{function} needs a constant text pattern"))
         })
+}
+
+fn map_text_to_float(text: &Value, f: impl Fn(&str) -> Option<f64>) -> Result<Value, KernelError> {
+    let text = text.cast(&DataType::Utf8)?;
+    let strings = text
+        .array()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| KernelError::Unsupported("expected text".into()))?;
+    let mapped: Float64Array = strings.iter().map(|s| s.and_then(&f)).collect();
+    Ok(text.with_array(Arc::new(mapped)))
 }
 
 fn map_text(text: &Value, f: impl Fn(&str) -> String) -> Result<Value, KernelError> {
@@ -778,5 +792,41 @@ mod tests {
             .map(|b| b.unwrap_or(false))
             .collect();
         assert_eq!(keep, vec![false, false, false]);
+    }
+
+    #[test]
+    fn unit_functions_read_text() {
+        let seconds = Expr::Call {
+            name: "parse_duration".into(),
+            args: vec![Expr::literal("250ms")],
+        };
+        let out = evaluate(&seconds, &batch()).unwrap();
+        assert!(
+            (out.as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0)
+                - 0.25)
+                .abs()
+                < f64::EPSILON
+        );
+        let bytes = Expr::Call {
+            name: "parse_bytes".into(),
+            args: vec![Expr::column("body")],
+        };
+        assert_eq!(
+            evaluate(&bytes, &batch()).unwrap().null_count(),
+            3,
+            "bodies are not sizes"
+        );
+        let plain = Expr::Call {
+            name: "decolorize".into(),
+            args: vec![Expr::literal("\u{1b}[1mx\u{1b}[0m")],
+        };
+        let out = evaluate(&plain, &batch()).unwrap();
+        assert_eq!(
+            out.as_any().downcast_ref::<StringArray>().unwrap().value(0),
+            "x"
+        );
     }
 }

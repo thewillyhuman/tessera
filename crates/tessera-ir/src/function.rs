@@ -134,6 +134,13 @@ fn text_predicate(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+fn text_to_float(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [DataType::Utf8] => Some(DataType::Float64),
+        _ => None,
+    }
+}
+
 fn coalesce(args: &[DataType]) -> Option<DataType> {
     let first = args.first()?;
     args.iter().all(|t| t == first).then(|| first.clone())
@@ -182,6 +189,21 @@ impl Registry {
             ScalarFunction {
                 name: "regexp_match",
                 return_type: text_predicate,
+            },
+            // Log-line helpers (LogQL section 9.4): strip ANSI colour codes;
+            // read a duration (`1.5s`, `250ms`) as seconds; read a byte
+            // size (`2KB`, `1.5MiB`) as bytes.
+            ScalarFunction {
+                name: "decolorize",
+                return_type: text_to_text,
+            },
+            ScalarFunction {
+                name: "parse_duration",
+                return_type: text_to_float,
+            },
+            ScalarFunction {
+                name: "parse_bytes",
+                return_type: text_to_float,
             },
         ] {
             registry.scalars.insert(scalar.name, scalar);
@@ -303,5 +325,11 @@ mod tests {
         assert_eq!((contains.return_type)(&[DataType::Utf8]), None);
         assert!(registry.scalar("has_token").is_some());
         assert!(registry.scalar("regexp_match").is_some());
+        assert_eq!(
+            (registry.scalar("parse_duration").unwrap().return_type)(&[DataType::Utf8]),
+            Some(DataType::Float64)
+        );
+        assert!(registry.scalar("decolorize").is_some());
+        assert!(registry.scalar("parse_bytes").is_some());
     }
 }
