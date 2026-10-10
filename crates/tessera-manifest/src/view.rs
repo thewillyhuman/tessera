@@ -22,11 +22,11 @@ use arrow::array::{BooleanArray, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
 use futures::TryStreamExt;
 use tessera_format::FileFormat;
-use tessera_object::{Pools, layout};
+use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::event::TIMESTAMP;
 use tessera_types::{
-    DatasetName, Env, FileMeta, Kind, PartitionId, Seq, TenantId, Timestamp, Version, Window,
-    WriterId,
+    DatasetName, Env, FileMeta, Kind, PartitionId, Seq, TenantId, TimeRange, Timestamp, Version,
+    Window, WriterId,
 };
 use tessera_wal::{EntryBody, reader};
 
@@ -66,6 +66,91 @@ impl View {
     }
 }
 
+/// The sources of a view: the files of the partitions considered and the
+/// tail rows not yet adopted by any of them, taken at one moment (VW-2).
+#[derive(Debug)]
+pub struct Sources {
+    /// Every partition of the dataset and kind, with its window.
+    pub partitions: Vec<PartitionId>,
+    /// The files of the partitions within `time_range`.
+    pub files: Vec<FileMeta>,
+    /// Tail rows from segments beyond every partition's position.
+    pub tail: Vec<RecordBatch>,
+    /// What was read.
+    pub sources: ViewSources,
+}
+
+/// Lists the files and reads the tail rows of one dataset and kind for
+/// the partitions whose window overlaps `time_range` (pruning stage 1).
+/// `window` is the dataset's partition window length, used to place
+/// tail rows in partitions.
+///
+/// # Errors
+///
+/// If the registry, a manifest or a segment cannot be read.
+pub async fn sources(
+    root: &Arc<dyn ObjectStore>,
+    env: &Env,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    kind: Kind,
+    window: Duration,
+    time_range: TimeRange,
+) -> Result<Sources, ManifestError> {
+    let writers = registry::list(&**root, tenant, dataset).await?;
+    let mut sources = ViewSources::default();
+    let partitions = list_partitions(&**root, tenant, dataset, kind).await?;
+    let mut files = Vec::new();
+    let mut positions: BTreeMap<Window, BTreeMap<WriterId, Seq>> = BTreeMap::new();
+    for partition in &partitions {
+        let w = partition.window;
+        let in_range = time_range.overlaps_closed(
+            w.start(),
+            Timestamp::from_nanos(w.end().as_nanos().saturating_sub(1)),
+        );
+        let manifest = Manifest::open(Arc::clone(root), partition.clone(), env.clone());
+        let snapshot = manifest.snapshot().await?;
+        sources
+            .manifests
+            .insert(partition.clone(), snapshot.version());
+        positions.insert(w, snapshot.state().positions().collect());
+        if in_range {
+            files.extend(snapshot.state().files().cloned());
+        }
+    }
+    sources.files = files.len();
+
+    let mut tail = Vec::new();
+    for registration in writers {
+        let writer = registration.writer;
+        let mut entries = reader::entries(Arc::clone(root), writer, Seq::ZERO);
+        while let Some(entry) = entries.try_next().await? {
+            if !matches!(entry.body(), EntryBody::Segment { .. }) {
+                continue;
+            }
+            sources.segments += 1;
+            for batch in entry.blocks_for(tenant, dataset, kind)? {
+                let position = |w: Window| {
+                    positions
+                        .get(&w)
+                        .and_then(|p| p.get(&writer))
+                        .copied()
+                        .unwrap_or(Seq::ZERO)
+                };
+                if let Some(rows) = beyond_position(batch.rows(), entry.seq(), window, position)? {
+                    tail.push(rows);
+                }
+            }
+        }
+    }
+    Ok(Sources {
+        partitions,
+        files,
+        tail,
+        sources,
+    })
+}
+
 /// Reads the rows of one dataset and kind. `window` is the dataset's
 /// partition window length, used to place tail rows in partitions.
 ///
@@ -82,47 +167,16 @@ pub async fn read(
     window: Duration,
 ) -> Result<View, ManifestError> {
     let root = Arc::clone(pools.root().store());
-    let writers = registry::list(&*root, tenant, dataset).await?;
-    let mut sources = ViewSources::default();
+    let found = sources(&root, env, tenant, dataset, kind, window, TimeRange::ALL).await?;
     let mut rows = Vec::new();
-
-    let mut positions: BTreeMap<Window, BTreeMap<WriterId, Seq>> = BTreeMap::new();
-    for partition in list_partitions(&*root, tenant, dataset, kind).await? {
-        let manifest = Manifest::open(Arc::clone(&root), partition.clone(), env.clone());
-        let snapshot = manifest.snapshot().await?;
-        sources
-            .manifests
-            .insert(partition.clone(), snapshot.version());
-        positions.insert(partition.window, snapshot.state().positions().collect());
-        for file in snapshot.state().files() {
-            rows.extend(read_file(pools, format, file).await?);
-            sources.files += 1;
-        }
+    for file in &found.files {
+        rows.extend(read_file(pools, format, file).await?);
     }
-
-    for registration in writers {
-        let writer = registration.writer;
-        let mut entries = reader::entries(Arc::clone(&root), writer, Seq::ZERO);
-        while let Some(entry) = entries.try_next().await? {
-            if !matches!(entry.body(), EntryBody::Segment { .. }) {
-                continue;
-            }
-            sources.segments += 1;
-            for batch in entry.blocks_for(tenant, dataset, kind)? {
-                let position = |w: Window| {
-                    positions
-                        .get(&w)
-                        .and_then(|p| p.get(&writer))
-                        .copied()
-                        .unwrap_or(Seq::ZERO)
-                };
-                if let Some(tail) = beyond_position(batch.rows(), entry.seq(), window, position)? {
-                    rows.push(tail);
-                }
-            }
-        }
-    }
-    Ok(View { rows, sources })
+    rows.extend(found.tail);
+    Ok(View {
+        rows,
+        sources: found.sources,
+    })
 }
 
 async fn read_file(
@@ -442,5 +496,58 @@ mod tests {
         let mut log = WriterLog::start(Arc::new(store.clone()), env());
         log.append_segment(&[batch(0, 1, 1)]).await.unwrap();
         assert!(read_view(&store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sources_list_only_the_partitions_in_range() {
+        let store = MemoryStore::new();
+        let env = env();
+        let mut log = WriterLog::start(Arc::new(store.clone()), env.clone());
+        registry::register(
+            &store,
+            &env,
+            &TenantId::DEFAULT,
+            &dataset(),
+            log.writer_id(),
+        )
+        .await
+        .unwrap();
+        log.append_segment(&[batch(0, 0, 3), batch(1, 10, 2)])
+            .await
+            .unwrap();
+        flush(
+            &store,
+            &env,
+            &mut log,
+            0,
+            1,
+            vec![batch(0, 0, 3), batch(1, 10, 2)],
+        )
+        .await;
+        adopt(&store, &log).await;
+        log.append_segment(&[batch(1, 30, 1)]).await.unwrap();
+
+        let root: Arc<dyn tessera_object::ObjectStore> = Arc::new(store.clone());
+        let day = i64::try_from(WINDOW.as_nanos()).unwrap();
+        let second_day = TimeRange::new(Timestamp::from_nanos(day), Timestamp::from_nanos(2 * day));
+        let found = sources(
+            &root,
+            &env,
+            &TenantId::DEFAULT,
+            &dataset(),
+            Kind::Log,
+            WINDOW,
+            second_day,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.partitions.len(), 2);
+        assert_eq!(found.files.len(), 1, "only the second day's file");
+        assert_eq!(
+            found.files[0].min_timestamp,
+            Timestamp::from_nanos(day + 10)
+        );
+        assert_eq!(found.tail.len(), 1, "the unadopted segment is the tail");
+        assert_eq!(found.sources.manifests.len(), 2);
     }
 }

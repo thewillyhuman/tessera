@@ -15,4 +15,4 @@ pub mod view;
 
 pub use manifest::{Manifest, ManifestError, ManifestState, list_partitions};
 pub use registry::Registration;
-pub use view::{View, ViewSources};
+pub use view::{Sources, View, ViewSources};
