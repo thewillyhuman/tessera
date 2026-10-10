@@ -15,7 +15,7 @@ tessera-types.workspace = true
 tessera-wal.workspace = true
 
 arrow = { version = "60", default-features = false }
-opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "with-serde"] }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "trace", "with-serde"] }
 prost = "0.14"
 serde_json = "1"
 thiserror = "2"

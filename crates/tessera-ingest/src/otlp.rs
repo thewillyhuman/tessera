@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! OTLP logs (IN-1): decoding an export request and normalizing it to an
-//! event batch (IN-5).
+//! event batch (IN-5). Traces are in [`traces`], sharing the attribute
+//! normalization below.
 //!
 //! Resource, scope and record attributes are flattened to dotted paths
 //! under `resource.`, `scope.` and `attr.`; nested maps flatten into the
@@ -18,6 +19,8 @@ use tessera_types::{
     DatasetName, EventBatch, Id128, InvalidBatch, LogRow, Random, TenantId, Timestamp,
 };
 
+pub mod traces;
+
 /// The record attribute that carries a client-supplied identity.
 const RECORD_UID: &str = "log.record.uid";
 
@@ -33,6 +36,9 @@ pub enum OtlpError {
     /// The records could not be turned into a batch.
     #[error(transparent)]
     Batch(#[from] InvalidBatch),
+    /// A record violates the protocol.
+    #[error("invalid OTLP request: {0}")]
+    Invalid(String),
 }
 
 /// Parses the protobuf encoding of an export request.
@@ -87,7 +93,9 @@ pub fn to_batch(
                 let mut attributes = base.clone();
                 flatten_all("attr", &record.attributes, &mut attributes);
                 let event_id = match attributes.get(&format!("attr.{RECORD_UID}")) {
-                    Some(Scalar::Text(uid)) => Id128::from_u128(u128::from_le_bytes(hash16(uid))),
+                    Some(Scalar::Text(uid)) => {
+                        Id128::from_u128(u128::from_le_bytes(hash16(uid.as_bytes())))
+                    }
                     _ => Id128::random(random),
                 };
                 let timestamp = if record.time_unix_nano == 0 {
@@ -121,13 +129,13 @@ pub fn to_batch(
     Ok(Some(EventBatch::from_logs(tenant, dataset, &rows)?))
 }
 
-fn nanos(value: u64) -> Timestamp {
+pub(crate) fn nanos(value: u64) -> Timestamp {
     Timestamp::from_nanos(i64::try_from(value).unwrap_or(i64::MAX))
 }
 
-/// A stable 16-byte digest of a client-supplied id.
-fn hash16(text: &str) -> [u8; 16] {
-    let a = tessera_types::stable_hash(text.as_bytes());
+/// A stable 16-byte digest of an identity supplied by the client.
+pub(crate) fn hash16(bytes: &[u8]) -> [u8; 16] {
+    let a = tessera_types::stable_hash(bytes);
     let b = tessera_types::stable_hash(&a.to_le_bytes());
     let mut out = [0u8; 16];
     out[..8].copy_from_slice(&a.to_le_bytes());
@@ -145,7 +153,7 @@ fn body_text(body: &AnyValue) -> Option<String> {
     }
 }
 
-fn flatten_all(prefix: &str, attributes: &[KeyValue], into: &mut Attributes) {
+pub(crate) fn flatten_all(prefix: &str, attributes: &[KeyValue], into: &mut Attributes) {
     for attribute in attributes {
         if let Some(value) = &attribute.value {
             flatten(&format!("{prefix}.{}", attribute.key), value, into);
@@ -176,7 +184,7 @@ fn flatten(path: &str, value: &AnyValue, into: &mut Attributes) {
 }
 
 /// A JSON rendering of a non-scalar value.
-fn json(value: &any_value::Value) -> serde_json::Value {
+pub(crate) fn json(value: &any_value::Value) -> serde_json::Value {
     match value {
         any_value::Value::StringValue(text) => serde_json::Value::String(text.clone()),
         any_value::Value::BoolValue(flag) => serde_json::Value::Bool(*flag),
@@ -201,15 +209,18 @@ fn json(value: &any_value::Value) -> serde_json::Value {
                 })
                 .collect(),
         ),
-        any_value::Value::BytesValue(bytes) => {
-            serde_json::Value::String(bytes.iter().fold(String::new(), |mut hex, b| {
-                use std::fmt::Write;
-                let _ = write!(hex, "{b:02x}");
-                hex
-            }))
-        }
+        any_value::Value::BytesValue(bytes) => serde_json::Value::String(hex(bytes)),
         any_value::Value::StringValueStrindex(_) => serde_json::Value::Null,
     }
+}
+
+/// Lowercase hex of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut hex, b| {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+        hex
+    })
 }
 
 #[cfg(test)]

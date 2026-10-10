@@ -1568,7 +1568,11 @@ version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c1f1a6ac9c875a4941e4c7c085b61e8f4daa326de03b4701768c3491a6ad9ee"
 dependencies = [
+ "futures-core",
+ "futures-sink",
  "js-sys",
+ "pin-project-lite",
+ "thiserror",
 ]
 
 [[package]]
@@ -1595,7 +1599,10 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "opentelemetry",
+ "percent-encoding",
  "portable-atomic",
+ "rand 0.9.5",
+ "thiserror",
 ]
 
 [[package]]
