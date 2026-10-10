@@ -9,6 +9,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -17,7 +19,10 @@ const SECONDS_PER_DAY: i64 = 86_400;
 ///
 /// Formats as RFC 3339 in UTC, with a nine-digit fraction when it is not
 /// zero.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default, Serialize, Deserialize,
+)]
+#[serde(transparent)]
 pub struct Timestamp(i64);
 
 impl Timestamp {
@@ -227,6 +232,13 @@ mod tests {
         assert_eq!(clock.now(), Timestamp::from_nanos(1_500));
         clock.set(Timestamp::from_nanos(7));
         assert_eq!(clock.now(), Timestamp::from_nanos(7));
+    }
+
+    #[test]
+    fn timestamp_serializes_as_nanoseconds() {
+        let ts = Timestamp::from_nanos(1_500);
+        assert_eq!(serde_json::to_string(&ts).unwrap(), "1500");
+        assert_eq!(serde_json::from_str::<Timestamp>("1500").unwrap(), ts);
     }
 
     #[test]
