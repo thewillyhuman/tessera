@@ -167,6 +167,12 @@ name_id! {
     DatasetName, "dataset name", leading_underscore = false
 }
 
+name_id! {
+    /// The name of a storage pool (ST-1, ST-2). Every object reference in
+    /// metadata carries one.
+    PoolId, "pool id", leading_underscore = false
+}
+
 /// A 128-bit identifier, formatted as 32 lowercase hex digits.
 ///
 /// The building block of [`WriterId`], [`FileId`] and [`NodeId`]; other

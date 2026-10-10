@@ -12,7 +12,7 @@ pub mod position;
 pub mod random;
 pub mod time;
 
-pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, TenantId, WriterId};
+pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
 pub use kind::Kind;
 pub use position::{Epoch, Seq, Version};
 pub use random::{OsRandom, Random, SeededRandom, SharedRandom};
