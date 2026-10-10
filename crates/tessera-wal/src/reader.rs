@@ -29,6 +29,32 @@ pub async fn list(store: &dyn ObjectStore, writer: WriterId) -> Result<Vec<Seq>,
     Ok(positions)
 }
 
+/// Every writer with at least one entry in the store, in id order:
+/// registered or not, so that ended logs can be collected after their
+/// writer left the registry.
+///
+/// # Errors
+///
+/// `Store` if the store cannot be listed.
+pub async fn writers(store: &dyn ObjectStore) -> Result<Vec<WriterId>, WalError> {
+    let prefix = tessera_object::Key::new("_wal")
+        .unwrap_or_else(|e| unreachable!("a literal valid key: {e}"));
+    let mut writers: Vec<WriterId> = Vec::new();
+    let mut listing = store.list(&prefix);
+    while let Some(meta) = listing.try_next().await? {
+        let mut components = meta.key.as_str().split('/');
+        if let (Some("_wal"), Some(writer)) = (components.next(), components.next()) {
+            if let Ok(writer) = writer.parse::<WriterId>() {
+                if !writers.contains(&writer) {
+                    writers.push(writer);
+                }
+            }
+        }
+    }
+    writers.sort();
+    Ok(writers)
+}
+
 /// The last position of a log, if it has any entry.
 ///
 /// # Errors
@@ -179,5 +205,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, vec![Seq::new(4)]);
+    }
+
+    #[tokio::test]
+    async fn lists_every_writer_with_entries() {
+        let store = MemoryStore::new();
+        assert!(writers(&store).await.unwrap().is_empty());
+        let env = Env::simulated(1, Timestamp::UNIX_EPOCH);
+        let mut a = WriterLog::start(Arc::new(store.clone()), env.clone());
+        let mut b = WriterLog::start(Arc::new(store.clone()), env);
+        a.append(EntryBody::End).await.unwrap();
+        b.append(EntryBody::End).await.unwrap();
+        b.append(EntryBody::End).await.unwrap();
+        let mut expected = vec![a.writer_id(), b.writer_id()];
+        expected.sort();
+        assert_eq!(writers(&store).await.unwrap(), expected);
     }
 }
