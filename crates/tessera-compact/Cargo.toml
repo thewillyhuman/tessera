@@ -1,0 +1,26 @@
+[package]
+name = "tessera-compact"
+description = "Tessera compaction and garbage collection: merging, deduplication, layouts, indexes, and deletion of unreferenced files and segments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-format.workspace = true
+tessera-manifest.workspace = true
+tessera-object.workspace = true
+tessera-types.workspace = true
+tessera-wal.workspace = true
+
+arrow = { version = "60", default-features = false }
+thiserror = "2"
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

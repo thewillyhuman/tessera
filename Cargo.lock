@@ -2028,6 +2028,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-compact"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "tessera-format",
+ "tessera-manifest",
+ "tessera-object",
+ "tessera-types",
+ "tessera-wal",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "tessera-compat-sql"
 version = "0.1.0"
 dependencies = [

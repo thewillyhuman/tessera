@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+
+//! Running a compaction job: read the inputs, merge, deduplicate, write
+//! the output in the kind's layout with its indexes, commit the
+//! replacement.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use arrow::array::{Array, BooleanArray, FixedSizeBinaryArray, RecordBatch};
+use arrow::compute::{concat_batches, filter_record_batch};
+use tessera_format::{FileFormat, Layout};
+use tessera_manifest::Manifest;
+use tessera_object::{ObjectStore, Pools, layout};
+use tessera_types::event::EVENT_ID;
+use tessera_types::{Env, FileId, FileMeta, FileSource};
+
+use crate::CompactError;
+use crate::plan::Job;
+
+/// Runs compaction jobs against the pools.
+pub struct Compactor {
+    pools: Arc<Pools>,
+    format: Arc<dyn FileFormat>,
+    env: Env,
+}
+
+/// What a job did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The inputs were replaced by the output.
+    Replaced {
+        /// The output file.
+        output: FileId,
+        /// Rows in the output.
+        rows: u64,
+        /// Rows dropped as duplicates (section 7.5).
+        duplicates: u64,
+    },
+    /// Some input had already left the manifest; the output was deleted.
+    Superseded,
+}
+
+impl Compactor {
+    /// A compactor writing to `pools` with `format`.
+    #[must_use]
+    pub fn new(pools: Arc<Pools>, format: Arc<dyn FileFormat>, env: Env) -> Self {
+        Compactor { pools, format, env }
+    }
+
+    /// Runs `job` against `manifest`, which must be the manifest of the
+    /// job's partition.
+    ///
+    /// # Errors
+    ///
+    /// If an input cannot be read, the output cannot be written, or the
+    /// manifest cannot be committed.
+    pub async fn run(&self, manifest: &Manifest, job: &Job) -> Result<Outcome, CompactError> {
+        let mut batches = Vec::new();
+        for input in &job.inputs {
+            batches.extend(self.read(input).await?);
+        }
+        let layout = Layout::default_for(job.partition.kind);
+        let format = Arc::clone(&self.format);
+        let (written, duplicates) = tokio::task::spawn_blocking(move || {
+            let (rows, duplicates) = deduplicate(&batches)?;
+            let written = format.write(&[rows], &layout)?;
+            Ok::<_, CompactError>((written, duplicates))
+        })
+        .await
+        .map_err(|e| CompactError::Task(e.to_string()))??;
+
+        let pool = self.pools.place(&mut self.env.random.clone()).clone();
+        let file_id = FileId::random(&mut self.env.random.clone());
+        let data_key = layout::data_file(&job.partition, file_id);
+        pool.store()
+            .put_if_absent(&data_key, written.bytes.clone())
+            .await?;
+        if let Some(sidecar) = &written.sidecar {
+            pool.store()
+                .put(&layout::sidecar(&job.partition, file_id), sidecar.clone())
+                .await?;
+        }
+        let output = FileMeta {
+            file_id,
+            partition: job.partition.clone(),
+            pool: pool.id().clone(),
+            level: job.level,
+            source: FileSource::Compaction {
+                inputs: job.inputs.iter().map(|f| f.file_id).collect(),
+            },
+            min_timestamp: written.min_timestamp,
+            max_timestamp: written.max_timestamp,
+            row_count: written.row_count,
+            size_bytes: written.bytes.len() as u64,
+            layout_epoch: 0,
+            sort_key: written.sort_key,
+            columns: written.columns,
+            indexes: written.indexes,
+        };
+        let inputs: Vec<FileId> = job.inputs.iter().map(|f| f.file_id).collect();
+        if manifest
+            .replace(&inputs, std::slice::from_ref(&output))
+            .await?
+        {
+            Ok(Outcome::Replaced {
+                output: file_id,
+                rows: written.row_count,
+                duplicates,
+            })
+        } else {
+            // Superseded (CP-4): the output is garbage; remove it now
+            // rather than leave it to a sweep that has no reference to it.
+            let _ = pool.store().delete(&data_key).await;
+            let _ = pool
+                .store()
+                .delete(&layout::sidecar(&job.partition, file_id))
+                .await;
+            Ok(Outcome::Superseded)
+        }
+    }
+
+    async fn read(&self, file: &FileMeta) -> Result<Vec<RecordBatch>, CompactError> {
+        let store: Arc<dyn ObjectStore> = Arc::clone(self.pools.get(&file.pool)?.store());
+        let bytes = store
+            .get(&layout::data_file(&file.partition, file.file_id))
+            .await?;
+        let format = Arc::clone(&self.format);
+        tokio::task::spawn_blocking(move || format.read(bytes))
+            .await
+            .map_err(|e| CompactError::Task(e.to_string()))?
+            .map_err(CompactError::from)
+    }
+}
+
+/// `batches` as one batch with later rows of a repeated `event_id`
+/// dropped (section 7.5), and how many were dropped.
+fn deduplicate(batches: &[RecordBatch]) -> Result<(RecordBatch, u64), CompactError> {
+    let schema = batches
+        .first()
+        .map(RecordBatch::schema)
+        .ok_or(tessera_format::FormatError::Empty)?;
+    let all = concat_batches(&schema, batches)?;
+    let Some(ids) = all
+        .column_by_name(EVENT_ID)
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+    else {
+        return Ok((all, 0));
+    };
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(ids.len());
+    let keep: BooleanArray = (0..ids.len())
+        .map(|i| ids.is_null(i) || seen.insert(ids.value(i)))
+        .collect();
+    let duplicates = keep.false_count() as u64;
+    if duplicates == 0 {
+        return Ok((all, 0));
+    }
+    Ok((filter_record_batch(&all, &keep)?, duplicates))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use tessera_types::event::Scalar;
+    use tessera_types::{DatasetName, EventBatch, LogRow, TenantId, Timestamp};
+
+    use super::*;
+
+    fn batch(ids: &[u8]) -> RecordBatch {
+        let rows: Vec<LogRow> = ids
+            .iter()
+            .map(|i| LogRow {
+                timestamp: Timestamp::from_nanos(i64::from(*i)),
+                event_id: [*i; 16],
+                body: Some(format!("row {i}")),
+                attributes: BTreeMap::from([("attr.n".to_owned(), Scalar::Int(i64::from(*i)))]),
+                ..LogRow::default()
+            })
+            .collect();
+        EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &rows)
+            .unwrap()
+            .rows()
+            .clone()
+    }
+
+    #[test]
+    fn duplicates_keep_their_first_occurrence() {
+        let (rows, duplicates) = deduplicate(&[batch(&[1, 2, 3]), batch(&[2, 4, 1])]).unwrap();
+        assert_eq!(duplicates, 2);
+        assert_eq!(rows.num_rows(), 4);
+        let ids = rows
+            .column_by_name(EVENT_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap()[0])
+            .collect::<Vec<u8>>();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        let (same, none) = deduplicate(&[batch(&[7, 8])]).unwrap();
+        assert_eq!((same.num_rows(), none), (2, 0));
+        let _ = Arc::new(());
+    }
+}
