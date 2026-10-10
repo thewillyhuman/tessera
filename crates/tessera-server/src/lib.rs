@@ -55,25 +55,27 @@ pub fn router(state: AppState) -> Router {
         .merge(query::router(state))
 }
 
-#[cfg(test)]
-pub(crate) mod testing {
-    use std::sync::Arc;
-    use std::time::Duration;
+impl AppState {
+    /// A single-node state over an in-memory store with an ingester that
+    /// flushes almost at once: for tests, demos and differential harnesses.
+    ///
+    /// # Panics
+    ///
+    /// If the in-memory catalog cannot be opened, which cannot happen
+    /// without a store failure.
+    pub async fn in_memory() -> AppState {
+        use std::time::Duration;
 
-    use tessera_catalog::{Catalog, PoolConfig};
-    use tessera_exec::{CpuPool, Engine, QueryLimits};
-    use tessera_format::ParquetFormat;
-    use tessera_ingest::{IngestConfig, Ingester};
-    use tessera_object::{MemoryStore, PoolState, Pools};
-    use tessera_types::{Env, PoolId};
+        use tessera_catalog::PoolConfig;
+        use tessera_exec::{CpuPool, QueryLimits};
+        use tessera_format::ParquetFormat;
+        use tessera_ingest::{IngestConfig, Ingester};
+        use tessera_object::{MemoryStore, PoolState};
+        use tessera_types::PoolId;
 
-    use super::AppState;
-
-    /// A single-node state over an in-memory store with a fast ingester.
-    pub async fn state() -> AppState {
         let store = MemoryStore::new();
         let env = Env::system();
-        let pool = PoolId::new("root").unwrap();
+        let pool = PoolId::new("root").unwrap_or_else(|_| unreachable!("a valid id"));
         let root = PoolConfig {
             id: pool.clone(),
             url: "memory://test".into(),
@@ -82,7 +84,7 @@ pub(crate) mod testing {
         };
         let catalog = Catalog::open(Arc::new(store.clone()), root, env.clone())
             .await
-            .unwrap();
+            .expect("an in-memory catalog opens");
         let config = IngestConfig {
             linger: Duration::from_millis(1),
             ..IngestConfig::default()
@@ -111,5 +113,15 @@ pub(crate) mod testing {
             engine: Arc::new(engine),
             env,
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::AppState;
+
+    /// A single-node state over an in-memory store with a fast ingester.
+    pub async fn state() -> AppState {
+        AppState::in_memory().await
     }
 }
