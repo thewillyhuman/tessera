@@ -54,17 +54,28 @@ pub async fn read(store: &dyn ObjectStore, writer: WriterId, seq: Seq) -> Result
 }
 
 /// The entries after `from`, in order, until the first missing position.
+///
+/// Garbage collection deletes a log's oldest entries (GC-2), so reading
+/// starts at the first entry that still exists after `from`, found by
+/// listing the log once; from there every position must be present.
 pub fn entries(
     store: Arc<dyn ObjectStore>,
     writer: WriterId,
     from: Seq,
 ) -> BoxStream<'static, Result<Entry, WalError>> {
-    Box::pin(stream::try_unfold(from, move |seq| {
+    Box::pin(stream::try_unfold((from, false), move |(seq, started)| {
         let store = Arc::clone(&store);
         async move {
-            let next = seq.next();
+            let next = if started {
+                seq.next()
+            } else {
+                match list(&*store, writer).await?.into_iter().find(|s| *s > seq) {
+                    Some(first) => first,
+                    None => return Ok(None),
+                }
+            };
             match read(&*store, writer, next).await {
-                Ok(entry) => Ok(Some((entry, next))),
+                Ok(entry) => Ok(Some((entry, (next, true)))),
                 Err(WalError::Store(ObjectError::NotFound { .. })) => Ok(None),
                 Err(error) => Err(error),
             }
@@ -137,5 +148,36 @@ mod tests {
             .try_collect()
             .await;
         assert!(matches!(streamed, Err(WalError::Corrupt { .. })));
+    }
+
+    #[tokio::test]
+    async fn reading_starts_at_the_first_surviving_entry() {
+        let store = MemoryStore::new();
+        let mut log = WriterLog::start(
+            Arc::new(store.clone()),
+            Env::simulated(1, Timestamp::UNIX_EPOCH),
+        );
+        for _ in 0..4 {
+            log.append(EntryBody::End).await.unwrap();
+        }
+        // Entries 1 and 2 were collected.
+        for seq in [1, 2] {
+            store
+                .delete(&layout::writer_log_entry(log.writer_id(), Seq::new(seq)))
+                .await
+                .unwrap();
+        }
+        let read: Vec<Seq> = entries(Arc::new(store.clone()), log.writer_id(), Seq::ZERO)
+            .map_ok(|e| e.seq())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(read, vec![Seq::new(3), Seq::new(4)]);
+        let after: Vec<Seq> = entries(Arc::new(store), log.writer_id(), Seq::new(3))
+            .map_ok(|e| e.seq())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(after, vec![Seq::new(4)]);
     }
 }
