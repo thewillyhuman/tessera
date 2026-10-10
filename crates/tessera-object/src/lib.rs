@@ -7,9 +7,11 @@
 #[cfg(test)]
 pub mod conformance;
 pub mod key;
+pub mod local;
 pub mod memory;
 pub mod store;
 
 pub use key::{InvalidKey, Key};
+pub use local::LocalStore;
 pub use memory::MemoryStore;
 pub use store::{BoxError, ObjectError, ObjectMeta, ObjectStore};
