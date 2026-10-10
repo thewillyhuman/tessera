@@ -20,7 +20,7 @@ pub mod work;
 
 pub use env::Env;
 pub use event::{Attributes, EventBatch, InvalidBatch, LogRow, Scalar};
-pub use file::{ColumnStats, FileMeta, FileSource, Level};
+pub use file::{ColumnStats, FileMeta, FileSource, IndexKind, IndexRef, Level};
 pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
 pub use kind::Kind;

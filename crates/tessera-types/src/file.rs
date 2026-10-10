@@ -43,6 +43,27 @@ pub enum FileSource {
     },
 }
 
+/// A secondary index kept in a file's sidecar (ST-14, section 8.4).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexKind {
+    /// A Bloom filter over the column's values, for point lookups.
+    Bloom,
+    /// A dictionary of tokens with row-group postings, for token search.
+    Term,
+    /// Trigrams with row-group postings, for substring and regex search.
+    Trigram,
+}
+
+/// One index of a file: its kind and the column it covers.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub struct IndexRef {
+    /// The kind of index.
+    pub kind: IndexKind,
+    /// The indexed column.
+    pub column: String,
+}
+
 /// Per-column statistics of a dedicated column.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ColumnStats {
@@ -88,6 +109,19 @@ pub struct FileMeta {
     /// Statistics of its dedicated columns.
     #[serde(default)]
     pub columns: Vec<ColumnStats>,
+    /// The indexes in its sidecar; empty when it has none.
+    #[serde(default)]
+    pub indexes: Vec<IndexRef>,
+}
+
+impl FileMeta {
+    /// Whether the file has an index of `kind` on `column`.
+    #[must_use]
+    pub fn has_index(&self, kind: IndexKind, column: &str) -> bool {
+        self.indexes
+            .iter()
+            .any(|i| i.kind == kind && i.column == column)
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +157,7 @@ mod tests {
                 max: None,
                 null_count: 3,
             }],
+            indexes: Vec::new(),
         }
     }
 
@@ -141,5 +176,26 @@ mod tests {
         value.as_object_mut().unwrap().remove("columns");
         let decoded: FileMeta = serde_json::from_value(value).unwrap();
         assert!(decoded.columns.is_empty());
+    }
+
+    #[test]
+    fn index_references_are_optional_and_queryable() {
+        let mut file = meta();
+        assert!(!file.has_index(IndexKind::Term, "body"));
+        file.indexes.push(IndexRef {
+            kind: IndexKind::Term,
+            column: "body".into(),
+        });
+        assert!(file.has_index(IndexKind::Term, "body"));
+        assert!(!file.has_index(IndexKind::Trigram, "body"));
+        let json = serde_json::to_string(&file).unwrap();
+        let without: FileMeta = serde_json::from_str(
+            &json.replace(r#","indexes":[{"kind":"term","column":"body"}]"#, ""),
+        )
+        .unwrap();
+        assert!(
+            without.indexes.is_empty(),
+            "older entries have no indexes field"
+        );
     }
 }

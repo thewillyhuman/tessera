@@ -202,6 +202,7 @@ mod tests {
                 max: Some(Scalar::Int(severity.1)),
                 null_count: 0,
             }],
+            indexes: Vec::new(),
         }
     }
 

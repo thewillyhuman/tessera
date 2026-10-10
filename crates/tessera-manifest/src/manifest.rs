@@ -326,6 +326,7 @@ mod tests {
             layout_epoch: 0,
             sort_key: vec!["timestamp".into()],
             columns: Vec::new(),
+            indexes: Vec::new(),
         }
     }
 
