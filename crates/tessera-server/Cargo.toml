@@ -1,0 +1,26 @@
+[package]
+name = "tessera-server"
+description = "Tessera network front ends: HTTP administration API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-catalog.workspace = true
+
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tessera-object.workspace = true
+tessera-types.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true
