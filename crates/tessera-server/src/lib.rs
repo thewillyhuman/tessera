@@ -15,6 +15,7 @@ pub mod encode;
 mod error;
 pub mod loki;
 pub mod otlp;
+mod params;
 pub mod pg;
 pub mod query;
 

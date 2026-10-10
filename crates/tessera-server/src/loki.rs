@@ -5,9 +5,8 @@
 //! fields and live tail, under `/loki/api/v1`. Grafana's Loki data
 //! source works against it unmodified (AP-1).
 //!
-//! The tenant comes from `X-Scope-OrgID` (CT-5), by tenant name,
-//! `default` when absent; the dataset from `x-tessera-dataset`,
-//! `default` when absent. A pushed stream's labels become record
+//! The tenant and dataset come from the headers the `params` module
+//! reads (CT-5). A pushed stream's labels become record
 //! attributes (`attr.<label>`), and every attribute of a stored row is a
 //! label under the mapping of section 9.8, so a selector matches what
 //! was pushed through any protocol (QL-8).
@@ -27,15 +26,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tessera_catalog::TenantName;
 use tessera_exec::QueryError;
 use tessera_ir::{BindContext, Expr, Plan, Scan, SortKey};
 use tessera_kernels::row_labels;
 use tessera_logql::{LogqlFrontend, Lowered, RangeParams, ResultKind};
 use tessera_opt::optimize;
 use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SEVERITY_TEXT, TIMESTAMP, VALUE_LABELS};
-use tessera_types::{DatasetName, EventBatch, Id128, Kind, LogRow, TenantId, TimeRange, Timestamp};
+use tessera_types::{EventBatch, Id128, Kind, LogRow, TimeRange, Timestamp};
 
+use crate::params::{Scope, parse_step, parse_time, scope};
 use crate::{ApiError, AppState};
 
 /// The Loki router.
@@ -72,69 +71,6 @@ const DISCOVERY_ROWS: usize = 50_000;
 const DEFAULT_LIMIT: usize = 100;
 /// How often tail polls for new rows.
 const TAIL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// The tenant and dataset a request addresses.
-struct Scope {
-    tenant: TenantId,
-    dataset: DatasetName,
-}
-
-fn scope(state: &AppState, headers: &HeaderMap) -> Result<Scope, ApiError> {
-    let tenant = match headers.get("x-scope-orgid").and_then(|v| v.to_str().ok()) {
-        None | Some("") => TenantId::DEFAULT,
-        Some(name) => {
-            let name = TenantName::new(name).map_err(|e| ApiError::bad_request(e.to_string()))?;
-            state
-                .catalog
-                .cached()
-                .state()
-                .tenant_by_name(&name)
-                .map(|t| t.id.clone())
-                .ok_or_else(|| ApiError::bad_request(format!("unknown tenant {name}")))?
-        }
-    };
-    let dataset = match headers
-        .get("x-tessera-dataset")
-        .and_then(|v| v.to_str().ok())
-    {
-        None | Some("") => {
-            DatasetName::new("default").unwrap_or_else(|_| unreachable!("a valid name"))
-        }
-        Some(name) => DatasetName::new(name).map_err(|e| ApiError::bad_request(e.to_string()))?,
-    };
-    Ok(Scope { tenant, dataset })
-}
-
-/// A Loki timestamp parameter: nanoseconds, seconds with a fraction, or
-/// RFC 3339.
-fn parse_time(text: &str, now: Timestamp) -> Result<Timestamp, ApiError> {
-    if let Ok(nanos) = text.parse::<i64>() {
-        // Loki takes integers as nanoseconds; small values are seconds.
-        return Ok(if nanos < 100_000_000_000 {
-            Timestamp::from_nanos(nanos.saturating_mul(1_000_000_000))
-        } else {
-            Timestamp::from_nanos(nanos)
-        });
-    }
-    if let Ok(seconds) = text.parse::<f64>() {
-        #[allow(clippy::cast_possible_truncation)]
-        return Ok(Timestamp::from_nanos((seconds * 1e9) as i64));
-    }
-    if text == "now" {
-        return Ok(now);
-    }
-    text.parse::<Timestamp>()
-        .map_err(|e| ApiError::bad_request(format!("invalid time {text:?}: {e}")))
-}
-
-/// A step or duration parameter: a duration such as `15s` or seconds.
-fn parse_step(text: &str) -> Result<Duration, ApiError> {
-    if let Ok(seconds) = text.parse::<f64>() {
-        return Ok(Duration::from_secs_f64(seconds.max(0.0)));
-    }
-    tessera_logql::lexer::parse_duration(text)
-        .ok_or_else(|| ApiError::bad_request(format!("invalid duration {text:?}")))
-}
 
 /// Parameters of the query endpoints; both GET and POST carry them as
 /// form fields.
