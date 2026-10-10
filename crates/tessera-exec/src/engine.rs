@@ -30,7 +30,7 @@ use crate::batch::Batch;
 use crate::memory::MemoryPool;
 use crate::operator::{
     CollectSink, Extract, Filter, Format, HashAggregate, Limit, Operator, Project, RangeVector,
-    Sort, TopK,
+    Sort, Steps, TopK,
 };
 use crate::pipeline::Pipeline;
 use crate::scan::{self, ScanAnalysis};
@@ -262,14 +262,18 @@ impl Engine {
                 step,
                 start,
                 end,
+                grouping,
                 ..
             } => Box::new(RangeVector::new(
                 *function,
                 value.clone(),
-                *range,
-                *step,
-                *start,
-                *end,
+                Steps {
+                    range: *range,
+                    step: *step,
+                    start: *start,
+                    end: *end,
+                },
+                grouping.clone(),
                 Arc::clone(memory),
             )),
             Plan::Scan(_) | Plan::Values { .. } | Plan::Union { .. } => {

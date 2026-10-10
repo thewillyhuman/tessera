@@ -38,6 +38,7 @@ fn bind_plan(plan: Plan) -> Plan {
             step,
             start,
             end,
+            grouping,
         } => Plan::RangeVector {
             input: Box::new(bind_plan(*input)),
             function,
@@ -46,6 +47,7 @@ fn bind_plan(plan: Plan) -> Plan {
             step,
             start,
             end,
+            grouping,
         },
         Plan::Filter { input, predicate } => Plan::Filter {
             input: Box::new(bind_plan(*input)),

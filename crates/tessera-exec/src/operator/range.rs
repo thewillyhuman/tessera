@@ -13,7 +13,7 @@ use arrow::array::{
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use tessera_ir::{Expr, RangeFunction, range_vector_schema};
+use tessera_ir::{Expr, RangeFunction, SeriesGrouping, range_vector_schema};
 use tessera_kernels::window::{Sample, evaluate as evaluate_window};
 use tessera_kernels::{evaluate, row_labels};
 use tessera_types::Timestamp;
@@ -28,6 +28,20 @@ use crate::operator::{Flow, Operator, Sink};
 /// Bytes accounted per sample held.
 const BYTES_PER_SAMPLE: usize = 16;
 
+/// The steps of a range vector: the window, the step and the first and
+/// last step times.
+#[derive(Clone, Copy, Debug)]
+pub struct Steps {
+    /// The window length.
+    pub range: Duration,
+    /// The distance between steps.
+    pub step: Duration,
+    /// The first step.
+    pub start: Timestamp,
+    /// The last step, inclusive.
+    pub end: Timestamp,
+}
+
 /// Per-series sliding windows.
 pub struct RangeVector {
     function: RangeFunction,
@@ -37,35 +51,54 @@ pub struct RangeVector {
     start: i64,
     end: i64,
     memory: Arc<MemoryPool>,
+    grouping: Option<SeriesGrouping>,
     series: BTreeMap<String, Vec<Sample>>,
     reserved: usize,
 }
 
 impl RangeVector {
-    /// Evaluates `function` over `(t - range, t]` at every step from
-    /// `start` to `end`.
+    /// Evaluates `function` over `(t - range, t]` at every step of `steps`.
     #[must_use]
     pub fn new(
         function: RangeFunction,
         value: Option<Expr>,
-        range: Duration,
-        step: Duration,
-        start: Timestamp,
-        end: Timestamp,
+        steps: Steps,
+        grouping: Option<SeriesGrouping>,
         memory: Arc<MemoryPool>,
     ) -> Self {
         let nanos = |d: Duration| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX);
         RangeVector {
             function,
             value,
-            range: nanos(range),
-            step: nanos(step),
-            start: start.as_nanos(),
-            end: end.as_nanos(),
+            range: nanos(steps.range),
+            step: nanos(steps.step),
+            start: steps.start.as_nanos(),
+            end: steps.end.as_nanos(),
             memory,
+            grouping,
             series: BTreeMap::new(),
             reserved: 0,
         }
+    }
+
+    /// The labels that identify a row's series.
+    fn series_labels(&self, mut labels: BTreeMap<String, String>) -> BTreeMap<String, String> {
+        match &self.grouping {
+            Some(SeriesGrouping {
+                by: true,
+                labels: keep,
+            }) => {
+                labels.retain(|name, _| keep.contains(name));
+            }
+            Some(SeriesGrouping {
+                by: false,
+                labels: drop,
+            }) => {
+                labels.retain(|name, _| !drop.contains(name));
+            }
+            None => {}
+        }
+        labels
     }
 
     /// The value each row contributes: 1 for counting functions, the
@@ -135,7 +168,11 @@ impl Operator for RangeVector {
             let Some(value) = value else {
                 continue;
             };
-            let labels = row_labels(cell(overflow, i), cell(extracted, i), cell(severity, i));
+            let labels = self.series_labels(row_labels(
+                cell(overflow, i),
+                cell(extracted, i),
+                cell(severity, i),
+            ));
             let key = serde_json::to_string(&labels).unwrap_or_default();
             self.series
                 .entry(key)
@@ -274,10 +311,13 @@ mod tests {
         let mut op = RangeVector::new(
             RangeFunction::CountOverTime,
             None,
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Timestamp::from_nanos(2 * S),
-            Timestamp::from_nanos(6 * S),
+            Steps {
+                range: Duration::from_secs(2),
+                step: Duration::from_secs(2),
+                start: Timestamp::from_nanos(2 * S),
+                end: Timestamp::from_nanos(6 * S),
+            },
+            None,
             MemoryPool::unbounded(),
         );
         let out = series(&run(&mut op, vec![input.clone()]));
@@ -292,10 +332,13 @@ mod tests {
         let mut bytes = RangeVector::new(
             RangeFunction::BytesOverTime,
             None,
-            Duration::from_secs(10),
-            Duration::from_secs(10),
-            Timestamp::from_nanos(10 * S),
-            Timestamp::from_nanos(10 * S),
+            Steps {
+                range: Duration::from_secs(10),
+                step: Duration::from_secs(10),
+                start: Timestamp::from_nanos(10 * S),
+                end: Timestamp::from_nanos(10 * S),
+            },
+            None,
             MemoryPool::unbounded(),
         );
         let out = series(&run(&mut bytes, vec![input.clone()]));
@@ -303,10 +346,13 @@ mod tests {
         let mut absent = RangeVector::new(
             RangeFunction::AbsentOverTime,
             None,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Timestamp::from_nanos(3 * S),
-            Timestamp::from_nanos(4 * S),
+            Steps {
+                range: Duration::from_secs(1),
+                step: Duration::from_secs(1),
+                start: Timestamp::from_nanos(3 * S),
+                end: Timestamp::from_nanos(4 * S),
+            },
+            None,
             MemoryPool::unbounded(),
         );
         let out = series(&run(&mut absent, vec![input]));
@@ -326,10 +372,13 @@ mod tests {
                 name: "n".into(),
                 data_type: DataType::Float64,
             }),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Timestamp::from_nanos(5 * S),
-            Timestamp::from_nanos(5 * S),
+            Steps {
+                range: Duration::from_secs(5),
+                step: Duration::from_secs(5),
+                start: Timestamp::from_nanos(5 * S),
+                end: Timestamp::from_nanos(5 * S),
+            },
+            None,
             MemoryPool::unbounded(),
         );
         let out = series(&run(&mut op, vec![input]));

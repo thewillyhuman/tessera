@@ -28,7 +28,7 @@ pub use extract::{Extract, Format};
 pub use filter::Filter;
 pub use limit::Limit;
 pub use project::Project;
-pub use range::RangeVector;
+pub use range::{RangeVector, Steps};
 pub use sort::Sort;
 pub use topk::TopK;
 

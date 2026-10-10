@@ -15,7 +15,7 @@ use std::time::Duration;
 use arrow::datatypes::DataType;
 use tessera_ir::{
     AggregateExpr, BindContext, Diagnostic, Expr, ExtractStage, Literal, NamedExpr, Plan,
-    RangeFunction, Scan, Span, VALUE,
+    RangeFunction, Scan, SeriesGrouping, Span, VALUE,
 };
 use tessera_types::event::{BODY, EXTRACTED, TIMESTAMP};
 use tessera_types::{Kind, TimeRange, Timestamp, event};
@@ -467,10 +467,6 @@ fn range_plan(
             format!("{function} needs an unwrapped value"),
         ));
     }
-    let plan = match spec.grouping {
-        Some(grouping) => group_labels(plan, Some(grouping)),
-        None => plan,
-    };
     let instant = params.step.is_zero();
     Ok(Plan::RangeVector {
         input: Box::new(plan),
@@ -484,6 +480,10 @@ fn range_plan(
         },
         start: if instant { params.end } else { params.start },
         end: params.end,
+        grouping: spec.grouping.map(|g| SeriesGrouping {
+            by: g.by,
+            labels: g.labels.clone(),
+        }),
     })
 }
 
@@ -697,7 +697,7 @@ mod tests {
         let text = out.plan.to_string();
         assert!(text.starts_with("RangeVector: quantile_over_time(0.9) of parse_duration(label(latency)) range=60s step=30s"), "{text}");
         assert!(
-            text.contains("Format: keep=[route]\n    Extract: json from body"),
+            text.contains("series by (route)\n  Extract: json from body"),
             "{text}"
         );
         let out = lowered(r#"sum(count_over_time({a="b"}[1m])) > 5"#, 30);

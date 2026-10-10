@@ -112,6 +112,7 @@ fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
             step,
             start,
             end,
+            grouping,
         } => Plan::RangeVector {
             input: Box::new(f(*input)),
             function,
@@ -120,6 +121,7 @@ fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
             step,
             start,
             end,
+            grouping,
         },
         Plan::Filter { input, predicate } => f(*input).filter(predicate),
         Plan::Project { input, exprs } => f(*input).project(exprs),
@@ -303,6 +305,7 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
             step,
             start,
             end,
+            grouping,
         } => {
             // Series keys come from every label source; lines are measured
             // by the byte functions; the unwrapped value reads what it reads.
@@ -326,6 +329,7 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
                 step,
                 start,
                 end,
+                grouping,
             }
         }
         Plan::Filter { input, predicate } => {

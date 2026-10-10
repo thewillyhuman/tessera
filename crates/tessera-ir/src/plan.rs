@@ -248,6 +248,24 @@ impl fmt::Display for RangeFunction {
     }
 }
 
+/// Which labels identify a series in a range vector: `by` keeps the
+/// named labels, `without` drops them. Samples of rows whose remaining
+/// labels agree merge into one series, as `LogQL` groups range functions.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SeriesGrouping {
+    /// `by` when true, `without` otherwise.
+    pub by: bool,
+    /// The labels.
+    pub labels: Vec<String>,
+}
+
+impl fmt::Display for SeriesGrouping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let word = if self.by { "by" } else { "without" };
+        write!(f, "{word} ({})", self.labels.join(", "))
+    }
+}
+
 /// The output column of a range vector: the step time.
 pub const VALUE: &str = "value";
 
@@ -369,6 +387,8 @@ pub enum Plan {
         start: Timestamp,
         /// The last step, inclusive.
         end: Timestamp,
+        /// Which labels identify a series; every label when `None`.
+        grouping: Option<SeriesGrouping>,
     },
     /// Constant rows, for queries without a table.
     Values {
@@ -639,6 +659,7 @@ impl Plan {
                 step,
                 start,
                 end,
+                grouping,
             } => {
                 fmt_range_vector(
                     f,
@@ -650,6 +671,9 @@ impl Plan {
                     *start,
                     *end,
                 )?;
+                if let Some(grouping) = grouping {
+                    writeln!(f, "{pad}  series {grouping}")?;
+                }
                 input.fmt_tree(f, depth + 1)
             }
             Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
@@ -1001,6 +1025,7 @@ mod tests {
             step: Duration::from_secs(60),
             start: Timestamp::UNIX_EPOCH,
             end: Timestamp::from_nanos(600_000_000_000),
+            grouping: None,
         };
         let schema = plan.schema(&registry()).unwrap();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
