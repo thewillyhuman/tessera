@@ -10,5 +10,6 @@
 //! ```
 
 pub mod ingester;
+pub mod otlp;
 
 pub use ingester::{Ack, IngestConfig, IngestError, Ingester};
