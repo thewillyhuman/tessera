@@ -328,69 +328,31 @@ async fn removed_files_are_deleted_after_the_retention_window() {
     assert_eq!(event_ids(&node).await, vec![1, 2, 3, 4]);
 }
 
-#[tokio::test]
-async fn adopted_segments_are_collected_after_the_grace_period() {
-    let mut node = node(&[&[1, 2], &[3]], Timestamp::UNIX_EPOCH).await;
-    // A third segment stays unadopted in the tail.
-    node.log.append_segment(&[batch(&[9])]).await.unwrap();
-    let writer: WriterId = node.log.writer_id();
+const GRACE: Duration = Duration::from_secs(3_600);
+
+/// A collection pass over the node's writer log at `now`.
+async fn collect(node: &Node, now: Timestamp) -> tessera_compact::LogCollection {
     let store: Arc<dyn ObjectStore> = node.store.clone();
-    let grace = Duration::from_secs(3_600);
-    let now = node
-        .env
-        .clock
-        .now()
-        .checked_add(Duration::from_secs(2 * 3_600))
-        .unwrap();
-    let collected = collect_log(
+    collect_log(
         &store,
         &node.env,
-        writer,
+        node.log.writer_id(),
         now,
-        grace,
+        GRACE,
         Window::DEFAULT_LENGTH,
     )
     .await
-    .unwrap();
-    // Segments 1 and 3 and flush records 2 and 4 go; segment 5 stays.
-    assert_eq!(collected.deleted, 4);
-    assert!(!collected.log_gone);
-    let remaining = reader::list(&*store, writer).await.unwrap();
-    assert_eq!(remaining, vec![Seq::new(5)]);
-    assert_eq!(
-        event_ids(&node).await,
-        vec![1, 2, 3, 9],
-        "the view still sees every row"
-    );
+    .unwrap()
+}
 
-    // Not yet aged: nothing more goes.
-    let soon = node
-        .env
-        .clock
-        .now()
-        .checked_add(Duration::from_secs(1))
-        .unwrap();
-    assert_eq!(
-        collect_log(
-            &store,
-            &node.env,
-            writer,
-            soon,
-            grace,
-            Window::DEFAULT_LENGTH
-        )
-        .await
-        .unwrap()
-        .deleted,
-        0
-    );
-
-    // Flush and adopt the last segment, end the log: everything can go.
+/// Flushes the tail segment `(3, 5]` holding row 9 and adopts it.
+async fn flush_tail(node: &mut Node) {
     let target = FlushTarget {
         store: node.store.clone(),
         pool: PoolId::new("root").unwrap(),
         format: Arc::new(ParquetFormat),
     };
+    let writer = node.log.writer_id();
     let files = write_l1_files(
         &target,
         &node.env,
@@ -412,6 +374,67 @@ async fn adopted_segments_are_collected_after_the_grace_period() {
         })
         .await
         .unwrap();
+    intake::run(
+        node.store.clone(),
+        &node.env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        writer,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn adopted_segments_are_collected_after_the_grace_period() {
+    let mut node = node(&[&[1, 2], &[3]], Timestamp::UNIX_EPOCH).await;
+    // A third segment stays unadopted in the tail.
+    node.log.append_segment(&[batch(&[9])]).await.unwrap();
+    let writer: WriterId = node.log.writer_id();
+    let later = node.env.clock.now().checked_add(2 * GRACE).unwrap();
+
+    // Segments 1 and 3 and flush records 2 and 4 go; segment 5 stays.
+    let collected = collect(&node, later).await;
+    assert_eq!((collected.deleted, collected.log_gone), (4, false));
+    assert_eq!(
+        reader::list(&*node.store, writer).await.unwrap(),
+        vec![Seq::new(5)]
+    );
+    assert_eq!(
+        event_ids(&node).await,
+        vec![1, 2, 3, 9],
+        "the view still sees every row"
+    );
+
+    // Adopting the tail segment does not make it collectable while it is
+    // the newest entry of a live log; its flush record becomes the newest.
+    flush_tail(&mut node).await;
+    let collected = collect(&node, later).await;
+    assert_eq!(
+        collected.deleted, 1,
+        "segment 5 goes, its flush record stays"
+    );
+    assert_eq!(
+        reader::list(&*node.store, writer).await.unwrap(),
+        vec![Seq::new(6)]
+    );
+
+    // Not yet aged: nothing goes.
+    let soon = node
+        .env
+        .clock
+        .now()
+        .checked_add(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(collect(&node, soon).await.deleted, 0);
+}
+
+#[tokio::test]
+async fn an_ended_and_adopted_log_is_removed_whole() {
+    let mut node = node(&[&[1, 2], &[3]], Timestamp::UNIX_EPOCH).await;
+    node.log.append_segment(&[batch(&[9])]).await.unwrap();
+    let writer: WriterId = node.log.writer_id();
+    flush_tail(&mut node).await;
     node.log.end().await.unwrap();
     intake::run(
         node.store.clone(),
@@ -422,17 +445,9 @@ async fn adopted_segments_are_collected_after_the_grace_period() {
     )
     .await
     .unwrap();
-    let collected = collect_log(
-        &store,
-        &node.env,
-        writer,
-        now,
-        grace,
-        Window::DEFAULT_LENGTH,
-    )
-    .await
-    .unwrap();
+    let later = node.env.clock.now().checked_add(2 * GRACE).unwrap();
+    let collected = collect(&node, later).await;
     assert!(collected.log_gone, "{collected:?}");
-    assert!(reader::list(&*store, writer).await.unwrap().is_empty());
+    assert!(reader::list(&*node.store, writer).await.unwrap().is_empty());
     assert_eq!(event_ids(&node).await, vec![1, 2, 3, 9]);
 }

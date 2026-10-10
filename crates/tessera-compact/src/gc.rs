@@ -121,11 +121,12 @@ pub async fn collect_log(
             }
         }
     }
-    // Keep the end marker until it is the last object: a log that still
-    // has entries must still look ended.
+    // The newest entry stays unless the whole log goes: a log that still
+    // has entries must still look ended, and a live writer's log must
+    // still show where it is.
     let whole_log = ended && deletable.len() == seqs.len();
     if !whole_log {
-        deletable.retain(|seq| seqs.last() != Some(seq) || !ended);
+        deletable.retain(|seq| seqs.last() != Some(seq));
     }
     for seq in &deletable {
         store
