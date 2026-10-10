@@ -142,7 +142,9 @@ fn next(t: Timestamp) -> Timestamp {
 }
 
 /// Turns limits over sorts into top-K and lets a scan under a newest-first
-/// top-K stop early.
+/// top-K stop early. A limit moves below a projection first: both are
+/// row-wise, and the sort it is looking for sits under the projection
+/// when the query orders by an input column.
 fn push_limits(plan: Plan) -> Plan {
     match plan {
         Plan::Limit {
@@ -155,6 +157,9 @@ fn push_limits(plan: Plan) -> Plan {
                 keys,
                 k: count,
             }),
+            Plan::Project { input, exprs } => {
+                push_limits(input.limit(0, Some(count))).project(exprs)
+            }
             other => newest_first(other.limit(0, Some(count))),
         },
         other => rebuild_inputs(other, push_limits),
@@ -363,6 +368,17 @@ mod tests {
         let bare = scan().limit(0, Some(3));
         let rewritten = rewrite(bare);
         assert_eq!(only_scan(&rewritten).newest_first_limit, Some(3));
+
+        let projected = scan()
+            .sort(vec![SortKey::descending(Expr::column(TIMESTAMP))])
+            .project(vec![NamedExpr::new(Expr::column(BODY), BODY)])
+            .limit(0, Some(4));
+        let rewritten = rewrite(projected);
+        assert!(
+            matches!(&rewritten, Plan::Project { input, .. } if matches!(**input, Plan::TopK { k: 4, .. })),
+            "{rewritten}"
+        );
+        assert_eq!(only_scan(&rewritten).newest_first_limit, Some(4));
     }
 
     #[test]
