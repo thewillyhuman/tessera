@@ -182,7 +182,9 @@ impl Manifest {
                 expected: Box::new(self.id.clone()),
             });
         }
-        let changed = std::cell::Cell::new(false);
+        // Shared with the decision closure; atomic so that the future stays
+        // `Send`.
+        let changed = std::sync::atomic::AtomicBool::new(false);
         self.log
             .update(|state| {
                 if state.is_dropped() {
@@ -197,11 +199,11 @@ impl Manifest {
                     .map(|f| Action::AddFile(Box::new(f.clone())))
                     .collect();
                 actions.push(Action::AdvanceWriter { writer, through });
-                changed.set(true);
+                changed.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(actions)
             })
             .await?;
-        Ok(changed.get())
+        Ok(changed.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Drops the partition (MF-6).
