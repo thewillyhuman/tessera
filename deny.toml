@@ -1,0 +1,36 @@
+# RS-6 / LI-5: dependencies must be under permissive licenses so that the
+# project's own license can be chosen freely. Checked in CI with cargo-deny.
+
+[graph]
+all-features = true
+
+[licenses]
+# Workspace crates carry LicenseRef-Tessera-Pending until the license is
+# final (LI-4); they are not published and are not checked.
+private = { ignore = true }
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
