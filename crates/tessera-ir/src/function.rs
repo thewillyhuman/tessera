@@ -52,7 +52,18 @@ fn timestamp() -> DataType {
 }
 
 fn is_numeric(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Int64 | DataType::Float64)
+    matches!(
+        data_type,
+        DataType::Int32 | DataType::Int64 | DataType::Float64
+    )
+}
+
+/// The type a sum of integers is kept in: 32-bit inputs widen to 64 bits.
+fn widened(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Int32 => DataType::Int64,
+        other => other.clone(),
+    }
 }
 
 fn count(args: &[DataType]) -> Option<DataType> {
@@ -63,9 +74,9 @@ fn weighted_count(args: &[DataType]) -> Option<DataType> {
     (args.len() <= 1).then_some(DataType::Float64)
 }
 
-fn numeric_passthrough(args: &[DataType]) -> Option<DataType> {
+fn numeric_widened(args: &[DataType]) -> Option<DataType> {
     match args {
-        [t] if is_numeric(t) => Some(t.clone()),
+        [t] if is_numeric(t) => Some(widened(t)),
         _ => None,
     }
 }
@@ -172,7 +183,7 @@ impl Registry {
             },
             AggregateFunction {
                 name: "sum_raw",
-                return_type: numeric_passthrough,
+                return_type: numeric_widened,
                 weighted: false,
             },
             AggregateFunction {
@@ -247,6 +258,10 @@ mod tests {
         let sum_raw = registry.aggregate("sum_raw").unwrap();
         assert_eq!(
             (sum_raw.return_type)(&[DataType::Int64]),
+            Some(DataType::Int64)
+        );
+        assert_eq!(
+            (sum_raw.return_type)(&[DataType::Int32]),
             Some(DataType::Int64)
         );
         let bucket = registry.scalar("time_bucket").unwrap();

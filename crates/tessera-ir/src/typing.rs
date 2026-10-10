@@ -38,7 +38,11 @@ fn duration() -> DataType {
 }
 
 fn is_numeric(t: &DataType) -> bool {
-    matches!(t, DataType::Int64 | DataType::Float64)
+    matches!(t, DataType::Int32 | DataType::Int64 | DataType::Float64)
+}
+
+fn is_integer(t: &DataType) -> bool {
+    matches!(t, DataType::Int32 | DataType::Int64)
 }
 
 /// Whether values of the two types can be compared.
@@ -78,7 +82,9 @@ pub fn expr_type(expr: &Expr, input: &Schema, registry: &Registry) -> Result<Dat
         }
         Expr::Negate(inner) => {
             let t = expr_type(inner, input, registry)?;
-            if is_numeric(&t) {
+            if is_integer(&t) {
+                Ok(DataType::Int64)
+            } else if is_numeric(&t) {
                 Ok(t)
             } else {
                 Err(TypeError::Mismatch(format!("- needs a number, got {t}")))
@@ -150,7 +156,7 @@ fn binary_type(op: BinaryOp, left: &DataType, right: &DataType) -> Result<DataTy
         };
     }
     match (op, left, right) {
-        (_, DataType::Int64, DataType::Int64) => Ok(DataType::Int64),
+        (_, l, r) if is_integer(l) && is_integer(r) => Ok(DataType::Int64),
         (_, l, r) if is_numeric(l) && is_numeric(r) => Ok(DataType::Float64),
         (BinaryOp::Add | BinaryOp::Sub, l, r) if *l == timestamp() && *r == duration() => {
             Ok(timestamp())
@@ -215,6 +221,12 @@ mod tests {
     fn arithmetic_follows_sql_rules() {
         let int = Expr::literal(1).binary(BinaryOp::Add, Expr::literal(2));
         assert_eq!(typed(&int), Ok(DataType::Int64));
+        let widened = Expr::column("severity_number").binary(BinaryOp::Add, Expr::literal(2));
+        assert_eq!(typed(&widened), Ok(DataType::Int64));
+        assert_eq!(
+            typed(&Expr::Negate(Box::new(Expr::column("severity_number")))),
+            Ok(DataType::Int64)
+        );
         let mixed = Expr::literal(1).binary(BinaryOp::Mul, Expr::column("sample_rate"));
         assert_eq!(typed(&mixed), Ok(DataType::Float64));
         let shifted =
