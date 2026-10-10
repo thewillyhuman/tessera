@@ -2,9 +2,9 @@
 
 //! Tessera's network front ends (spec section 16): the HTTP
 //! administration API, OTLP ingest over HTTP, SQL over HTTP and over
-//! the `PostgreSQL` wire protocol, and the Loki API with `LogQL`. The
-//! other query languages and compatibility APIs arrive with their
-//! milestones.
+//! the `PostgreSQL` wire protocol, the Loki API with `LogQL` and the
+//! Tempo API with `TraceQL`. The other query languages and
+//! compatibility APIs arrive with their milestones.
 //!
 //! This crate is transport only: it decodes requests, calls the catalog,
 //! the ingest service and the query engine, and encodes responses. No
@@ -18,6 +18,7 @@ pub mod otlp;
 mod params;
 pub mod pg;
 pub mod query;
+pub mod tempo;
 
 use std::sync::Arc;
 
@@ -53,6 +54,7 @@ pub fn router(state: AppState) -> Router {
     admin::router(state.clone())
         .merge(otlp::router(state.clone()))
         .merge(loki::router(state.clone()))
+        .merge(tempo::router(state.clone()))
         .merge(query::router(state))
 }
 

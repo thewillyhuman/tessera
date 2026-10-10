@@ -2526,6 +2526,7 @@ dependencies = [
  "tessera-object",
  "tessera-opt",
  "tessera-sql",
+ "tessera-traceql",
  "tessera-types",
  "tokio",
  "tokio-postgres",
