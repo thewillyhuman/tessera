@@ -1,0 +1,17 @@
+[package]
+name = "tessera-ir"
+description = "Tessera plan representation: expressions, plan nodes, types, function registry and the front-end contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-types.workspace = true
+
+arrow = { version = "60", default-features = false }
+thiserror = "2"
+
+[lints]
+workspace = true

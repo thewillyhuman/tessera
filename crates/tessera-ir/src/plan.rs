@@ -1,0 +1,674 @@
+// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+
+//! The operator tree (spec section 10.2).
+//!
+//! Operators arrive with the milestone that needs them; the tree holds
+//! only what the engine can run. Every node answers its time range and
+//! its ordering (QE-3) from its inputs, so no rewrite can forget them.
+//! [`Plan`] displays as the text of `EXPLAIN` (QE-4).
+
+use std::fmt;
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use tessera_types::event::{SAMPLE_RATE, TIMESTAMP};
+use tessera_types::{DatasetName, Kind, TenantId, TimeRange, event};
+
+use crate::expr::{Expr, Literal};
+use crate::function::Registry;
+use crate::typing::{TypeError, expr_type};
+
+/// Why a plan is not well formed.
+#[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
+pub enum PlanError {
+    /// An expression has no type over its input.
+    #[error("{0}")]
+    Type(#[from] TypeError),
+    /// A projection names a column the scan does not have.
+    #[error("scan projects unknown column {0}")]
+    UnknownProjection(String),
+    /// The inputs of a union differ in schema.
+    #[error("union inputs have different schemas")]
+    UnionMismatch,
+    /// A union has no inputs.
+    #[error("union has no inputs")]
+    EmptyUnion,
+}
+
+/// An expression with the name it is output under.
+#[derive(Clone, PartialEq, Debug)]
+pub struct NamedExpr {
+    /// The expression.
+    pub expr: Expr,
+    /// The output column name.
+    pub name: String,
+}
+
+impl NamedExpr {
+    /// `expr AS name`.
+    #[must_use]
+    pub fn new(expr: Expr, name: impl Into<String>) -> Self {
+        NamedExpr {
+            expr,
+            name: name.into(),
+        }
+    }
+}
+
+/// An aggregate function application.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AggregateExpr {
+    /// The function, by registry name.
+    pub function: String,
+    /// Its arguments; empty for `count(*)`.
+    pub args: Vec<Expr>,
+    /// The output column name.
+    pub name: String,
+}
+
+/// One key of an ordering.
+#[derive(Clone, PartialEq, Debug)]
+pub struct SortKey {
+    /// The sorted expression.
+    pub expr: Expr,
+    /// Largest first when true.
+    pub descending: bool,
+}
+
+impl SortKey {
+    /// Ascending on `expr`.
+    #[must_use]
+    pub fn ascending(expr: Expr) -> Self {
+        SortKey {
+            expr,
+            descending: false,
+        }
+    }
+
+    /// Descending on `expr`.
+    #[must_use]
+    pub fn descending(expr: Expr) -> Self {
+        SortKey {
+            expr,
+            descending: true,
+        }
+    }
+}
+
+impl fmt::Display for SortKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let direction = if self.descending { "DESC" } else { "ASC" };
+        write!(f, "{} {direction}", self.expr)
+    }
+}
+
+/// A read of one dataset and kind with everything pushed down into it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Scan {
+    /// The tenant.
+    pub tenant: TenantId,
+    /// The dataset.
+    pub dataset: DatasetName,
+    /// The kind of event.
+    pub kind: Kind,
+    /// Rows outside this range are not read.
+    pub time_range: TimeRange,
+    /// Predicates every output row satisfies, as a conjunction.
+    pub predicates: Vec<Expr>,
+    /// The columns to read, or every column.
+    pub projection: Option<Vec<String>>,
+    /// Stop after this many rows, read newest first (the time-ordered
+    /// top-K scan of section 10.6).
+    pub newest_first_limit: Option<usize>,
+}
+
+impl Scan {
+    /// A scan of every row of `kind` in `dataset`.
+    #[must_use]
+    pub fn all(tenant: TenantId, dataset: DatasetName, kind: Kind) -> Self {
+        Scan {
+            tenant,
+            dataset,
+            kind,
+            time_range: TimeRange::ALL,
+            predicates: Vec::new(),
+            projection: None,
+            newest_first_limit: None,
+        }
+    }
+
+    /// The schema of the rows the scan produces.
+    ///
+    /// # Errors
+    ///
+    /// `UnknownProjection` if the projection names a column the kind does
+    /// not have.
+    pub fn schema(&self) -> Result<SchemaRef, PlanError> {
+        let full = event::schema(self.kind);
+        match &self.projection {
+            None => Ok(full),
+            Some(names) => {
+                let fields = names
+                    .iter()
+                    .map(|name| {
+                        full.field_with_name(name)
+                            .cloned()
+                            .map_err(|_| PlanError::UnknownProjection(name.clone()))
+                    })
+                    .collect::<Result<Vec<Field>, _>>()?;
+                Ok(Arc::new(Schema::new(fields)))
+            }
+        }
+    }
+}
+
+/// A node of the operator tree.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Plan {
+    /// Read a dataset.
+    Scan(Scan),
+    /// Keep the rows where `predicate` holds.
+    Filter {
+        /// The input.
+        input: Box<Plan>,
+        /// The condition.
+        predicate: Expr,
+    },
+    /// Compute output columns from each input row.
+    Project {
+        /// The input.
+        input: Box<Plan>,
+        /// The output columns.
+        exprs: Vec<NamedExpr>,
+    },
+    /// Group rows and aggregate each group. With no keys, one group.
+    Aggregate {
+        /// The input.
+        input: Box<Plan>,
+        /// The grouping keys, output first.
+        group_by: Vec<NamedExpr>,
+        /// The aggregates, output after the keys.
+        aggregates: Vec<AggregateExpr>,
+    },
+    /// Order the rows.
+    Sort {
+        /// The input.
+        input: Box<Plan>,
+        /// The ordering.
+        keys: Vec<SortKey>,
+    },
+    /// Skip `offset` rows and keep at most `count`.
+    Limit {
+        /// The input.
+        input: Box<Plan>,
+        /// Rows to skip.
+        offset: usize,
+        /// Rows to keep, or every remaining row.
+        count: Option<usize>,
+    },
+    /// The first `k` rows under an ordering, found without a full sort.
+    TopK {
+        /// The input.
+        input: Box<Plan>,
+        /// The ordering.
+        keys: Vec<SortKey>,
+        /// How many rows to keep.
+        k: usize,
+    },
+    /// The rows of every input, which share one schema.
+    Union {
+        /// The inputs.
+        inputs: Vec<Plan>,
+    },
+    /// Constant rows, for queries without a table.
+    Values {
+        /// The schema of the rows.
+        schema: SchemaRef,
+        /// The rows, one literal per column.
+        rows: Vec<Vec<Literal>>,
+    },
+}
+
+impl Plan {
+    /// Wraps `self` in a filter.
+    #[must_use]
+    pub fn filter(self, predicate: Expr) -> Self {
+        Plan::Filter {
+            input: Box::new(self),
+            predicate,
+        }
+    }
+
+    /// Wraps `self` in a projection.
+    #[must_use]
+    pub fn project(self, exprs: Vec<NamedExpr>) -> Self {
+        Plan::Project {
+            input: Box::new(self),
+            exprs,
+        }
+    }
+
+    /// Wraps `self` in a sort.
+    #[must_use]
+    pub fn sort(self, keys: Vec<SortKey>) -> Self {
+        Plan::Sort {
+            input: Box::new(self),
+            keys,
+        }
+    }
+
+    /// Wraps `self` in a limit.
+    #[must_use]
+    pub fn limit(self, offset: usize, count: Option<usize>) -> Self {
+        Plan::Limit {
+            input: Box::new(self),
+            offset,
+            count,
+        }
+    }
+
+    /// The inputs of the node, in order.
+    #[must_use]
+    pub fn inputs(&self) -> Vec<&Plan> {
+        match self {
+            Plan::Scan(_) | Plan::Values { .. } => Vec::new(),
+            Plan::Filter { input, .. }
+            | Plan::Project { input, .. }
+            | Plan::Aggregate { input, .. }
+            | Plan::Sort { input, .. }
+            | Plan::Limit { input, .. }
+            | Plan::TopK { input, .. } => vec![input],
+            Plan::Union { inputs } => inputs.iter().collect(),
+        }
+    }
+
+    /// The event time the node's rows can lie in (QE-3): the union of its
+    /// inputs' ranges, or the scan's own.
+    #[must_use]
+    pub fn time_range(&self) -> TimeRange {
+        match self {
+            Plan::Scan(scan) => scan.time_range,
+            Plan::Values { .. } => TimeRange::ALL,
+            Plan::Union { inputs } => inputs
+                .iter()
+                .map(Plan::time_range)
+                .reduce(|a, b| TimeRange::new(a.start.min(b.start), a.end.max(b.end)))
+                .unwrap_or(TimeRange::ALL),
+            other => other.inputs()[0].time_range(),
+        }
+    }
+
+    /// The ordering the node's rows are known to have (QE-3). Empty when
+    /// the order is unspecified.
+    #[must_use]
+    pub fn ordering(&self) -> Vec<SortKey> {
+        match self {
+            Plan::Scan(scan) => match scan.newest_first_limit {
+                Some(_) => vec![SortKey::descending(Expr::column(TIMESTAMP))],
+                None => Vec::new(),
+            },
+            Plan::Sort { keys, .. } | Plan::TopK { keys, .. } => keys.clone(),
+            Plan::Filter { input, .. } | Plan::Limit { input, .. } => input.ordering(),
+            Plan::Project { input, exprs } => {
+                // The ordering survives a projection that passes its keys through
+                // unchanged.
+                let keys = input.ordering();
+                let passed = keys.iter().all(|k| {
+                    exprs
+                        .iter()
+                        .any(|e| e.expr == k.expr && e.name == k.expr.to_string())
+                });
+                if passed { keys } else { Vec::new() }
+            }
+            Plan::Aggregate { .. } | Plan::Union { .. } | Plan::Values { .. } => Vec::new(),
+        }
+    }
+
+    /// Whether the node's rows still carry `sample_rate`, so that an
+    /// aggregate above it is weighted (QE-13).
+    ///
+    /// # Errors
+    ///
+    /// If the plan is not well formed.
+    pub fn weighted(&self, registry: &Registry) -> Result<bool, PlanError> {
+        Ok(self.schema(registry)?.field_with_name(SAMPLE_RATE).is_ok())
+    }
+
+    /// The schema of the node's rows.
+    ///
+    /// # Errors
+    ///
+    /// If an expression has no type, a projection or union is malformed.
+    pub fn schema(&self, registry: &Registry) -> Result<SchemaRef, PlanError> {
+        match self {
+            Plan::Scan(scan) => scan.schema(),
+            Plan::Values { schema, .. } => Ok(Arc::clone(schema)),
+            Plan::Filter { input, .. }
+            | Plan::Sort { input, .. }
+            | Plan::Limit { input, .. }
+            | Plan::TopK { input, .. } => input.schema(registry),
+            Plan::Project { input, exprs } => {
+                let input = input.schema(registry)?;
+                let fields = exprs
+                    .iter()
+                    .map(|e| {
+                        expr_type(&e.expr, &input, registry)
+                            .map(|t| Field::new(&e.name, t, true))
+                            .map_err(PlanError::Type)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Arc::new(Schema::new(fields)))
+            }
+            Plan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
+                let input = input.schema(registry)?;
+                let mut fields = Vec::with_capacity(group_by.len() + aggregates.len());
+                for key in group_by {
+                    let t = expr_type(&key.expr, &input, registry)?;
+                    fields.push(Field::new(&key.name, t, true));
+                }
+                for aggregate in aggregates {
+                    fields.push(Field::new(
+                        &aggregate.name,
+                        aggregate_type(aggregate, &input, registry)?,
+                        true,
+                    ));
+                }
+                Ok(Arc::new(Schema::new(fields)))
+            }
+            Plan::Union { inputs } => {
+                let first = inputs.first().ok_or(PlanError::EmptyUnion)?;
+                let schema = first.schema(registry)?;
+                for input in &inputs[1..] {
+                    if input.schema(registry)? != schema {
+                        return Err(PlanError::UnionMismatch);
+                    }
+                }
+                Ok(schema)
+            }
+        }
+    }
+
+    fn fmt_tree(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
+        let pad = "  ".repeat(depth);
+        match self {
+            Plan::Scan(scan) => {
+                write!(
+                    f,
+                    "{pad}Scan: {}/{} {} {}",
+                    scan.dataset, scan.kind, scan.time_range, scan.tenant
+                )?;
+                if !scan.predicates.is_empty() {
+                    let shown: Vec<String> =
+                        scan.predicates.iter().map(ToString::to_string).collect();
+                    write!(f, " predicates=[{}]", shown.join(", "))?;
+                }
+                if let Some(columns) = &scan.projection {
+                    write!(f, " columns=[{}]", columns.join(", "))?;
+                }
+                if let Some(limit) = scan.newest_first_limit {
+                    write!(f, " newest_first_limit={limit}")?;
+                }
+                writeln!(f)
+            }
+            Plan::Filter { input, predicate } => {
+                writeln!(f, "{pad}Filter: {predicate}")?;
+                input.fmt_tree(f, depth + 1)
+            }
+            Plan::Project { input, exprs } => {
+                let shown: Vec<String> = exprs
+                    .iter()
+                    .map(|e| format!("{} AS {}", e.expr, e.name))
+                    .collect();
+                writeln!(f, "{pad}Project: {}", shown.join(", "))?;
+                input.fmt_tree(f, depth + 1)
+            }
+            Plan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+            } => {
+                let keys: Vec<String> = group_by
+                    .iter()
+                    .map(|e| format!("{} AS {}", e.expr, e.name))
+                    .collect();
+                let aggs: Vec<String> = aggregates
+                    .iter()
+                    .map(|a| {
+                        let args: Vec<String> = a.args.iter().map(ToString::to_string).collect();
+                        format!("{}({}) AS {}", a.function, args.join(", "), a.name)
+                    })
+                    .collect();
+                writeln!(
+                    f,
+                    "{pad}Aggregate: group_by=[{}] aggregates=[{}]",
+                    keys.join(", "),
+                    aggs.join(", ")
+                )?;
+                input.fmt_tree(f, depth + 1)
+            }
+            Plan::Sort { input, keys } => {
+                let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
+                writeln!(f, "{pad}Sort: {}", shown.join(", "))?;
+                input.fmt_tree(f, depth + 1)
+            }
+            Plan::Limit {
+                input,
+                offset,
+                count,
+            } => {
+                match count {
+                    Some(count) => writeln!(f, "{pad}Limit: offset={offset} count={count}")?,
+                    None => writeln!(f, "{pad}Limit: offset={offset}")?,
+                }
+                input.fmt_tree(f, depth + 1)
+            }
+            Plan::TopK { input, keys, k } => {
+                let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
+                writeln!(f, "{pad}TopK: k={k} order=[{}]", shown.join(", "))?;
+                input.fmt_tree(f, depth + 1)
+            }
+            Plan::Union { inputs } => {
+                writeln!(f, "{pad}Union")?;
+                for input in inputs {
+                    input.fmt_tree(f, depth + 1)?;
+                }
+                Ok(())
+            }
+            Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
+        }
+    }
+}
+
+/// The result type of an aggregate over `input`.
+///
+/// # Errors
+///
+/// If the function is unknown or its arguments do not fit.
+pub fn aggregate_type(
+    aggregate: &AggregateExpr,
+    input: &Schema,
+    registry: &Registry,
+) -> Result<DataType, PlanError> {
+    let function = registry
+        .aggregate(&aggregate.function)
+        .ok_or_else(|| TypeError::UnknownAggregate(aggregate.function.clone()))?;
+    let types = aggregate
+        .args
+        .iter()
+        .map(|a| expr_type(a, input, registry))
+        .collect::<Result<Vec<_>, _>>()?;
+    (function.return_type)(&types).ok_or_else(|| {
+        let shown: Vec<String> = types.iter().map(ToString::to_string).collect();
+        TypeError::Mismatch(format!(
+            "{} does not accept ({})",
+            aggregate.function,
+            shown.join(", ")
+        ))
+        .into()
+    })
+}
+
+impl fmt::Display for Plan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_tree(f, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::TimeUnit;
+    use tessera_types::Timestamp;
+    use tessera_types::event::{BODY, SEVERITY_NUMBER};
+
+    use super::*;
+    use crate::expr::BinaryOp;
+
+    fn scan() -> Scan {
+        Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Log,
+        )
+    }
+
+    fn registry() -> Registry {
+        Registry::builtin()
+    }
+
+    #[test]
+    fn a_scan_schema_is_the_kind_schema_projected() {
+        let full = Plan::Scan(scan()).schema(&registry()).unwrap();
+        assert_eq!(full, event::schema(Kind::Log));
+        let mut narrow = scan();
+        narrow.projection = Some(vec![BODY.into(), TIMESTAMP.into()]);
+        let schema = narrow.schema().unwrap();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec![BODY, TIMESTAMP]);
+        narrow.projection = Some(vec!["nope".into()]);
+        assert_eq!(
+            narrow.schema(),
+            Err(PlanError::UnknownProjection("nope".into()))
+        );
+    }
+
+    #[test]
+    fn projections_and_aggregates_are_typed() {
+        let plan = Plan::Scan(scan())
+            .filter(Expr::column(SEVERITY_NUMBER).binary(BinaryOp::GtEq, Expr::literal(17)))
+            .project(vec![
+                NamedExpr::new(Expr::column(BODY), "body"),
+                NamedExpr::new(
+                    Expr::Call {
+                        name: "length".into(),
+                        args: vec![Expr::column(BODY)],
+                    },
+                    "len",
+                ),
+            ]);
+        let schema = plan.schema(&registry()).unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+
+        let grouped = Plan::Aggregate {
+            input: Box::new(Plan::Scan(scan())),
+            group_by: vec![NamedExpr::new(Expr::column("severity_text"), "severity")],
+            aggregates: vec![
+                AggregateExpr {
+                    function: "count".into(),
+                    args: vec![],
+                    name: "n".into(),
+                },
+                AggregateExpr {
+                    function: "max".into(),
+                    args: vec![Expr::column(TIMESTAMP)],
+                    name: "latest".into(),
+                },
+            ],
+        };
+        let schema = grouped.schema(&registry()).unwrap();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["severity", "n", "latest"]);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+        assert!(Plan::Scan(scan()).weighted(&registry()).unwrap());
+        assert!(!grouped.weighted(&registry()).unwrap());
+    }
+
+    #[test]
+    fn unions_need_matching_inputs() {
+        let a = Plan::Scan(scan());
+        let b = Plan::Scan(scan()).project(vec![NamedExpr::new(Expr::column(BODY), "body")]);
+        assert_eq!(
+            Plan::Union {
+                inputs: vec![a.clone(), b]
+            }
+            .schema(&registry()),
+            Err(PlanError::UnionMismatch)
+        );
+        assert!(
+            Plan::Union {
+                inputs: vec![a.clone(), a]
+            }
+            .schema(&registry())
+            .is_ok()
+        );
+        assert_eq!(
+            Plan::Union { inputs: vec![] }.schema(&registry()),
+            Err(PlanError::EmptyUnion)
+        );
+    }
+
+    #[test]
+    fn time_range_and_ordering_follow_the_inputs() {
+        let mut bounded = scan();
+        bounded.time_range = TimeRange::new(Timestamp::from_nanos(5), Timestamp::from_nanos(9));
+        let plan = Plan::Scan(bounded.clone())
+            .filter(Expr::literal(true))
+            .sort(vec![SortKey::descending(Expr::column(TIMESTAMP))])
+            .limit(0, Some(3));
+        assert_eq!(plan.time_range(), bounded.time_range);
+        assert_eq!(
+            plan.ordering(),
+            vec![SortKey::descending(Expr::column(TIMESTAMP))]
+        );
+        let projected = plan
+            .clone()
+            .project(vec![NamedExpr::new(Expr::column(TIMESTAMP), TIMESTAMP)]);
+        assert_eq!(projected.ordering().len(), 1);
+        let renamed = plan.project(vec![NamedExpr::new(Expr::column(TIMESTAMP), "t")]);
+        assert!(renamed.ordering().is_empty());
+
+        let mut other = scan();
+        other.time_range = TimeRange::new(Timestamp::from_nanos(1), Timestamp::from_nanos(6));
+        let union = Plan::Union {
+            inputs: vec![Plan::Scan(bounded), Plan::Scan(other)],
+        };
+        assert_eq!(
+            union.time_range(),
+            TimeRange::new(Timestamp::from_nanos(1), Timestamp::from_nanos(9))
+        );
+        assert!(union.ordering().is_empty());
+    }
+
+    #[test]
+    fn displays_as_an_explain_tree() {
+        let mut s = scan();
+        s.predicates =
+            vec![Expr::column(SEVERITY_NUMBER).binary(BinaryOp::GtEq, Expr::literal(17))];
+        s.projection = Some(vec![TIMESTAMP.into(), BODY.into()]);
+        let plan = Plan::Scan(s)
+            .sort(vec![SortKey::descending(Expr::column(TIMESTAMP))])
+            .limit(0, Some(10));
+        assert_eq!(
+            plan.to_string(),
+            "Limit: offset=0 count=10\n  Sort: timestamp DESC\n    Scan: prod/log [all time) default predicates=[(severity_number >= 17)] columns=[timestamp, body]\n"
+        );
+    }
+}
