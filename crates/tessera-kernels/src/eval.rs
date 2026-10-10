@@ -8,12 +8,13 @@
 //! meet in float, and `NULL` takes the other side's type. Logic is
 //! three-valued; a predicate treats an unknown result as false.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Datum, DurationNanosecondArray, Float64Array,
-    Int64Array, RecordBatch, Scalar, StringArray, TimestampNanosecondArray, UInt32Array,
-    new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Datum, DurationNanosecondArray,
+    FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, Scalar, StringArray,
+    TimestampNanosecondArray, UInt32Array, new_null_array,
 };
 use arrow::compute::kernels::regexp::regexp_is_match_scalar;
 use arrow::compute::kernels::zip::zip;
@@ -200,20 +201,10 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
             negated,
         } => {
             let tested = value(expr, batch)?;
-            let mut found: Option<Value> = None;
-            for item in list {
-                let equal = binary(BinaryOp::Eq, &tested, &Value::Constant(literal(item)))?;
-                found = Some(match found {
-                    None => equal,
-                    Some(acc) => binary(BinaryOp::Or, &acc, &equal)?,
-                });
-            }
-            let found = found.unwrap_or_else(|| {
-                tested.with_array(Arc::new(BooleanArray::from(vec![
-                    false;
-                    tested.array().len()
-                ])))
-            });
+            let found = match in_byte_set(&tested, list) {
+                Some(found) => tested.with_array(Arc::new(found)),
+                None => in_list(&tested, list)?,
+            };
             if *negated {
                 let booleans = as_booleans(found.array())?;
                 Ok(found.with_array(Arc::new(not(booleans)?)))
@@ -224,6 +215,60 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
         Expr::Call { name, args } => call(name, args, batch),
         Expr::Cast { expr, to } => value(expr, batch)?.cast(to),
     }
+}
+
+/// Lists at least this long are probed through a hash set when their
+/// items are bytes, as a trace group's list of trace ids is.
+const HASHED_LIST_MIN: usize = 8;
+
+/// `tested IN list` as one comparison per item.
+fn in_list(tested: &Value, list: &[Literal]) -> Result<Value, KernelError> {
+    let mut found: Option<Value> = None;
+    for item in list {
+        let equal = binary(BinaryOp::Eq, tested, &Value::Constant(literal(item)))?;
+        found = Some(match found {
+            None => equal,
+            Some(acc) => binary(BinaryOp::Or, &acc, &equal)?,
+        });
+    }
+    Ok(found.unwrap_or_else(|| {
+        tested.with_array(Arc::new(BooleanArray::from(vec![
+            false;
+            tested.array().len()
+        ])))
+    }))
+}
+
+/// `tested IN list` through a hash set, for a long list of bytes over a
+/// binary column; `None` when the fast path does not apply.
+fn in_byte_set(tested: &Value, list: &[Literal]) -> Option<BooleanArray> {
+    if list.len() < HASHED_LIST_MIN {
+        return None;
+    }
+    let set: HashSet<&[u8]> = list
+        .iter()
+        .map(|item| match item {
+            Literal::Bytes(bytes) => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let array = tested.array();
+    let probe = |value: Option<&[u8]>| value.map(|v| set.contains(v));
+    Some(match array.data_type() {
+        DataType::FixedSizeBinary(_) => array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()?
+            .iter()
+            .map(probe)
+            .collect(),
+        DataType::Binary => array
+            .as_any()
+            .downcast_ref::<BinaryArray>()?
+            .iter()
+            .map(probe)
+            .collect(),
+        _ => return None,
+    })
 }
 
 /// SQL `LIKE` and its negated and case-insensitive forms.
@@ -760,6 +805,45 @@ mod tests {
         }
         .binary(BinaryOp::GtEq, Expr::literal(2));
         assert_eq!(booleans(&number), vec![false, true, false]);
+    }
+
+    #[test]
+    fn long_byte_lists_are_probed_through_a_hash_set() {
+        let schema = Schema::new(vec![Field::new("id", DataType::FixedSizeBinary(2), true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(
+                arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    vec![Some(vec![1u8, 2]), Some(vec![3u8, 4]), None].into_iter(),
+                    2,
+                )
+                .unwrap(),
+            )],
+        )
+        .unwrap();
+        let list: Vec<Literal> = (0..HASHED_LIST_MIN + 2)
+            .map(|i| Literal::Bytes(vec![u8::try_from(i).unwrap(), 4]))
+            .collect();
+        let keep = |negated: bool| -> Vec<bool> {
+            let expr = Expr::InList {
+                expr: Box::new(Expr::column("id")),
+                list: list.clone(),
+                negated,
+            };
+            evaluate_predicate(&expr, &batch)
+                .unwrap()
+                .iter()
+                .map(|b| b.unwrap_or(false))
+                .collect()
+        };
+        assert_eq!(keep(false), vec![false, true, false]);
+        assert_eq!(keep(true), vec![true, false, false], "null stays unknown");
+        let mut mixed = list.clone();
+        mixed.push(Literal::Int(1));
+        assert!(
+            in_byte_set(&Value::Column(batch.column(0).clone()), &mixed).is_none(),
+            "a mixed list takes the comparison path"
+        );
     }
 
     #[test]
