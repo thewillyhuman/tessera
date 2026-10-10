@@ -104,6 +104,23 @@ fn wrap_filter(plan: Plan, predicates: Vec<Expr>) -> Plan {
 fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
     match plan {
         Plan::Scan(_) | Plan::Values { .. } => plan,
+        Plan::RangeVector {
+            input,
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+        } => Plan::RangeVector {
+            input: Box::new(f(*input)),
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+        },
         Plan::Filter { input, predicate } => f(*input).filter(predicate),
         Plan::Project { input, exprs } => f(*input).project(exprs),
         Plan::Aggregate {
@@ -278,6 +295,39 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
     match plan {
         Plan::Scan(scan) => Plan::Scan(narrow_scan(scan, needed)),
         Plan::Values { schema, rows } => Plan::Values { schema, rows },
+        Plan::RangeVector {
+            input,
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+        } => {
+            // Series keys come from every label source; lines are measured
+            // by the byte functions; the unwrapped value reads what it reads.
+            let mut needed: BTreeSet<String> = [
+                TIMESTAMP,
+                BODY,
+                OVERFLOW,
+                EXTRACTED,
+                tessera_types::event::SEVERITY_TEXT,
+            ]
+            .map(str::to_owned)
+            .into();
+            if let Some(value) = &value {
+                needed = add(needed, value);
+            }
+            Plan::RangeVector {
+                input: Box::new(push_projection(*input, Some(needed))),
+                function,
+                value,
+                range,
+                step,
+                start,
+                end,
+            }
+        }
         Plan::Filter { input, predicate } => {
             let needed = needed.map(|n| add(n, &predicate));
             push_projection(*input, needed).filter(predicate)
@@ -325,6 +375,24 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
             offset,
             count,
         } => push_projection(*input, needed).limit(offset, count),
+        Plan::Union { inputs } => Plan::Union {
+            inputs: inputs
+                .into_iter()
+                .map(|i| push_projection(i, needed.clone()))
+                .collect(),
+        },
+        other => push_projection_text(other, needed),
+    }
+}
+
+/// The text and window nodes of [`push_projection`]: parser stages read
+/// their source, templates and series keys read every label source.
+fn push_projection_text(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
+    let add = |mut set: BTreeSet<String>, expr: &Expr| {
+        set.extend(expr.references());
+        set
+    };
+    match plan {
         Plan::Extract {
             input,
             source,
@@ -366,12 +434,7 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
                 keep,
             }
         }
-        Plan::Union { inputs } => Plan::Union {
-            inputs: inputs
-                .into_iter()
-                .map(|i| push_projection(i, needed.clone()))
-                .collect(),
-        },
+        other => other,
     }
 }
 

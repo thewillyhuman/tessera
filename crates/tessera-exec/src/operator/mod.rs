@@ -14,6 +14,7 @@ mod extract;
 mod filter;
 mod limit;
 mod project;
+mod range;
 mod sort;
 mod topk;
 
@@ -27,6 +28,7 @@ pub use extract::{Extract, Format};
 pub use filter::Filter;
 pub use limit::Limit;
 pub use project::Project;
+pub use range::RangeVector;
 pub use sort::Sort;
 pub use topk::TopK;
 

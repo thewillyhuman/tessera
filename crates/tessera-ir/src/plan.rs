@@ -9,10 +9,11 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use tessera_types::event::{EXTRACTED, SAMPLE_RATE, TIMESTAMP};
-use tessera_types::{DatasetName, Kind, TenantId, TimeRange, event};
+use tessera_types::{DatasetName, Kind, TenantId, TimeRange, Timestamp, event};
 
 use crate::expr::{Expr, Literal};
 use crate::function::Registry;
@@ -192,6 +193,79 @@ impl fmt::Display for ExtractStage {
     }
 }
 
+/// A function over the samples of one series in a sliding window
+/// (`RangeVector`, section 10.2), with `LogQL` and `PromQL` semantics.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RangeFunction {
+    /// Samples in the window.
+    CountOverTime,
+    /// Samples per second.
+    Rate,
+    /// Bytes of the lines in the window.
+    BytesOverTime,
+    /// Bytes per second.
+    BytesRate,
+    /// Sum of the unwrapped values.
+    SumOverTime,
+    /// Mean of the unwrapped values.
+    AvgOverTime,
+    /// Smallest unwrapped value.
+    MinOverTime,
+    /// Largest unwrapped value.
+    MaxOverTime,
+    /// The oldest unwrapped value.
+    FirstOverTime,
+    /// The newest unwrapped value.
+    LastOverTime,
+    /// Population standard deviation of the unwrapped values.
+    StddevOverTime,
+    /// Population variance of the unwrapped values.
+    StdvarOverTime,
+    /// The given quantile of the unwrapped values.
+    QuantileOverTime(f64),
+    /// 1 where the window holds no sample.
+    AbsentOverTime,
+}
+
+impl fmt::Display for RangeFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeFunction::CountOverTime => write!(f, "count_over_time"),
+            RangeFunction::Rate => write!(f, "rate"),
+            RangeFunction::BytesOverTime => write!(f, "bytes_over_time"),
+            RangeFunction::BytesRate => write!(f, "bytes_rate"),
+            RangeFunction::SumOverTime => write!(f, "sum_over_time"),
+            RangeFunction::AvgOverTime => write!(f, "avg_over_time"),
+            RangeFunction::MinOverTime => write!(f, "min_over_time"),
+            RangeFunction::MaxOverTime => write!(f, "max_over_time"),
+            RangeFunction::FirstOverTime => write!(f, "first_over_time"),
+            RangeFunction::LastOverTime => write!(f, "last_over_time"),
+            RangeFunction::StddevOverTime => write!(f, "stddev_over_time"),
+            RangeFunction::StdvarOverTime => write!(f, "stdvar_over_time"),
+            RangeFunction::QuantileOverTime(q) => write!(f, "quantile_over_time({q})"),
+            RangeFunction::AbsentOverTime => write!(f, "absent_over_time"),
+        }
+    }
+}
+
+/// The output column of a range vector: the step time.
+pub const VALUE: &str = "value";
+
+/// The schema every `RangeVector` produces: the step `timestamp`, the
+/// series labels in `_extracted`, and `value`.
+#[must_use]
+pub fn range_vector_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            TIMESTAMP,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new(EXTRACTED, DataType::Utf8, true),
+        Field::new(VALUE, DataType::Float64, true),
+    ]))
+}
+
 /// A node of the operator tree.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Plan {
@@ -276,6 +350,26 @@ pub enum Plan {
         /// The only labels to keep, when set.
         keep: Option<Vec<String>>,
     },
+    /// Per-series sliding windows (section 10.6): the input rows are
+    /// grouped by their full label set, and `function` is evaluated at
+    /// every step from `start` to `end` over `(t - range, t]`.
+    RangeVector {
+        /// The input rows.
+        input: Box<Plan>,
+        /// The function.
+        function: RangeFunction,
+        /// The unwrapped value for the functions that need one; `None`
+        /// counts rows or measures lines.
+        value: Option<Expr>,
+        /// The window length.
+        range: Duration,
+        /// The distance between steps.
+        step: Duration,
+        /// The first step.
+        start: Timestamp,
+        /// The last step, inclusive.
+        end: Timestamp,
+    },
     /// Constant rows, for queries without a table.
     Values {
         /// The schema of the rows.
@@ -335,7 +429,8 @@ impl Plan {
             | Plan::Limit { input, .. }
             | Plan::TopK { input, .. }
             | Plan::Extract { input, .. }
-            | Plan::Format { input, .. } => vec![input],
+            | Plan::Format { input, .. }
+            | Plan::RangeVector { input, .. } => vec![input],
             Plan::Union { inputs } => inputs.iter().collect(),
         }
     }
@@ -381,7 +476,10 @@ impl Plan {
                 });
                 if passed { keys } else { Vec::new() }
             }
-            Plan::Aggregate { .. } | Plan::Union { .. } | Plan::Values { .. } => Vec::new(),
+            Plan::Aggregate { .. }
+            | Plan::Union { .. }
+            | Plan::Values { .. }
+            | Plan::RangeVector { .. } => Vec::new(),
         }
     }
 
@@ -409,6 +507,7 @@ impl Plan {
             | Plan::Limit { input, .. }
             | Plan::TopK { input, .. } => input.schema(registry),
             Plan::Extract { input, .. } => Ok(with_extracted(&input.schema(registry)?)),
+            Plan::RangeVector { .. } => Ok(range_vector_schema()),
             Plan::Format { input, labels, .. } => {
                 let input = input.schema(registry)?;
                 Ok(if labels.is_empty() {
@@ -465,25 +564,7 @@ impl Plan {
     fn fmt_tree(&self, f: &mut fmt::Formatter<'_>, depth: usize) -> fmt::Result {
         let pad = "  ".repeat(depth);
         match self {
-            Plan::Scan(scan) => {
-                write!(
-                    f,
-                    "{pad}Scan: {}/{} {} {}",
-                    scan.dataset, scan.kind, scan.time_range, scan.tenant
-                )?;
-                if !scan.predicates.is_empty() {
-                    let shown: Vec<String> =
-                        scan.predicates.iter().map(ToString::to_string).collect();
-                    write!(f, " predicates=[{}]", shown.join(", "))?;
-                }
-                if let Some(columns) = &scan.projection {
-                    write!(f, " columns=[{}]", columns.join(", "))?;
-                }
-                if let Some(limit) = scan.newest_first_limit {
-                    write!(f, " newest_first_limit={limit}")?;
-                }
-                writeln!(f)
-            }
+            Plan::Scan(scan) => fmt_scan(f, &pad, scan),
             Plan::Filter { input, predicate } => {
                 writeln!(f, "{pad}Filter: {predicate}")?;
                 input.fmt_tree(f, depth + 1)
@@ -550,9 +631,50 @@ impl Plan {
                 fmt_format(f, &pad, line.as_deref(), labels, drop, keep.as_deref())?;
                 input.fmt_tree(f, depth + 1)
             }
+            Plan::RangeVector {
+                input,
+                function,
+                value,
+                range,
+                step,
+                start,
+                end,
+            } => {
+                fmt_range_vector(
+                    f,
+                    &pad,
+                    *function,
+                    value.as_ref(),
+                    *range,
+                    *step,
+                    *start,
+                    *end,
+                )?;
+                input.fmt_tree(f, depth + 1)
+            }
             Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
         }
     }
+}
+
+/// The `Scan` line of `EXPLAIN`.
+fn fmt_scan(f: &mut fmt::Formatter<'_>, pad: &str, scan: &Scan) -> fmt::Result {
+    write!(
+        f,
+        "{pad}Scan: {}/{} {} {}",
+        scan.dataset, scan.kind, scan.time_range, scan.tenant
+    )?;
+    if !scan.predicates.is_empty() {
+        let shown: Vec<String> = scan.predicates.iter().map(ToString::to_string).collect();
+        write!(f, " predicates=[{}]", shown.join(", "))?;
+    }
+    if let Some(columns) = &scan.projection {
+        write!(f, " columns=[{}]", columns.join(", "))?;
+    }
+    if let Some(limit) = scan.newest_first_limit {
+        write!(f, " newest_first_limit={limit}")?;
+    }
+    writeln!(f)
 }
 
 /// The `Aggregate` line of `EXPLAIN`.
@@ -604,6 +726,30 @@ fn fmt_format(
         write!(f, " keep=[{}]", keep.join(", "))?;
     }
     writeln!(f)
+}
+
+/// The `RangeVector` line of `EXPLAIN`.
+#[allow(clippy::too_many_arguments)]
+fn fmt_range_vector(
+    f: &mut fmt::Formatter<'_>,
+    pad: &str,
+    function: RangeFunction,
+    value: Option<&Expr>,
+    range: Duration,
+    step: Duration,
+    start: Timestamp,
+    end: Timestamp,
+) -> fmt::Result {
+    write!(f, "{pad}RangeVector: {function}")?;
+    if let Some(value) = value {
+        write!(f, " of {value}")?;
+    }
+    writeln!(
+        f,
+        " range={}s step={}s steps=[{start}, {end}]",
+        range.as_secs_f64(),
+        step.as_secs_f64()
+    )
 }
 
 /// `schema` with the `_extracted` column, added when absent.
@@ -843,5 +989,23 @@ mod tests {
             formatted.to_string(),
             "Format: line=\"{{.x}}\" drop=[y]\n  Scan: prod/log [all time) default\n"
         );
+    }
+
+    #[test]
+    fn range_vectors_have_a_fixed_schema_and_no_ordering() {
+        let plan = Plan::RangeVector {
+            input: Box::new(Plan::Scan(scan())),
+            function: RangeFunction::Rate,
+            value: None,
+            range: Duration::from_secs(300),
+            step: Duration::from_secs(60),
+            start: Timestamp::UNIX_EPOCH,
+            end: Timestamp::from_nanos(600_000_000_000),
+        };
+        let schema = plan.schema(&registry()).unwrap();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec![TIMESTAMP, EXTRACTED, VALUE]);
+        assert!(plan.ordering().is_empty());
+        assert!(plan.to_string().starts_with("RangeVector: rate range=300s step=60s steps=[1970-01-01T00:00:00Z, 1970-01-01T00:10:00Z]\n"));
     }
 }

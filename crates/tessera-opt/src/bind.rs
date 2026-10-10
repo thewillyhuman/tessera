@@ -30,6 +30,23 @@ fn bind_plan(plan: Plan) -> Plan {
             Plan::Scan(scan)
         }
         Plan::Values { schema, rows } => Plan::Values { schema, rows },
+        Plan::RangeVector {
+            input,
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+        } => Plan::RangeVector {
+            input: Box::new(bind_plan(*input)),
+            function,
+            value: value.map(|v| retype(bind_expr(v), Some(DataType::Float64))),
+            range,
+            step,
+            start,
+            end,
+        },
         Plan::Filter { input, predicate } => Plan::Filter {
             input: Box::new(bind_plan(*input)),
             predicate: bind_expr(predicate),

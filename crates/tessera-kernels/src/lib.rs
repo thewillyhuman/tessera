@@ -21,6 +21,7 @@ pub mod group;
 pub mod template;
 pub mod time;
 pub mod variant;
+pub mod window;
 
 use arrow::error::ArrowError;
 

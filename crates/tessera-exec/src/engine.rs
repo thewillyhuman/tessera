@@ -29,7 +29,8 @@ use crate::ExecError;
 use crate::batch::Batch;
 use crate::memory::MemoryPool;
 use crate::operator::{
-    CollectSink, Extract, Filter, Format, HashAggregate, Limit, Operator, Project, Sort, TopK,
+    CollectSink, Extract, Filter, Format, HashAggregate, Limit, Operator, Project, RangeVector,
+    Sort, TopK,
 };
 use crate::pipeline::Pipeline;
 use crate::scan::{self, ScanAnalysis};
@@ -188,85 +189,93 @@ impl Engine {
                     }
                     Ok(batches)
                 }
-                Plan::Filter { input, predicate } => {
+                other => {
+                    let input = other.inputs()[0];
+                    let operator = self.operator(other, input, memory)?;
                     let batches = self.execute(input, memory, analysis).await?;
-                    self.pipe(Box::new(Filter::new(predicate.clone())), batches)
-                        .await
+                    self.pipe(operator, batches).await
                 }
-                Plan::Extract {
-                    input,
-                    source,
-                    stage,
-                } => {
-                    let batches = self.execute(input, memory, analysis).await?;
-                    let schema = plan.schema(&self.registry)?;
-                    let operator = Extract::new(source.clone(), stage.clone(), schema);
-                    self.pipe(Box::new(operator), batches).await
-                }
-                Plan::Format {
-                    input,
-                    line,
-                    labels,
-                    drop,
-                    keep,
-                } => {
-                    let batches = self.execute(input, memory, analysis).await?;
-                    let schema = plan.schema(&self.registry)?;
-                    let operator = Format::new(
-                        line.clone(),
-                        labels.clone(),
-                        drop.clone(),
-                        keep.clone(),
-                        schema,
-                    );
-                    self.pipe(Box::new(operator), batches).await
-                }
-                Plan::Project { input, exprs } => {
-                    let batches = self.execute(input, memory, analysis).await?;
-                    let schema = plan.schema(&self.registry)?;
-                    self.pipe(Box::new(Project::new(exprs.clone(), schema)), batches)
-                        .await
-                }
-                Plan::Aggregate {
-                    input,
-                    group_by,
-                    aggregates,
-                } => {
-                    let weighted = input.weighted(&self.registry)?;
-                    let input_schema = input.schema(&self.registry)?;
-                    let batches = self.execute(input, memory, analysis).await?;
-                    let schema = plan.schema(&self.registry)?;
-                    let operator = HashAggregate::new(
-                        group_by.clone(),
-                        aggregates.clone(),
-                        weighted,
-                        &input_schema,
-                        schema,
-                        Arc::clone(memory),
-                    )?;
-                    self.pipe(Box::new(operator), batches).await
-                }
-                Plan::Sort { input, keys } => {
-                    let schema = input.schema(&self.registry)?;
-                    let batches = self.execute(input, memory, analysis).await?;
-                    let operator = Sort::new(keys.clone(), schema, Arc::clone(memory));
-                    self.pipe(Box::new(operator), batches).await
-                }
-                Plan::TopK { input, keys, k } => {
-                    let schema = input.schema(&self.registry)?;
-                    let batches = self.execute(input, memory, analysis).await?;
-                    let operator = TopK::new(keys.clone(), *k, schema, Arc::clone(memory));
-                    self.pipe(Box::new(operator), batches).await
-                }
-                Plan::Limit {
-                    input,
-                    offset,
-                    count,
-                } => {
-                    let batches = self.execute(input, memory, analysis).await?;
-                    self.pipe(Box::new(Limit::new(*offset, *count)), batches)
-                        .await
-                }
+            }
+        })
+    }
+
+    /// The operator that turns `input`'s rows into `plan`'s, for the
+    /// single-input nodes.
+    fn operator(
+        &self,
+        plan: &Plan,
+        input: &Plan,
+        memory: &Arc<MemoryPool>,
+    ) -> Result<Box<dyn Operator>, EngineError> {
+        let registry = &self.registry;
+        Ok(match plan {
+            Plan::Filter { predicate, .. } => Box::new(Filter::new(predicate.clone())),
+            Plan::Project { exprs, .. } => {
+                Box::new(Project::new(exprs.clone(), plan.schema(registry)?))
+            }
+            Plan::Extract { source, stage, .. } => Box::new(Extract::new(
+                source.clone(),
+                stage.clone(),
+                plan.schema(registry)?,
+            )),
+            Plan::Format {
+                line,
+                labels,
+                drop,
+                keep,
+                ..
+            } => Box::new(Format::new(
+                line.clone(),
+                labels.clone(),
+                drop.clone(),
+                keep.clone(),
+                plan.schema(registry)?,
+            )),
+            Plan::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => Box::new(HashAggregate::new(
+                group_by.clone(),
+                aggregates.clone(),
+                input.weighted(registry)?,
+                &input.schema(registry)?,
+                plan.schema(registry)?,
+                Arc::clone(memory),
+            )?),
+            Plan::Sort { keys, .. } => Box::new(Sort::new(
+                keys.clone(),
+                input.schema(registry)?,
+                Arc::clone(memory),
+            )),
+            Plan::TopK { keys, k, .. } => Box::new(TopK::new(
+                keys.clone(),
+                *k,
+                input.schema(registry)?,
+                Arc::clone(memory),
+            )),
+            Plan::Limit { offset, count, .. } => Box::new(Limit::new(*offset, *count)),
+            Plan::RangeVector {
+                function,
+                value,
+                range,
+                step,
+                start,
+                end,
+                ..
+            } => Box::new(RangeVector::new(
+                *function,
+                value.clone(),
+                *range,
+                *step,
+                *start,
+                *end,
+                Arc::clone(memory),
+            )),
+            Plan::Scan(_) | Plan::Values { .. } | Plan::Union { .. } => {
+                return Err(EngineError::Exec(ExecError::Unsupported(
+                    "not a single-input node".into(),
+                )));
             }
         })
     }
