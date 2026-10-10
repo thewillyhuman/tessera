@@ -206,12 +206,14 @@ pub enum Spanset {
         value: Literal,
     },
     /// `A | by(key)`: each spanset of `A` split by the value of `key`,
-    /// labelled `by(key)`.
+    /// labelled `label` (`by(key)` in the query's own words).
     By {
         /// The spansets.
         input: Box<Spanset>,
         /// The key.
         key: Expr,
+        /// The label the value is reported under.
+        label: String,
     },
     /// `A | coalesce()`: every spanset of `A` merged into one.
     Coalesce(Box<Spanset>),
@@ -283,7 +285,7 @@ impl Spanset {
                     f(arg);
                 }
             }
-            Spanset::By { input, key } => {
+            Spanset::By { input, key, .. } => {
                 input.visit(f);
                 f(key);
             }
@@ -318,9 +320,10 @@ impl Spanset {
                 op,
                 value,
             },
-            Spanset::By { input, key } => Spanset::By {
+            Spanset::By { input, key, label } => Spanset::By {
                 input: Box::new(input.map(f)),
                 key: f(key),
+                label,
             },
             Spanset::Coalesce(input) => Spanset::Coalesce(Box::new(input.map(f))),
         }
@@ -350,7 +353,7 @@ impl fmt::Display for Spanset {
                     op.symbol()
                 )
             }
-            Spanset::By { input, key } => write!(f, "{input} | by({key})"),
+            Spanset::By { input, label, .. } => write!(f, "{input} | {label}"),
             Spanset::Coalesce(input) => write!(f, "{input} | coalesce()"),
         }
     }
@@ -419,10 +422,11 @@ mod tests {
                 value: Literal::Int(5),
             }),
             key: Expr::column(SPAN_KIND),
+            label: "by(kind)".into(),
         };
         assert_eq!(
             spanset.to_string(),
-            "{ (name = 'a') } | avg(duration_ns) > 5 | by(span_kind)"
+            "{ (name = 'a') } | avg(duration_ns) > 5 | by(kind)"
         );
         let mut visited = 0;
         let renamed = spanset.map(&mut |expr| {
