@@ -82,6 +82,32 @@ fn build_schema(kind: Kind) -> Schema {
     Schema::new(fields)
 }
 
+/// The Prometheus and Loki label name of an attribute path (QL-19): the
+/// path without its scope prefix, with every character outside
+/// `[a-zA-Z0-9_]` replaced by `_`. `resource.service.name` is
+/// `service_name`; `attr.http.request.method` is `http_request_method`.
+#[must_use]
+pub fn label_name(path: &str) -> String {
+    let unscoped = SCOPES
+        .iter()
+        .find_map(|scope| path.strip_prefix(scope))
+        .unwrap_or(path);
+    unscoped
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The attribute scopes of section 4.2, in the order a label name
+/// resolves against them (QL-20): the more specific scope wins.
+pub const SCOPES: [&str; 3] = ["attr.", "resource.", "scope."];
+
 /// A scalar attribute value (section 4.3). Lists and nested maps are
 /// flattened or kept as JSON text by normalization (IN-5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -452,6 +478,22 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Attributes>(&json).unwrap(),
             attributes
+        );
+    }
+
+    #[test]
+    fn label_names_drop_the_scope_and_sanitize() {
+        assert_eq!(label_name("resource.service.name"), "service_name");
+        assert_eq!(
+            label_name("attr.http.request.method"),
+            "http_request_method"
+        );
+        assert_eq!(label_name("scope.k8s-pod/name"), "k8s_pod_name");
+        assert_eq!(label_name("level"), "level");
+        assert_eq!(
+            label_name("attr.scope.x"),
+            "scope_x",
+            "only the leading scope goes"
         );
     }
 }
