@@ -8,6 +8,7 @@
 //! the position up to which the writer's segments are represented by
 //! those files.
 
+pub mod intake;
 pub mod manifest;
 pub mod registry;
 

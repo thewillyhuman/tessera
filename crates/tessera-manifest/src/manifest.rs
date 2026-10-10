@@ -52,6 +52,9 @@ pub enum ManifestError {
     /// The manifest log failed.
     #[error(transparent)]
     Log(#[from] CommitError),
+    /// A writer log could not be read.
+    #[error(transparent)]
+    Wal(#[from] tessera_wal::WalError),
     /// The object store failed.
     #[error(transparent)]
     Store(#[from] tessera_object::ObjectError),
