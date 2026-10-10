@@ -7,6 +7,7 @@
 //! 18.1), so any crate may use it without creating a cycle.
 
 pub mod env;
+pub mod event;
 pub mod hash;
 pub mod id;
 pub mod kind;
@@ -16,6 +17,7 @@ pub mod time;
 pub mod work;
 
 pub use env::Env;
+pub use event::{Attributes, EventBatch, InvalidBatch, LogRow, Scalar};
 pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
 pub use kind::Kind;
