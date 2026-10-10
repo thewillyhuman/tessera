@@ -1,0 +1,814 @@
+// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+
+//! A recursive-descent parser for the supported SQL.
+//!
+//! Precedence, lowest first: `OR`, `AND`, `NOT`, comparison and
+//! predicates (`=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`, `ILIKE`, `IN`,
+//! `BETWEEN`, `IS NULL`), `+ -`, `* / %`, unary `-`, `::` casts.
+
+use tessera_ir::{Diagnostic, Span};
+
+use crate::ast::{BinaryOp, Expr, ExprKind, OrderItem, Query, SelectItem, Statement, TableRef};
+use crate::lexer::{Spanned, Token, tokenize};
+
+/// Parses one statement.
+///
+/// # Errors
+///
+/// The first syntax error, with its position.
+pub fn parse(text: &str) -> Result<Statement, Diagnostic> {
+    let tokens = tokenize(text)?;
+    let mut parser = Parser {
+        tokens,
+        at: 0,
+        end: text.len(),
+    };
+    let statement = parser.statement()?;
+    let _ = parser.eat_symbol(";");
+    if let Some(extra) = parser.peek() {
+        return Err(Diagnostic::at(
+            extra.span,
+            format!("unexpected {} after the statement", describe(&extra.token)),
+        ));
+    }
+    Ok(statement)
+}
+
+struct Parser {
+    tokens: Vec<Spanned>,
+    at: usize,
+    end: usize,
+}
+
+fn describe(token: &Token) -> String {
+    match token {
+        Token::Ident { name, .. } => format!("{name:?}"),
+        Token::Number(n) => format!("number {n}"),
+        Token::String(s) => format!("string {s:?}"),
+        Token::Symbol(s) => format!("{s:?}"),
+    }
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Spanned> {
+        self.tokens.get(self.at)
+    }
+
+    fn span_here(&self) -> Span {
+        self.peek()
+            .map_or(Span::new(self.end, self.end), |t| t.span)
+    }
+
+    fn advance(&mut self) -> Option<Spanned> {
+        let token = self.tokens.get(self.at).cloned();
+        if token.is_some() {
+            self.at += 1;
+        }
+        token
+    }
+
+    fn is_keyword(&self, keyword: &str) -> bool {
+        matches!(
+            self.peek(),
+            Some(Spanned {
+                token: Token::Ident { name, quoted: false },
+                ..
+            }) if name == keyword
+        )
+    }
+
+    fn is_symbol(&self, symbol: &str) -> bool {
+        matches!(self.peek(), Some(Spanned { token: Token::Symbol(s), .. }) if *s == symbol)
+    }
+
+    fn eat_keyword(&mut self, keyword: &str) -> bool {
+        if self.is_keyword(keyword) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_symbol(&mut self, symbol: &str) -> bool {
+        if self.is_symbol(symbol) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_keyword(&mut self, keyword: &str) -> Result<(), Diagnostic> {
+        if self.eat_keyword(keyword) {
+            Ok(())
+        } else {
+            Err(self.unexpected(&format!("expected {}", keyword.to_ascii_uppercase())))
+        }
+    }
+
+    fn expect_symbol(&mut self, symbol: &str) -> Result<Span, Diagnostic> {
+        let span = self.span_here();
+        if self.eat_symbol(symbol) {
+            Ok(span)
+        } else {
+            Err(self.unexpected(&format!("expected {symbol:?}")))
+        }
+    }
+
+    fn unexpected(&self, expected: &str) -> Diagnostic {
+        match self.peek() {
+            Some(token) => Diagnostic::at(
+                token.span,
+                format!("{expected}, found {}", describe(&token.token)),
+            ),
+            None => Diagnostic::at(
+                Span::new(self.end, self.end),
+                format!("{expected}, found end of input"),
+            ),
+        }
+    }
+
+    fn identifier(&mut self) -> Result<(String, Span), Diagnostic> {
+        match self.peek() {
+            Some(Spanned {
+                token: Token::Ident { name, .. },
+                span,
+            }) => {
+                let out = (name.clone(), *span);
+                self.at += 1;
+                Ok(out)
+            }
+            _ => Err(self.unexpected("expected a name")),
+        }
+    }
+
+    fn statement(&mut self) -> Result<Statement, Diagnostic> {
+        if self.eat_keyword("explain") {
+            let analyze = self.eat_keyword("analyze");
+            let query = self.query()?;
+            return Ok(Statement::Explain { analyze, query });
+        }
+        Ok(Statement::Select(self.query()?))
+    }
+
+    fn query(&mut self) -> Result<Query, Diagnostic> {
+        self.expect_keyword("select")?;
+        let mut items = vec![self.select_item()?];
+        while self.eat_symbol(",") {
+            items.push(self.select_item()?);
+        }
+        let from = if self.eat_keyword("from") {
+            Some(self.table_ref()?)
+        } else {
+            None
+        };
+        let filter = if self.eat_keyword("where") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let mut group_by = Vec::new();
+        if self.eat_keyword("group") {
+            self.expect_keyword("by")?;
+            group_by.push(self.expr()?);
+            while self.eat_symbol(",") {
+                group_by.push(self.expr()?);
+            }
+        }
+        let mut order_by = Vec::new();
+        if self.eat_keyword("order") {
+            self.expect_keyword("by")?;
+            loop {
+                let expr = self.expr()?;
+                let descending = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    let _ = self.eat_keyword("asc");
+                    false
+                };
+                order_by.push(OrderItem { expr, descending });
+                if !self.eat_symbol(",") {
+                    break;
+                }
+            }
+        }
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            if self.eat_keyword("limit") {
+                limit = Some(self.count()?);
+            } else if self.eat_keyword("offset") {
+                offset = Some(self.count()?);
+            } else {
+                break;
+            }
+        }
+        Ok(Query {
+            items,
+            from,
+            filter,
+            group_by,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
+    fn count(&mut self) -> Result<usize, Diagnostic> {
+        match self.advance() {
+            Some(Spanned {
+                token: Token::Number(n),
+                span,
+            }) => n
+                .parse()
+                .map_err(|_| Diagnostic::at(span, format!("expected a whole number, found {n}"))),
+            Some(other) => Err(Diagnostic::at(
+                other.span,
+                format!("expected a number, found {}", describe(&other.token)),
+            )),
+            None => Err(self.unexpected("expected a number")),
+        }
+    }
+
+    fn select_item(&mut self) -> Result<SelectItem, Diagnostic> {
+        if self.eat_symbol("*") {
+            return Ok(SelectItem::Wildcard);
+        }
+        let expr = self.expr()?;
+        let alias = if self.eat_keyword("as") {
+            Some(self.identifier()?.0)
+        } else {
+            match self.peek() {
+                // A bare name after an expression is an alias, unless it is
+                // a clause keyword.
+                Some(Spanned {
+                    token: Token::Ident { name, quoted },
+                    ..
+                }) if *quoted || !CLAUSE_KEYWORDS.contains(&name.as_str()) => {
+                    Some(self.identifier()?.0)
+                }
+                _ => None,
+            }
+        };
+        Ok(SelectItem::Expr { expr, alias })
+    }
+
+    fn table_ref(&mut self) -> Result<TableRef, Diagnostic> {
+        let (first, start) = self.identifier()?;
+        if self.eat_symbol(".") {
+            let (table, end) = self.identifier()?;
+            return Ok(TableRef {
+                dataset: Some(first),
+                table,
+                span: Span::new(start.start, end.end),
+            });
+        }
+        Ok(TableRef {
+            dataset: None,
+            table: first,
+            span: start,
+        })
+    }
+
+    fn expr(&mut self) -> Result<Expr, Diagnostic> {
+        self.or_expr()
+    }
+
+    fn or_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let mut left = self.and_expr()?;
+        while self.eat_keyword("or") {
+            let right = self.and_expr()?;
+            left = binary(BinaryOp::Or, left, right);
+        }
+        Ok(left)
+    }
+
+    fn and_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let mut left = self.not_expr()?;
+        while self.eat_keyword("and") {
+            let right = self.not_expr()?;
+            left = binary(BinaryOp::And, left, right);
+        }
+        Ok(left)
+    }
+
+    fn not_expr(&mut self) -> Result<Expr, Diagnostic> {
+        let start = self.span_here();
+        if self.eat_keyword("not") {
+            let inner = self.not_expr()?;
+            let span = Span::new(start.start, inner.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Not(Box::new(inner)),
+                span,
+            });
+        }
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> Result<Expr, Diagnostic> {
+        let left = self.additive()?;
+        let negated = self.eat_keyword("not");
+        if self.eat_keyword("like") || self.is_keyword("ilike") {
+            let case_insensitive = self.eat_keyword("ilike");
+            let (pattern, end) = self.string()?;
+            let span = Span::new(left.span.start, end.end);
+            return Ok(Expr {
+                kind: ExprKind::Like {
+                    expr: Box::new(left),
+                    pattern,
+                    negated,
+                    case_insensitive,
+                },
+                span,
+            });
+        }
+        if self.eat_keyword("in") {
+            self.expect_symbol("(")?;
+            let mut list = vec![self.expr()?];
+            while self.eat_symbol(",") {
+                list.push(self.expr()?);
+            }
+            let end = self.expect_symbol(")")?;
+            let span = Span::new(left.span.start, end.end);
+            return Ok(Expr {
+                kind: ExprKind::InList {
+                    expr: Box::new(left),
+                    list,
+                    negated,
+                },
+                span,
+            });
+        }
+        if self.eat_keyword("between") {
+            let low = self.additive()?;
+            self.expect_keyword("and")?;
+            let high = self.additive()?;
+            let span = Span::new(left.span.start, high.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Between {
+                    expr: Box::new(left),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated,
+                },
+                span,
+            });
+        }
+        if negated {
+            return Err(self.unexpected("expected LIKE, ILIKE, IN or BETWEEN after NOT"));
+        }
+        if self.eat_keyword("is") {
+            let negated = self.eat_keyword("not");
+            let end = self.span_here();
+            self.expect_keyword("null")?;
+            let span = Span::new(left.span.start, end.end);
+            return Ok(Expr {
+                kind: ExprKind::IsNull {
+                    expr: Box::new(left),
+                    negated,
+                },
+                span,
+            });
+        }
+        let op = match self.peek() {
+            Some(Spanned {
+                token: Token::Symbol(s),
+                ..
+            }) => match *s {
+                "=" => BinaryOp::Eq,
+                "<>" | "!=" => BinaryOp::NotEq,
+                "<" => BinaryOp::Lt,
+                "<=" => BinaryOp::LtEq,
+                ">" => BinaryOp::Gt,
+                ">=" => BinaryOp::GtEq,
+                _ => return Ok(left),
+            },
+            _ => return Ok(left),
+        };
+        self.at += 1;
+        let right = self.additive()?;
+        Ok(binary(op, left, right))
+    }
+
+    fn additive(&mut self) -> Result<Expr, Diagnostic> {
+        let mut left = self.multiplicative()?;
+        loop {
+            let op = if self.eat_symbol("+") {
+                BinaryOp::Add
+            } else if self.eat_symbol("-") {
+                BinaryOp::Sub
+            } else {
+                return Ok(left);
+            };
+            let right = self.multiplicative()?;
+            left = binary(op, left, right);
+        }
+    }
+
+    fn multiplicative(&mut self) -> Result<Expr, Diagnostic> {
+        let mut left = self.unary()?;
+        loop {
+            let op = if self.eat_symbol("*") {
+                BinaryOp::Mul
+            } else if self.eat_symbol("/") {
+                BinaryOp::Div
+            } else if self.eat_symbol("%") {
+                BinaryOp::Rem
+            } else {
+                return Ok(left);
+            };
+            let right = self.unary()?;
+            left = binary(op, left, right);
+        }
+    }
+
+    fn unary(&mut self) -> Result<Expr, Diagnostic> {
+        let start = self.span_here();
+        if self.eat_symbol("-") {
+            let inner = self.unary()?;
+            let span = Span::new(start.start, inner.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Negate(Box::new(inner)),
+                span,
+            });
+        }
+        let _ = self.eat_symbol("+");
+        self.postfix()
+    }
+
+    fn postfix(&mut self) -> Result<Expr, Diagnostic> {
+        let mut expr = self.primary()?;
+        while self.eat_symbol("::") {
+            let (type_name, end) = self.identifier()?;
+            let span = Span::new(expr.span.start, end.end);
+            expr = Expr {
+                kind: ExprKind::Cast {
+                    expr: Box::new(expr),
+                    type_name,
+                },
+                span,
+            };
+        }
+        Ok(expr)
+    }
+
+    fn string(&mut self) -> Result<(String, Span), Diagnostic> {
+        match self.advance() {
+            Some(Spanned {
+                token: Token::String(s),
+                span,
+            }) => Ok((s, span)),
+            Some(other) => Err(Diagnostic::at(
+                other.span,
+                format!("expected a string, found {}", describe(&other.token)),
+            )),
+            None => Err(self.unexpected("expected a string")),
+        }
+    }
+
+    fn primary(&mut self) -> Result<Expr, Diagnostic> {
+        let Some(next) = self.advance() else {
+            return Err(self.unexpected("expected an expression"));
+        };
+        let span = next.span;
+        match next.token {
+            Token::Number(n) => Ok(Expr {
+                kind: ExprKind::Number(n),
+                span,
+            }),
+            Token::String(s) => Ok(Expr {
+                kind: ExprKind::String(s),
+                span,
+            }),
+            Token::Symbol("(") => {
+                let inner = self.expr()?;
+                let end = self.expect_symbol(")")?;
+                Ok(Expr {
+                    kind: inner.kind,
+                    span: Span::new(span.start, end.end),
+                })
+            }
+            Token::Symbol(s) => Err(Diagnostic::at(
+                span,
+                format!("expected an expression, found {s:?}"),
+            )),
+            Token::Ident {
+                name,
+                quoted: false,
+            } if RESERVED.contains(&name.as_str()) => Err(Diagnostic::at(
+                span,
+                format!("expected an expression, found {name:?}"),
+            )),
+            Token::Ident {
+                name,
+                quoted: false,
+            } => match name.as_str() {
+                "true" => Ok(Expr {
+                    kind: ExprKind::Bool(true),
+                    span,
+                }),
+                "false" => Ok(Expr {
+                    kind: ExprKind::Bool(false),
+                    span,
+                }),
+                "null" => Ok(Expr {
+                    kind: ExprKind::Null,
+                    span,
+                }),
+                "timestamp"
+                    if matches!(
+                        self.peek(),
+                        Some(Spanned {
+                            token: Token::String(_),
+                            ..
+                        })
+                    ) =>
+                {
+                    let (text, end) = self.string()?;
+                    Ok(Expr {
+                        kind: ExprKind::Timestamp(text),
+                        span: Span::new(span.start, end.end),
+                    })
+                }
+                "interval" => {
+                    let (text, end) = self.string()?;
+                    Ok(Expr {
+                        kind: ExprKind::Interval(text),
+                        span: Span::new(span.start, end.end),
+                    })
+                }
+                "cast" => {
+                    self.expect_symbol("(")?;
+                    let inner = self.expr()?;
+                    self.expect_keyword("as")?;
+                    let (type_name, _) = self.identifier()?;
+                    let end = self.expect_symbol(")")?;
+                    Ok(Expr {
+                        kind: ExprKind::Cast {
+                            expr: Box::new(inner),
+                            type_name,
+                        },
+                        span: Span::new(span.start, end.end),
+                    })
+                }
+                _ => self.name_or_call(name, span),
+            },
+            Token::Ident { name, quoted: true } => self.name_or_call(name, span),
+        }
+    }
+
+    fn name_or_call(&mut self, first: String, start: Span) -> Result<Expr, Diagnostic> {
+        if self.eat_symbol("(") {
+            if self.eat_symbol("*") {
+                let end = self.expect_symbol(")")?;
+                return Ok(Expr {
+                    kind: ExprKind::Call {
+                        name: first,
+                        args: Vec::new(),
+                        wildcard: true,
+                    },
+                    span: Span::new(start.start, end.end),
+                });
+            }
+            let mut args = Vec::new();
+            if !self.is_symbol(")") {
+                args.push(self.expr()?);
+                while self.eat_symbol(",") {
+                    args.push(self.expr()?);
+                }
+            }
+            let end = self.expect_symbol(")")?;
+            return Ok(Expr {
+                kind: ExprKind::Call {
+                    name: first,
+                    args,
+                    wildcard: false,
+                },
+                span: Span::new(start.start, end.end),
+            });
+        }
+        let mut parts = vec![first];
+        let mut end = start;
+        while self.eat_symbol(".") {
+            let (part, span) = self.identifier()?;
+            parts.push(part);
+            end = span;
+        }
+        Ok(Expr {
+            kind: ExprKind::Name(parts),
+            span: Span::new(start.start, end.end),
+        })
+    }
+}
+
+/// Keywords that cannot start an expression.
+const RESERVED: [&str; 22] = [
+    "select", "from", "where", "group", "by", "order", "limit", "offset", "and", "or", "not", "as",
+    "in", "is", "like", "ilike", "between", "asc", "desc", "having", "explain", "analyze",
+];
+
+/// Keywords that end a select item, so a bare name before them is not an
+/// alias.
+const CLAUSE_KEYWORDS: [&str; 10] = [
+    "from", "where", "group", "order", "limit", "offset", "and", "or", "as", "having",
+];
+
+fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
+    let span = Span::new(left.span.start, right.span.end);
+    Expr {
+        kind: ExprKind::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+        span,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(text: &str) -> Query {
+        match parse(text).unwrap() {
+            Statement::Select(q) => q,
+            Statement::Explain { .. } => panic!("explain"),
+        }
+    }
+
+    #[test]
+    fn parses_every_clause() {
+        let q = query(
+            "SELECT body AS text, count(*) n FROM prod.logs WHERE severity_number >= 17 \
+             GROUP BY body ORDER BY n DESC, body LIMIT 10 OFFSET 5;",
+        );
+        assert_eq!(q.items.len(), 2);
+        assert!(matches!(&q.items[0], SelectItem::Expr { alias: Some(a), .. } if a == "text"));
+        assert!(matches!(&q.items[1], SelectItem::Expr { alias: Some(a), .. } if a == "n"));
+        let from = q.from.unwrap();
+        assert_eq!(from.dataset.as_deref(), Some("prod"));
+        assert_eq!(from.table, "logs");
+        assert!(q.filter.is_some());
+        assert_eq!(q.group_by.len(), 1);
+        assert_eq!(q.order_by.len(), 2);
+        assert!(q.order_by[0].descending);
+        assert!(!q.order_by[1].descending);
+        assert_eq!(q.limit, Some(10));
+        assert_eq!(q.offset, Some(5));
+    }
+
+    #[test]
+    fn respects_precedence() {
+        let q = query("SELECT * FROM logs WHERE a = 1 OR b = 2 AND NOT c < 3 + 4 * 5");
+        let ExprKind::Binary {
+            op: BinaryOp::Or,
+            right,
+            ..
+        } = q.filter.unwrap().kind
+        else {
+            panic!("expected OR at the top");
+        };
+        let ExprKind::Binary {
+            op: BinaryOp::And,
+            right,
+            ..
+        } = right.kind
+        else {
+            panic!("expected AND under OR");
+        };
+        let ExprKind::Not(inner) = right.kind else {
+            panic!("expected NOT");
+        };
+        let ExprKind::Binary {
+            op: BinaryOp::Lt,
+            right,
+            ..
+        } = inner.kind
+        else {
+            panic!("expected <");
+        };
+        let ExprKind::Binary {
+            op: BinaryOp::Add,
+            right,
+            ..
+        } = right.kind
+        else {
+            panic!("expected + under <");
+        };
+        assert!(matches!(
+            right.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_predicates_literals_and_casts() {
+        let q = query(
+            "SELECT attr.http.method, \"attr.x\"::int, CAST(n AS float), TIMESTAMP '2024-01-01', \
+             INTERVAL '5 minutes', -1, now() FROM logs \
+             WHERE body NOT LIKE '%x%' AND b ILIKE 'y' AND n IN (1, 2) AND t IS NOT NULL \
+             AND n BETWEEN 1 AND 2 AND z NOT IN ('a')",
+        );
+        let kinds: Vec<&ExprKind> = q
+            .items
+            .iter()
+            .map(|i| match i {
+                SelectItem::Expr { expr, .. } => &expr.kind,
+                SelectItem::Wildcard => panic!(),
+            })
+            .collect();
+        assert_eq!(
+            kinds[0],
+            &ExprKind::Name(vec!["attr".into(), "http".into(), "method".into()])
+        );
+        assert!(matches!(kinds[1], ExprKind::Cast { type_name, .. } if type_name == "int"));
+        assert!(matches!(kinds[2], ExprKind::Cast { type_name, .. } if type_name == "float"));
+        assert_eq!(kinds[3], &ExprKind::Timestamp("2024-01-01".into()));
+        assert_eq!(kinds[4], &ExprKind::Interval("5 minutes".into()));
+        assert!(matches!(kinds[5], ExprKind::Negate(_)));
+        assert!(
+            matches!(kinds[6], ExprKind::Call { name, args, wildcard: false } if name == "now" && args.is_empty())
+        );
+        let mut conjuncts = Vec::new();
+        let mut cursor = q.filter.unwrap();
+        loop {
+            match cursor.kind {
+                ExprKind::Binary {
+                    op: BinaryOp::And,
+                    left,
+                    right,
+                } => {
+                    conjuncts.push(right.kind);
+                    cursor = *left;
+                }
+                other => {
+                    conjuncts.push(other);
+                    break;
+                }
+            }
+        }
+        conjuncts.reverse();
+        assert!(matches!(
+            &conjuncts[0],
+            ExprKind::Like {
+                negated: true,
+                case_insensitive: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &conjuncts[1],
+            ExprKind::Like {
+                negated: false,
+                case_insensitive: true,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&conjuncts[2], ExprKind::InList { negated: false, list, .. } if list.len() == 2)
+        );
+        assert!(matches!(
+            &conjuncts[3],
+            ExprKind::IsNull { negated: true, .. }
+        ));
+        assert!(matches!(
+            &conjuncts[4],
+            ExprKind::Between { negated: false, .. }
+        ));
+        assert!(matches!(
+            &conjuncts[5],
+            ExprKind::InList { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn explain_wraps_a_query() {
+        assert!(matches!(
+            parse("EXPLAIN ANALYZE SELECT 1").unwrap(),
+            Statement::Explain { analyze: true, .. }
+        ));
+        assert!(matches!(
+            parse("explain select 1").unwrap(),
+            Statement::Explain { analyze: false, .. }
+        ));
+    }
+
+    #[test]
+    fn errors_name_what_was_expected_and_where() {
+        let error = parse("SELECT FROM logs").unwrap_err();
+        assert_eq!(error.message, "expected an expression, found \"from\"");
+        assert_eq!(error.span, Some(Span::new(7, 11)));
+        let error = parse("SELECT * FROM logs WHERE").unwrap_err();
+        assert_eq!(error.message, "expected an expression, found end of input");
+        let error = parse("SELECT * FROM logs LIMIT x").unwrap_err();
+        assert!(error.message.starts_with("expected a number"));
+        let error = parse("SELECT * FROM logs extra").unwrap_err();
+        assert_eq!(error.message, "unexpected \"extra\" after the statement");
+        let error = parse("SELECT (1 FROM logs").unwrap_err();
+        assert!(error.message.starts_with("expected \")\""));
+    }
+}

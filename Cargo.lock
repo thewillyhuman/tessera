@@ -1694,6 +1694,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-sql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "tessera-ir",
+ "tessera-types",
+]
+
+[[package]]
 name = "tessera-types"
 version = "0.1.0"
 dependencies = [
