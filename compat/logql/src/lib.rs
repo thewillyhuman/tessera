@@ -118,12 +118,18 @@ pub enum Normalized {
 #[allow(clippy::cast_possible_truncation)]
 pub fn normalize(data: &Value) -> Normalized {
     // Parser error details are engine-specific messages; the error kind
-    // is what both must agree on.
+    // is what both must agree on. `detected_level` and `service_name` are
+    // labels Loki adds at ingest when configured to, not LogQL semantics.
     let labels = |v: &Value| -> BTreeMap<String, String> {
         v.as_object()
             .map(|o| {
                 o.iter()
-                    .filter(|(k, _)| k.as_str() != "__error_details__")
+                    .filter(|(k, _)| {
+                        !matches!(
+                            k.as_str(),
+                            "__error_details__" | "detected_level" | "service_name"
+                        )
+                    })
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
                     .collect()
             })
