@@ -27,6 +27,12 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// The message, for transports that frame errors their own way.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// A malformed request.
     #[must_use]
     pub fn bad_request(message: impl Into<String>) -> Self {

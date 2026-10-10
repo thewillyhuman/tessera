@@ -47,6 +47,8 @@ pub const BODY: &str = "body";
 pub const NAME: &str = "name";
 /// Attributes without a dedicated column, as a JSON object.
 pub const OVERFLOW: &str = "_overflow";
+/// The value column of a metric result (`RangeVector`, section 10.2).
+pub const VALUE_LABELS: &str = "value";
 /// Labels derived at query time by a parser stage (`LogQL` `json`,
 /// `logfmt`, ...), as a JSON object of label name to text. Never stored;
 /// only plans add it.
