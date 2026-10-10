@@ -1,0 +1,25 @@
+[package]
+name = "tessera-compat-sql"
+description = "Differential tests of Tessera's SQL against SQLite on identical data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-exec.workspace = true
+tessera-format.workspace = true
+tessera-ir.workspace = true
+tessera-manifest.workspace = true
+tessera-object.workspace = true
+tessera-sql.workspace = true
+tessera-types.workspace = true
+tessera-wal.workspace = true
+
+arrow = { version = "60", default-features = false }
+rusqlite = { version = "0.40", features = ["bundled"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -9,6 +9,8 @@
 //! optionally qualified as `dataset.logs`; an unqualified name reads the
 //! dataset of the [`BindContext`]. Attribute paths are written
 //! `attr.http.request.method`, or quoted `attr."http.request.method"`.
+//! A bare attribute reads as text; compared with a number, cast
+//! (`attr.n::int`) or used by a numeric function it reads as that type.
 //!
 //! Statements of the control plane (`CREATE ALERT`, `CREATE TENANT` and
 //! the others of section 9.2) arrive with their milestones.
