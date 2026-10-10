@@ -101,7 +101,7 @@ pub fn accumulator(
                 | DataType::Int64
                 | DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(Box::new(ExtremeInt {
                     keep_smaller,
-                    output: widened(input),
+                    output: input.clone(),
                     values: Vec::new(),
                 })),
                 DataType::Float64 => Ok(Box::new(ExtremeFloat {
@@ -125,13 +125,6 @@ pub fn accumulator(
 #[allow(clippy::cast_possible_truncation)]
 fn whole(value: f64) -> i64 {
     value.round() as i64
-}
-
-fn widened(data_type: &DataType) -> DataType {
-    match data_type {
-        DataType::Int32 => DataType::Int64,
-        other => other.clone(),
-    }
 }
 
 /// The weight of row `i`: `1 / sample_rate`, or 1 when unweighted or the
@@ -298,6 +291,8 @@ impl Accumulator for Avg {
     }
 }
 
+/// `min`/`max` over integers and timestamps, kept as 64-bit and cast back
+/// to the input type at the end: an extremum has the type of its input.
 struct ExtremeInt {
     keep_smaller: bool,
     output: DataType,
@@ -495,6 +490,22 @@ mod tests {
             .update(&[0, 0, 1], Some(&values), Some(&rates))
             .unwrap();
         assert_eq!(floats(&avg_raw.finish(2).unwrap()), vec![Some(15.0), None]);
+    }
+
+    #[test]
+    fn extrema_keep_the_input_type() {
+        let mut min = accumulator("min", Some(&DataType::Int32)).unwrap();
+        let narrow: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![Some(5), Some(3)]));
+        min.update(&[0, 0], Some(&narrow), None).unwrap();
+        let out = min.finish(1).unwrap();
+        assert_eq!(out.data_type(), &DataType::Int32);
+        assert_eq!(
+            out.as_any()
+                .downcast_ref::<arrow::array::Int32Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
     }
 
     #[test]
