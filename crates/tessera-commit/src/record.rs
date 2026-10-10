@@ -59,7 +59,7 @@ impl FromStr for CommitId {
 }
 
 /// One commit object.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Commit {
     /// The format this object was written in.
     pub format: u32,

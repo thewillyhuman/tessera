@@ -13,7 +13,7 @@ pub mod record;
 pub mod slot;
 pub mod state;
 
-pub use action::{Action, KvMutation};
+pub use action::{Action, KvMutation, RemoveReason};
 pub use lease::{Lease, LeaseError, LeaseManager};
 pub use log::{CommitError, CommitLog, UpdateError};
 pub use record::{Commit, CommitId, DecodeError, FORMAT};

@@ -108,7 +108,9 @@ pub(crate) fn put_record(key: String, record: &impl Serialize) -> Action {
 
 impl State for CatalogState {
     fn apply(&mut self, action: &Action) -> Result<(), ApplyError> {
-        let Action::Kv(mutation) = action;
+        let Action::Kv(mutation) = action else {
+            return Err(ApplyError::new(format!("not a catalog action: {action:?}")));
+        };
         let (key, value) = match mutation {
             KvMutation::Put { key, value } => (key.as_str(), Some(value.as_str())),
             KvMutation::Delete { key } => (key.as_str(), None),
@@ -216,6 +218,12 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(state.setting("grace"), Some("7d"));
+    }
+
+    #[test]
+    fn rejects_manifest_actions() {
+        let mut state = CatalogState::default();
+        assert!(state.apply(&Action::DropPartition).is_err());
     }
 
     #[test]

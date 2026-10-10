@@ -116,6 +116,11 @@ impl State for KvState {
             Action::Kv(KvMutation::Delete { key }) => {
                 self.entries.remove(key);
             }
+            other => {
+                return Err(ApplyError::new(format!(
+                    "not a key-value action: {other:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -144,6 +149,12 @@ mod tests {
         assert_eq!(state.get("a"), None);
         assert_eq!(state.get("b"), Some("2"));
         assert_eq!(state.len(), 1);
+    }
+
+    #[test]
+    fn a_kv_state_rejects_manifest_actions() {
+        let mut state = KvState::default();
+        assert!(state.apply(&Action::DropPartition).is_err());
     }
 
     #[test]

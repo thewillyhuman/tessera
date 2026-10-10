@@ -6,14 +6,45 @@
 //! dataset-log actions arrive with those logs.
 
 use serde::{Deserialize, Serialize};
+use tessera_types::{FileId, FileMeta, Seq, WriterId};
 
 /// One action of a commit.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
     /// A key-value mutation: the cluster catalog, control stores and rule
     /// state are key-value logs.
     Kv(KvMutation),
+    /// A partition manifest gains a file.
+    AddFile(Box<FileMeta>),
+    /// A partition manifest loses a file; the object is garbage-collected
+    /// later (GC-1).
+    RemoveFile {
+        /// The file.
+        file_id: FileId,
+        /// Why it is removed.
+        reason: RemoveReason,
+    },
+    /// Every row of this partition in `writer`'s segments up to `through`
+    /// is represented by files in this manifest (IT-1).
+    AdvanceWriter {
+        /// The writer.
+        writer: WriterId,
+        /// The last adopted segment.
+        through: Seq,
+    },
+    /// The partition is dropped (MF-6); its files are garbage-collected.
+    DropPartition,
+}
+
+/// Why a file leaves a manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoveReason {
+    /// Replaced by the output of a compaction.
+    Compacted,
+    /// Removed by a retention policy.
+    Expired,
 }
 
 /// A mutation of one key in a key-value log.
@@ -37,6 +68,33 @@ pub enum KvMutation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_actions_serialize_with_explicit_tags() {
+        let advance = Action::AdvanceWriter {
+            writer: WriterId::from_u128(1),
+            through: Seq::new(3),
+        };
+        let json = serde_json::to_string(&advance).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"advance_writer","writer":"00000000000000000000000000000001","through":3}"#
+        );
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), advance);
+        let remove = Action::RemoveFile {
+            file_id: FileId::from_u128(2),
+            reason: RemoveReason::Compacted,
+        };
+        assert!(
+            serde_json::to_string(&remove)
+                .unwrap()
+                .contains(r#""reason":"compacted""#)
+        );
+        assert_eq!(
+            serde_json::to_string(&Action::DropPartition).unwrap(),
+            r#"{"type":"drop_partition"}"#
+        );
+    }
 
     #[test]
     fn actions_serialize_with_explicit_tags() {
