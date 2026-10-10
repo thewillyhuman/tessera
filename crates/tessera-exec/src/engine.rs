@@ -60,6 +60,9 @@ pub enum EngineError {
     /// A CPU task did not complete.
     #[error("{0}")]
     Task(#[from] TaskError),
+    /// An object could not be read.
+    #[error("{0}")]
+    Store(#[from] tessera_object::ObjectError),
 }
 
 /// What a query did, for `EXPLAIN ANALYZE`.

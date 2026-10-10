@@ -96,6 +96,11 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
         );
         let _ = writeln!(
             out,
+            "  indexes: {} files skipped, {} row groups skipped",
+            scan.files_skipped_by_index, scan.row_groups_skipped_by_index
+        );
+        let _ = writeln!(
+            out,
             "  row groups: {} read of {}",
             scan.row_groups_read, scan.row_groups
         );

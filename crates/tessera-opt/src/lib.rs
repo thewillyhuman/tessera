@@ -11,12 +11,14 @@
 //! statistics they need.
 
 pub mod bind;
+pub mod index;
 pub mod prune;
 pub mod rewrite;
 
 use tessera_ir::{Plan, PlanError, Registry};
 
 pub use bind::bind;
+pub use index::{Decision, decide};
 pub use prune::{PruneReport, bounds, prune_files};
 pub use rewrite::rewrite;
 

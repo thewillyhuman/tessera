@@ -63,7 +63,25 @@ impl RowGroups {
             .collect()
     }
 
-    fn intersect(&self, other: &RowGroups) -> RowGroups {
+    /// A set of the given row groups out of `row_groups`.
+    #[must_use]
+    pub fn from_indices(row_groups: usize, indices: &[usize]) -> Self {
+        let mut set = RowGroups::with_capacity(row_groups);
+        for index in indices {
+            set.set(*index);
+        }
+        set
+    }
+
+    /// Whether no row group is in the set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|w| *w == 0)
+    }
+
+    /// The row groups in both sets.
+    #[must_use]
+    pub fn intersect(&self, other: &RowGroups) -> RowGroups {
         RowGroups(self.0.iter().zip(&other.0).map(|(a, b)| a & b).collect())
     }
 

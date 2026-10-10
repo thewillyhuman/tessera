@@ -313,3 +313,78 @@ async fn an_empty_dataset_yields_no_rows_and_no_errors() {
     assert_eq!(output.num_rows(), 0);
     assert_eq!(output.analysis.scans[0].partitions, 0);
 }
+
+/// Compacts every partition of the populated node into indexed L2 files.
+async fn compact_all(store: &Arc<MemoryStore>, env: &Env) {
+    use tessera_compact::{Compactor, Policy, plan};
+    let pools = Arc::new(Pools::new(PoolId::new("root").unwrap(), store.clone()));
+    let compactor = Compactor::new(pools, Arc::new(ParquetFormat), env.clone());
+    let policy = Policy {
+        min_inputs: 1,
+        ..Policy::default()
+    };
+    let root: Arc<dyn tessera_object::ObjectStore> = store.clone();
+    for partition in
+        tessera_manifest::list_partitions(&*root, &TenantId::DEFAULT, &dataset(), Kind::Log)
+            .await
+            .unwrap()
+    {
+        let manifest =
+            tessera_manifest::Manifest::open(root.clone(), partition.clone(), env.clone());
+        let snapshot = manifest.snapshot().await.unwrap();
+        let job = plan(&partition, snapshot.state(), env.clock.now(), &policy).unwrap();
+        compactor.run(&manifest, &job).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sidecar_indexes_skip_files_and_row_groups() {
+    let (store, env) = populate().await;
+    compact_all(&store, &env).await;
+    let engine = engine(&store, &env);
+    let call = |name: &str, text: &str| Expr::Call {
+        name: name.into(),
+        args: vec![Expr::column(BODY), Expr::literal(text)],
+    };
+
+    // "row10x on day 1" rows live in the day-1 file only.
+    let output = run(
+        &engine,
+        Plan::Scan(scan()).filter(call("contains", "row10")),
+    )
+    .await;
+    assert_eq!(output.num_rows(), 6);
+    let scanned = &output.analysis.scans[0];
+    assert_eq!(scanned.files.after_statistics, 2);
+    assert_eq!(scanned.files_skipped_by_index, 1, "{scanned:?}");
+    assert_eq!(scanned.files_read, 1);
+
+    // Nothing anywhere: both files skipped, nothing decoded.
+    let output = run(
+        &engine,
+        Plan::Scan(scan()).filter(call("has_token", "nowhere")),
+    )
+    .await;
+    assert_eq!(output.num_rows(), 0);
+    let scanned = &output.analysis.scans[0];
+    assert_eq!(scanned.files_skipped_by_index, 2);
+    assert_eq!(scanned.row_groups_read, 0);
+
+    // A regular expression with required literals and a LIKE pattern.
+    let output = run(
+        &engine,
+        Plan::Scan(scan()).filter(call("regexp_match", "^row5[0-9] on")),
+    )
+    .await;
+    assert_eq!(output.num_rows(), 6);
+    assert_eq!(output.analysis.scans[0].files_skipped_by_index, 1);
+    let like = Expr::Like {
+        expr: Box::new(Expr::column(BODY)),
+        pattern: "%day 1%".into(),
+        negated: false,
+        case_insensitive: false,
+    };
+    let output = run(&engine, Plan::Scan(scan()).filter(like)).await;
+    assert_eq!(output.num_rows(), 9, "six in the file, three in the tail");
+    assert_eq!(output.analysis.scans[0].files_skipped_by_index, 1);
+}

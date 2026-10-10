@@ -63,7 +63,10 @@ impl ApiError {
             QueryError::Syntax(diagnostic) => ApiError::bad_request(diagnostic.describe(text)),
             QueryError::Plan(error) => ApiError::bad_request(error.to_string()),
             QueryError::Engine(
-                error @ (EngineError::Manifest(_) | EngineError::Format(_) | EngineError::Pool(_)),
+                error @ (EngineError::Manifest(_)
+                | EngineError::Format(_)
+                | EngineError::Pool(_)
+                | EngineError::Store(_)),
             ) => {
                 tracing::warn!(error = %error, "query storage read failed");
                 ApiError::unavailable(error.to_string())
