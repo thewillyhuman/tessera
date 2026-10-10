@@ -1,0 +1,19 @@
+[package]
+name = "tessera-format"
+description = "Tessera data file format: the FileFormat trait and its Parquet implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-types.workspace = true
+
+arrow = { version = "60", default-features = false }
+bytes = "1"
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
+thiserror = "2"
+
+[lints]
+workspace = true
