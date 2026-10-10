@@ -8,6 +8,8 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+tessera-types.workspace = true
+
 async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
