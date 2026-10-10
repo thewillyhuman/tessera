@@ -9,6 +9,7 @@
 //! type the query asks for; values that do not fit the type are null, as
 //! a cast of a dynamic value is in SQL.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -51,12 +52,20 @@ pub fn extract(
 /// `Unsupported` for a type a label cannot be read as.
 pub fn label(
     overflow: Option<&StringArray>,
+    extracted: Option<&StringArray>,
     severity_text: Option<&StringArray>,
     name: &str,
     data_type: &DataType,
     rows: usize,
 ) -> Result<ArrayRef, KernelError> {
     let values = (0..rows).map(|i| {
+        let from_extracted = extracted
+            .filter(|e| !e.is_null(i))
+            .and_then(|e| serde_json::from_str::<Value>(e.value(i)).ok())
+            .and_then(|object| object.get(name).cloned());
+        if from_extracted.is_some() {
+            return from_extracted;
+        }
         let from_attributes = overflow
             .filter(|o| !o.is_null(i))
             .and_then(|o| serde_json::from_str::<Value>(o.value(i)).ok())
@@ -77,6 +86,41 @@ pub fn label(
         })
     });
     typed(values, data_type, name)
+}
+
+/// Every label of one row by name: derived labels first, then attributes
+/// under their label names with the more specific scope winning, then
+/// `level` from the severity text.
+#[must_use]
+pub fn row_labels(
+    overflow: Option<&str>,
+    extracted: Option<&str>,
+    severity_text: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    if let Some(level) = severity_text {
+        labels.insert("level".to_owned(), level.to_owned());
+    }
+    if let Some(Value::Object(object)) = overflow.and_then(|o| serde_json::from_str(o).ok()) {
+        // Later scopes must not override earlier ones: insert in reverse.
+        for scope in SCOPES.iter().rev() {
+            for (path, value) in &object {
+                if path.starts_with(scope) {
+                    if let Some(text) = as_text(value.clone()) {
+                        labels.insert(label_name(path), text);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(Value::Object(object)) = extracted.and_then(|e| serde_json::from_str(e).ok()) {
+        for (name, value) in object {
+            if let Some(text) = as_text(value) {
+                labels.insert(name, text);
+            }
+        }
+    }
+    labels
 }
 
 /// `values` as an array of `data_type`.
@@ -201,6 +245,7 @@ mod tests {
         let severity = StringArray::from(vec![Some("ERROR"), None, Some("INFO")]);
         let service = label(
             Some(&overflow),
+            None,
             Some(&severity),
             "service_name",
             &DataType::Utf8,
@@ -215,7 +260,15 @@ mod tests {
         );
         assert_eq!(service.value(1), "lib");
         assert!(service.is_null(2));
-        let method = label(Some(&overflow), None, "http_method", &DataType::Utf8, 3).unwrap();
+        let method = label(
+            Some(&overflow),
+            None,
+            None,
+            "http_method",
+            &DataType::Utf8,
+            3,
+        )
+        .unwrap();
         assert_eq!(
             method
                 .as_any()
@@ -226,6 +279,7 @@ mod tests {
         );
         let level = label(
             Some(&overflow),
+            None,
             Some(&severity),
             "level",
             &DataType::Utf8,
@@ -236,7 +290,43 @@ mod tests {
         assert_eq!(level.value(0), "ERROR");
         assert!(level.is_null(1));
         assert_eq!(level.value(2), "INFO");
-        let none = label(None, None, "x", &DataType::Int64, 2).unwrap();
+        let none = label(None, None, None, "x", &DataType::Int64, 2).unwrap();
         assert_eq!(none.null_count(), 2);
+        let extracted = StringArray::from(vec![Some(r#"{"service_name":"parsed"}"#), None, None]);
+        let parsed = label(
+            Some(&overflow),
+            Some(&extracted),
+            None,
+            "service_name",
+            &DataType::Utf8,
+            3,
+        )
+        .unwrap();
+        let parsed = parsed.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(parsed.value(0), "parsed", "derived labels win");
+        assert_eq!(parsed.value(1), "lib");
+    }
+
+    #[test]
+    fn row_labels_merge_every_source() {
+        let labels = row_labels(
+            Some(r#"{"resource.service.name":"api","attr.service.name":"shadow","scope.v":"1"}"#),
+            Some(r#"{"status":"500","v":"2"}"#),
+            Some("ERROR"),
+        );
+        let pairs: Vec<(&str, &str)> = labels
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("level", "ERROR"),
+                ("service_name", "shadow"),
+                ("status", "500"),
+                ("v", "2")
+            ]
+        );
+        assert!(row_labels(None, None, None).is_empty());
     }
 }

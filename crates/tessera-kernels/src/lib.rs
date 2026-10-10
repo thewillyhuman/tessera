@@ -16,7 +16,9 @@
 
 pub mod aggregate;
 pub mod eval;
+pub mod extract;
 pub mod group;
+pub mod template;
 pub mod time;
 pub mod variant;
 
@@ -24,7 +26,9 @@ use arrow::error::ArrowError;
 
 pub use aggregate::{Accumulator, accumulator};
 pub use eval::{evaluate, evaluate_predicate};
+pub use extract::{Extracted, extract};
 pub use group::Grouper;
+pub use variant::row_labels;
 
 /// Why a kernel could not run.
 #[derive(Debug, thiserror::Error)]

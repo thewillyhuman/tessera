@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use tessera_types::Timestamp;
-use tessera_types::event::{OVERFLOW, SEVERITY_TEXT};
+use tessera_types::event::{EXTRACTED, OVERFLOW, SEVERITY_TEXT};
 
 /// A constant.
 #[derive(Clone, PartialEq, Debug)]
@@ -173,9 +173,10 @@ pub enum Expr {
         /// The type the value is read as.
         data_type: DataType,
     },
-    /// A Prometheus or Loki label (QL-19): the attribute whose path maps
-    /// to `name`, the more specific scope first (QL-20), or a well-known
-    /// column under its label name (`level` for the severity text).
+    /// A Prometheus or Loki label (QL-19): a label a parser stage derived
+    /// (`_extracted`), else the attribute whose path maps to `name`, the
+    /// more specific scope first (QL-20), else a well-known column under
+    /// its label name (`level` for the severity text).
     Label {
         /// The label name.
         name: String,
@@ -317,6 +318,7 @@ impl Expr {
                 into.insert(OVERFLOW.to_owned());
             }
             Expr::Label { .. } => {
+                into.insert(EXTRACTED.to_owned());
                 into.insert(OVERFLOW.to_owned());
                 into.insert(SEVERITY_TEXT.to_owned());
             }
@@ -518,7 +520,7 @@ mod tests {
             data_type: DataType::Utf8,
         };
         let refs: Vec<String> = label.references().into_iter().collect();
-        assert_eq!(refs, vec!["_overflow", "severity_text"]);
+        assert_eq!(refs, vec!["_extracted", "_overflow", "severity_text"]);
         assert_eq!(label.to_string(), "label(level)");
         assert_eq!(Literal::Bytes(vec![0xab, 1]).to_string(), "X'ab01'");
         assert_eq!(Literal::Bytes(vec![]).data_type(), Some(DataType::Binary));

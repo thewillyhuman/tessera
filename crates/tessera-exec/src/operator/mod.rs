@@ -10,6 +10,7 @@
 //! upstream early.
 
 mod aggregate;
+mod extract;
 mod filter;
 mod limit;
 mod project;
@@ -22,6 +23,7 @@ use crate::ExecError;
 use crate::batch::Batch;
 
 pub use aggregate::HashAggregate;
+pub use extract::{Extract, Format};
 pub use filter::Filter;
 pub use limit::Limit;
 pub use project::Project;

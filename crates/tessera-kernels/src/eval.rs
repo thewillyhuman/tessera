@@ -21,7 +21,7 @@ use arrow::compute::kernels::{cmp, comparison, numeric};
 use arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene, take};
 use arrow::datatypes::{DataType, TimeUnit};
 use tessera_ir::{BinaryOp, Expr, Literal};
-use tessera_types::event::{OVERFLOW, SEVERITY_TEXT};
+use tessera_types::event::{EXTRACTED, OVERFLOW, SEVERITY_TEXT};
 
 use crate::{KernelError, time, variant};
 
@@ -148,11 +148,15 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
             let overflow = batch
                 .column_by_name(OVERFLOW)
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let extracted = batch
+                .column_by_name(EXTRACTED)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             let severity = batch
                 .column_by_name(SEVERITY_TEXT)
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
             Ok(Value::Column(variant::label(
                 overflow,
+                extracted,
                 severity,
                 name,
                 data_type,
@@ -189,18 +193,7 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
             pattern,
             negated,
             case_insensitive,
-        } => {
-            let text = value(expr, batch)?.cast(&DataType::Utf8)?;
-            let pattern = StringArray::from(vec![pattern.as_str()]);
-            let pattern = Scalar::new(&pattern);
-            let matched = match (negated, case_insensitive) {
-                (false, false) => comparison::like(text.datum().as_ref(), &pattern)?,
-                (false, true) => comparison::ilike(text.datum().as_ref(), &pattern)?,
-                (true, false) => comparison::nlike(text.datum().as_ref(), &pattern)?,
-                (true, true) => comparison::nilike(text.datum().as_ref(), &pattern)?,
-            };
-            Ok(text.with_array(Arc::new(matched)))
-        }
+        } => like(&value(expr, batch)?, pattern, *negated, *case_insensitive),
         Expr::InList {
             expr,
             list,
@@ -231,6 +224,25 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
         Expr::Call { name, args } => call(name, args, batch),
         Expr::Cast { expr, to } => value(expr, batch)?.cast(to),
     }
+}
+
+/// SQL `LIKE` and its negated and case-insensitive forms.
+fn like(
+    text: &Value,
+    pattern: &str,
+    negated: bool,
+    case_insensitive: bool,
+) -> Result<Value, KernelError> {
+    let text = text.cast(&DataType::Utf8)?;
+    let pattern = StringArray::from(vec![pattern]);
+    let pattern = Scalar::new(&pattern);
+    let matched = match (negated, case_insensitive) {
+        (false, false) => comparison::like(text.datum().as_ref(), &pattern)?,
+        (false, true) => comparison::ilike(text.datum().as_ref(), &pattern)?,
+        (true, false) => comparison::nlike(text.datum().as_ref(), &pattern)?,
+        (true, true) => comparison::nilike(text.datum().as_ref(), &pattern)?,
+    };
+    Ok(text.with_array(Arc::new(matched)))
 }
 
 fn as_booleans(array: &ArrayRef) -> Result<&BooleanArray, KernelError> {

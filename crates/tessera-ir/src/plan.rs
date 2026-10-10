@@ -11,7 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use tessera_types::event::{SAMPLE_RATE, TIMESTAMP};
+use tessera_types::event::{EXTRACTED, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{DatasetName, Kind, TenantId, TimeRange, event};
 
 use crate::expr::{Expr, Literal};
@@ -162,6 +162,36 @@ impl Scan {
     }
 }
 
+/// How a parser stage derives labels from text (`Extract`, section
+/// 10.2; `LogQL` section 9.4).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ExtractStage {
+    /// A JSON object: every property becomes a label, nested objects
+    /// flattened with `_`.
+    Json,
+    /// `key=value` pairs.
+    Logfmt,
+    /// A regular expression with named groups.
+    Regexp(String),
+    /// A pattern with `<name>` captures between literal text.
+    Pattern(String),
+    /// A JSON object whose `_entry` property replaces the line and whose
+    /// other properties become labels.
+    Unpack,
+}
+
+impl fmt::Display for ExtractStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExtractStage::Json => write!(f, "json"),
+            ExtractStage::Logfmt => write!(f, "logfmt"),
+            ExtractStage::Regexp(pattern) => write!(f, "regexp {pattern:?}"),
+            ExtractStage::Pattern(pattern) => write!(f, "pattern {pattern:?}"),
+            ExtractStage::Unpack => write!(f, "unpack"),
+        }
+    }
+}
+
 /// A node of the operator tree.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Plan {
@@ -220,6 +250,32 @@ pub enum Plan {
         /// The inputs.
         inputs: Vec<Plan>,
     },
+    /// Derive labels from text: parse `source` by `stage` and add the
+    /// results to the `_extracted` column, later stages overriding
+    /// earlier labels of the same name.
+    Extract {
+        /// The input.
+        input: Box<Plan>,
+        /// The text to parse.
+        source: Expr,
+        /// How to parse it.
+        stage: ExtractStage,
+    },
+    /// Rewrite each row's line and labels: `LogQL` `line_format`,
+    /// `label_format`, `drop` and `keep`. Templates use `{{.label}}` and
+    /// `{{__line__}}`.
+    Format {
+        /// The input.
+        input: Box<Plan>,
+        /// A template for the new line, if the line changes.
+        line: Option<String>,
+        /// Labels to set, each from a template.
+        labels: Vec<(String, String)>,
+        /// Labels to remove.
+        drop: Vec<String>,
+        /// The only labels to keep, when set.
+        keep: Option<Vec<String>>,
+    },
     /// Constant rows, for queries without a table.
     Values {
         /// The schema of the rows.
@@ -277,7 +333,9 @@ impl Plan {
             | Plan::Aggregate { input, .. }
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. }
-            | Plan::TopK { input, .. } => vec![input],
+            | Plan::TopK { input, .. }
+            | Plan::Extract { input, .. }
+            | Plan::Format { input, .. } => vec![input],
             Plan::Union { inputs } => inputs.iter().collect(),
         }
     }
@@ -308,7 +366,10 @@ impl Plan {
                 None => Vec::new(),
             },
             Plan::Sort { keys, .. } | Plan::TopK { keys, .. } => keys.clone(),
-            Plan::Filter { input, .. } | Plan::Limit { input, .. } => input.ordering(),
+            Plan::Filter { input, .. }
+            | Plan::Limit { input, .. }
+            | Plan::Extract { input, .. }
+            | Plan::Format { input, .. } => input.ordering(),
             Plan::Project { input, exprs } => {
                 // The ordering survives a projection that passes its keys through
                 // unchanged.
@@ -347,6 +408,15 @@ impl Plan {
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. }
             | Plan::TopK { input, .. } => input.schema(registry),
+            Plan::Extract { input, .. } => Ok(with_extracted(&input.schema(registry)?)),
+            Plan::Format { input, labels, .. } => {
+                let input = input.schema(registry)?;
+                Ok(if labels.is_empty() {
+                    input
+                } else {
+                    with_extracted(&input)
+                })
+            }
             Plan::Project { input, exprs } => {
                 let input = input.schema(registry)?;
                 let fields = exprs
@@ -431,23 +501,7 @@ impl Plan {
                 group_by,
                 aggregates,
             } => {
-                let keys: Vec<String> = group_by
-                    .iter()
-                    .map(|e| format!("{} AS {}", e.expr, e.name))
-                    .collect();
-                let aggs: Vec<String> = aggregates
-                    .iter()
-                    .map(|a| {
-                        let args: Vec<String> = a.args.iter().map(ToString::to_string).collect();
-                        format!("{}({}) AS {}", a.function, args.join(", "), a.name)
-                    })
-                    .collect();
-                writeln!(
-                    f,
-                    "{pad}Aggregate: group_by=[{}] aggregates=[{}]",
-                    keys.join(", "),
-                    aggs.join(", ")
-                )?;
+                fmt_aggregate(f, &pad, group_by, aggregates)?;
                 input.fmt_tree(f, depth + 1)
             }
             Plan::Sort { input, keys } => {
@@ -478,9 +532,88 @@ impl Plan {
                 }
                 Ok(())
             }
+            Plan::Extract {
+                input,
+                source,
+                stage,
+            } => {
+                writeln!(f, "{pad}Extract: {stage} from {source}")?;
+                input.fmt_tree(f, depth + 1)
+            }
+            Plan::Format {
+                input,
+                line,
+                labels,
+                drop,
+                keep,
+            } => {
+                fmt_format(f, &pad, line.as_deref(), labels, drop, keep.as_deref())?;
+                input.fmt_tree(f, depth + 1)
+            }
             Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
         }
     }
+}
+
+/// The `Aggregate` line of `EXPLAIN`.
+fn fmt_aggregate(
+    f: &mut fmt::Formatter<'_>,
+    pad: &str,
+    group_by: &[NamedExpr],
+    aggregates: &[AggregateExpr],
+) -> fmt::Result {
+    let keys: Vec<String> = group_by
+        .iter()
+        .map(|e| format!("{} AS {}", e.expr, e.name))
+        .collect();
+    let aggs: Vec<String> = aggregates
+        .iter()
+        .map(|a| {
+            let args: Vec<String> = a.args.iter().map(ToString::to_string).collect();
+            format!("{}({}) AS {}", a.function, args.join(", "), a.name)
+        })
+        .collect();
+    writeln!(
+        f,
+        "{pad}Aggregate: group_by=[{}] aggregates=[{}]",
+        keys.join(", "),
+        aggs.join(", ")
+    )
+}
+
+/// The `Format` line of `EXPLAIN`.
+fn fmt_format(
+    f: &mut fmt::Formatter<'_>,
+    pad: &str,
+    line: Option<&str>,
+    labels: &[(String, String)],
+    drop: &[String],
+    keep: Option<&[String]>,
+) -> fmt::Result {
+    write!(f, "{pad}Format:")?;
+    if let Some(line) = line {
+        write!(f, " line={line:?}")?;
+    }
+    for (name, template) in labels {
+        write!(f, " {name}={template:?}")?;
+    }
+    if !drop.is_empty() {
+        write!(f, " drop=[{}]", drop.join(", "))?;
+    }
+    if let Some(keep) = keep {
+        write!(f, " keep=[{}]", keep.join(", "))?;
+    }
+    writeln!(f)
+}
+
+/// `schema` with the `_extracted` column, added when absent.
+fn with_extracted(schema: &SchemaRef) -> SchemaRef {
+    if schema.field_with_name(EXTRACTED).is_ok() {
+        return Arc::clone(schema);
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.push(Field::new(EXTRACTED, DataType::Utf8, true));
+    Arc::new(Schema::new(fields))
 }
 
 /// The result type of an aggregate over `input`.
@@ -669,6 +802,46 @@ mod tests {
         assert_eq!(
             plan.to_string(),
             "Limit: offset=0 count=10\n  Sort: timestamp DESC\n    Scan: prod/log [all time) default predicates=[(severity_number >= 17)] columns=[timestamp, body]\n"
+        );
+    }
+
+    #[test]
+    fn extract_and_format_add_the_extracted_column_once() {
+        let plan = Plan::Extract {
+            input: Box::new(Plan::Scan(scan())),
+            source: Expr::column(BODY),
+            stage: ExtractStage::Json,
+        };
+        let schema = plan.schema(&registry()).unwrap();
+        assert_eq!(schema.fields().last().unwrap().name(), EXTRACTED);
+        let again = Plan::Extract {
+            input: Box::new(plan.clone()),
+            source: Expr::column(BODY),
+            stage: ExtractStage::Regexp("(?P<x>.)".into()),
+        };
+        assert_eq!(
+            again.schema(&registry()).unwrap().fields().len(),
+            schema.fields().len()
+        );
+        let formatted = Plan::Format {
+            input: Box::new(Plan::Scan(scan())),
+            line: Some("{{.x}}".into()),
+            labels: vec![],
+            drop: vec!["y".into()],
+            keep: None,
+        };
+        assert_eq!(
+            formatted.schema(&registry()).unwrap(),
+            event::schema(Kind::Log)
+        );
+        assert!(
+            again
+                .to_string()
+                .starts_with("Extract: regexp \"(?P<x>.)\" from body\n  Extract: json from body\n")
+        );
+        assert_eq!(
+            formatted.to_string(),
+            "Format: line=\"{{.x}}\" drop=[y]\n  Scan: prod/log [all time) default\n"
         );
     }
 }

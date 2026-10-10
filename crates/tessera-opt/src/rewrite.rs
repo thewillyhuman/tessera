@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 
 use tessera_ir::{BinaryOp, Expr, Literal, Plan, Scan, SortKey};
-use tessera_types::event::{SAMPLE_RATE, TIMESTAMP};
+use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{TimeRange, Timestamp};
 
 /// Applies every rewrite to `plan`.
@@ -58,6 +58,26 @@ fn push_predicates(plan: Plan, mut pending: Vec<Expr>) -> Plan {
             wrap_filter(input.project(exprs), above)
         }
         Plan::Sort { input, keys } => push_predicates(*input, pending).sort(keys),
+        Plan::Extract {
+            input,
+            source,
+            stage,
+        } => {
+            // A predicate that reads nothing a parser stage derives may run
+            // before it; labels read `_extracted`, so they stay above.
+            let (below, above): (Vec<Expr>, Vec<Expr>) = pending
+                .into_iter()
+                .partition(|p| !p.references().contains(EXTRACTED));
+            let input = push_predicates(*input, below);
+            wrap_filter(
+                Plan::Extract {
+                    input: Box::new(input),
+                    source,
+                    stage,
+                },
+                above,
+            )
+        }
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs
                 .into_iter()
@@ -105,6 +125,28 @@ fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
             input: Box::new(f(*input)),
             keys,
             k,
+        },
+        Plan::Extract {
+            input,
+            source,
+            stage,
+        } => Plan::Extract {
+            input: Box::new(f(*input)),
+            source,
+            stage,
+        },
+        Plan::Format {
+            input,
+            line,
+            labels,
+            drop,
+            keep,
+        } => Plan::Format {
+            input: Box::new(f(*input)),
+            line,
+            labels,
+            drop,
+            keep,
         },
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs.into_iter().map(f).collect(),
@@ -205,28 +247,36 @@ fn newest_first(plan: Plan) -> Plan {
 
 /// Narrows each scan to the columns needed above it. `needed` is `None`
 /// when everything above wants every column.
+/// `scan` narrowed to `needed` and the columns its own predicates read,
+/// in schema order; untouched when everything above wants every column.
+fn narrow_scan(mut scan: Scan, needed: Option<BTreeSet<String>>) -> Scan {
+    let Some(needed) = needed else {
+        return scan;
+    };
+    let mut needed = scan.predicates.iter().fold(needed, |mut set, expr| {
+        set.extend(expr.references());
+        set
+    });
+    if let Some(projection) = &scan.projection {
+        needed.retain(|c| projection.contains(c));
+    }
+    let columns: Vec<String> = tessera_types::event::schema(scan.kind)
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|c| needed.contains(c))
+        .collect();
+    scan.projection = Some(columns);
+    scan
+}
+
 fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
     let add = |mut set: BTreeSet<String>, expr: &Expr| {
         set.extend(expr.references());
         set
     };
     match plan {
-        Plan::Scan(mut scan) => {
-            if let Some(needed) = needed {
-                let mut needed = scan.predicates.iter().fold(needed, add);
-                if let Some(projection) = &scan.projection {
-                    needed.retain(|c| projection.contains(c));
-                }
-                let columns: Vec<String> = tessera_types::event::schema(scan.kind)
-                    .fields()
-                    .iter()
-                    .map(|f| f.name().clone())
-                    .filter(|c| needed.contains(c))
-                    .collect();
-                scan.projection = Some(columns);
-            }
-            Plan::Scan(scan)
-        }
+        Plan::Scan(scan) => Plan::Scan(narrow_scan(scan, needed)),
         Plan::Values { schema, rows } => Plan::Values { schema, rows },
         Plan::Filter { input, predicate } => {
             let needed = needed.map(|n| add(n, &predicate));
@@ -275,6 +325,47 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
             offset,
             count,
         } => push_projection(*input, needed).limit(offset, count),
+        Plan::Extract {
+            input,
+            source,
+            stage,
+        } => {
+            let needed = needed.map(|n| add(n, &source));
+            Plan::Extract {
+                input: Box::new(push_projection(*input, needed)),
+                source,
+                stage,
+            }
+        }
+        Plan::Format {
+            input,
+            line,
+            labels,
+            drop,
+            keep,
+        } => {
+            // Templates may read any label: the line, the attributes, the
+            // derived labels and the severity text all stay.
+            let needed = needed.map(|mut n| {
+                n.extend(
+                    [
+                        BODY,
+                        OVERFLOW,
+                        EXTRACTED,
+                        tessera_types::event::SEVERITY_TEXT,
+                    ]
+                    .map(str::to_owned),
+                );
+                n
+            });
+            Plan::Format {
+                input: Box::new(push_projection(*input, needed)),
+                line,
+                labels,
+                drop,
+                keep,
+            }
+        }
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs
                 .into_iter()
@@ -409,5 +500,45 @@ mod tests {
         let plan = scan().filter(Expr::column(BODY).binary(BinaryOp::Eq, Expr::literal("x")));
         let rewritten = rewrite(plan);
         assert_eq!(only_scan(&rewritten).projection, None);
+    }
+
+    #[test]
+    fn predicates_on_derived_labels_stay_above_the_extraction() {
+        use tessera_ir::ExtractStage;
+        let plan = Plan::Extract {
+            input: Box::new(scan()),
+            source: Expr::column(BODY),
+            stage: ExtractStage::Json,
+        }
+        .filter(
+            Expr::Label {
+                name: "status".into(),
+                data_type: arrow::datatypes::DataType::Int64,
+            }
+            .binary(BinaryOp::GtEq, Expr::literal(500))
+            .and(Expr::column(SEVERITY_NUMBER).binary(BinaryOp::GtEq, Expr::literal(9))),
+        )
+        .project(vec![NamedExpr::new(Expr::column(BODY), BODY)]);
+        let rewritten = rewrite(plan);
+        let Plan::Project { input, .. } = &rewritten else {
+            panic!("{rewritten}")
+        };
+        let Plan::Filter { input, predicate } = input.as_ref() else {
+            panic!("{rewritten}")
+        };
+        assert!(predicate.to_string().contains("label(status)"));
+        assert!(matches!(input.as_ref(), Plan::Extract { .. }));
+        let scan = only_scan(&rewritten);
+        assert_eq!(
+            scan.predicates.len(),
+            1,
+            "the severity test reached the scan"
+        );
+        let columns = scan.projection.clone().unwrap();
+        assert!(columns.contains(&BODY.to_owned()));
+        assert!(
+            columns.contains(&OVERFLOW.to_owned()),
+            "labels read the overflow: {columns:?}"
+        );
     }
 }

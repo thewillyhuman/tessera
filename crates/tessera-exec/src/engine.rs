@@ -28,7 +28,9 @@ use tessera_types::{Env, Window};
 use crate::ExecError;
 use crate::batch::Batch;
 use crate::memory::MemoryPool;
-use crate::operator::{CollectSink, Filter, HashAggregate, Limit, Operator, Project, Sort, TopK};
+use crate::operator::{
+    CollectSink, Extract, Filter, Format, HashAggregate, Limit, Operator, Project, Sort, TopK,
+};
 use crate::pipeline::Pipeline;
 use crate::scan::{self, ScanAnalysis};
 use crate::scheduler::{CpuPool, TaskError};
@@ -190,6 +192,34 @@ impl Engine {
                     let batches = self.execute(input, memory, analysis).await?;
                     self.pipe(Box::new(Filter::new(predicate.clone())), batches)
                         .await
+                }
+                Plan::Extract {
+                    input,
+                    source,
+                    stage,
+                } => {
+                    let batches = self.execute(input, memory, analysis).await?;
+                    let schema = plan.schema(&self.registry)?;
+                    let operator = Extract::new(source.clone(), stage.clone(), schema);
+                    self.pipe(Box::new(operator), batches).await
+                }
+                Plan::Format {
+                    input,
+                    line,
+                    labels,
+                    drop,
+                    keep,
+                } => {
+                    let batches = self.execute(input, memory, analysis).await?;
+                    let schema = plan.schema(&self.registry)?;
+                    let operator = Format::new(
+                        line.clone(),
+                        labels.clone(),
+                        drop.clone(),
+                        keep.clone(),
+                        schema,
+                    );
+                    self.pipe(Box::new(operator), batches).await
                 }
                 Plan::Project { input, exprs } => {
                     let batches = self.execute(input, memory, analysis).await?;

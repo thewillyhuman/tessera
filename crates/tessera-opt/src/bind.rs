@@ -34,6 +34,28 @@ fn bind_plan(plan: Plan) -> Plan {
             input: Box::new(bind_plan(*input)),
             predicate: bind_expr(predicate),
         },
+        Plan::Extract {
+            input,
+            source,
+            stage,
+        } => Plan::Extract {
+            input: Box::new(bind_plan(*input)),
+            source: bind_expr(source),
+            stage,
+        },
+        Plan::Format {
+            input,
+            line,
+            labels,
+            drop,
+            keep,
+        } => Plan::Format {
+            input: Box::new(bind_plan(*input)),
+            line,
+            labels,
+            drop,
+            keep,
+        },
         Plan::Project { input, exprs } => Plan::Project {
             input: Box::new(bind_plan(*input)),
             exprs: exprs.into_iter().map(bind_named).collect(),

@@ -47,6 +47,10 @@ pub const BODY: &str = "body";
 pub const NAME: &str = "name";
 /// Attributes without a dedicated column, as a JSON object.
 pub const OVERFLOW: &str = "_overflow";
+/// Labels derived at query time by a parser stage (`LogQL` `json`,
+/// `logfmt`, ...), as a JSON object of label name to text. Never stored;
+/// only plans add it.
+pub const EXTRACTED: &str = "_extracted";
 
 /// The schema of events of one kind. Column order is fixed, so that
 /// batches of one kind always line up.
