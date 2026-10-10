@@ -12,10 +12,13 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
-use tessera_commit::{Action, ApplyError, CommitError, CommitLog, Snapshot, State, UpdateError};
+use tessera_commit::{
+    Action, ApplyError, CommitError, CommitLog, RemoveReason, Snapshot, State, UpdateError,
+};
 use tessera_object::{ObjectStore, layout};
 use tessera_types::{
-    DatasetName, Env, FileId, FileMeta, Kind, PartitionId, Seq, TenantId, Window, WriterId,
+    DatasetName, Env, FileId, FileMeta, Kind, PartitionId, Seq, TenantId, Timestamp, Window,
+    WriterId,
 };
 
 /// Why a manifest operation failed.
@@ -70,12 +73,24 @@ impl From<UpdateError<ManifestError>> for ManifestError {
     }
 }
 
+/// A removed file whose object still exists: deleted once no snapshot
+/// within the retention window can reference it (GC-1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Tombstone {
+    /// The file as it was.
+    pub meta: FileMeta,
+    /// When it was removed, by the committer's clock.
+    pub at: Timestamp,
+}
+
 /// The folded state of a manifest.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ManifestState {
     files: BTreeMap<FileId, FileMeta>,
     positions: BTreeMap<WriterId, Seq>,
     dropped: bool,
+    #[serde(default)]
+    removed: BTreeMap<FileId, Tombstone>,
 }
 
 impl ManifestState {
@@ -107,6 +122,11 @@ impl ManifestState {
     pub fn is_dropped(&self) -> bool {
         self.dropped
     }
+
+    /// Removed files whose objects are still to be deleted, in id order.
+    pub fn tombstones(&self) -> impl Iterator<Item = &Tombstone> {
+        self.removed.values()
+    }
 }
 
 impl State for ManifestState {
@@ -115,8 +135,15 @@ impl State for ManifestState {
             Action::AddFile(meta) => {
                 self.files.insert(meta.file_id, (**meta).clone());
             }
-            Action::RemoveFile { file_id, .. } => {
-                self.files.remove(file_id);
+            Action::RemoveFile { file_id, at, .. } => {
+                if let Some(meta) = self.files.remove(file_id) {
+                    self.removed.insert(*file_id, Tombstone { meta, at: *at });
+                }
+            }
+            Action::Forget { file_ids } => {
+                for file_id in file_ids {
+                    self.removed.remove(file_id);
+                }
             }
             Action::AdvanceWriter { writer, through } => {
                 let position = self.positions.entry(*writer).or_insert(Seq::ZERO);
@@ -124,7 +151,12 @@ impl State for ManifestState {
             }
             Action::DropPartition => {
                 self.dropped = true;
-                self.files.clear();
+                // Dropped files become tombstones so that their objects are
+                // still collected (MF-6).
+                let at = Timestamp::UNIX_EPOCH;
+                for (file_id, meta) in std::mem::take(&mut self.files) {
+                    self.removed.insert(file_id, Tombstone { meta, at });
+                }
             }
             Action::Kv(_) => return Err(ApplyError::new("a manifest has no key-value actions")),
         }
@@ -136,6 +168,7 @@ impl State for ManifestState {
 pub struct Manifest {
     id: PartitionId,
     log: CommitLog<ManifestState>,
+    env: Env,
 }
 
 impl Manifest {
@@ -143,8 +176,8 @@ impl Manifest {
     /// partition's dataset).
     #[must_use]
     pub fn open(store: Arc<dyn ObjectStore>, id: PartitionId, env: Env) -> Self {
-        let log = CommitLog::new(store, layout::partition(&id), env);
-        Manifest { id, log }
+        let log = CommitLog::new(store, layout::partition(&id), env.clone());
+        Manifest { id, log, env }
     }
 
     /// The partition.
@@ -204,6 +237,75 @@ impl Manifest {
             })
             .await?;
         Ok(changed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Replaces `inputs` with `outputs` in one commit: the result of a
+    /// compaction (CP-1). Returns `false` without committing when some
+    /// input is no longer in the manifest, which means the job was
+    /// superseded and the outputs are garbage (CP-4).
+    ///
+    /// # Errors
+    ///
+    /// `Dropped`, `WrongPartition`, or a log failure.
+    pub async fn replace(
+        &self,
+        inputs: &[FileId],
+        outputs: &[FileMeta],
+    ) -> Result<bool, ManifestError> {
+        if let Some(wrong) = outputs.iter().find(|f| f.partition != self.id) {
+            return Err(ManifestError::WrongPartition {
+                file: wrong.file_id,
+                actual: Box::new(wrong.partition.clone()),
+                expected: Box::new(self.id.clone()),
+            });
+        }
+        let at = self.env.clock.now();
+        let committed = std::sync::atomic::AtomicBool::new(false);
+        self.log
+            .update(|state| {
+                if state.is_dropped() {
+                    return Err(ManifestError::Dropped(self.id.clone()));
+                }
+                if inputs.iter().any(|id| state.file(*id).is_none()) {
+                    return Ok(Vec::new());
+                }
+                let mut actions: Vec<Action> = inputs
+                    .iter()
+                    .map(|id| Action::RemoveFile {
+                        file_id: *id,
+                        reason: RemoveReason::Compacted,
+                        at,
+                    })
+                    .collect();
+                actions.extend(outputs.iter().map(|f| Action::AddFile(Box::new(f.clone()))));
+                committed.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(actions)
+            })
+            .await?;
+        Ok(committed.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Drops the tombstones of files whose objects have been deleted
+    /// (GC-3). Tombstones already gone are ignored.
+    ///
+    /// # Errors
+    ///
+    /// A log failure.
+    pub async fn forget(&self, file_ids: &[FileId]) -> Result<(), ManifestError> {
+        self.log
+            .update(|state| {
+                let present: Vec<FileId> = file_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| state.removed.contains_key(id))
+                    .collect();
+                if present.is_empty() {
+                    return Ok::<_, ManifestError>(Vec::new());
+                }
+                Ok(vec![Action::Forget { file_ids: present }])
+            })
+            .await?;
+        Ok(())
     }
 
     /// Drops the partition (MF-6).
@@ -291,7 +393,7 @@ pub async fn list_partitions(
 #[cfg(test)]
 mod tests {
     use tessera_object::MemoryStore;
-    use tessera_types::{FileSource, Level, PoolId, Timestamp, Version};
+    use tessera_types::{FileSource, Level, PoolId, Version};
 
     use super::*;
 
@@ -483,5 +585,89 @@ mod tests {
         manifest.checkpoint().await.unwrap();
         let cold = Manifest::open(Arc::new(store.clone()), partition(0), env(2));
         assert_eq!(cold.snapshot().await.unwrap().state().files().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn replace_commits_outputs_and_keeps_tombstones() {
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let env = Env::simulated(1, Timestamp::from_nanos(1_000));
+        let partition = partition(0);
+        let manifest = Manifest::open(Arc::clone(&store), partition.clone(), env);
+        let writer = WriterId::from_u128(1);
+        let a = file(1, &partition, writer, 1);
+        let b = file(2, &partition, writer, 2);
+        manifest
+            .adopt(writer, Seq::new(2), &[a.clone(), b.clone()])
+            .await
+            .unwrap();
+        let mut out = file(3, &partition, writer, 2);
+        out.level = Level::L2;
+        assert!(
+            manifest
+                .replace(&[a.file_id, b.file_id], &[out.clone()])
+                .await
+                .unwrap()
+        );
+        let state = manifest.snapshot().await.unwrap();
+        let ids: Vec<FileId> = state.state().files().map(|f| f.file_id).collect();
+        assert_eq!(ids, vec![out.file_id]);
+        let tombstones: Vec<(FileId, Timestamp)> = state
+            .state()
+            .tombstones()
+            .map(|t| (t.meta.file_id, t.at))
+            .collect();
+        assert_eq!(
+            tombstones,
+            vec![
+                (a.file_id, Timestamp::from_nanos(1_000)),
+                (b.file_id, Timestamp::from_nanos(1_000))
+            ]
+        );
+
+        // A superseded job finds its inputs gone and commits nothing.
+        assert!(
+            !manifest
+                .replace(&[a.file_id], &[file(4, &partition, writer, 2)])
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            manifest.snapshot().await.unwrap().version(),
+            state.version()
+        );
+
+        manifest
+            .forget(&[a.file_id, FileId::from_u128(99)])
+            .await
+            .unwrap();
+        let state = manifest.snapshot().await.unwrap();
+        assert_eq!(state.state().tombstones().count(), 1);
+        manifest.forget(&[FileId::from_u128(99)]).await.unwrap();
+        assert_eq!(
+            manifest.snapshot().await.unwrap().version(),
+            state.version(),
+            "nothing to forget commits nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_partition_leaves_tombstones_for_its_files() {
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let partition = partition(0);
+        let manifest = Manifest::open(
+            Arc::clone(&store),
+            partition.clone(),
+            Env::simulated(1, Timestamp::UNIX_EPOCH),
+        );
+        let writer = WriterId::from_u128(1);
+        manifest
+            .adopt(writer, Seq::new(1), &[file(1, &partition, writer, 1)])
+            .await
+            .unwrap();
+        manifest.drop_partition().await.unwrap();
+        let state = manifest.snapshot().await.unwrap();
+        assert!(state.state().is_dropped());
+        assert_eq!(state.state().files().count(), 0);
+        assert_eq!(state.state().tombstones().count(), 1);
     }
 }

@@ -6,7 +6,7 @@
 //! dataset-log actions arrive with those logs.
 
 use serde::{Deserialize, Serialize};
-use tessera_types::{FileId, FileMeta, Seq, WriterId};
+use tessera_types::{FileId, FileMeta, Seq, Timestamp, WriterId};
 
 /// One action of a commit.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -18,12 +18,23 @@ pub enum Action {
     /// A partition manifest gains a file.
     AddFile(Box<FileMeta>),
     /// A partition manifest loses a file; the object is garbage-collected
-    /// later (GC-1).
+    /// once no snapshot within the retention window can reference it
+    /// (GC-1), which is measured from `at`.
     RemoveFile {
         /// The file.
         file_id: FileId,
         /// Why it is removed.
         reason: RemoveReason,
+        /// When it was removed, by the committer's clock. Records written
+        /// before this field carry the epoch and are collected at once.
+        #[serde(default)]
+        at: Timestamp,
+    },
+    /// The tombstones of removed files whose objects have been deleted
+    /// are dropped from the manifest (GC-3).
+    Forget {
+        /// The files.
+        file_ids: Vec<FileId>,
     },
     /// Every row of this partition in `writer`'s segments up to `through`
     /// is represented by files in this manifest (IT-1).
@@ -84,12 +95,22 @@ mod tests {
         let remove = Action::RemoveFile {
             file_id: FileId::from_u128(2),
             reason: RemoveReason::Compacted,
+            at: Timestamp::from_nanos(5),
         };
-        assert!(
-            serde_json::to_string(&remove)
-                .unwrap()
-                .contains(r#""reason":"compacted""#)
-        );
+        let json = serde_json::to_string(&remove).unwrap();
+        assert!(json.contains(r#""reason":"compacted""#));
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), remove);
+        let old: Action = serde_json::from_str(
+            r#"{"type":"remove_file","file_id":"00000000000000000000000000000002","reason":"expired"}"#,
+        )
+        .unwrap();
+        assert!(matches!(old, Action::RemoveFile { at, .. } if at == Timestamp::UNIX_EPOCH));
+        let forget = Action::Forget {
+            file_ids: vec![FileId::from_u128(2)],
+        };
+        let json = serde_json::to_string(&forget).unwrap();
+        assert!(json.starts_with(r#"{"type":"forget""#));
+        assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), forget);
         assert_eq!(
             serde_json::to_string(&Action::DropPartition).unwrap(),
             r#"{"type":"drop_partition"}"#
