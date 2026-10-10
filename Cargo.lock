@@ -2178,6 +2178,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-search"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "tessera-ir",
+ "tessera-types",
+]
+
+[[package]]
 name = "tessera-server"
 version = "0.1.0"
 dependencies = [
