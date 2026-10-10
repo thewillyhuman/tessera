@@ -34,6 +34,18 @@ impl Timestamp {
     /// The latest representable time.
     pub const MAX: Timestamp = Timestamp(i64::MAX);
 
+    /// [`Timestamp::MIN`], for serde defaults.
+    #[must_use]
+    pub const fn min_value() -> Self {
+        Timestamp::MIN
+    }
+
+    /// [`Timestamp::MAX`], for serde defaults.
+    #[must_use]
+    pub const fn max_value() -> Self {
+        Timestamp::MAX
+    }
+
     /// Wraps a count of nanoseconds since the Unix epoch.
     #[must_use]
     pub const fn from_nanos(nanos: i64) -> Self {

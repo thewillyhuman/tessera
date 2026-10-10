@@ -67,6 +67,15 @@ pub struct BlockMeta {
     pub min_observed: Timestamp,
     /// The latest observed time of its rows.
     pub max_observed: Timestamp,
+    /// The earliest event time of its rows; the open bound for entries
+    /// written before this field, so that garbage collection stays
+    /// conservative (GC-2).
+    #[serde(default = "Timestamp::min_value")]
+    pub min_timestamp: Timestamp,
+    /// The latest event time of its rows; the open bound for older
+    /// entries.
+    #[serde(default = "Timestamp::max_value")]
+    pub max_timestamp: Timestamp,
 }
 
 /// What an entry means (section 6.3).
@@ -189,6 +198,7 @@ impl Entry {
             )?;
             bytes.extend_from_slice(&encode_block(batch.rows())?);
             let (min_observed, max_observed) = batch.observed_bounds();
+            let (min_timestamp, max_timestamp) = batch.time_bounds();
             blocks.push(BlockMeta {
                 tenant: batch.tenant().clone(),
                 dataset: batch.dataset().clone(),
@@ -198,6 +208,8 @@ impl Entry {
                 rows: batch.len() as u64,
                 min_observed,
                 max_observed,
+                min_timestamp,
+                max_timestamp,
             });
         }
         let body = EntryBody::Segment { blocks };
@@ -425,6 +437,10 @@ mod tests {
             (metas[0].min_observed, metas[0].max_observed),
             (Timestamp::from_nanos(100), Timestamp::from_nanos(120))
         );
+        assert_eq!(
+            (metas[0].min_timestamp, metas[0].max_timestamp),
+            (Timestamp::from_nanos(0), Timestamp::from_nanos(20))
+        );
         assert_eq!(metas[1].offset, metas[0].length);
         let a = decoded
             .blocks_for(
@@ -526,5 +542,13 @@ mod tests {
             "{} bytes for {raw} in memory",
             entry.encode().len()
         );
+    }
+
+    #[test]
+    fn block_metadata_without_event_bounds_reads_as_open() {
+        let json = r#"{"tenant":"a","dataset":"prod","kind":"log","offset":0,"length":1,"rows":1,"min_observed":5,"max_observed":6}"#;
+        let meta: BlockMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.min_timestamp, Timestamp::MIN);
+        assert_eq!(meta.max_timestamp, Timestamp::MAX);
     }
 }
