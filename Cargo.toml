@@ -21,6 +21,7 @@ tessera-manifest = { path = "crates/tessera-manifest" }
 tessera-ingest = { path = "crates/tessera-ingest" }
 tessera-ir = { path = "crates/tessera-ir" }
 tessera-kernels = { path = "crates/tessera-kernels" }
+tessera-exec = { path = "crates/tessera-exec" }
 tessera-server = { path = "crates/tessera-server" }
 
 [workspace.lints.rust]

@@ -1,0 +1,19 @@
+[package]
+name = "tessera-exec"
+description = "Tessera execution: push-based operators, pipelines, the CPU scheduler, scans and memory accounting"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-ir.workspace = true
+tessera-kernels.workspace = true
+tessera-types.workspace = true
+
+arrow = { version = "60", default-features = false }
+thiserror = "2"
+
+[lints]
+workspace = true
