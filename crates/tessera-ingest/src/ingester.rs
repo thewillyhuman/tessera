@@ -13,6 +13,12 @@
 //! is left to recovery, whose flush covers every row the log holds, and
 //! the ingester carries on with a new writer id. Rows that were pending
 //! are retried on the new log; nothing acknowledged is lost either way.
+//!
+//! An append whose outcome is unknown is settled before the next one: a
+//! segment that turns out to have landed joins the memtable so that it is
+//! flushed (its rows are durable, which is at-least-once delivery for a
+//! caller that was told otherwise); a flush record that landed clears the
+//! rows it covers, so that no two records cover the same rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -117,6 +123,15 @@ struct Memtable {
     flushed_through: Seq,
 }
 
+/// What the last append attempted, when its outcome is unknown.
+enum Doubt {
+    Segment(Vec<EventBatch>),
+    Flush {
+        key: (TenantId, DatasetName),
+        through: Seq,
+    },
+}
+
 /// One ingester process's state.
 pub struct Ingester {
     store: Arc<dyn ObjectStore>,
@@ -130,6 +145,7 @@ pub struct Ingester {
     pending_since: Option<Timestamp>,
     memtables: BTreeMap<(TenantId, DatasetName), Memtable>,
     log_started: Timestamp,
+    in_doubt: Option<Doubt>,
     stopped: bool,
 }
 
@@ -162,6 +178,7 @@ impl Ingester {
             pending_since: None,
             memtables: BTreeMap::new(),
             log_started,
+            in_doubt: None,
             stopped: false,
         }
     }
@@ -201,6 +218,9 @@ impl Ingester {
     /// linger has elapsed and flushes datasets whose memtable is large or
     /// old enough.
     pub async fn tick(&mut self) {
+        if let Err(error) = self.settle().await {
+            tracing::debug!(error = %error, "previous append still in doubt");
+        }
         let now = self.env.clock.now();
         let linger_elapsed = self.pending_since.is_some_and(|since| {
             now.duration_since(since)
@@ -269,11 +289,17 @@ impl Ingester {
         self.pending_bytes = 0;
         self.pending_since = None;
         let batches: Vec<EventBatch> = pending.iter().map(|(b, _)| b.clone()).collect();
-        let mut result = self.append(&batches).await;
+        let mut result = match self.settle().await {
+            Ok(()) => self.append(&batches).await,
+            Err(error) => Err(error),
+        };
         if matches!(result, Err(IngestError::Fenced)) {
             tracing::warn!(writer = %self.log.writer_id(), "writer log fenced by recovery; starting a new one");
             self.replace_log();
             result = self.append(&batches).await;
+        }
+        if matches!(result, Err(IngestError::NotStored(_))) && self.log.has_doubt() {
+            self.in_doubt = Some(Doubt::Segment(batches));
         }
         match result {
             Ok(seq) => {
@@ -313,6 +339,52 @@ impl Ingester {
         self.log_started = self.env.clock.now();
         self.registered.clear();
         self.memtables.clear();
+        self.in_doubt = None;
+    }
+
+    /// Settles the last append if its outcome was unknown, and applies what
+    /// it turns out to have done.
+    async fn settle(&mut self) -> Result<(), IngestError> {
+        let Some(doubt) = self.in_doubt.take() else {
+            return Ok(());
+        };
+        match self.log.settle().await {
+            Ok(Some(seq)) => match doubt {
+                Doubt::Segment(batches) => {
+                    tracing::info!(%seq, "a segment thought lost had landed; its rows will be flushed");
+                    for batch in batches {
+                        self.remember(seq, batch);
+                    }
+                }
+                Doubt::Flush { key, through } => self.mark_flushed(&key, through),
+            },
+            // Nothing landed, or a seal sits at the position and the next
+            // append rotates the log.
+            Ok(None) | Err(WalError::Fenced { .. }) => {}
+            Err(error) => {
+                self.in_doubt = Some(doubt);
+                return Err(IngestError::NotStored(error.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops a dataset's rows up to `through`: a flush record covering them
+    /// is in the log.
+    fn mark_flushed(&mut self, key: &(TenantId, DatasetName), through: Seq) {
+        let Some(memtable) = self.memtables.get_mut(key) else {
+            return;
+        };
+        memtable.rows.retain(|(seq, _)| *seq > through);
+        memtable.bytes = memtable
+            .rows
+            .iter()
+            .map(|(_, b)| b.rows().get_array_memory_size())
+            .sum();
+        if memtable.rows.is_empty() {
+            memtable.oldest = None;
+        }
+        memtable.flushed_through = memtable.flushed_through.max(through);
     }
 
     /// Ends the current log cleanly, with everything flushed, and starts
@@ -365,6 +437,7 @@ impl Ingester {
     /// Flushes one dataset's memtable to L1 files and appends the flush
     /// record. On failure the rows stay for the next attempt.
     async fn flush(&mut self, key: &(TenantId, DatasetName)) -> Result<(), IngestError> {
+        self.settle().await?;
         let Some(memtable) = self.memtables.get(key) else {
             return Ok(());
         };
@@ -396,15 +469,16 @@ impl Ingester {
             through,
             files,
         };
-        self.log.append(record).await?;
-        let memtable = self
-            .memtables
-            .get_mut(key)
-            .unwrap_or_else(|| unreachable!("checked above"));
-        memtable.rows.clear();
-        memtable.bytes = 0;
-        memtable.oldest = None;
-        memtable.flushed_through = through;
+        if let Err(error) = self.log.append(record).await {
+            if self.log.has_doubt() {
+                self.in_doubt = Some(Doubt::Flush {
+                    key: key.clone(),
+                    through,
+                });
+            }
+            return Err(error.into());
+        }
+        self.mark_flushed(key, through);
         Ok(())
     }
 }
@@ -425,7 +499,7 @@ mod tests {
     use futures::TryStreamExt;
     use tessera_format::ParquetFormat;
     use tessera_manifest::{intake, view};
-    use tessera_object::{FaultPolicy, FaultyStore, MemoryStore, Pools, layout};
+    use tessera_object::{FaultPolicy, FaultyStore, LostResponseStore, MemoryStore, Pools, layout};
     use tessera_types::event::EVENT_ID;
     use tessera_types::{Clock, Kind, LogRow, ManualClock, NodeId, SeededRandom, SharedRandom};
     use tessera_wal::{Entry, EntryId, reader};
@@ -766,6 +840,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(h.view_ids("prod").await, [0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn appends_in_doubt_are_settled_and_never_repeated() {
+        let h = Harness::new();
+        let lying = Arc::new(LostResponseStore::new(
+            Arc::new(h.store.clone()),
+            tessera_object::Key::new("_wal").unwrap(),
+        ));
+        let mut ingester = h.ingester_on(
+            Arc::clone(&lying) as Arc<dyn ObjectStore>,
+            IngestConfig {
+                segment_bytes: 1,
+                ..config()
+            },
+        );
+        // A segment that lands while the store is blind: rejected, but durable.
+        lying.set_blind(true);
+        let mut ack = ingester.write(batch("prod", 0..2)).await;
+        assert!(matches!(
+            ack.try_now(),
+            Some(Err(IngestError::NotStored(_)))
+        ));
+        lying.set_blind(false);
+        let mut ack = ingester.write(batch("prod", 2..3)).await;
+        assert!(
+            matches!(ack.try_now(), Some(Ok(seq)) if seq == Seq::new(2)),
+            "the lost segment is counted"
+        );
+        assert_eq!(h.view_ids("prod").await, [0, 1, 2]);
+        // A flush record that lands while the store is blind: the rows must
+        // not be flushed a second time.
+        h.clock.advance(Duration::from_secs(120));
+        lying.set_blind(true);
+        ingester.tick().await;
+        lying.set_blind(false);
+        h.clock.advance(Duration::from_secs(120));
+        ingester.tick().await;
+        assert_eq!(
+            h.entry_kinds(&ingester).await,
+            ["segment", "segment", "flush"]
+        );
+        intake::run(
+            Arc::new(h.store.clone()),
+            &h.env,
+            &TenantId::DEFAULT,
+            &DatasetName::new("prod").unwrap(),
+            ingester.writer_id(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            h.view_ids("prod").await,
+            [0, 1, 2],
+            "every row exactly once"
+        );
     }
 
     #[tokio::test(start_paused = true)]
