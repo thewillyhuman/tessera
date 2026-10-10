@@ -7,12 +7,14 @@
 
 pub mod action;
 mod checkpoint;
+pub mod lease;
 pub mod log;
 pub mod record;
 pub mod slot;
 pub mod state;
 
 pub use action::{Action, KvMutation};
+pub use lease::{Lease, LeaseError, LeaseManager};
 pub use log::{CommitError, CommitLog, UpdateError};
 pub use record::{Commit, CommitId, DecodeError, FORMAT};
 pub use slot::{InvalidSlotCount, Slot, SlotCount};
