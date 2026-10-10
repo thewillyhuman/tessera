@@ -9,9 +9,11 @@ pub mod action;
 mod checkpoint;
 pub mod log;
 pub mod record;
+pub mod slot;
 pub mod state;
 
 pub use action::{Action, KvMutation};
 pub use log::{CommitError, CommitLog, UpdateError};
 pub use record::{Commit, CommitId, DecodeError, FORMAT};
+pub use slot::{InvalidSlotCount, Slot, SlotCount};
 pub use state::{ApplyError, KvState, Snapshot, State};
