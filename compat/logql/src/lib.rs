@@ -53,12 +53,12 @@ impl Endpoint {
         );
     }
 
-    /// Runs a range query and returns the `data` of the response.
+    /// Runs a range query and returns the `data` of the response, or the
+    /// endpoint's complaint.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// If the request fails or the endpoint answers an error.
-    #[must_use]
     pub fn query_range(
         &self,
         query: &str,
@@ -66,7 +66,7 @@ impl Endpoint {
         end: i64,
         step: &str,
         direction: &str,
-    ) -> Value {
+    ) -> Result<Value, String> {
         let url = format!("{}/loki/api/v1/query_range", self.base);
         let mut response = agent()
             .get(&url)
@@ -77,18 +77,18 @@ impl Endpoint {
             .query("direction", direction)
             .query("limit", "1000")
             .call()
-            .unwrap_or_else(|e| panic!("{}: query failed: {e}", self.name));
+            .map_err(|e| format!("{}: query failed: {e}", self.name))?;
         let status = response.status();
-        let body: Value = response
+        let text = response
             .body_mut()
-            .read_json()
-            .unwrap_or_else(|e| panic!("{}: unreadable response: {e}", self.name));
-        assert!(
-            status.is_success(),
-            "{}: {query} returned {status}: {body}",
-            self.name
-        );
-        body["data"].clone()
+            .read_to_string()
+            .map_err(|e| format!("{}: unreadable response: {e}", self.name))?;
+        if !status.is_success() {
+            return Err(format!("{}: returned {status}: {text}", self.name));
+        }
+        let body: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{}: answered non-JSON ({e}): {text}", self.name))?;
+        Ok(body["data"].clone())
     }
 }
 
@@ -117,10 +117,13 @@ pub enum Normalized {
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn normalize(data: &Value) -> Normalized {
+    // Parser error details are engine-specific messages; the error kind
+    // is what both must agree on.
     let labels = |v: &Value| -> BTreeMap<String, String> {
         v.as_object()
             .map(|o| {
                 o.iter()
+                    .filter(|(k, _)| k.as_str() != "__error_details__")
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_owned()))
                     .collect()
             })
@@ -211,8 +214,10 @@ pub fn loki_from_env() -> Option<Endpoint> {
 
 /// The lines both engines receive: three apps, two levels, JSON and
 /// logfmt bodies, over `count` entries one second apart from `start`.
+/// Every stream carries `run`, so that a Loki instance that keeps the
+/// data of earlier runs answers queries scoped to this one alone.
 #[must_use]
-pub fn fixture(start_seconds: i64, count: i64) -> Value {
+pub fn fixture(start_seconds: i64, count: i64, run: &str) -> Value {
     let apps = ["checkout", "web", "search"];
     let levels = ["info", "error"];
     let mut streams: BTreeMap<(usize, usize), Vec<Value>> = BTreeMap::new();
@@ -244,9 +249,70 @@ pub fn fixture(start_seconds: i64, count: i64) -> Value {
         "streams": streams
             .into_iter()
             .map(|((app, level), values)| json!({
-                "stream": {"app": apps[app], "level": levels[level]},
+                "stream": {"app": apps[app], "level": levels[level], "run": run},
                 "values": values,
             }))
             .collect::<Vec<_>>()
     })
+}
+
+/// A readable account of how two normalized results differ.
+#[must_use]
+pub fn difference(ours: &Normalized, theirs: &Normalized) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    match (ours, theirs) {
+        (Normalized::Streams(a), Normalized::Streams(b)) => {
+            let _ = writeln!(out, "  streams: tessera {} vs loki {}", a.len(), b.len());
+            let keys = |s: &[(Labels, Entries)]| {
+                s.iter()
+                    .map(|(l, e)| (l.clone(), e.len()))
+                    .collect::<Vec<_>>()
+            };
+            for (l, n) in keys(a) {
+                if !keys(b).contains(&(l.clone(), n)) {
+                    let _ = writeln!(out, "  only tessera: {l:?} with {n} entries");
+                }
+            }
+            for (l, n) in keys(b) {
+                if !keys(a).contains(&(l.clone(), n)) {
+                    let _ = writeln!(out, "  only loki:    {l:?} with {n} entries");
+                }
+            }
+            for ((la, ea), (lb, eb)) in a.iter().zip(b) {
+                if la == lb && ea != eb {
+                    let _ = writeln!(
+                        out,
+                        "  entries differ for {la:?}:\n    tessera {ea:?}\n    loki    {eb:?}"
+                    );
+                    break;
+                }
+            }
+        }
+        (Normalized::Matrix(a), Normalized::Matrix(b)) => {
+            let _ = writeln!(out, "  series: tessera {} vs loki {}", a.len(), b.len());
+            for (la, sa) in a {
+                match b.iter().find(|(lb, _)| lb == la) {
+                    None => {
+                        let _ = writeln!(out, "  only tessera: {la:?}");
+                    }
+                    Some((_, sb)) if sa != sb => {
+                        let _ = writeln!(
+                            out,
+                            "  samples differ for {la:?}:\n    tessera {sa:?}\n    loki    {sb:?}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for (lb, _) in b {
+                if !a.iter().any(|(la, _)| la == lb) {
+                    let _ = writeln!(out, "  only loki:    {lb:?}");
+                }
+            }
+        }
+        _ => out.push_str("  result types differ\n"),
+    }
+    out
 }
