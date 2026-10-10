@@ -8,12 +8,17 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+tessera-object.workspace = true
 tessera-types.workspace = true
 
 arrow = { version = "60", default-features = false }
+async-trait = "0.1"
 bytes = "1"
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

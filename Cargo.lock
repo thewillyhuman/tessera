@@ -1553,10 +1553,13 @@ name = "tessera-format"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "parquet",
+ "tessera-object",
  "tessera-types",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

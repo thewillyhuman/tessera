@@ -17,6 +17,12 @@ use parquet::file::properties::WriterProperties;
 use tessera_types::Timestamp;
 use tessera_types::event::TIMESTAMP;
 
+use std::sync::Arc;
+
+use tessera_object::{Key, ObjectStore};
+
+use crate::reader::ParquetReader;
+use crate::scan::FileReader;
 use crate::stats::column_stats;
 use crate::{FileFormat, FormatError, Written};
 
@@ -72,6 +78,10 @@ impl FileFormat for ParquetFormat {
             sort_key: vec![TIMESTAMP.to_owned()],
             columns,
         })
+    }
+
+    fn open(&self, store: Arc<dyn ObjectStore>, key: Key, size: u64) -> Box<dyn FileReader> {
+        Box::new(ParquetReader::new(store, key, size))
     }
 
     fn read(&self, bytes: Bytes) -> Result<Vec<RecordBatch>, FormatError> {

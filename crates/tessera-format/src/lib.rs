@@ -4,19 +4,28 @@
 //! (ST-11); everything else reaches them through the [`FileFormat`] trait
 //! (ST-15), so that the format decision stays local to this crate.
 //!
-//! Files are encoded and decoded whole here. L1 files are small by
-//! construction (section 6.9); the streaming scan path with range requests,
-//! row-group pruning and late materialization belongs to the query engine
-//! (section 10.4) and extends this trait when it arrives.
+//! Files are written whole: L1 files are small by construction (section
+//! 6.9). They are read whole where the caller wants every row, or through
+//! a [`FileReader`] that fetches only the row groups and columns a query
+//! needs ([`scan`]).
 
 pub mod parquet;
+mod prune;
+pub mod reader;
+pub mod scan;
+mod sparse;
 pub mod stats;
+
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use bytes::Bytes;
+use tessera_object::{Key, ObjectStore};
 use tessera_types::{ColumnStats, Timestamp};
 
 pub use crate::parquet::ParquetFormat;
+pub use crate::reader::ParquetReader;
+pub use crate::scan::{Bound, Fetched, FileReader, RowPredicate, ScanRequest, ScanStats};
 
 /// Why a file could not be written or read.
 #[derive(Debug, thiserror::Error)]
@@ -73,4 +82,7 @@ pub trait FileFormat: Send + Sync {
     ///
     /// `Unreadable` if the bytes are not a file this format wrote.
     fn read(&self, bytes: Bytes) -> Result<Vec<RecordBatch>, FormatError>;
+
+    /// Opens the `size`-byte file at `key` for partial reads.
+    fn open(&self, store: Arc<dyn ObjectStore>, key: Key, size: u64) -> Box<dyn FileReader>;
 }
