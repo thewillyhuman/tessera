@@ -166,6 +166,108 @@ impl ObjectStore for FaultyStore {
     }
 }
 
+/// A store that applies every write under one key prefix but reports it
+/// as failed, and whose reads fail while it is blind. This is the worst
+/// case for a writer: a write that landed with no way to find out. For
+/// tests of lost-response handling.
+pub struct LostResponseStore {
+    inner: Arc<dyn ObjectStore>,
+    lie_under: Key,
+    blind: std::sync::atomic::AtomicBool,
+}
+
+impl LostResponseStore {
+    /// Wraps `inner`, lying about writes under `lie_under`; not blind.
+    #[must_use]
+    pub fn new(inner: Arc<dyn ObjectStore>, lie_under: Key) -> Self {
+        LostResponseStore {
+            inner,
+            lie_under,
+            blind: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Makes reads fail (`true`) or succeed (`false`).
+    pub fn set_blind(&self, blind: bool) {
+        self.blind.store(blind, Ordering::Relaxed);
+    }
+
+    fn blind(&self) -> bool {
+        self.blind.load(Ordering::Relaxed)
+    }
+
+    fn lost(key: &Key) -> ObjectError {
+        ObjectError::Unavailable {
+            key: key.clone(),
+            source: "response lost".into(),
+        }
+    }
+
+    fn lie_after(&self, key: &Key, result: Result<(), ObjectError>) -> Result<(), ObjectError> {
+        result?;
+        if key.is_under(&self.lie_under) {
+            Err(Self::lost(key))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl std::fmt::Debug for LostResponseStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LostResponseStore")
+            .field("lie_under", &self.lie_under)
+            .field("blind", &self.blind())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for LostResponseStore {
+    async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
+        if self.blind() {
+            return Err(Self::lost(key));
+        }
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
+        if self.blind() {
+            return Err(Self::lost(key));
+        }
+        self.inner.get_range(key, range).await
+    }
+
+    async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
+        if self.blind() {
+            return Err(Self::lost(key));
+        }
+        self.inner.head(key).await
+    }
+
+    async fn put(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+        let result = self.inner.put(key, body).await;
+        self.lie_after(key, result)
+    }
+
+    async fn put_if_absent(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+        let result = self.inner.put_if_absent(key, body).await;
+        self.lie_after(key, result)
+    }
+
+    fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+        if self.blind() {
+            let error = Self::lost(prefix);
+            return stream::once(async move { Err(error) }).boxed();
+        }
+        self.inner.list(prefix)
+    }
+
+    async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
+        self.inner.delete(key).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -305,6 +407,36 @@ mod tests {
         );
         store.set_policy(FaultPolicy::NONE);
         assert!(store.put(&key("a"), Bytes::from_static(b"x")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_lost_response_store_applies_writes_it_reports_as_failed() {
+        let inner = MemoryStore::new();
+        let store = LostResponseStore::new(Arc::new(inner.clone()), key("_wal"));
+        let error = store
+            .put_if_absent(&key("_wal/a"), Bytes::from_static(b"x"))
+            .await
+            .unwrap_err();
+        assert!(error.is_retryable());
+        assert_eq!(
+            inner.get(&key("_wal/a")).await.unwrap(),
+            Bytes::from_static(b"x"),
+            "the write landed"
+        );
+        store
+            .put(&key("other/b"), Bytes::from_static(b"y"))
+            .await
+            .expect("honest outside the prefix");
+        assert!(matches!(
+            store
+                .put_if_absent(&key("_wal/a"), Bytes::from_static(b"z"))
+                .await,
+            Err(ObjectError::AlreadyExists { .. })
+        ));
+        store.set_blind(true);
+        assert!(store.get(&key("_wal/a")).await.unwrap_err().is_retryable());
+        store.set_blind(false);
+        assert!(store.get(&key("_wal/a")).await.is_ok());
     }
 
     #[tokio::test]

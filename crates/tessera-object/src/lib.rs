@@ -14,7 +14,7 @@ pub mod memory;
 pub mod pool;
 pub mod store;
 
-pub use fault::{FaultPolicy, FaultyStore};
+pub use fault::{FaultPolicy, FaultyStore, LostResponseStore};
 pub use key::{InvalidKey, Key};
 pub use local::LocalStore;
 pub use memory::MemoryStore;
