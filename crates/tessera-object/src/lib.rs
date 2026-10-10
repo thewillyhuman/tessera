@@ -8,6 +8,7 @@
 pub mod conformance;
 pub mod fault;
 pub mod key;
+pub mod layout;
 pub mod local;
 pub mod memory;
 pub mod pool;
