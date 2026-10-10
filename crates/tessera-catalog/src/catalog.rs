@@ -86,8 +86,6 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// Where the catalog lives in the root pool (section 6.2).
-    pub const PREFIX: &'static str = "_cluster/catalog";
     /// The setting that holds the grace period of CT-8, in seconds.
     pub const DROP_GRACE_SETTING: &'static str = "tenant_drop_grace_seconds";
     /// The default grace period of CT-8.
@@ -112,10 +110,10 @@ impl Catalog {
         Ok(catalog)
     }
 
-    /// The key prefix of the catalog log.
+    /// The key prefix of the catalog log in the root pool (section 6.2).
     #[must_use]
     pub fn prefix() -> Key {
-        Key::new(Self::PREFIX).unwrap_or_else(|_| unreachable!("the catalog prefix is a valid key"))
+        tessera_object::layout::catalog()
     }
 
     /// The latest state, read from the root pool.
