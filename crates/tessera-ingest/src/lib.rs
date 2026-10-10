@@ -11,5 +11,7 @@
 
 pub mod ingester;
 pub mod otlp;
+pub mod service;
 
 pub use ingester::{Ack, IngestConfig, IngestError, Ingester};
+pub use service::{IngestHandle, spawn};
