@@ -9,10 +9,12 @@
 //! writer by creating the next entry itself (ST-9).
 
 pub mod entry;
+pub mod flush;
 pub mod reader;
 pub mod writer;
 
 pub use entry::{BlockMeta, Entry, EntryBody, EntryId, FORMAT};
+pub use flush::{FlushTarget, write_l1_files};
 pub use writer::WriterLog;
 
 /// Why a writer-log operation failed.
@@ -67,4 +69,16 @@ pub enum WalError {
     /// The object store failed.
     #[error(transparent)]
     Store(#[from] tessera_object::ObjectError),
+    /// An event time has no partition window.
+    #[error("event time {timestamp} lies before the epoch and has no partition")]
+    Unwindowed {
+        /// The offending time.
+        timestamp: tessera_types::Timestamp,
+    },
+    /// A file could not be encoded.
+    #[error(transparent)]
+    Format(#[from] tessera_format::FormatError),
+    /// The flush failed for another reason.
+    #[error("flush failed: {0}")]
+    Flush(String),
 }
