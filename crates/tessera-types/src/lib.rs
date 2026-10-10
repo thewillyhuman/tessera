@@ -6,14 +6,18 @@
 //! This crate depends on nothing else in the workspace (spec section
 //! 18.1), so any crate may use it without creating a cycle.
 
+pub mod hash;
 pub mod id;
 pub mod kind;
 pub mod position;
 pub mod random;
 pub mod time;
+pub mod work;
 
+pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
 pub use kind::Kind;
 pub use position::{Epoch, Seq, Version};
 pub use random::{OsRandom, Random, SeededRandom, SharedRandom};
 pub use time::{Clock, ManualClock, SystemClock, Timestamp};
+pub use work::WorkKind;
