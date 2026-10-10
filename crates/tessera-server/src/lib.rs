@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! Tessera's network front ends (spec section 16): the HTTP
-//! administration API, OTLP ingest over HTTP, SQL queries over HTTP and
-//! a plain read of a dataset. The other query languages and the
-//! compatibility APIs arrive with their milestones.
+//! administration API, OTLP ingest over HTTP, SQL over HTTP and over the
+//! `PostgreSQL` wire protocol, and a plain read of a dataset. The other
+//! query languages and the compatibility APIs arrive with their
+//! milestones.
 //!
 //! This crate is transport only: it decodes requests, calls the catalog,
 //! the ingest service and the consistent view, and encodes responses. No
@@ -13,6 +14,7 @@ pub mod admin;
 pub mod encode;
 mod error;
 pub mod otlp;
+pub mod pg;
 pub mod query;
 pub mod read;
 

@@ -2,9 +2,11 @@
 
 //! The `tessera` binary (AR-1): one executable for every role.
 //!
-//! Only the catalog and its administration API exist yet, so `tessera run`
-//! starts those against a local directory. Roles, listeners and the rest
-//! of the start-up configuration of OP-11 arrive with their milestones.
+//! `tessera run` starts every role in one process against a local
+//! directory: the catalog and its administration API, OTLP ingest, the
+//! query engine with SQL over HTTP and the `PostgreSQL` wire protocol.
+//! Roles and the rest of the start-up configuration of OP-11 arrive with
+//! their milestones.
 
 mod background;
 mod run;
@@ -40,6 +42,10 @@ struct RunArgs {
     /// authentication yet.
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
+    /// Where the `PostgreSQL` wire protocol listens. Loopback by default:
+    /// there is no authentication yet.
+    #[arg(long, default_value = "127.0.0.1:5432")]
+    pg_listen: SocketAddr,
 }
 
 #[tokio::main]
@@ -56,6 +62,7 @@ async fn main() -> ExitCode {
             run::run(run::Config {
                 data_dir: args.data_dir,
                 listen: args.listen,
+                pg_listen: args.pg_listen,
             })
             .await
         }
@@ -78,6 +85,7 @@ mod tests {
         let cli = Cli::try_parse_from(["tessera", "run"]).unwrap();
         let Command::Run(args) = cli.command;
         assert_eq!(args.listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(args.pg_listen, "127.0.0.1:5432".parse().unwrap());
         assert_eq!(args.data_dir, PathBuf::from("./tessera-data"));
     }
 

@@ -33,6 +33,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Where the HTTP API listens.
     pub listen: SocketAddr,
+    /// Where the `PostgreSQL` wire protocol listens.
+    pub pg_listen: SocketAddr,
 }
 
 /// Why the node could not start or stopped.
@@ -50,8 +52,8 @@ pub enum RunError {
     /// The catalog cannot be opened.
     #[error("cannot open the catalog: {0}")]
     Catalog(#[from] tessera_catalog::CatalogError),
-    /// The listener cannot be bound or served.
-    #[error("cannot serve the HTTP API on {address}: {source}")]
+    /// A listener cannot be bound or served.
+    #[error("cannot serve on {address}: {source}")]
     Serve {
         /// The address.
         address: SocketAddr,
@@ -116,12 +118,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     tracing::info!(writer = %ingester.writer_id(), "ingest started");
     let ingest = tessera_ingest::spawn(ingester, INGEST_TICK);
 
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .map_err(|source| RunError::Serve {
-            address: config.listen,
-            source,
-        })?;
+    let listener = bind(config.listen).await?;
     tracing::info!(address = %config.listen, "http api listening");
     let engine = Engine::new(
         Arc::clone(&pools),
@@ -130,14 +127,25 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         CpuPool::for_host(),
         QueryLimits::default(),
     );
-    let app = tessera_server::router(AppState {
+    let pg_listener = bind(config.pg_listen).await?;
+    tracing::info!(address = %config.pg_listen, "postgresql protocol listening");
+    let state = AppState {
         catalog: Arc::clone(&catalog),
         ingest: ingest.clone(),
         pools,
         format,
         engine: Arc::new(engine),
         env,
-    });
+    };
+    let (stop_pg, stopped) = tokio::sync::oneshot::channel::<()>();
+    let pg = tokio::spawn(tessera_server::pg::serve(
+        pg_listener,
+        state.clone(),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let app = tessera_server::router(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -145,6 +153,8 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             address: config.listen,
             source,
         })?;
+    let _ = stop_pg.send(());
+    let _ = pg.await;
 
     keeper.abort();
     compactor.abort();
@@ -153,6 +163,12 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     }
     tracing::info!("stopped");
     Ok(())
+}
+
+async fn bind(address: SocketAddr) -> Result<tokio::net::TcpListener, RunError> {
+    tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|source| RunError::Serve { address, source })
 }
 
 /// Re-reads the catalog every second and checkpoints it every minute if
