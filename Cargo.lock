@@ -1495,6 +1495,8 @@ dependencies = [
  "axum",
  "clap",
  "tessera-catalog",
+ "tessera-format",
+ "tessera-ingest",
  "tessera-object",
  "tessera-server",
  "tessera-types",
@@ -1599,11 +1601,18 @@ dependencies = [
 name = "tessera-server"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "axum",
+ "bytes",
  "http-body-util",
+ "opentelemetry-proto",
+ "prost",
  "serde",
  "serde_json",
  "tessera-catalog",
+ "tessera-format",
+ "tessera-ingest",
+ "tessera-manifest",
  "tessera-object",
  "tessera-types",
  "tokio",

@@ -16,33 +16,24 @@
 //! | `DELETE /api/v1/tenants/{name}`        | Drop (restorable, CT-8)         |
 //! | `POST /api/v1/tenants/{name}/restore`  | Restore a dropped tenant        |
 //!
-//! Errors are `{"error": "..."}` with a status that says whether to retry:
-//! 503 for a failing object store, 409 for a conflict with the current
-//! state, 404 for an unknown tenant, 400 for a malformed request.
+//! Errors follow the shape described in the crate's error module.
 //!
 //! Authentication (SE-1) is not implemented yet; `tessera run` binds the
 //! API to the loopback interface.
 
-use std::sync::Arc;
-
+use axum::Json;
+use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Path, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
-use tessera_catalog::{Catalog, CatalogError, Tenant, TenantName, TenantSettings};
+use serde::Deserialize;
+use tessera_catalog::{CatalogError, Tenant, TenantName, TenantSettings};
 
-/// What the handlers share.
-#[derive(Clone)]
-pub struct AdminState {
-    /// The cluster catalog.
-    pub catalog: Arc<Catalog>,
-}
+use crate::{ApiError, AppState};
 
 /// The administration router.
-pub fn router(state: AdminState) -> Router {
+pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/v1/tenants", get(list_tenants).post(create_tenant))
@@ -66,9 +57,13 @@ impl<S: Send + Sync, T: serde::de::DeserializeOwned> FromRequest<S> for Body<T> 
     async fn from_request(request: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
         match Json::<T>::from_request(request, state).await {
             Ok(Json(value)) => Ok(Body(value)),
-            Err(rejection) => Err(ApiError::bad_request(&rejection)),
+            Err(rejection) => Err(bad_json(&rejection)),
         }
     }
+}
+
+fn bad_json(rejection: &JsonRejection) -> ApiError {
+    ApiError::bad_request(rejection.body_text())
 }
 
 /// The body of `POST /api/v1/tenants`.
@@ -85,79 +80,17 @@ struct RenameTenant {
     new_name: TenantName,
 }
 
-/// The JSON shape of an error.
-#[derive(Serialize)]
-struct ErrorBody {
-    error: String,
-}
-
-/// An error with the status that tells the client what to do.
-struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(rejection: &JsonRejection) -> Self {
-        ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: rejection.body_text(),
-        }
-    }
-}
-
-impl From<CatalogError> for ApiError {
-    fn from(error: CatalogError) -> Self {
-        let status = match &error {
-            CatalogError::UnknownTenant(_) | CatalogError::UnknownPool(_) => StatusCode::NOT_FOUND,
-            CatalogError::ReservedName(_) => StatusCode::BAD_REQUEST,
-            CatalogError::TenantExists(_)
-            | CatalogError::BuiltinTenant(_)
-            | CatalogError::WrongStatus { .. }
-            | CatalogError::GracePeriod(_)
-            | CatalogError::PoolExists(_)
-            | CatalogError::RootPool(_)
-            | CatalogError::SlotsAtMaximum(_) => StatusCode::CONFLICT,
-            CatalogError::Contention { .. } | CatalogError::Log(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-        };
-        if status == StatusCode::SERVICE_UNAVAILABLE {
-            tracing::warn!(error = %error, "catalog unavailable");
-        }
-        ApiError {
-            status,
-            message: error.to_string(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(ErrorBody {
-                error: self.message,
-            }),
-        )
-            .into_response()
-    }
-}
-
 fn name(text: &str) -> Result<TenantName, ApiError> {
-    TenantName::new(text).map_err(|e| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        message: e.to_string(),
-    })
+    TenantName::new(text).map_err(|e| ApiError::bad_request(e.to_string()))
 }
 
-async fn list_tenants(State(state): State<AdminState>) -> Result<Json<Vec<Tenant>>, ApiError> {
+async fn list_tenants(State(state): State<AppState>) -> Result<Json<Vec<Tenant>>, ApiError> {
     let snapshot = state.catalog.snapshot().await?;
     Ok(Json(snapshot.state().tenants().cloned().collect()))
 }
 
 async fn create_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Body(request): Body<CreateTenant>,
 ) -> Result<(StatusCode, Json<Tenant>), ApiError> {
     let tenant = state
@@ -169,7 +102,7 @@ async fn create_tenant(
 }
 
 async fn get_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
     let name = name(&text)?;
@@ -183,7 +116,7 @@ async fn get_tenant(
 }
 
 async fn alter_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Path(text): Path<String>,
     Body(patch): Body<TenantSettings>,
 ) -> Result<Json<Tenant>, ApiError> {
@@ -193,7 +126,7 @@ async fn alter_tenant(
 }
 
 async fn rename_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Path(text): Path<String>,
     Body(request): Body<RenameTenant>,
 ) -> Result<Json<Tenant>, ApiError> {
@@ -206,21 +139,21 @@ async fn rename_tenant(
 }
 
 async fn suspend_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
     Ok(Json(state.catalog.suspend_tenant(&name(&text)?).await?))
 }
 
 async fn resume_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
     Ok(Json(state.catalog.resume_tenant(&name(&text)?).await?))
 }
 
 async fn drop_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
     let tenant = state.catalog.drop_tenant(&name(&text)?).await?;
@@ -229,7 +162,7 @@ async fn drop_tenant(
 }
 
 async fn restore_tenant(
-    State(state): State<AdminState>,
+    State(state): State<AppState>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
     Ok(Json(state.catalog.restore_tenant(&name(&text)?).await?))
@@ -240,27 +173,13 @@ mod tests {
     use axum::body::Body as HttpBody;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
-    use tessera_catalog::{PoolConfig, TenantStatus};
-    use tessera_object::{MemoryStore, PoolState};
-    use tessera_types::{Env, PoolId, Timestamp};
+    use tessera_catalog::TenantStatus;
     use tower::ServiceExt;
 
     use super::*;
 
     async fn app() -> Router {
-        let root = PoolConfig {
-            id: PoolId::new("root").unwrap(),
-            url: "memory://test".into(),
-            weight: 1,
-            state: PoolState::Active,
-        };
-        let env = Env::simulated(1, Timestamp::UNIX_EPOCH);
-        let catalog = Catalog::open(Arc::new(MemoryStore::new()), root, env)
-            .await
-            .unwrap();
-        router(AdminState {
-            catalog: Arc::new(catalog),
-        })
+        router(crate::testing::state().await)
     }
 
     async fn call(

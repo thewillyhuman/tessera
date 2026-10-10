@@ -9,8 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, PoolConfig};
-use tessera_object::{LocalStore, PoolState};
-use tessera_server::AdminState;
+use tessera_format::{FileFormat, ParquetFormat};
+use tessera_ingest::{IngestConfig, Ingester};
+use tessera_object::{LocalStore, ObjectStore, PoolState, Pools};
+use tessera_server::AppState;
 use tessera_types::{Env, PoolId};
 
 /// How often a node re-reads the catalog, so that a change made elsewhere
@@ -18,6 +20,8 @@ use tessera_types::{Env, PoolId};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the catalog is checkpointed, if it changed.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the ingester does its time-based work.
+const INGEST_TICK: Duration = Duration::from_millis(50);
 
 /// What `run` needs.
 #[derive(Debug)]
@@ -61,14 +65,15 @@ pub enum RunError {
 /// If the data directory, the catalog or the listener cannot be opened.
 pub async fn run(config: Config) -> Result<(), RunError> {
     let env = Env::system();
-    let store = LocalStore::open(&config.data_dir)
-        .await
-        .map_err(|source| RunError::DataDir {
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&config.data_dir).await.map_err(
+        |source| RunError::DataDir {
             path: config.data_dir.clone(),
             source,
-        })?;
+        },
+    )?);
+    let pool = PoolId::new("root").unwrap_or_else(|_| unreachable!("a literal valid pool id"));
     let root_pool = PoolConfig {
-        id: PoolId::new("root").unwrap_or_else(|_| unreachable!("a literal valid pool id")),
+        id: pool.clone(),
         url: format!(
             "file://{}",
             config
@@ -80,15 +85,27 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         weight: 1,
         state: PoolState::Active,
     };
-    let catalog = Arc::new(Catalog::open(Arc::new(store), root_pool, env.clone()).await?);
+    let catalog = Arc::new(Catalog::open(Arc::clone(&store), root_pool, env.clone()).await?);
     tracing::info!(
         node = %env.node,
         data_dir = %config.data_dir.display(),
         version = %catalog.cached().version(),
         "catalog open"
     );
-
     let keeper = tokio::spawn(keep_fresh(Arc::clone(&catalog)));
+
+    let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat);
+    let pools = Arc::new(Pools::new(pool.clone(), Arc::clone(&store)));
+    let ingester = Ingester::start(
+        Arc::clone(&store),
+        env.clone(),
+        IngestConfig::default(),
+        pool,
+        Arc::clone(&format),
+    );
+    tracing::info!(writer = %ingester.writer_id(), "ingest started");
+    let ingest = tessera_ingest::spawn(ingester, INGEST_TICK);
+
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|source| RunError::Serve {
@@ -96,8 +113,12 @@ pub async fn run(config: Config) -> Result<(), RunError> {
             source,
         })?;
     tracing::info!(address = %config.listen, "http api listening");
-    let app = tessera_server::router(AdminState {
+    let app = tessera_server::router(AppState {
         catalog: Arc::clone(&catalog),
+        ingest: ingest.clone(),
+        pools,
+        format,
+        env,
     });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -108,6 +129,9 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         })?;
 
     keeper.abort();
+    if let Err(error) = ingest.shutdown().await {
+        tracing::warn!(error = %error, "ingest shutdown left work for recovery");
+    }
     tracing::info!("stopped");
     Ok(())
 }
