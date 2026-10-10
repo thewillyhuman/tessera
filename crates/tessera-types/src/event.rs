@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int32Array, RecordBatch, StringArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,20 @@ pub const SEVERITY_TEXT: &str = "severity_text";
 pub const BODY: &str = "body";
 /// Span name, event name or metric name.
 pub const NAME: &str = "name";
+/// The parent of a span, 8 bytes; null for a root span.
+pub const PARENT_SPAN_ID: &str = "parent_span_id";
+/// The span kind, as its lowercase OpenTelemetry name (`server`, ...).
+pub const SPAN_KIND: &str = "span_kind";
+/// The span duration in nanoseconds.
+pub const DURATION_NS: &str = "duration_ns";
+/// The span status, as its lowercase OpenTelemetry name (`unset`, `ok`,
+/// `error`).
+pub const STATUS_CODE: &str = "status_code";
+/// The span status message.
+pub const STATUS_MESSAGE: &str = "status_message";
+/// Span links (DM-9): a JSON list of objects with `trace_id` and
+/// `span_id` as hex and the link's flattened attributes.
+pub const LINKS: &str = "links";
 /// Attributes without a dedicated column, as a JSON object.
 pub const OVERFLOW: &str = "_overflow";
 /// The value column of a metric result (`RangeVector`, section 10.2).
@@ -80,7 +94,16 @@ fn build_schema(kind: Kind) -> Schema {
             Field::new(SEVERITY_TEXT, DataType::Utf8, true),
             Field::new(BODY, DataType::Utf8, true),
         ]),
-        Kind::Span | Kind::Metric | Kind::Event | Kind::Alert => {
+        Kind::Span => fields.extend([
+            Field::new(PARENT_SPAN_ID, DataType::FixedSizeBinary(8), true),
+            Field::new(NAME, DataType::Utf8, true),
+            Field::new(SPAN_KIND, DataType::Utf8, true),
+            Field::new(DURATION_NS, DataType::Int64, true),
+            Field::new(STATUS_CODE, DataType::Utf8, true),
+            Field::new(STATUS_MESSAGE, DataType::Utf8, true),
+            Field::new(LINKS, DataType::Utf8, true),
+        ]),
+        Kind::Metric | Kind::Event | Kind::Alert => {
             fields.push(Field::new(NAME, DataType::Utf8, true));
         }
     }
@@ -237,6 +260,132 @@ impl EventBatch {
         })
     }
 
+    /// A batch of spans.
+    ///
+    /// # Errors
+    ///
+    /// `Empty` if there are no rows; `Arrow` if a column cannot be built.
+    pub fn from_spans(
+        tenant: TenantId,
+        dataset: DatasetName,
+        spans: &[SpanRow],
+    ) -> Result<Self, InvalidBatch> {
+        if spans.is_empty() {
+            return Err(InvalidBatch::Empty);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            timestamps(spans.iter().map(|s| s.timestamp)),
+            timestamps(spans.iter().map(|s| s.observed_timestamp)),
+            Arc::new(StringArray::from(vec![Kind::Span.as_str(); spans.len()])),
+            fixed(spans.iter().map(|s| Some(&s.event_id[..])), 16)?,
+            fixed(spans.iter().map(|s| Some(&s.trace_id[..])), 16)?,
+            fixed(spans.iter().map(|s| Some(&s.span_id[..])), 8)?,
+            Arc::new(Float64Array::from(vec![1.0; spans.len()])),
+            fixed(
+                spans
+                    .iter()
+                    .map(|s| s.parent_span_id.as_ref().map(|id| &id[..])),
+                8,
+            )?,
+            Arc::new(StringArray::from(
+                spans
+                    .iter()
+                    .map(|s| Some(s.name.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                spans
+                    .iter()
+                    .map(|s| Some(s.span_kind.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                spans
+                    .iter()
+                    .map(|s| Some(s.duration_ns))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                spans
+                    .iter()
+                    .map(|s| Some(s.status_code.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                spans
+                    .iter()
+                    .map(|s| s.status_message.as_deref())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                spans.iter().map(|s| s.links.as_deref()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                spans
+                    .iter()
+                    .map(|s| overflow(&s.attributes))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        let rows = RecordBatch::try_new(schema(Kind::Span), columns)?;
+        Ok(EventBatch {
+            tenant,
+            dataset,
+            kind: Kind::Span,
+            rows,
+        })
+    }
+
+    /// A batch of events of kind `event`: free-form events and span
+    /// events (DM-8).
+    ///
+    /// # Errors
+    ///
+    /// `Empty` if there are no rows; `Arrow` if a column cannot be built.
+    pub fn from_events(
+        tenant: TenantId,
+        dataset: DatasetName,
+        events: &[EventRow],
+    ) -> Result<Self, InvalidBatch> {
+        if events.is_empty() {
+            return Err(InvalidBatch::Empty);
+        }
+        let columns: Vec<ArrayRef> = vec![
+            timestamps(events.iter().map(|e| e.timestamp)),
+            timestamps(events.iter().map(|e| e.observed_timestamp)),
+            Arc::new(StringArray::from(vec![Kind::Event.as_str(); events.len()])),
+            fixed(events.iter().map(|e| Some(&e.event_id[..])), 16)?,
+            fixed(
+                events.iter().map(|e| e.trace_id.as_ref().map(|id| &id[..])),
+                16,
+            )?,
+            fixed(
+                events.iter().map(|e| e.span_id.as_ref().map(|id| &id[..])),
+                8,
+            )?,
+            Arc::new(Float64Array::from(vec![1.0; events.len()])),
+            Arc::new(StringArray::from(
+                events
+                    .iter()
+                    .map(|e| Some(e.name.as_str()))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                events
+                    .iter()
+                    .map(|e| overflow(&e.attributes))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        let rows = RecordBatch::try_new(schema(Kind::Event), columns)?;
+        Ok(EventBatch {
+            tenant,
+            dataset,
+            kind: Kind::Event,
+            rows,
+        })
+    }
+
     /// The tenant the events belong to.
     #[must_use]
     pub fn tenant(&self) -> &TenantId {
@@ -305,6 +454,160 @@ pub struct LogRow {
     pub severity_text: Option<String>,
     /// The body.
     pub body: Option<String>,
+    /// Flattened attributes.
+    pub attributes: Attributes,
+}
+
+/// The kind of a span (section 4.2), as OpenTelemetry names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SpanKind {
+    /// Not specified by the producer.
+    #[default]
+    Unspecified,
+    /// An operation inside the application.
+    Internal,
+    /// The server side of a remote request.
+    Server,
+    /// The client side of a remote request.
+    Client,
+    /// The sending side of an asynchronous message.
+    Producer,
+    /// The receiving side of an asynchronous message.
+    Consumer,
+}
+
+impl SpanKind {
+    /// Every kind, in OpenTelemetry's numbering order.
+    pub const ALL: [SpanKind; 6] = [
+        SpanKind::Unspecified,
+        SpanKind::Internal,
+        SpanKind::Server,
+        SpanKind::Client,
+        SpanKind::Producer,
+        SpanKind::Consumer,
+    ];
+
+    /// The lowercase name stored in the `span_kind` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SpanKind::Unspecified => "unspecified",
+            SpanKind::Internal => "internal",
+            SpanKind::Server => "server",
+            SpanKind::Client => "client",
+            SpanKind::Producer => "producer",
+            SpanKind::Consumer => "consumer",
+        }
+    }
+
+    /// The kind with OpenTelemetry's number `code`; `Unspecified` for
+    /// an unknown number.
+    #[must_use]
+    pub fn from_code(code: i32) -> Self {
+        usize::try_from(code)
+            .ok()
+            .and_then(|i| SpanKind::ALL.get(i).copied())
+            .unwrap_or_default()
+    }
+
+    /// The kind with the given stored name, if any.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        SpanKind::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+}
+
+/// The status of a span (section 4.2), as OpenTelemetry names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StatusCode {
+    /// No status was set.
+    #[default]
+    Unset,
+    /// The operation succeeded.
+    Ok,
+    /// The operation failed.
+    Error,
+}
+
+impl StatusCode {
+    /// Every status, in OpenTelemetry's numbering order.
+    pub const ALL: [StatusCode; 3] = [StatusCode::Unset, StatusCode::Ok, StatusCode::Error];
+
+    /// The lowercase name stored in the `status_code` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusCode::Unset => "unset",
+            StatusCode::Ok => "ok",
+            StatusCode::Error => "error",
+        }
+    }
+
+    /// The status with OpenTelemetry's number `code`; `Unset` for an
+    /// unknown number.
+    #[must_use]
+    pub fn from_code(code: i32) -> Self {
+        usize::try_from(code)
+            .ok()
+            .and_then(|i| StatusCode::ALL.get(i).copied())
+            .unwrap_or_default()
+    }
+
+    /// The status with the given stored name, if any.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        StatusCode::ALL.into_iter().find(|s| s.as_str() == name)
+    }
+}
+
+/// One span, before it is turned into a column of a batch.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct SpanRow {
+    /// Start time.
+    pub timestamp: Timestamp,
+    /// Ingest time.
+    pub observed_timestamp: Timestamp,
+    /// Identity for deduplication.
+    pub event_id: [u8; 16],
+    /// The trace.
+    pub trace_id: [u8; 16],
+    /// The span.
+    pub span_id: [u8; 8],
+    /// The parent span; none for a root.
+    pub parent_span_id: Option<[u8; 8]>,
+    /// The operation name.
+    pub name: String,
+    /// The kind.
+    pub span_kind: SpanKind,
+    /// End time minus start time, in nanoseconds.
+    pub duration_ns: i64,
+    /// The status.
+    pub status_code: StatusCode,
+    /// The status message, when one was set.
+    pub status_message: Option<String>,
+    /// Links as the JSON text of the `links` column, when there are any.
+    pub links: Option<String>,
+    /// Flattened attributes.
+    pub attributes: Attributes,
+}
+
+/// One event of kind `event`, before it is turned into a column of a
+/// batch: a free-form event, or a span event (DM-8) carrying the ids of
+/// its span.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct EventRow {
+    /// Event time.
+    pub timestamp: Timestamp,
+    /// Ingest time.
+    pub observed_timestamp: Timestamp,
+    /// Identity for deduplication.
+    pub event_id: [u8; 16],
+    /// The trace this event belongs to, if any.
+    pub trace_id: Option<[u8; 16]>,
+    /// The span this event belongs to, if any.
+    pub span_id: Option<[u8; 8]>,
+    /// The event name.
+    pub name: String,
     /// Flattened attributes.
     pub attributes: Attributes,
 }
@@ -412,6 +715,116 @@ mod tests {
         assert!(schema.column_with_name(BODY).is_some());
         assert!(schema.column_with_name(SEVERITY_NUMBER).is_some());
         assert!(schema.column_with_name(NAME).is_none());
+    }
+
+    #[test]
+    fn the_span_schema_has_the_span_columns() {
+        let schema = schema(Kind::Span);
+        for column in [
+            PARENT_SPAN_ID,
+            NAME,
+            SPAN_KIND,
+            DURATION_NS,
+            STATUS_CODE,
+            STATUS_MESSAGE,
+            LINKS,
+        ] {
+            assert!(schema.column_with_name(column).is_some(), "{column}");
+        }
+        assert!(schema.column_with_name(BODY).is_none());
+        let events = super::schema(Kind::Event);
+        assert!(events.column_with_name(NAME).is_some());
+        assert!(events.column_with_name(DURATION_NS).is_none());
+    }
+
+    #[test]
+    fn span_kinds_and_statuses_round_trip_their_codes_and_names() {
+        assert_eq!(SpanKind::from_code(2), SpanKind::Server);
+        assert_eq!(SpanKind::from_code(99), SpanKind::Unspecified);
+        assert_eq!(SpanKind::from_code(-1), SpanKind::Unspecified);
+        assert_eq!(SpanKind::parse("consumer"), Some(SpanKind::Consumer));
+        assert_eq!(SpanKind::parse("nope"), None);
+        assert_eq!(StatusCode::from_code(2), StatusCode::Error);
+        assert_eq!(StatusCode::from_code(7), StatusCode::Unset);
+        assert_eq!(StatusCode::parse("ok"), Some(StatusCode::Ok));
+        for kind in SpanKind::ALL {
+            assert_eq!(SpanKind::parse(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn builds_a_span_batch() {
+        let span = SpanRow {
+            timestamp: Timestamp::from_nanos(100),
+            observed_timestamp: Timestamp::from_nanos(105),
+            event_id: [2; 16],
+            trace_id: [3; 16],
+            span_id: [4; 8],
+            parent_span_id: None,
+            name: "GET /".into(),
+            span_kind: SpanKind::Server,
+            duration_ns: 1_500,
+            status_code: StatusCode::Error,
+            status_message: Some("boom".into()),
+            links: Some(r#"[{"trace_id":"00","span_id":"01"}]"#.into()),
+            attributes: BTreeMap::from([(
+                "attr.http.method".to_owned(),
+                Scalar::Text("GET".into()),
+            )]),
+        };
+        let child = SpanRow {
+            span_id: [5; 8],
+            parent_span_id: Some([4; 8]),
+            status_message: None,
+            links: None,
+            attributes: BTreeMap::new(),
+            ..span.clone()
+        };
+        let batch = EventBatch::from_spans(tenant(), dataset(), &[span, child]).unwrap();
+        assert_eq!(batch.kind(), Kind::Span);
+        assert_eq!(batch.len(), 2);
+        let rows = batch.rows();
+        let parent = rows.column_by_name(PARENT_SPAN_ID).unwrap();
+        assert!(parent.is_null(0));
+        assert!(parent.is_valid(1));
+        let kind = rows.column_by_name(SPAN_KIND).unwrap();
+        let kind = kind.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(kind.value(0), "server");
+        let duration = rows.column_by_name(DURATION_NS).unwrap();
+        let duration = duration.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(duration.value(1), 1_500);
+        let status = rows.column_by_name(STATUS_CODE).unwrap();
+        let status = status.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(status.value(0), "error");
+        assert!(rows.column_by_name(STATUS_MESSAGE).unwrap().is_null(1));
+        assert!(rows.column_by_name(LINKS).unwrap().is_valid(0));
+        assert!(rows.column_by_name(OVERFLOW).unwrap().is_null(1));
+    }
+
+    #[test]
+    fn builds_an_event_batch_for_span_events() {
+        let event = EventRow {
+            timestamp: Timestamp::from_nanos(7),
+            observed_timestamp: Timestamp::from_nanos(9),
+            event_id: [6; 16],
+            trace_id: Some([3; 16]),
+            span_id: Some([4; 8]),
+            name: "exception".into(),
+            attributes: BTreeMap::from([(
+                "attr.exception.type".to_owned(),
+                Scalar::Text("IOError".into()),
+            )]),
+        };
+        let batch = EventBatch::from_events(tenant(), dataset(), &[event]).unwrap();
+        assert_eq!(batch.kind(), Kind::Event);
+        let name = batch.rows().column_by_name(NAME).unwrap();
+        let name = name.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name.value(0), "exception");
+        assert!(batch.rows().column_by_name(SPAN_ID).unwrap().is_valid(0));
+        assert!(matches!(
+            EventBatch::from_events(tenant(), dataset(), &[]),
+            Err(InvalidBatch::Empty)
+        ));
     }
 
     #[test]

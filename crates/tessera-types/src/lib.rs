@@ -19,7 +19,10 @@ pub mod time;
 pub mod work;
 
 pub use env::Env;
-pub use event::{Attributes, EventBatch, InvalidBatch, LogRow, Scalar, label_name};
+pub use event::{
+    Attributes, EventBatch, EventRow, InvalidBatch, LogRow, Scalar, SpanKind, SpanRow, StatusCode,
+    label_name,
+};
 pub use file::{ColumnStats, FileMeta, FileSource, IndexKind, IndexRef, Level};
 pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
