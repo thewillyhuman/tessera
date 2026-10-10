@@ -28,6 +28,10 @@ pub struct Timestamp(i64);
 impl Timestamp {
     /// 1970-01-01T00:00:00Z.
     pub const UNIX_EPOCH: Timestamp = Timestamp(0);
+    /// The earliest representable time.
+    pub const MIN: Timestamp = Timestamp(i64::MIN);
+    /// The latest representable time.
+    pub const MAX: Timestamp = Timestamp(i64::MAX);
 
     /// Wraps a count of nanoseconds since the Unix epoch.
     #[must_use]
@@ -117,6 +121,71 @@ fn civil_from_days(days: i64) -> (i64, u8, u8) {
 
 /// A source of the current time.
 ///
+/// A half-open range of event time, `[start, end)`.
+///
+/// Every plan node carries one (QE-3) and pruning starts from it (section
+/// 10.4). [`TimeRange::ALL`] covers every representable time.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+pub struct TimeRange {
+    /// The first time in the range.
+    pub start: Timestamp,
+    /// The first time after the range.
+    pub end: Timestamp,
+}
+
+impl TimeRange {
+    /// Every representable time.
+    pub const ALL: TimeRange = TimeRange {
+        start: Timestamp::MIN,
+        end: Timestamp::MAX,
+    };
+
+    /// `[start, end)`. An `end` at or before `start` gives an empty range.
+    #[must_use]
+    pub const fn new(start: Timestamp, end: Timestamp) -> Self {
+        TimeRange { start, end }
+    }
+
+    /// Whether no time lies in the range.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.end <= self.start
+    }
+
+    /// Whether `at` lies in the range.
+    #[must_use]
+    pub fn contains(self, at: Timestamp) -> bool {
+        self.start <= at && at < self.end
+    }
+
+    /// The times in both ranges.
+    #[must_use]
+    pub fn intersect(self, other: TimeRange) -> TimeRange {
+        TimeRange {
+            start: self.start.max(other.start),
+            end: self.end.min(other.end),
+        }
+    }
+
+    /// Whether the closed interval `[min, max]` shares a time with the
+    /// range: the test applied to a file's recorded bounds.
+    #[must_use]
+    pub fn overlaps_closed(self, min: Timestamp, max: Timestamp) -> bool {
+        min < self.end && max >= self.start
+    }
+}
+
+impl fmt::Display for TimeRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.start == Timestamp::MIN, self.end == Timestamp::MAX) {
+            (true, true) => write!(f, "[all time)"),
+            (true, false) => write!(f, "[.., {})", self.end),
+            (false, true) => write!(f, "[{}, ..)", self.start),
+            (false, false) => write!(f, "[{}, {})", self.start, self.end),
+        }
+    }
+}
+
 /// Production code uses [`SystemClock`]; tests and the simulation harness
 /// inject a [`ManualClock`] so that time only moves when the test says so.
 pub trait Clock: Send + Sync {
@@ -245,5 +314,47 @@ mod tests {
     fn system_clock_is_after_2020() {
         let year_2020 = Timestamp::from_nanos(1_577_836_800_000_000_000);
         assert!(SystemClock.now() > year_2020);
+    }
+
+    #[test]
+    fn a_range_is_half_open() {
+        let range = TimeRange::new(Timestamp::from_nanos(10), Timestamp::from_nanos(20));
+        assert!(range.contains(Timestamp::from_nanos(10)));
+        assert!(range.contains(Timestamp::from_nanos(19)));
+        assert!(!range.contains(Timestamp::from_nanos(20)));
+        assert!(!range.is_empty());
+        assert!(TimeRange::new(Timestamp::from_nanos(5), Timestamp::from_nanos(5)).is_empty());
+    }
+
+    #[test]
+    fn intersection_keeps_the_common_times() {
+        let a = TimeRange::new(Timestamp::from_nanos(0), Timestamp::from_nanos(20));
+        let b = TimeRange::new(Timestamp::from_nanos(10), Timestamp::from_nanos(30));
+        let both = a.intersect(b);
+        assert_eq!(both.start, Timestamp::from_nanos(10));
+        assert_eq!(both.end, Timestamp::from_nanos(20));
+        assert!(
+            a.intersect(TimeRange::new(
+                Timestamp::from_nanos(50),
+                Timestamp::from_nanos(60)
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn file_bounds_overlap_when_they_touch_the_range() {
+        let range = TimeRange::new(Timestamp::from_nanos(10), Timestamp::from_nanos(20));
+        assert!(range.overlaps_closed(Timestamp::from_nanos(0), Timestamp::from_nanos(10)));
+        assert!(range.overlaps_closed(Timestamp::from_nanos(19), Timestamp::from_nanos(99)));
+        assert!(!range.overlaps_closed(Timestamp::from_nanos(20), Timestamp::from_nanos(99)));
+        assert!(!range.overlaps_closed(Timestamp::from_nanos(0), Timestamp::from_nanos(9)));
+    }
+
+    #[test]
+    fn ranges_display_their_open_ends() {
+        assert_eq!(TimeRange::ALL.to_string(), "[all time)");
+        let until = TimeRange::new(Timestamp::MIN, Timestamp::UNIX_EPOCH);
+        assert_eq!(until.to_string(), "[.., 1970-01-01T00:00:00Z)");
     }
 }

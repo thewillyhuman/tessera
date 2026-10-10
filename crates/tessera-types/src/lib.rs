@@ -27,5 +27,5 @@ pub use kind::Kind;
 pub use partition::{InvalidWindow, PartitionId, Window};
 pub use position::{Epoch, Seq, Version};
 pub use random::{OsRandom, Random, SeededRandom, SharedRandom};
-pub use time::{Clock, ManualClock, SystemClock, Timestamp};
+pub use time::{Clock, ManualClock, SystemClock, TimeRange, Timestamp};
 pub use work::WorkKind;
