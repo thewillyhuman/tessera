@@ -16,6 +16,7 @@ pub mod engine;
 pub mod memory;
 pub mod operator;
 pub mod pipeline;
+pub mod query;
 pub mod scan;
 pub mod scheduler;
 
@@ -24,6 +25,7 @@ pub use engine::{Analysis, Engine, EngineError, QueryLimits, QueryOutput};
 pub use memory::{MemoryPool, OutOfMemory};
 pub use operator::{CollectSink, Flow, Operator, Sink};
 pub use pipeline::Pipeline;
+pub use query::{QueryError, Response, explain_text};
 pub use scan::ScanAnalysis;
 pub use scheduler::{CpuPool, Task, TaskError};
 
