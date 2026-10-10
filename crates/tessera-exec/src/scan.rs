@@ -131,6 +131,7 @@ pub(crate) async fn run(
         projection: Some(schema.fields().iter().map(|f| f.name().clone()).collect()),
         bounds: bounds(&scan.predicates, scan.time_range),
         filter: predicate.as_ref().map(|p| row_predicate(p.clone())),
+        row_groups: None,
     };
     // Newest first, so that a limit can stop early; otherwise any order.
     files.sort_by_key(|f| std::cmp::Reverse(f.max_timestamp));

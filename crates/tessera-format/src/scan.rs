@@ -61,6 +61,8 @@ pub struct ScanRequest {
     pub bounds: Vec<Bound>,
     /// A filter applied before the projected columns are materialized.
     pub filter: Option<RowPredicate>,
+    /// Only these row groups are read, when an index narrowed them.
+    pub row_groups: Option<Vec<usize>>,
 }
 
 /// What a scan did, for `EXPLAIN ANALYZE` (QE-8).

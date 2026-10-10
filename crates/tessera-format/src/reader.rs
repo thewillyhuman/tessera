@@ -131,6 +131,12 @@ impl FileReader for ParquetReader {
 
         stats.row_groups = metadata.num_row_groups();
         let kept: Vec<usize> = (0..metadata.num_row_groups())
+            .filter(|i| {
+                request
+                    .row_groups
+                    .as_ref()
+                    .is_none_or(|rgs| rgs.contains(i))
+            })
             .filter(|i| may_match(metadata.row_group(*i), &request.bounds, index_of))
             .collect();
         stats.row_groups_read = kept.len();
@@ -278,6 +284,7 @@ mod tests {
                 max: Some(Scalar::Int(3)),
             }],
             filter: None,
+            row_groups: None,
         };
         let fetched = reader.fetch(request).await.unwrap();
         assert_eq!(fetched.stats().row_groups_read, 1);
@@ -291,6 +298,7 @@ mod tests {
                 max: None,
             }],
             filter: None,
+            row_groups: None,
         };
         let fetched = reader.fetch(by_text).await.unwrap();
         assert_eq!(fetched.stats().row_groups_read, 1);
@@ -334,6 +342,7 @@ mod tests {
                         .collect::<BooleanArray>())
                 }),
             }),
+            row_groups: None,
         };
         let fetched = reader.fetch(request).await.unwrap();
         let batches = fetched.decode().unwrap();
@@ -372,5 +381,18 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (reader, _) = runtime.block_on(file());
         assert!(runtime.block_on(reader.fetch(request)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_index_decision_restricts_the_row_groups() {
+        let (reader, _) = file().await;
+        let request = ScanRequest {
+            projection: Some(vec!["timestamp".into()]),
+            row_groups: Some(vec![0, 2]),
+            ..ScanRequest::default()
+        };
+        let fetched = reader.fetch(request).await.unwrap();
+        assert_eq!(fetched.stats().row_groups_read, 2);
+        assert_eq!(timestamps(&fetched.decode().unwrap()), vec![0, 1, 4, 5]);
     }
 }
