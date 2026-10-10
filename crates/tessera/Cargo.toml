@@ -1,0 +1,28 @@
+[package]
+name = "tessera"
+description = "Tessera: a unified observability database, as one binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tessera"
+path = "src/main.rs"
+
+[dependencies]
+tessera-catalog.workspace = true
+tessera-object.workspace = true
+tessera-server.workspace = true
+tessera-types.workspace = true
+
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+thiserror = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints]
+workspace = true
