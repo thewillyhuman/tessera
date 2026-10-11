@@ -74,7 +74,7 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
                         .iter()
                         .cloned()
                         .zip(row)
-                        .map(|(c, e)| Ok((c, literal(e)?)))
+                        .map(|(c, e)| Ok((c, literal(e, ctx)?)))
                         .collect()
                 })
                 .collect::<Result<_, Diagnostic>>()?,
@@ -82,14 +82,14 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
         ast::Statement::Update { table, set, filter } => {
             Ok(Statement::Control(ControlStatement::Update {
                 table: control_table(table)?,
-                set: literals(set)?,
-                filter: literals(filter)?,
+                set: literals(set, ctx)?,
+                filter: literals(filter, ctx)?,
             }))
         }
         ast::Statement::Delete { table, filter } => {
             Ok(Statement::Control(ControlStatement::Delete {
                 table: control_table(table)?,
-                filter: literals(filter)?,
+                filter: literals(filter, ctx)?,
             }))
         }
     }
@@ -107,21 +107,47 @@ fn control_table(table: &ast::TableRef) -> Result<String, Diagnostic> {
     Ok(table.table.clone())
 }
 
-fn literals(pairs: &[(String, ast::Expr)]) -> Result<Vec<(String, Literal)>, Diagnostic> {
+fn literals(
+    pairs: &[(String, ast::Expr)],
+    ctx: &BindContext,
+) -> Result<Vec<(String, Literal)>, Diagnostic> {
     pairs
         .iter()
-        .map(|(column, expr)| Ok((column.clone(), literal(expr)?)))
+        .map(|(column, expr)| Ok((column.clone(), literal(expr, ctx)?)))
         .collect()
 }
 
-/// A literal as written in a control statement.
-fn literal(expr: &ast::Expr) -> Result<Literal, Diagnostic> {
+/// A literal as written in a control statement; `now()` and `now()`
+/// plus or minus an interval are read at the statement's time.
+fn literal(expr: &ast::Expr, ctx: &BindContext) -> Result<Literal, Diagnostic> {
     match &expr.kind {
+        ast::ExprKind::Call { name, args, .. } if name == "now" && args.is_empty() => {
+            Ok(Literal::Timestamp(ctx.now))
+        }
+        ast::ExprKind::Binary {
+            op: op @ (ast::BinaryOp::Add | ast::BinaryOp::Sub),
+            left,
+            right,
+        } => match (literal(left, ctx)?, literal(right, ctx)?) {
+            (Literal::Timestamp(at), Literal::Duration(by)) => {
+                let by = i64::try_from(by.as_nanos()).unwrap_or(i64::MAX);
+                let nanos = if *op == ast::BinaryOp::Add {
+                    at.as_nanos().saturating_add(by)
+                } else {
+                    at.as_nanos().saturating_sub(by)
+                };
+                Ok(Literal::Timestamp(Timestamp::from_nanos(nanos)))
+            }
+            _ => Err(Diagnostic::at(
+                expr.span,
+                "only a timestamp plus or minus an interval can be computed here",
+            )),
+        },
         ast::ExprKind::Number(text) => match number(text, expr.span)? {
             Expr::Literal(literal) => Ok(literal),
             _ => Err(Diagnostic::at(expr.span, "expected a literal")),
         },
-        ast::ExprKind::Negate(inner) => match literal(inner)? {
+        ast::ExprKind::Negate(inner) => match literal(inner, ctx)? {
             Literal::Int(i) => Ok(Literal::Int(-i)),
             Literal::Float(f) => Ok(Literal::Float(-f)),
             _ => Err(Diagnostic::at(expr.span, "expected a number")),
@@ -978,6 +1004,19 @@ mod tests {
             panic!("not a delete");
         };
         assert_eq!(filter, [("id".to_owned(), Literal::Text("s1".into()))]);
+        let ControlStatement::Insert { rows, .. } = control(
+            "INSERT INTO system.silences (id, starts_at, ends_at) \
+             VALUES ('s', now(), now() + INTERVAL '2 hours')",
+        ) else {
+            panic!("not an insert");
+        };
+        assert_eq!(rows[0][1].1, Literal::Timestamp(ctx().now));
+        assert_eq!(
+            rows[0][2].1,
+            Literal::Timestamp(Timestamp::from_nanos(
+                ctx().now.as_nanos() + 7_200 * 1_000_000_000
+            ))
+        );
         assert!(
             error("DELETE FROM logs WHERE body = 'x'")
                 .message
