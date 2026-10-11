@@ -142,24 +142,24 @@ fn bind_plan(plan: Plan) -> Plan {
             group_by: group_by.into_iter().map(bind_named).collect(),
             aggregates: aggregates.into_iter().map(bind_aggregate).collect(),
         },
-        Plan::Sort { input, keys } => Plan::Sort {
-            input: Box::new(bind_plan(*input)),
-            keys: keys.into_iter().map(bind_key).collect(),
-        },
-        Plan::TopK { input, keys, k } => Plan::TopK {
-            input: Box::new(bind_plan(*input)),
-            keys: keys.into_iter().map(bind_key).collect(),
+        Plan::Sort { input, keys } => {
+            bind_plan(*input).sort(keys.into_iter().map(bind_key).collect())
+        }
+        Plan::TopK {
+            input,
+            keys,
             k,
-        },
+            partition_by,
+        } => bind_plan(*input).top_k(
+            keys.into_iter().map(bind_key).collect(),
+            k,
+            partition_by.into_iter().map(bind_expr).collect(),
+        ),
         Plan::Limit {
             input,
             offset,
             count,
-        } => Plan::Limit {
-            input: Box::new(bind_plan(*input)),
-            offset,
-            count,
-        },
+        } => bind_plan(*input).limit(offset, count),
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs.into_iter().map(bind_plan).collect(),
         },

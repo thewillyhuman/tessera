@@ -265,11 +265,12 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
             offset,
             count,
         } => f(*input).limit(offset, count),
-        Plan::TopK { input, keys, k } => Plan::TopK {
-            input: Box::new(f(*input)),
+        Plan::TopK {
+            input,
             keys,
             k,
-        },
+            partition_by,
+        } => f(*input).top_k(keys, k, partition_by),
         Plan::Extract {
             input,
             source,
@@ -382,11 +383,7 @@ fn push_limits(plan: Plan) -> Plan {
             offset: 0,
             count: Some(count),
         } => match push_limits(*input) {
-            Plan::Sort { input, keys } => newest_first(Plan::TopK {
-                input,
-                keys,
-                k: count,
-            }),
+            Plan::Sort { input, keys } => newest_first(input.top_k(keys, count, Vec::new())),
             Plan::Project { input, exprs } => {
                 push_limits(input.limit(0, Some(count))).project(exprs)
             }
@@ -401,20 +398,17 @@ fn push_limits(plan: Plan) -> Plan {
 fn newest_first(plan: Plan) -> Plan {
     let by_time_desc = |keys: &[SortKey]| matches!(keys, [key] if key.descending && key.expr == Expr::column(TIMESTAMP));
     match plan {
-        Plan::TopK { input, keys, k } if by_time_desc(&keys) => match *input {
+        Plan::TopK {
+            input,
+            keys,
+            k,
+            partition_by,
+        } if partition_by.is_empty() && by_time_desc(&keys) => match *input {
             Plan::Scan(mut scan) => {
                 scan.newest_first_limit = Some(k);
-                Plan::TopK {
-                    input: Box::new(Plan::Scan(scan)),
-                    keys,
-                    k,
-                }
+                Plan::Scan(scan).top_k(keys, k, partition_by)
             }
-            input => Plan::TopK {
-                input: Box::new(input),
-                keys,
-                k,
-            },
+            input => input.top_k(keys, k, partition_by),
         },
         Plan::Limit {
             input,
@@ -513,14 +507,16 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
             let whole = whole || keys.iter().any(|k| k.expr.needs_overflow_whole());
             push_projection(*input, needed, whole).sort(keys)
         }
-        Plan::TopK { input, keys, k } => {
-            let needed = needed.map(|n| keys.iter().fold(n, |set, k| add(set, &k.expr)));
-            let whole = whole || keys.iter().any(|k| k.expr.needs_overflow_whole());
-            Plan::TopK {
-                input: Box::new(push_projection(*input, needed, whole)),
-                keys,
-                k,
-            }
+        Plan::TopK {
+            input,
+            keys,
+            k,
+            partition_by,
+        } => {
+            let exprs = || keys.iter().map(|k| &k.expr).chain(&partition_by);
+            let needed = needed.map(|n| exprs().fold(n, add));
+            let whole = whole || exprs().any(Expr::needs_overflow_whole);
+            push_projection(*input, needed, whole).top_k(keys, k, partition_by)
         }
         Plan::Limit {
             input,

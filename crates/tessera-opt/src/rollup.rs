@@ -57,11 +57,12 @@ pub fn substitute(plan: Plan, rollups: &[RollupEntry]) -> Plan {
             offset,
             count,
         },
-        Plan::TopK { input, keys, k } => Plan::TopK {
-            input: Box::new(substitute(*input, rollups)),
+        Plan::TopK {
+            input,
             keys,
             k,
-        },
+            partition_by,
+        } => substitute(*input, rollups).top_k(keys, k, partition_by),
         other => other,
     }
 }

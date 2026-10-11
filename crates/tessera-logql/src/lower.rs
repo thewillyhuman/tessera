@@ -15,7 +15,7 @@ use std::time::Duration;
 use arrow::datatypes::DataType;
 use tessera_ir::{
     AggregateExpr, BindContext, Diagnostic, Expr, ExtractStage, Literal, NamedExpr, Plan,
-    RangeFunction, Scan, SeriesGrouping, Span, VALUE,
+    RangeFunction, Scan, SeriesGrouping, SortKey, Span, VALUE,
 };
 use tessera_types::event::{BODY, EXTRACTED, TIMESTAMP};
 use tessera_types::{Kind, TimeRange, Timestamp, event};
@@ -505,11 +505,8 @@ fn aggregate_plan(
         AggregateOp::Count => "count_raw",
         AggregateOp::Stddev => "stddev_raw",
         AggregateOp::Stdvar => "stdvar_raw",
-        AggregateOp::Topk(_) | AggregateOp::Bottomk(_) => {
-            return Err(Diagnostic::at(
-                span,
-                "topk and bottomk are not supported yet",
-            ));
+        AggregateOp::Topk(k) | AggregateOp::Bottomk(k) => {
+            return ranked_plan(op, k, grouping, inner, span, ctx, params);
         }
     };
     let input = group_labels(metric_plan(inner, ctx, params)?, grouping);
@@ -578,6 +575,42 @@ fn fold_scalars(op: BinaryOp, left: f64, right: f64, span: Span) -> Result<Plan,
             arrow::datatypes::Field::new(VALUE, DataType::Float64, true),
         ])),
         rows: vec![vec![Literal::Float(value)]],
+    })
+}
+
+/// `topk` and `bottomk`: at each step the `k` largest or smallest
+/// values, within each group of the `by` labels, the series' labels
+/// kept as they are.
+fn ranked_plan(
+    op: AggregateOp,
+    k: usize,
+    grouping: Option<&Grouping>,
+    inner: &MetricExpr,
+    span: Span,
+    ctx: &BindContext,
+    params: RangeParams,
+) -> Result<Plan, Diagnostic> {
+    let mut partition_by = vec![Expr::column(TIMESTAMP)];
+    match grouping {
+        Some(g) if g.by => {
+            partition_by.extend(g.labels.iter().map(|l| label(l, DataType::Utf8)));
+        }
+        Some(_) => {
+            return Err(Diagnostic::at(
+                span,
+                "topk and bottomk group with `by`; `without` is not supported yet",
+            ));
+        }
+        None => {}
+    }
+    Ok(Plan::TopK {
+        input: Box::new(metric_plan(inner, ctx, params)?),
+        keys: vec![SortKey {
+            expr: Expr::column(VALUE),
+            descending: matches!(op, AggregateOp::Topk(_)),
+        }],
+        k,
+        partition_by,
     })
 }
 
@@ -772,13 +805,31 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.message, "sum_over_time needs an unwrapped value");
         assert_eq!(e.span, Some(Span::new(0, 26)));
+        let ranked = lowered(r#"topk(2, rate({a="b"}[1m]))"#, 30);
+        assert!(
+            ranked.plan.to_string().starts_with(
+                "TopK: k=2 order=[value DESC] per=[timestamp]
+  RangeVector: rate"
+            ),
+            "{}",
+            ranked.plan
+        );
+        let grouped = lowered(r#"bottomk by (app) (1, rate({a="b"}[1m]))"#, 30);
+        assert!(
+            grouped
+                .plan
+                .to_string()
+                .starts_with("TopK: k=1 order=[value ASC] per=[timestamp, label(app)]"),
+            "{}",
+            grouped.plan
+        );
         let e = lower(
-            &parse(r#"topk(2, rate({a="b"}[1m]))"#).unwrap(),
+            &parse(r#"topk without (app) (2, rate({a="b"}[1m]))"#).unwrap(),
             &ctx(),
             params(0),
         )
         .unwrap_err();
-        assert!(e.message.contains("topk"));
+        assert!(e.message.contains("without"));
         let out = lowered(r#"stddev by (app) (rate({a="b"}[1m]))"#, 30);
         assert!(
             out.plan

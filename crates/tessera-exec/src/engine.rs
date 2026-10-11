@@ -600,9 +600,15 @@ impl Engine {
                 input.schema(registry)?,
                 Arc::clone(memory),
             )),
-            Plan::TopK { keys, k, .. } => Box::new(TopK::new(
+            Plan::TopK {
+                keys,
+                k,
+                partition_by,
+                ..
+            } => Box::new(TopK::new(
                 keys.clone(),
                 *k,
+                partition_by.clone(),
                 input.schema(registry)?,
                 Arc::clone(memory),
             )),

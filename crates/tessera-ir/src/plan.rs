@@ -410,7 +410,8 @@ pub enum Plan {
         /// Rows to keep, or every remaining row.
         count: Option<usize>,
     },
-    /// The first `k` rows under an ordering, found without a full sort.
+    /// The first `k` rows under an ordering, found without a full sort;
+    /// within each distinct value of `partition_by` when there is one.
     TopK {
         /// The input.
         input: Box<Plan>,
@@ -418,6 +419,9 @@ pub enum Plan {
         keys: Vec<SortKey>,
         /// How many rows to keep.
         k: usize,
+        /// The expressions whose distinct values each keep `k` rows;
+        /// none ranks every row together.
+        partition_by: Vec<Expr>,
     },
     /// The rows of every input, which share one schema.
     Union {
@@ -565,6 +569,18 @@ impl Plan {
             input: Box::new(self),
             offset,
             count,
+        }
+    }
+
+    /// The first `k` rows of this plan under `keys`, per distinct value
+    /// of `partition_by` when given.
+    #[must_use]
+    pub fn top_k(self, keys: Vec<SortKey>, k: usize, partition_by: Vec<Expr>) -> Self {
+        Plan::TopK {
+            input: Box::new(self),
+            keys,
+            k,
+            partition_by,
         }
     }
 
@@ -806,9 +822,24 @@ impl Plan {
                 writeln!(f, "{pad}Sort: {}", shown.join(", "))
             }
             Plan::Limit { offset, count, .. } => fmt_limit(f, pad, *offset, *count),
-            Plan::TopK { keys, k, .. } => {
+            Plan::TopK {
+                keys,
+                k,
+                partition_by,
+                ..
+            } => {
                 let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
-                writeln!(f, "{pad}TopK: k={k} order=[{}]", shown.join(", "))
+                if partition_by.is_empty() {
+                    writeln!(f, "{pad}TopK: k={k} order=[{}]", shown.join(", "))
+                } else {
+                    let per: Vec<String> = partition_by.iter().map(ToString::to_string).collect();
+                    writeln!(
+                        f,
+                        "{pad}TopK: k={k} order=[{}] per=[{}]",
+                        shown.join(", "),
+                        per.join(", ")
+                    )
+                }
             }
             Plan::Extract { source, stage, .. } => {
                 writeln!(f, "{pad}Extract: {stage} from {source}")

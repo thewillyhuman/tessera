@@ -5,10 +5,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use arrow::compute::concat_batches;
+use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow::compute::{concat_batches, partition, take_record_batch};
 use arrow::datatypes::SchemaRef;
-use tessera_ir::SortKey;
+use tessera_ir::{Expr, SortKey};
+use tessera_kernels::evaluate;
 
 use crate::ExecError;
 use crate::batch::Batch;
@@ -21,6 +22,8 @@ use crate::operator::{Flow, Operator, Sink};
 pub struct TopK {
     keys: Vec<SortKey>,
     k: usize,
+    /// Each distinct value of these keeps `k` rows; none keeps `k` in all.
+    partition: Vec<Expr>,
     schema: SchemaRef,
     memory: Arc<MemoryPool>,
     buffered: Vec<RecordBatch>,
@@ -31,10 +34,17 @@ pub struct TopK {
 impl TopK {
     /// The first `k` rows by `keys` over rows of `schema`.
     #[must_use]
-    pub fn new(keys: Vec<SortKey>, k: usize, schema: SchemaRef, memory: Arc<MemoryPool>) -> Self {
+    pub fn new(
+        keys: Vec<SortKey>,
+        k: usize,
+        partition: Vec<Expr>,
+        schema: SchemaRef,
+        memory: Arc<MemoryPool>,
+    ) -> Self {
         TopK {
             keys,
             k,
+            partition,
             schema,
             memory,
             buffered: Vec::new(),
@@ -47,8 +57,10 @@ impl TopK {
         let all = concat_batches(&self.schema, &self.buffered)?;
         let best = if all.num_rows() == 0 {
             all
-        } else {
+        } else if self.partition.is_empty() {
             sorted(&all, &self.keys, Some(self.k))?
+        } else {
+            self.best_per_partition(&all)?
         };
         self.memory.release(self.reserved);
         self.reserved = best.get_array_memory_size();
@@ -56,6 +68,33 @@ impl TopK {
         self.buffered_rows = best.num_rows();
         self.buffered = vec![best.clone()];
         Ok(best)
+    }
+}
+
+impl TopK {
+    /// The first `k` rows of every partition: the rows sorted by the
+    /// partition values and then the keys, each run of equal partition
+    /// values cut to `k`.
+    fn best_per_partition(&self, all: &RecordBatch) -> Result<RecordBatch, ExecError> {
+        let mut keys: Vec<SortKey> = self
+            .partition
+            .iter()
+            .cloned()
+            .map(SortKey::ascending)
+            .collect();
+        keys.extend(self.keys.iter().cloned());
+        let ordered = sorted(all, &keys, None)?;
+        let columns: Vec<ArrayRef> = self
+            .partition
+            .iter()
+            .map(|expr| evaluate(expr, &ordered))
+            .collect::<Result<_, _>>()?;
+        let mut indices: Vec<u32> = Vec::new();
+        for range in partition(&columns)?.ranges() {
+            let end = range.end.min(range.start + self.k);
+            indices.extend((range.start..end).map(|i| u32::try_from(i).unwrap_or(u32::MAX)));
+        }
+        Ok(take_record_batch(&ordered, &UInt32Array::from(indices))?)
     }
 }
 
@@ -98,6 +137,7 @@ mod tests {
         let mut topk = TopK::new(
             vec![SortKey::descending(Expr::column("timestamp"))],
             3,
+            Vec::new(),
             schema(),
             MemoryPool::unbounded(),
         );
@@ -106,12 +146,29 @@ mod tests {
         assert_eq!(timestamps(&out), vec![100, 99, 98]);
     }
 
+    /// With a partition, every distinct value keeps its own `k` rows.
+    #[test]
+    fn keeps_k_rows_per_partition() {
+        let mut topk = TopK::new(
+            vec![SortKey::descending(Expr::column("timestamp"))],
+            1,
+            vec![Expr::column("severity_number")],
+            schema(),
+            MemoryPool::unbounded(),
+        );
+        // Severities are 0, 10 and 20 within every batch of three rows.
+        let inputs = (0..4).map(|i| rows(&[i, 100 + i, 200 + i])).collect();
+        let out = run(&mut topk, inputs);
+        assert_eq!(timestamps(&out), vec![3, 103, 203]);
+    }
+
     #[test]
     fn memory_stays_proportional_to_k() {
         let pool = MemoryPool::unbounded();
         let mut topk = TopK::new(
             vec![SortKey::ascending(Expr::column("timestamp"))],
             2,
+            Vec::new(),
             schema(),
             Arc::clone(&pool),
         );
