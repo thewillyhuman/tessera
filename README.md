@@ -172,7 +172,39 @@ interval (five seconds by default) rather than measured; hopping and
 sliding windows, sketches and histograms, and absence detection run
 periodically.
 
-**M8, adaptive design: next.**
+**M8, adaptive design: done, with gaps listed below.** A workload
+log: every query appends to `_system.queries` what it asked of each
+table, the columns referenced, the predicates with their observed
+selectivity, grouping and ordering, files considered and pruned,
+bytes and rows scanned, latency, language and source (AD-1); a
+dataset log holding each kind's layout under a layout epoch, the
+partition window and the advisor's report (AD-9); the advisor, which
+weighs the workload with a seven-day half-life and chooses a sort key
+greedily by estimated bytes scanned plus rewrite cost, dedicated
+columns for hot paths, Bloom, term and trigram indexes from the
+predicates, and the partition window from the file counts, adopting
+a layout that beats the current one by a fifth on two consecutive
+runs and honouring pins (AD-2, AD-5 to AD-7, AD-12, AD-14, 8.4);
+column promotion at compaction for well-known, dense and requested
+attribute paths, with `_overflow` kept whole, and scans that serve a
+path from a dedicated column where a file has one and extract it
+elsewhere, pruning on promoted columns by statistics and Bloom
+filters (8.2, AD-3, AD-4); compaction that writes new files in the
+current epoch and re-clusters files of older epochs within a budget,
+recent partitions first (AD-10); default sort keys that lead with the
+service (8.5); `EXPLAIN LAYOUT` (AD-11). The node test shows a
+dataset whose queries filter on an attribute adopt it as the leading
+sort column and rewrite its files without intervention.
+
+Gaps left in M8: automatic rollups (8.7, with M9); the cost model
+estimates selectivity from the workload and guesses cardinality,
+there are no per-column sketches (AD-6); the storage term of the cost
+is ignored; the workload events of alert rules are not logged; a
+promoted column is read from `_overflow` by the tail and by files
+older than its promotion, which is correct but not faster; space-
+filling curves are not planned.
+
+**M9, cost and retention: next.**
 
 ## Layout
 
@@ -198,6 +230,7 @@ crates/
   tessera-traceql   TraceQL lexer, parser and lowering
   tessera-promql    PromQL lexer, parser and lowering
   tessera-eval      continuous queries and alerting: rules, lifecycle, state logs, incremental and periodic evaluation, notifications
+  tessera-advisor   adaptive physical design: the cost model that turns the workload log into sort keys, indexes, dedicated columns and windows
   tessera-server    HTTP administration, OTLP ingest, remote write, SQL over HTTP, PostgreSQL wire protocol, Loki, Tempo, Prometheus and ruler APIs
   tessera-node      one node: wires the roles, the background work and the APIs of a process
   tessera           the binary: the command line over tessera-node
@@ -318,6 +351,21 @@ curl -G localhost:8080/api/v1/query_range \
      --data-urlencode "start=$(($(date +%s) - 3600))" --data-urlencode "end=$(date +%s)" \
      --data-urlencode 'step=60'
 curl -G localhost:8080/api/v1/query --data-urlencode 'query=up'
+```
+
+The physical design adapts to use. Every query is logged to
+`_system.queries`; the advisor on compact nodes reads the log back,
+weighs it by age and proposes, per dataset and kind, a sort key,
+dedicated columns, indexes and a partition window, adopting a change
+once it has paid off on two consecutive runs; compaction writes new
+files that way and rewrites old ones within a budget. Pins in
+`system.layout_pins` override it, and `EXPLAIN LAYOUT` shows what it
+found:
+
+```
+psql 'host=127.0.0.1 port=5432 dbname=prod' -c "EXPLAIN LAYOUT prod"
+psql 'host=127.0.0.1 port=5432 dbname=prod' -c \
+  "INSERT INTO system.layout_pins (key, document) VALUES ('prod/log', '{\"sort_key\": [\"attr.host\"]}')"
 ```
 
 Alert rules are continuous queries whose sink is the alert state
