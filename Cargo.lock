@@ -2615,6 +2615,7 @@ dependencies = [
  "tempfile",
  "tessera-catalog",
  "tessera-cluster",
+ "tessera-commit",
  "tessera-compact",
  "tessera-exec",
  "tessera-format",

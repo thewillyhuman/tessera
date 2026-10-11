@@ -11,6 +11,7 @@
 
 mod background;
 mod heartbeat;
+mod leases;
 mod peers;
 
 use std::collections::BTreeSet;
@@ -21,15 +22,17 @@ use std::time::Duration;
 
 use tessera_catalog::{Catalog, PoolConfig};
 use tessera_cluster::{Admission, Limits, Membership, Registry, Role, registry};
+use tessera_commit::LeaseManager;
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
-use tessera_object::{LocalStore, ObjectStore, PoolState, Pools};
+use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
 use tessera_server::{AppState, Cluster, HttpRemote};
 use tessera_types::{Env, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+pub use leases::{Leases, Owned};
 pub use peers::MembershipPeers;
 
 /// How often a node re-reads the catalog, so that a change made elsewhere
@@ -60,6 +63,10 @@ pub struct Config {
     pub advertise: Option<String>,
     /// How often the node announces itself and re-reads the registry.
     pub heartbeat: Duration,
+    /// How long a slot lease lasts (OP-3).
+    pub lease: Duration,
+    /// How often held leases are renewed and free ones tried (OP-3).
+    pub renewal: Duration,
     /// The ingester's tunables.
     pub ingest: IngestConfig,
 }
@@ -77,6 +84,8 @@ impl Config {
             roles: Role::ALL.into_iter().collect(),
             advertise: None,
             heartbeat: registry::HEARTBEAT,
+            lease: LeaseManager::DEFAULT_DURATION,
+            renewal: LeaseManager::DEFAULT_RENEWAL,
             ingest: IngestConfig::default(),
         }
     }
@@ -119,6 +128,7 @@ pub struct Node {
     ingest: IngestHandle,
     registry: Arc<Registry>,
     membership: Arc<Membership>,
+    leases: Option<Arc<Leases>>,
     stop_servers: Vec<oneshot::Sender<()>>,
     servers: Vec<JoinHandle<()>>,
     loops: Vec<JoinHandle<()>>,
@@ -136,19 +146,11 @@ impl Node {
 
         let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat);
         let pools = Arc::new(Pools::new(pool.clone(), Arc::clone(&store)));
-        loops.push(tokio::spawn(background::run(background::Background {
-            store: Arc::clone(&store),
-            env: env.clone(),
-            catalog: Arc::clone(&catalog),
-            format: Arc::clone(&format),
-            pool: pool.clone(),
-            pools: Arc::clone(&pools),
-        })));
         let ingester = Ingester::start(
             Arc::clone(&store),
             env.clone(),
             config.ingest,
-            pool,
+            pool.clone(),
             Arc::clone(&format),
         );
         tracing::info!(writer = %ingester.writer_id(), "ingest started");
@@ -162,20 +164,44 @@ impl Node {
         tracing::info!(address = %pg, "postgresql protocol listening");
 
         let advertise = config.advertise.unwrap_or_else(|| format!("http://{http}"));
-        let registry = Arc::new(Registry::new(
-            Arc::clone(&store),
-            env.clone(),
+        let (registry, membership) = join(
+            &store,
+            &env,
             config.roles.clone(),
-            advertise.clone(),
-        ));
-        let own = registry.announce().await?;
-        tracing::info!(roles = ?config.roles, %advertise, "joined the cluster");
-        let membership = Arc::new(Membership::new(env.clone(), own));
-        loops.push(tokio::spawn(heartbeat::run(
-            Arc::clone(&registry),
-            Arc::clone(&membership),
+            advertise,
+            &mut loops,
             config.heartbeat,
-        )));
+        )
+        .await?;
+        let leases = config.roles.contains(&Role::Compact).then(|| {
+            Arc::new(Leases {
+                manager: LeaseManager::new(
+                    Arc::clone(&store),
+                    layout::leases(),
+                    env.clone(),
+                    config.lease,
+                ),
+                catalog: Arc::clone(&catalog),
+                membership: Arc::clone(&membership),
+                owned: Owned::default(),
+            })
+        });
+        if let Some(leases) = &leases {
+            loops.push(tokio::spawn(leases::run(
+                Arc::clone(leases),
+                config.renewal,
+            )));
+            loops.push(tokio::spawn(background::run(background::Background {
+                store: Arc::clone(&store),
+                env: env.clone(),
+                catalog: Arc::clone(&catalog),
+                format: Arc::clone(&format),
+                pool,
+                pools: Arc::clone(&pools),
+                owned: leases.owned.clone(),
+                membership: Arc::clone(&membership),
+            })));
+        }
 
         let remote = HttpRemote::new();
         let engine = Engine::new(
@@ -211,6 +237,7 @@ impl Node {
             ingest,
             registry,
             membership,
+            leases,
             stop_servers,
             servers,
             loops,
@@ -221,6 +248,15 @@ impl Node {
     #[must_use]
     pub fn membership(&self) -> &Arc<Membership> {
         &self.membership
+    }
+
+    /// The slots this node owns; none without the `compact` role.
+    #[must_use]
+    pub fn owned(&self) -> Owned {
+        self.leases
+            .as_ref()
+            .map(|leases| leases.owned.clone())
+            .unwrap_or_default()
     }
 
     /// Where the HTTP API listens.
@@ -258,6 +294,9 @@ impl Node {
         }
         for task in &self.loops {
             task.abort();
+        }
+        if let Some(leases) = &self.leases {
+            leases.release_all().await;
         }
         if let Err(error) = self.ingest.shutdown().await {
             tracing::warn!(error = %error, "ingest shutdown left work for recovery");
@@ -322,6 +361,33 @@ async fn open(
         "catalog open"
     );
     Ok((store, catalog, pool))
+}
+
+/// Announces the node under `roles` and `advertise`, and keeps the
+/// registry and the membership view fresh from a heartbeat loop.
+async fn join(
+    store: &Arc<dyn ObjectStore>,
+    env: &Env,
+    roles: BTreeSet<Role>,
+    advertise: String,
+    loops: &mut Vec<JoinHandle<()>>,
+    heartbeat: Duration,
+) -> Result<(Arc<Registry>, Arc<Membership>), RunError> {
+    let registry = Arc::new(Registry::new(
+        Arc::clone(store),
+        env.clone(),
+        roles.clone(),
+        advertise.clone(),
+    ));
+    let own = registry.announce().await?;
+    tracing::info!(?roles, %advertise, "joined the cluster");
+    let membership = Arc::new(Membership::new(env.clone(), own));
+    loops.push(tokio::spawn(heartbeat::run(
+        Arc::clone(&registry),
+        Arc::clone(&membership),
+        heartbeat,
+    )));
+    Ok((registry, membership))
 }
 
 /// Serves the HTTP API and the `PostgreSQL` protocol until told to stop:

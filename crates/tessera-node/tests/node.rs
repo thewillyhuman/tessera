@@ -8,7 +8,7 @@ use std::time::Duration;
 use tessera_cluster::Role;
 use tessera_ingest::IngestConfig;
 use tessera_node::{Config, Node};
-use tessera_types::Env;
+use tessera_types::{Env, WorkKind};
 
 fn config(dir: &std::path::Path) -> Config {
     let free: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -16,6 +16,8 @@ fn config(dir: &std::path::Path) -> Config {
         listen: free,
         pg_listen: free,
         heartbeat: Duration::from_millis(50),
+        lease: Duration::from_secs(2),
+        renewal: Duration::from_millis(50),
         ingest: IngestConfig {
             linger: Duration::from_millis(1),
             ..IngestConfig::default()
@@ -85,4 +87,37 @@ async fn nodes_in_one_root_pool_find_each_other() {
     })
     .await;
     b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_nodes_share_the_slots_and_take_over_on_leave() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Node::start(config(dir.path()), Env::system())
+        .await
+        .unwrap();
+    let catalog = &a.state().catalog;
+    for _ in 0..3 {
+        catalog.double_slots(WorkKind::Partition).await.unwrap();
+    }
+    eventually("a owns every partition slot", || {
+        a.owned().slots(WorkKind::Partition).len() == 8
+    })
+    .await;
+    let b = Node::start(config(dir.path()), Env::system())
+        .await
+        .unwrap();
+    eventually("a and b split the slots", || {
+        let (sa, sb) = (
+            a.owned().slots(WorkKind::Partition),
+            b.owned().slots(WorkKind::Partition),
+        );
+        !sa.is_empty() && !sb.is_empty() && sa.is_disjoint(&sb) && sa.len() + sb.len() == 8
+    })
+    .await;
+    b.stop().await;
+    eventually("a takes b's slots back", || {
+        a.owned().slots(WorkKind::Partition).len() == 8
+    })
+    .await;
+    a.stop().await;
 }

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 tessera-catalog.workspace = true
 tessera-cluster.workspace = true
+tessera-commit.workspace = true
 tessera-compact.workspace = true
 tessera-exec.workspace = true
 tessera-format.workspace = true

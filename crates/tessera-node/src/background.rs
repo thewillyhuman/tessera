@@ -1,31 +1,40 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! The `compact` role's background work in a single node: intake for every
-//! registered writer (section 6.7), recovery of writers that are dead
-//! (ST-9, ST-10), compaction of every partition that is due (section 6.9)
-//! and garbage collection of replaced files and adopted segments (section
-//! 6.10).
+//! The `compact` role's background work: intake for every registered
+//! writer (section 6.7), recovery of writers that are dead (ST-9, ST-10),
+//! compaction of every partition that is due (section 6.9) and garbage
+//! collection of replaced files and adopted segments (section 6.10).
 //!
-//! Without cluster membership (M6), a dead writer is recognised by its
-//! registration: a writer registered by another node process whose log
-//! has not ended and has been quiet for a while. Writers of this process
-//! are never recovered; the ingester ends or rotates its own logs.
+//! Each item is done by the node that owns its slot (AR-4): writers and
+//! their logs under the intake and recovery kinds, partitions under the
+//! partition kind. A writer is dead when the node that registered it is
+//! no longer live in the membership view and its log has been quiet for
+//! a few heartbeats, or, whatever the view says, when the log has been
+//! quiet for a long time. Writers of this process are never recovered;
+//! the ingester ends or rotates its own logs.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::Catalog;
+use tessera_cluster::Membership;
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, plan};
 use tessera_format::FileFormat;
-use tessera_manifest::{Manifest, intake, list_partitions, registry};
+use tessera_manifest::{Manifest, Registration, intake, list_partitions, registry};
 use tessera_object::{ObjectStore, Pools};
-use tessera_types::{DatasetName, Env, Kind, PoolId, TenantId, Window, WriterId};
+use tessera_types::{DatasetName, Env, Kind, PoolId, TenantId, Window, WorkKind, WriterId};
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
+
+use crate::leases::Owned;
 
 /// How often the background work runs.
 const INTERVAL: Duration = Duration::from_secs(5);
-/// How long a foreign writer may be quiet before it is recovered.
+/// How long the writer of a node that left the membership view may be
+/// quiet before it is recovered: enough for a registration to reach the
+/// view before its node does.
+const DEAD_QUIET: Duration = Duration::from_secs(15);
+/// How long any foreign writer may be quiet before it is recovered.
 const RECOVER_AFTER: Duration = Duration::from_secs(300);
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
@@ -44,6 +53,10 @@ pub struct Background {
     pub pool: PoolId,
     /// Every pool, for compaction and collection.
     pub pools: Arc<Pools>,
+    /// The slots this node owns.
+    pub owned: Owned,
+    /// The cluster, for which writers' nodes are gone.
+    pub membership: Arc<Membership>,
 }
 
 /// Runs the background work forever. Failures are logged and retried on
@@ -84,20 +97,25 @@ async fn round(
     for dataset in registry::datasets(&*background.store, tenant).await? {
         for registration in registry::list(&*background.store, tenant, &dataset).await? {
             let writer = registration.writer;
-            let outcome = intake::run(
-                Arc::clone(&background.store),
-                &background.env,
-                tenant,
-                &dataset,
-                writer,
-            )
-            .await?;
-            if outcome.adoptions > 0 || outcome.removed {
-                tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
+            let key = writer.to_string();
+            let mut ended = false;
+            if background.owned.owns(WorkKind::Intake, key.as_bytes()) {
+                let outcome = intake::run(
+                    Arc::clone(&background.store),
+                    &background.env,
+                    tenant,
+                    &dataset,
+                    writer,
+                )
+                .await?;
+                if outcome.adoptions > 0 || outcome.removed {
+                    tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
+                }
+                ended = outcome.ended;
             }
-            if !outcome.ended
-                && registration.node != background.env.node
-                && is_quiet(background, writer).await?
+            if !ended
+                && background.owned.owns(WorkKind::Recovery, key.as_bytes())
+                && is_dead(background, &registration).await?
             {
                 let target = FlushTarget {
                     store: Arc::clone(&background.store),
@@ -127,6 +145,12 @@ async fn compact_and_collect(
 ) -> Result<(), Failure> {
     let now = background.env.clock.now();
     for partition in list_partitions(&*background.store, tenant, dataset, kind).await? {
+        if !background
+            .owned
+            .owns(WorkKind::Partition, partition.to_string().as_bytes())
+        {
+            continue;
+        }
         let manifest = Manifest::open(
             Arc::clone(&background.store),
             partition.clone(),
@@ -161,6 +185,12 @@ async fn compact_and_collect(
 async fn collect_logs(background: &Background) -> Result<(), Failure> {
     let now = background.env.clock.now();
     for writer in reader::writers(&*background.store).await? {
+        if !background
+            .owned
+            .owns(WorkKind::Intake, writer.to_string().as_bytes())
+        {
+            continue;
+        }
         let collected = collect_log(
             &background.store,
             &background.env,
@@ -177,17 +207,34 @@ async fn collect_logs(background: &Background) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Whether a writer's log has been quiet for longer than `RECOVER_AFTER`.
-async fn is_quiet(background: &Background, writer: WriterId) -> Result<bool, Failure> {
+/// Whether a foreign writer counts as dead: its node is gone from the
+/// view and its log quiet for a few heartbeats, or the log quiet for a
+/// long time whatever the view says. A writer of this node or one whose
+/// log has ended is never dead.
+async fn is_dead(background: &Background, registration: &Registration) -> Result<bool, Failure> {
+    if registration.node == background.env.node {
+        return Ok(false);
+    }
+    let Some(quiet) = quiet_for(background, registration.writer).await? else {
+        return Ok(false);
+    };
+    let gone = !background.membership.is_live(registration.node);
+    Ok(quiet >= RECOVER_AFTER || (gone && quiet >= DEAD_QUIET))
+}
+
+/// How long a writer's log has been quiet; `None` once it has ended. A
+/// log without entries has been quiet forever.
+async fn quiet_for(background: &Background, writer: WriterId) -> Result<Option<Duration>, Failure> {
     let Some(last) = reader::last(&*background.store, writer).await? else {
-        return Ok(true);
+        return Ok(Some(Duration::MAX));
     };
     let entry = reader::read(&*background.store, writer, last).await?;
     if matches!(entry.body(), EntryBody::End) {
-        return Ok(false);
+        return Ok(None);
     }
     let now = background.env.clock.now();
-    Ok(now
-        .duration_since(entry.header().written_at)
-        .is_some_and(|quiet| quiet >= RECOVER_AFTER))
+    Ok(Some(
+        now.duration_since(entry.header().written_at)
+            .unwrap_or(Duration::ZERO),
+    ))
 }
