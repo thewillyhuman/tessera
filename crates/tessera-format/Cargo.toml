@@ -18,6 +18,7 @@ parquet = { version = "60", default-features = false, features = ["arrow", "zstd
 thiserror = "2"
 
 [dev-dependencies]
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

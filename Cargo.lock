@@ -2606,6 +2606,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "parquet",
+ "serde_json",
  "tessera-object",
  "tessera-types",
  "thiserror",

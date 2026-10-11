@@ -28,10 +28,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tessera_exec::QueryError;
 use tessera_ir::{BindContext, Expr, Plan, Scan, SortKey};
-use tessera_kernels::row_labels;
+use tessera_kernels::{attributes_column, row_labels};
 use tessera_logql::{LogqlFrontend, Lowered, RangeParams, ResultKind};
 use tessera_opt::optimize;
-use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SEVERITY_TEXT, TIMESTAMP, VALUE_LABELS};
+use tessera_types::event::{BODY, EXTRACTED, SEVERITY_TEXT, TIMESTAMP, VALUE_LABELS};
 use tessera_types::{EventBatch, Id128, Kind, LogRow, TimeRange, Timestamp};
 
 use crate::params::{Need, Scope, parse_step, parse_time, scope};
@@ -191,9 +191,10 @@ fn rows(batches: &[RecordBatch]) -> Vec<Row> {
         else {
             continue;
         };
+        let merged = attributes_column(batch);
         let (body, overflow, extracted, severity) = (
             text(batch, BODY),
-            text(batch, OVERFLOW),
+            merged.as_ref(),
             text(batch, EXTRACTED),
             text(batch, SEVERITY_TEXT),
         );

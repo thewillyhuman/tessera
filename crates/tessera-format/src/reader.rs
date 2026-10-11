@@ -6,6 +6,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::error::ArrowError;
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
@@ -15,6 +16,7 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use tessera_object::{Key, ObjectStore};
+use tessera_types::event::{OVERFLOW, SCOPES, attributes_column};
 
 use crate::FormatError;
 use crate::footer::FooterCache;
@@ -144,21 +146,10 @@ impl FileReader for ParquetReader {
         let schema = arrow_metadata.schema();
         let index_of = |name: &str| schema.index_of(name).ok();
 
-        let projection: Vec<usize> = match &request.projection {
-            None => (0..schema.fields().len()).collect(),
-            Some(names) => names
-                .iter()
-                .map(|n| {
-                    index_of(n)
-                        .ok_or_else(|| FormatError::Unreadable(format!("file has no column {n}")))
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        let filter_columns: Vec<usize> = request
-            .filter
-            .as_ref()
-            .map(|f| f.columns.iter().filter_map(|n| index_of(n)).collect())
-            .unwrap_or_default();
+        let columns = columns_to_read(schema, &request)?;
+        let (projection, filter_columns) = (columns.projection, columns.filter);
+        let (merge_projection, merge_filter) = (columns.merge_projection, columns.merge_filter);
+        let requested = request.projection.clone();
 
         stats.row_groups = metadata.num_row_groups();
         let kept: Vec<usize> = (0..metadata.num_row_groups())
@@ -208,18 +199,133 @@ impl FileReader for ParquetReader {
                 let mask = ProjectionMask::roots(&parquet_schema, filter_columns);
                 let evaluate = filter.evaluate;
                 let predicate = ArrowPredicateFn::new(mask, move |batch| {
+                    let batch = if merge_filter {
+                        with_merged_overflow(&batch)?
+                    } else {
+                        batch
+                    };
                     evaluate(&batch).map_err(ArrowError::ComputeError)
                 });
                 builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
             }
-            builder
+            let batches = builder
                 .build()
                 .map_err(|e| FormatError::Unreadable(e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| FormatError::Unreadable(e.to_string()))
+                .map_err(|e| FormatError::Unreadable(e.to_string()))?;
+            if merge_projection {
+                merged_and_projected(batches, requested.as_deref())
+            } else {
+                Ok(batches)
+            }
         };
         Ok(Fetched::new(stats, Box::new(decode)))
     }
+}
+
+/// The columns a request reads, as indexes into the file's schema.
+struct ReadColumns {
+    /// The columns returned.
+    projection: Vec<usize>,
+    /// The columns the row filter evaluates.
+    filter: Vec<usize>,
+    /// Whether the returned `_overflow` is rebuilt from dedicated
+    /// attribute columns.
+    merge_projection: bool,
+    /// Whether the filter's `_overflow` is.
+    merge_filter: bool,
+}
+
+/// Resolves the request's columns against `schema`. `_overflow` stands
+/// for every attribute, and a compacted file keeps the promoted ones in
+/// dedicated columns only (AD-4): a read of the overflow reads those
+/// columns too and merges them back, for the rows returned and for the
+/// filter alike.
+fn columns_to_read(
+    schema: &arrow::datatypes::SchemaRef,
+    request: &ScanRequest,
+) -> Result<ReadColumns, FormatError> {
+    let index_of = |name: &str| schema.index_of(name).ok();
+    let projection: Vec<usize> = match &request.projection {
+        None => (0..schema.fields().len()).collect(),
+        Some(names) => names
+            .iter()
+            .map(|n| {
+                index_of(n)
+                    .ok_or_else(|| FormatError::Unreadable(format!("file has no column {n}")))
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    let filter: Vec<usize> = request
+        .filter
+        .as_ref()
+        .map(|f| f.columns.iter().filter_map(|n| index_of(n)).collect())
+        .unwrap_or_default();
+    let attribute_columns: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| SCOPES.iter().any(|scope| f.name().starts_with(scope)))
+        .map(|(i, _)| i)
+        .collect();
+    let wants_overflow = |columns: &[usize]| {
+        !attribute_columns.is_empty() && index_of(OVERFLOW).is_some_and(|o| columns.contains(&o))
+    };
+    let merge_projection = wants_overflow(&projection);
+    let merge_filter = wants_overflow(&filter);
+    let widen = |mut columns: Vec<usize>, merge: bool| {
+        if merge {
+            columns.extend(attribute_columns.iter().copied());
+            columns.sort_unstable();
+            columns.dedup();
+        }
+        columns
+    };
+    Ok(ReadColumns {
+        projection: widen(projection, merge_projection),
+        filter: widen(filter, merge_filter),
+        merge_projection,
+        merge_filter,
+    })
+}
+
+/// `batches` with their `_overflow` rebuilt, narrowed to the columns
+/// `requested` when the request named them.
+fn merged_and_projected(
+    batches: Vec<RecordBatch>,
+    requested: Option<&[String]>,
+) -> Result<Vec<RecordBatch>, FormatError> {
+    batches
+        .into_iter()
+        .map(|batch| {
+            let merged = with_merged_overflow(&batch)?;
+            match requested {
+                Some(names) => {
+                    let indices: Vec<usize> = names
+                        .iter()
+                        .filter_map(|n| merged.schema().index_of(n).ok())
+                        .collect();
+                    Ok(merged.project(&indices)?)
+                }
+                None => Ok(merged),
+            }
+        })
+        .collect()
+}
+
+/// `batch` with its `_overflow` column rebuilt from the dedicated
+/// attribute columns it carries.
+fn with_merged_overflow(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+    let Ok(index) = batch.schema().index_of(OVERFLOW) else {
+        return Ok(batch.clone());
+    };
+    let merged: ArrayRef = match attributes_column(batch) {
+        Some(column) => Arc::new(column),
+        None => arrow::array::new_null_array(&arrow::datatypes::DataType::Utf8, batch.num_rows()),
+    };
+    let mut columns = batch.columns().to_vec();
+    columns[index] = merged;
+    RecordBatch::try_new(batch.schema(), columns)
 }
 
 #[cfg(test)]
@@ -338,6 +444,100 @@ mod tests {
         let fetched = reader.fetch(by_text).await.unwrap();
         assert_eq!(fetched.stats().row_groups_read, 1);
         assert_eq!(timestamps(&fetched.decode().unwrap()), vec![4, 5]);
+    }
+
+    /// A compacted file: the attribute `attr.host` promoted to its own
+    /// column and left out of `_overflow`, which keeps only `attr.rare`
+    /// on the first row.
+    async fn promoted_file() -> ParquetReader {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(OVERFLOW, DataType::Utf8, true),
+            Field::new("attr.host", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"attr.rare":1}"#),
+                    None,
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![Some("h1"), Some("h2"), None])),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+        writer.write(&rows).unwrap();
+        writer.close().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let key = Key::new("data/promoted.parquet").unwrap();
+        store.put(&key, Bytes::from(bytes.clone())).await.unwrap();
+        ParquetReader::new(store, key, bytes.len() as u64)
+    }
+
+    fn overflow_of(batches: &[RecordBatch]) -> Vec<Option<String>> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let column = b
+                    .column_by_name(OVERFLOW)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..column.len())
+                    .map(|i| (!column.is_null(i)).then(|| column.value(i).to_owned()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reading_the_overflow_merges_promoted_attributes_back() {
+        let reader = promoted_file().await;
+        let request = ScanRequest {
+            projection: Some(vec!["timestamp".into(), OVERFLOW.into()]),
+            ..ScanRequest::default()
+        };
+        let batches = reader.fetch(request).await.unwrap().decode().unwrap();
+        assert_eq!(batches[0].num_columns(), 2, "only what was asked for");
+        let merged = overflow_of(&batches);
+        let first: serde_json::Value = serde_json::from_str(merged[0].as_deref().unwrap()).unwrap();
+        assert_eq!(first["attr.rare"], 1);
+        assert_eq!(first["attr.host"], "h1");
+        let second: serde_json::Value =
+            serde_json::from_str(merged[1].as_deref().unwrap()).unwrap();
+        assert_eq!(second, serde_json::json!({ "attr.host": "h2" }));
+        assert_eq!(merged[2], None, "nothing stored on the third row");
+
+        // A filter over the overflow sees the promoted attribute too.
+        let request = ScanRequest {
+            projection: Some(vec!["timestamp".into()]),
+            filter: Some(RowPredicate {
+                columns: vec![OVERFLOW.into()],
+                evaluate: Arc::new(|batch: &RecordBatch| {
+                    let overflow = batch
+                        .column_by_name(OVERFLOW)
+                        .unwrap()
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    Ok((0..overflow.len())
+                        .map(|i| !overflow.is_null(i) && overflow.value(i).contains("\"h2\""))
+                        .collect::<BooleanArray>())
+                }),
+            }),
+            ..ScanRequest::default()
+        };
+        let batches = reader.fetch(request).await.unwrap().decode().unwrap();
+        assert_eq!(timestamps(&batches), vec![1]);
     }
 
     #[tokio::test]

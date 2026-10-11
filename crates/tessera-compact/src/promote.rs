@@ -15,7 +15,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use serde_json::Value;
 use tessera_kernels::variant;
-use tessera_types::event::OVERFLOW;
+use tessera_types::event::{OVERFLOW, SCOPES};
 
 use crate::CompactError;
 
@@ -110,7 +110,21 @@ pub fn promote(
     chosen.extend(dense.into_iter().map(|(path, _)| path.clone()));
     chosen.dedup();
     chosen.truncate(cap);
-    if chosen.is_empty() {
+    // Attributes with a dedicated column, new or from an earlier epoch,
+    // leave `_overflow`: stored once, read back merged (AD-4).
+    let stripped: Vec<String> = chosen
+        .iter()
+        .cloned()
+        .chain(
+            rows.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .filter(|name| SCOPES.iter().any(|scope| name.starts_with(scope))),
+        )
+        .filter(|path| seen.contains_key(path))
+        .collect();
+    if chosen.is_empty() && stripped.is_empty() {
         return Ok((rows.clone(), Vec::new()));
     }
     let mut fields: Vec<Field> = rows
@@ -126,8 +140,34 @@ pub fn promote(
         fields.push(Field::new(path, data_type, true));
         columns.push(column);
     }
+    if let Ok(index) = rows.schema().index_of(OVERFLOW) {
+        columns[index] = without(overflow, &stripped);
+    }
     let promoted = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
     Ok((promoted, chosen))
+}
+
+/// `overflow` without the attributes at `paths`; a row left with none
+/// becomes null.
+fn without(overflow: &StringArray, paths: &[String]) -> ArrayRef {
+    let stripped: StringArray = (0..overflow.len())
+        .map(|i| {
+            if overflow.is_null(i) {
+                return None;
+            }
+            let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(overflow.value(i))
+            else {
+                return Some(overflow.value(i).to_owned());
+            };
+            object.retain(|path, _| !paths.contains(path));
+            if object.is_empty() {
+                None
+            } else {
+                Some(Value::Object(object).to_string())
+            }
+        })
+        .collect();
+    Arc::new(stripped)
 }
 
 #[cfg(test)]
@@ -166,6 +206,35 @@ mod tests {
             .unwrap()
             .rows()
             .clone()
+    }
+
+    #[test]
+    fn promoted_attributes_leave_the_overflow_and_read_back_merged() {
+        let (promoted, paths) = promote(&rows(), &[], MAX_DEDICATED).unwrap();
+        assert!(paths.contains(&"attr.host".to_owned()), "{paths:?}");
+        let overflow = promoted
+            .column_by_name(OVERFLOW)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        // Row 0 had host, n and the service, all promoted: nothing is left.
+        assert!(overflow.is_null(0), "stored once, in their columns");
+        // Row 7 also had the rare attribute, which stays.
+        let row7: serde_json::Value = serde_json::from_str(overflow.value(7)).unwrap();
+        assert_eq!(row7, serde_json::json!({ "attr.rare": true }));
+        let merged = tessera_kernels::attributes_column(&promoted).unwrap();
+        let back: serde_json::Value = serde_json::from_str(merged.value(0)).unwrap();
+        assert_eq!(back["attr.host"], "h0");
+        assert_eq!(back["attr.n"], 0);
+        // Rows whose every attribute was promoted carry no overflow at all.
+        let again = promote(&promoted, &[], MAX_DEDICATED).unwrap().0;
+        assert_eq!(
+            again.column_by_name(OVERFLOW).unwrap().null_count(),
+            overflow.null_count(),
+            "a second pass changes nothing"
+        );
     }
 
     #[test]

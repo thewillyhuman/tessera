@@ -15,9 +15,9 @@ use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use tessera_ir::{Expr, RangeFunction, SeriesGrouping, range_vector_schema};
 use tessera_kernels::window::{Sample, evaluate as evaluate_window};
-use tessera_kernels::{evaluate, row_labels};
+use tessera_kernels::{attributes_column, evaluate, row_labels};
 use tessera_types::Timestamp;
-use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SEVERITY_TEXT, TIMESTAMP};
+use tessera_types::event::{BODY, EXTRACTED, SEVERITY_TEXT, TIMESTAMP};
 
 use crate::ExecError;
 use crate::batch::Batch;
@@ -158,8 +158,9 @@ impl Operator for RangeVector {
             .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>())
             .ok_or_else(|| ExecError::Unsupported("range vector input has no timestamp".into()))?;
         let values = self.values(&rows)?;
+        let merged = attributes_column(&rows);
         let (overflow, extracted, severity) = (
-            text(&rows, OVERFLOW),
+            merged.as_ref(),
             text(&rows, EXTRACTED),
             text(&rows, SEVERITY_TEXT),
         );
@@ -242,6 +243,7 @@ mod tests {
 
     use super::*;
     use crate::operator::testing::run;
+    use tessera_types::event::OVERFLOW;
 
     const S: i64 = 1_000_000_000;
 

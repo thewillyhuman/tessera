@@ -30,9 +30,7 @@ use tessera_ir::{
     BinaryOp, Expr, Literal, Relation, SpanAggregate, Spanset, Structural, trace_group_schema,
 };
 use tessera_kernels::{evaluate, evaluate_predicate};
-use tessera_types::event::{
-    DURATION_NS, NAME, OVERFLOW, PARENT_SPAN_ID, SPAN_ID, TIMESTAMP, TRACE_ID,
-};
+use tessera_types::event::{DURATION_NS, NAME, PARENT_SPAN_ID, SPAN_ID, TIMESTAMP, TRACE_ID};
 
 use crate::ExecError;
 use crate::batch::Batch;
@@ -189,7 +187,8 @@ impl Trace {
             .unwrap_or(start);
         let root = (0..n).find(|&i| parents.is_null(i));
         let names = text(spans, NAME);
-        let overflow = text(spans, OVERFLOW);
+        let merged = tessera_kernels::attributes_column(spans);
+        let overflow = merged.as_ref();
         let root_name = root.and_then(|r| {
             names
                 .filter(|a| !a.is_null(r))

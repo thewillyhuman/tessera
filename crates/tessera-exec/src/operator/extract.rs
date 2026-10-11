@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::SchemaRef;
 use tessera_ir::{Expr, ExtractStage};
-use tessera_kernels::{evaluate, extract, row_labels, template};
+use tessera_kernels::{attributes_column, evaluate, extract, row_labels, template};
 use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SEVERITY_TEXT};
 
 use crate::ExecError;
@@ -128,7 +128,8 @@ impl Operator for Format {
     fn push(&mut self, input: Batch, out: &mut dyn Sink) -> Result<Flow, ExecError> {
         let rows = input.materialize()?;
         let body = text_column(&rows, BODY);
-        let overflow = text_column(&rows, OVERFLOW);
+        let merged = attributes_column(&rows);
+        let overflow = merged.as_ref();
         let extracted = text_column(&rows, EXTRACTED);
         let severity = text_column(&rows, SEVERITY_TEXT);
         let mut new_lines: Vec<Option<String>> = Vec::with_capacity(rows.num_rows());

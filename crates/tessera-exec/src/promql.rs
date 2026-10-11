@@ -18,8 +18,8 @@ use arrow::array::{
 use tessera_ir::promql::PromExpr;
 use tessera_ir::{VALUE, range_vector_schema};
 use tessera_kernels::promql::{self, NAME_LABEL, Params, Series};
-use tessera_kernels::row_labels;
-use tessera_types::event::{OVERFLOW, TIMESTAMP};
+use tessera_kernels::{attributes_column, row_labels};
+use tessera_types::event::TIMESTAMP;
 
 use crate::ExecError;
 
@@ -39,9 +39,8 @@ pub fn series_of(batches: &[RecordBatch]) -> Result<Vec<Series>, ExecError> {
             .column_by_name(VALUE)
             .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
             .ok_or_else(|| ExecError::Unsupported("promql input has no value".into()))?;
-        let overflow = batch
-            .column_by_name(OVERFLOW)
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let merged = attributes_column(batch);
+        let overflow = merged.as_ref();
         let names = batch
             .column_by_name(NAME_LABEL)
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
@@ -104,6 +103,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     use super::*;
+    use tessera_types::event::OVERFLOW;
 
     #[test]
     fn rows_become_series_with_names_and_later_samples_win() {

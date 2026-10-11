@@ -16,10 +16,11 @@ use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampNanosecondArray,
+    RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{DatasetName, Kind, TenantId, Timestamp};
 
@@ -878,6 +879,89 @@ fn fixed<'a>(
 
 /// The `_overflow` value for a set of attributes: a JSON object, or null
 /// when there are none.
+/// The attributes of every row as one JSON object per row: what
+/// `_overflow` holds, plus the attributes a file stores in dedicated
+/// columns (AD-4), which compaction leaves out of `_overflow` so that
+/// nothing is stored twice. A batch without dedicated attribute columns
+/// gives `_overflow` itself; a batch with neither gives nothing. Readers
+/// that enumerate attributes, such as label sets, go through this;
+/// readers of one path use the dedicated column when there is one.
+#[must_use]
+pub fn attributes_column(rows: &RecordBatch) -> Option<StringArray> {
+    let overflow = rows
+        .column_by_name(OVERFLOW)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let schema = rows.schema();
+    let dedicated: Vec<(&str, &ArrayRef)> = schema
+        .fields()
+        .iter()
+        .zip(rows.columns())
+        .filter(|(field, _)| SCOPES.iter().any(|scope| field.name().starts_with(scope)))
+        .map(|(field, column)| (field.name().as_str(), column))
+        .collect();
+    if dedicated.is_empty() {
+        return overflow.cloned();
+    }
+    let merged: StringArray = (0..rows.num_rows())
+        .map(|i| {
+            let mut object = match overflow.filter(|o| !o.is_null(i)) {
+                Some(o) => match serde_json::from_str::<Value>(o.value(i)) {
+                    Ok(Value::Object(object)) => object,
+                    _ => serde_json::Map::new(),
+                },
+                None => serde_json::Map::new(),
+            };
+            for (path, column) in &dedicated {
+                if object.contains_key(*path) {
+                    continue;
+                }
+                if let Some(value) = cell_value(column, i) {
+                    object.insert((*path).to_owned(), value);
+                }
+            }
+            if object.is_empty() {
+                None
+            } else {
+                Some(Value::Object(object).to_string())
+            }
+        })
+        .collect();
+    Some(merged)
+}
+
+/// The value at `row` of a dedicated attribute column, as JSON.
+fn cell_value(column: &ArrayRef, row: usize) -> Option<Value> {
+    if column.is_null(row) {
+        return None;
+    }
+    let any = column.as_any();
+    match column.data_type() {
+        DataType::Utf8 => any
+            .downcast_ref::<StringArray>()
+            .map(|a| Value::String(a.value(row).to_owned())),
+        DataType::Int64 => any
+            .downcast_ref::<Int64Array>()
+            .map(|a| Value::from(a.value(row))),
+        DataType::Int32 => any
+            .downcast_ref::<Int32Array>()
+            .map(|a| Value::from(a.value(row))),
+        DataType::UInt64 => any
+            .downcast_ref::<UInt64Array>()
+            .map(|a| Value::from(a.value(row))),
+        DataType::Float64 => any
+            .downcast_ref::<Float64Array>()
+            .and_then(|a| serde_json::Number::from_f64(a.value(row)))
+            .map(Value::Number),
+        DataType::Boolean => any
+            .downcast_ref::<BooleanArray>()
+            .map(|a| Value::Bool(a.value(row))),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => any
+            .downcast_ref::<TimestampNanosecondArray>()
+            .map(|a| Value::from(a.value(row))),
+        _ => None,
+    }
+}
+
 fn overflow(attributes: &Attributes) -> Option<String> {
     if attributes.is_empty() {
         return None;
@@ -904,6 +988,48 @@ fn bounds(rows: &RecordBatch, column: usize) -> (Timestamp, Timestamp) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dedicated_attribute_columns_merge_back_into_the_overflow_view() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(OVERFLOW, DataType::Utf8, true),
+            Field::new("attr.host", DataType::Utf8, true),
+            Field::new("attr.n", DataType::Int64, true),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some(r#"{"attr.rare":true}"#), None])),
+                Arc::new(StringArray::from(vec![Some("h1"), None])),
+                Arc::new(Int64Array::from(vec![Some(7), Some(8)])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+        )
+        .unwrap();
+        let merged = attributes_column(&rows).unwrap();
+        let first: serde_json::Value = serde_json::from_str(merged.value(0)).unwrap();
+        assert_eq!(first["attr.rare"], true);
+        assert_eq!(first["attr.host"], "h1");
+        assert_eq!(first["attr.n"], 7);
+        assert!(first.get("body").is_none(), "not an attribute column");
+        let second: serde_json::Value = serde_json::from_str(merged.value(1)).unwrap();
+        assert_eq!(second, serde_json::json!({ "attr.n": 8 }));
+        let plain = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                OVERFLOW,
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![Some("{}")]))],
+        )
+        .unwrap();
+        assert_eq!(
+            attributes_column(&plain).unwrap().value(0),
+            "{}",
+            "the column itself"
+        );
+    }
+
     use super::*;
 
     fn tenant() -> TenantId {

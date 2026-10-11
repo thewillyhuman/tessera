@@ -35,11 +35,12 @@ use tessera_ir::trace::{
     MATCHED, ROOT_NAME, ROOT_SERVICE, SPANSET, SPANSET_LABELS, TRACE_DURATION_NS, TRACE_START,
 };
 use tessera_ir::{BinaryOp, BindContext, Expr, Literal, Plan, Scan, SortKey, VALUE};
+use tessera_kernels::attributes_column;
 use tessera_opt::optimize;
 use tessera_traceql::{Lowered, RangeParams, ResultKind, TraceqlFrontend};
 use tessera_types::event::{
-    DURATION_NS, LINKS, NAME, OVERFLOW, PARENT_SPAN_ID, SPAN_ID, SPAN_KIND, STATUS_CODE,
-    STATUS_MESSAGE, TIMESTAMP, TRACE_ID,
+    DURATION_NS, LINKS, NAME, PARENT_SPAN_ID, SPAN_ID, SPAN_KIND, STATUS_CODE, STATUS_MESSAGE,
+    TIMESTAMP, TRACE_ID,
 };
 use tessera_types::{Kind, TimeRange, Timestamp};
 
@@ -317,9 +318,15 @@ struct MatchedTrace {
 }
 
 /// The shown values of a span, as OTLP key-values: intrinsics from the
-/// columns, attributes from `_overflow`.
-fn shown_attributes(batch: &RecordBatch, i: usize, shown: &[String]) -> Vec<Value> {
-    let attributes = attributes(cell(text(batch, OVERFLOW), i));
+/// columns, attributes from `overflow`, the merged attribute view of
+/// the span's batch.
+fn shown_attributes(
+    batch: &RecordBatch,
+    overflow: Option<&StringArray>,
+    i: usize,
+    shown: &[String],
+) -> Vec<Value> {
+    let attributes = attributes(cell(overflow, i));
     let mut out = Vec::new();
     for name in shown {
         let value = match name.as_str() {
@@ -376,6 +383,7 @@ fn traces(batches: &[RecordBatch], shown: &[String], limit: usize, spss: usize) 
         let spansets = ints(batch, SPANSET);
         let matched = ints(batch, MATCHED);
         let labels = text(batch, SPANSET_LABELS);
+        let merged = attributes_column(batch);
         for i in 0..batch.num_rows() {
             let trace = by_trace
                 .entry(trace_ids.value(i).to_vec())
@@ -402,7 +410,7 @@ fn traces(batches: &[RecordBatch], shown: &[String], limit: usize, spss: usize) 
                 duration: durations
                     .filter(|d| !d.is_null(i))
                     .map_or(0, |d| d.value(i)),
-                attributes: shown_attributes(batch, i, shown),
+                attributes: shown_attributes(batch, merged.as_ref(), i, shown),
             });
         }
     }
@@ -495,11 +503,12 @@ async fn load_trace(
         let (Some(ids), Some(starts)) = (fixed(batch, SPAN_ID), times(batch, TIMESTAMP)) else {
             continue;
         };
+        let merged = attributes_column(batch);
         for i in 0..batch.num_rows() {
             if ids.is_null(i) {
                 continue;
             }
-            let attributes = attributes(cell(text(batch, OVERFLOW), i));
+            let attributes = attributes(cell(merged.as_ref(), i));
             events_by_span
                 .entry(ids.value(i).to_vec())
                 .or_default()
@@ -626,8 +635,9 @@ fn traces_data(
         let Some(ids) = fixed(batch, SPAN_ID) else {
             continue;
         };
+        let merged = attributes_column(batch);
         for i in 0..batch.num_rows() {
-            let attributes = attributes(cell(text(batch, OVERFLOW), i));
+            let attributes = attributes(cell(merged.as_ref(), i));
             let (_, scopes) = grouped
                 .entry(group_key(&attributes, "resource."))
                 .or_insert_with(|| {
@@ -830,7 +840,8 @@ async fn discovery_rows(
 fn tag_names(batches: &[RecordBatch]) -> BTreeMap<&'static str, BTreeSet<String>> {
     let mut names: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     for batch in batches {
-        let overflow = text(batch, OVERFLOW);
+        let merged = attributes_column(batch);
+        let overflow = merged.as_ref();
         for i in 0..batch.num_rows() {
             for path in attributes(cell(overflow, i)).keys() {
                 let (scope, name) = if let Some(name) = path.strip_prefix("attr.") {
@@ -872,7 +883,8 @@ fn tag_values(batches: &[RecordBatch], name: &str) -> BTreeSet<(String, String)>
     }
     let paths = paths_of(name);
     for batch in batches {
-        let overflow = text(batch, OVERFLOW);
+        let merged = attributes_column(batch);
+        let overflow = merged.as_ref();
         let parents = fixed(batch, PARENT_SPAN_ID);
         for i in 0..batch.num_rows() {
             let is_root = parents.is_none_or(|p| p.is_null(i));

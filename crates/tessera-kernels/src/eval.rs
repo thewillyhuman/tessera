@@ -156,9 +156,8 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
             Ok(Value::Column(variant::extract(overflow, path, data_type)?))
         }
         Expr::Label { name, data_type } => {
-            let overflow = batch
-                .column_by_name(OVERFLOW)
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+            let merged = tessera_types::event::attributes_column(batch);
+            let overflow = merged.as_ref();
             let extracted = batch
                 .column_by_name(EXTRACTED)
                 .and_then(|c| c.as_any().downcast_ref::<StringArray>());
