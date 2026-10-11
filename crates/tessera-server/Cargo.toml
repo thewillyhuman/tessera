@@ -22,6 +22,7 @@ tessera-traceql.workspace = true
 tessera-types.workspace = true
 
 arrow = { version = "60", default-features = false }
+arrow-ipc = "60"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
@@ -36,6 +37,7 @@ serde_urlencoded = "0.7"
 tessera-opt.workspace = true
 tokio = { version = "1", features = ["net", "rt", "macros"] }
 tracing = "0.1"
+ureq = { version = "3", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"

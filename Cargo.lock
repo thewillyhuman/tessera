@@ -2570,6 +2570,7 @@ name = "tessera-server"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-ipc",
  "async-trait",
  "axum",
  "bytes",
@@ -2600,6 +2601,7 @@ dependencies = [
  "tokio-postgres",
  "tower",
  "tracing",
+ "ureq",
 ]
 
 [[package]]

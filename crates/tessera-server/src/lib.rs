@@ -14,6 +14,7 @@
 pub mod admin;
 pub mod encode;
 mod error;
+pub mod internal;
 pub mod loki;
 pub mod otlp;
 mod params;
@@ -54,6 +55,7 @@ pub struct AppState {
 /// Every HTTP route of a node.
 pub fn router(state: AppState) -> Router {
     admin::router(state.clone())
+        .merge(internal::router(state.clone()))
         .merge(otlp::router(state.clone()))
         .merge(loki::router(state.clone()))
         .merge(tempo::router(state.clone()))
