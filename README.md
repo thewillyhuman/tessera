@@ -114,11 +114,12 @@ Prometheus 3.15.0 on every case.
 
 The Prometheus compliance suite (539 cases, a Prometheus 3.1.0
 reference scraping the PromLabs demo targets and writing the same
-samples to a node over remote write) passes 537 cases; the two apart
-are a `topk` pick between two series with the same value, which
-Prometheus breaks by the order its storage returns series, and one
-`histogram_quantile` step where the rank falls on a bucket boundary
-and the last bit of the rates decides the bucket.
+samples to a node over remote write) passes 538 cases; the one apart
+is a `topk` pick between two series with the same value, which
+Prometheus breaks by the order its storage returns series. Rates
+follow Prometheus' own order of operations, so that a
+`histogram_quantile` whose rank falls on a bucket boundary agrees to
+the last bit.
 
 Gaps left in M5: an OTLP histogram answers PromQL as the classic
 `_bucket`, `_count` and `_sum` series a scrape would give, but there

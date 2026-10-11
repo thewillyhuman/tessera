@@ -447,35 +447,37 @@ fn extrapolated_rate(
             previous = value;
         }
     }
+    // The operations and their order are Prometheus' own
+    // (extrapolatedRate), so that the last bit of a rate agrees with it:
+    // a quantile whose rank falls on a bucket boundary is decided by it.
     let seconds = |nanos: i64| nanos as f64 / 1e9;
     let mut duration_to_start = seconds(first.0 - start);
-    let duration_to_end = seconds(end - last.0);
+    let mut duration_to_end = seconds(end - last.0);
     let sampled_interval = seconds(last.0 - first.0);
     let average_between_samples = sampled_interval / (samples.len() - 1) as f64;
+    let threshold = average_between_samples * 1.1;
+    let mut extrapolate_to = sampled_interval;
+    if duration_to_start >= threshold {
+        duration_to_start = average_between_samples / 2.0;
+    }
     if counter && result > 0.0 && first.1 >= 0.0 {
+        // A counter cannot be negative: the start is at most where the
+        // slope reaches zero.
         let duration_to_zero = sampled_interval * (first.1 / result);
         if duration_to_zero < duration_to_start {
             duration_to_start = duration_to_zero;
         }
     }
-    let threshold = average_between_samples * 1.1;
-    let mut extrapolate_to = sampled_interval;
-    extrapolate_to += if duration_to_start < threshold {
-        duration_to_start
-    } else {
-        average_between_samples / 2.0
-    };
-    extrapolate_to += if duration_to_end < threshold {
-        duration_to_end
-    } else {
-        average_between_samples / 2.0
-    };
-    let factor = extrapolate_to / sampled_interval;
-    result *= factor;
-    if rate {
-        result /= seconds(end - start);
+    extrapolate_to += duration_to_start;
+    if duration_to_end >= threshold {
+        duration_to_end = average_between_samples / 2.0;
     }
-    Some(result)
+    extrapolate_to += duration_to_end;
+    let mut factor = extrapolate_to / sampled_interval;
+    if rate {
+        factor /= seconds(end - start);
+    }
+    Some(result * factor)
 }
 
 /// The slope and intercept of the least-squares line through `samples`,
@@ -790,5 +792,23 @@ mod tests {
             unique(vec![(labels("a"), 1.0), (labels("a"), 2.0)]),
             Err(KernelError::Unsupported(message)) if message.contains("same labelset")
         ));
+    }
+
+    /// Prometheus caps the start extrapolation at half a sample interval
+    /// before it considers the counter's zero point; a counter that
+    /// started late in the range gets the zero point only when it is
+    /// nearer than that cap.
+    #[test]
+    fn rate_takes_the_zero_point_after_the_extrapolation_cap() {
+        // Samples 10 s apart from t = 30 s, values 5, 15: the slope reaches
+        // zero 5 s before the first sample; the range starts at 0.
+        let samples: Vec<Sample> = vec![(30_000_000_000, 5.0), (40_000_000_000, 15.0)];
+        let increase = extrapolated_rate(&samples, 0, 50_000_000_000, true, false).unwrap();
+        // 30 s to the start is past the 11 s threshold: the cap of 5 s
+        // applies, and the zero point, 5 s, is not nearer. End: 10 s to
+        // the end is under the threshold. Interval 10 + 5 + 10 = 25 s.
+        assert!((increase - 10.0 * 25.0 / 10.0).abs() < 1e-9, "{increase}");
+        let rate = extrapolated_rate(&samples, 0, 50_000_000_000, true, true).unwrap();
+        assert!((rate - 25.0 / 50.0).abs() < 1e-12, "{rate}");
     }
 }
