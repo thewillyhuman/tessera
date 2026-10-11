@@ -8,7 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use tessera_types::{Budget, InvalidBudget, Redaction, TenantId, Timestamp};
+use tessera_types::{Budget, InvalidBudget, PoolId, Redaction, TenantId, Timestamp};
 
 const MAX_NAME_LEN: usize = 63;
 
@@ -172,6 +172,73 @@ pub struct TenantSettings {
     /// what the old key sealed is read with it while it stays in the
     /// keyring.
     pub encryption_key: Option<String>,
+    /// The pool compaction places the tenant's files in (ST-2, CT-7);
+    /// by the pools' weights when none, or when the pool no longer
+    /// accepts placements. L1 files land in the ingester's pool first.
+    pub storage_pool: Option<PoolId>,
+    /// What is switched off for the tenant (CT-7); everything is on
+    /// by default.
+    pub features: Features,
+}
+
+/// Per-tenant feature switches (CT-7). Each is on unless set to
+/// `false`; a patch sets only what it names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Features {
+    /// Log pattern mining at compaction (section 8.6).
+    pub patterns: Option<bool>,
+    /// Dedicated columns for the attributes the advisor names (section
+    /// 8.8); sort-key columns stay dedicated.
+    pub promotion: Option<bool>,
+    /// The advisor's rounds over the tenant's datasets (section 8.8).
+    pub advisor: Option<bool>,
+    /// Reading rollups in place of the raw rows (AD-13).
+    pub rollups: Option<bool>,
+}
+
+impl Features {
+    /// Whether log pattern mining is on.
+    #[must_use]
+    pub fn patterns(&self) -> bool {
+        self.patterns != Some(false)
+    }
+
+    /// Whether attribute promotion is on.
+    #[must_use]
+    pub fn promotion(&self) -> bool {
+        self.promotion != Some(false)
+    }
+
+    /// Whether the advisor runs for the tenant.
+    #[must_use]
+    pub fn advisor(&self) -> bool {
+        self.advisor != Some(false)
+    }
+
+    /// Whether queries read rollups.
+    #[must_use]
+    pub fn rollups(&self) -> bool {
+        self.rollups != Some(false)
+    }
+
+    /// These switches with every one set in `patch` replacing its own.
+    #[must_use]
+    pub fn merged(&self, patch: &Features) -> Features {
+        Features {
+            patterns: patch.patterns.or(self.patterns),
+            promotion: patch.promotion.or(self.promotion),
+            advisor: patch.advisor.or(self.advisor),
+            rollups: patch.rollups.or(self.rollups),
+        }
+    }
+}
+
+/// Where a tenant's current settings come from, for the components
+/// that apply them as they change (CT-7): the catalog, or a stand-in.
+pub trait TenantSettingsSource: Send + Sync {
+    /// The settings of `tenant`; the defaults for a tenant unknown here.
+    fn settings_of(&self, tenant: &TenantId) -> TenantSettings;
 }
 
 /// Why settings were refused.
@@ -239,6 +306,11 @@ impl TenantSettings {
                 .encryption_key
                 .clone()
                 .or_else(|| self.encryption_key.clone()),
+            storage_pool: patch
+                .storage_pool
+                .clone()
+                .or_else(|| self.storage_pool.clone()),
+            features: self.features.merged(&patch.features),
         }
     }
 
@@ -340,6 +412,47 @@ mod tests {
         assert_eq!(
             zero.validate(),
             Err(InvalidSettings::Zero("query_max_memory_bytes".into()))
+        );
+    }
+
+    /// CT-7: every switch is on until set off, a patch names only what
+    /// it changes, and the pool merges like any setting.
+    #[test]
+    fn switches_are_on_until_set_off_and_the_pool_merges() {
+        let base = TenantSettings {
+            features: Features {
+                patterns: Some(false),
+                ..Features::default()
+            },
+            storage_pool: Some(PoolId::new("cold").unwrap()),
+            ..TenantSettings::default()
+        };
+        assert!(!base.features.patterns());
+        assert!(base.features.promotion() && base.features.advisor() && base.features.rollups());
+        let patch = TenantSettings {
+            features: Features {
+                rollups: Some(false),
+                ..Features::default()
+            },
+            ..TenantSettings::default()
+        };
+        let merged = base.merged(&patch);
+        assert!(!merged.features.patterns(), "kept");
+        assert!(!merged.features.rollups(), "patched");
+        assert_eq!(
+            merged.storage_pool.as_ref().map(PoolId::as_str),
+            Some("cold")
+        );
+        let again = TenantSettings {
+            features: Features {
+                patterns: Some(true),
+                ..Features::default()
+            },
+            ..TenantSettings::default()
+        };
+        assert!(
+            merged.merged(&again).features.patterns(),
+            "switched back on"
         );
     }
 

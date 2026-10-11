@@ -13,6 +13,7 @@ use arrow::array::{
     TimestampNanosecondArray,
 };
 use arrow::compute::{concat_batches, filter_record_batch};
+use tessera_catalog::{TenantSettings, TenantSettingsSource};
 use tessera_format::FileFormat;
 use tessera_format::layout::SERVICE;
 use tessera_manifest::{LayoutRecord, Manifest, Tombstone};
@@ -30,6 +31,9 @@ pub struct Compactor {
     format: Arc<dyn FileFormat>,
     env: Env,
     meter: Option<Arc<dyn Meter>>,
+    /// Where the tenants' pool and switches come from (CT-7); the
+    /// defaults without one.
+    tenants: Option<Arc<dyn TenantSettingsSource>>,
 }
 
 /// What a job did.
@@ -139,7 +143,40 @@ impl Compactor {
             format,
             env,
             meter: None,
+            tenants: None,
         }
+    }
+
+    /// The tenant's settings and what they ask of `job` (CT-7): the
+    /// attributes to promote, sort-key columns always among them, and
+    /// whether to mine log patterns.
+    fn tenant_choices(
+        &self,
+        job: &Job,
+        record: &LayoutRecord,
+    ) -> (TenantSettings, Vec<String>, bool) {
+        let settings = self
+            .tenants
+            .as_ref()
+            .map_or_else(TenantSettings::default, |t| {
+                t.settings_of(&job.partition.tenant)
+            });
+        let mut wanted: Vec<String> = if settings.features.promotion() {
+            record.dedicated.clone()
+        } else {
+            Vec::new()
+        };
+        wanted.extend(record.sort_key.iter().filter(|c| is_path(c)).cloned());
+        let patterns = job.partition.kind == Kind::Log && settings.features.patterns();
+        (settings, wanted, patterns)
+    }
+
+    /// The compactor placing each tenant's files in its pool and
+    /// honouring its switches, as `tenants` reports them (CT-7).
+    #[must_use]
+    pub fn with_tenants(mut self, tenants: Arc<dyn TenantSettingsSource>) -> Self {
+        self.tenants = Some(tenants);
+        self
     }
 
     /// The compactor reporting what it stores to `meter` (CO-2).
@@ -175,8 +212,7 @@ impl Compactor {
             }
         }
         let layout = record.to_layout();
-        let mut wanted: Vec<String> = record.dedicated.clone();
-        wanted.extend(record.sort_key.iter().filter(|c| is_path(c)).cloned());
+        let (settings, wanted, patterns) = self.tenant_choices(job, record);
         let format = Arc::clone(&self.format);
         let keys = Arc::clone(&self.env.keys);
         let partition = job.partition.clone();
@@ -202,7 +238,7 @@ impl Compactor {
                 None => rows,
             };
             let (rows, _) = promote::promote(&rows, &wanted, promote::MAX_DEDICATED)?;
-            let (rows, templates) = if partition.kind == Kind::Log {
+            let (rows, templates) = if patterns {
                 patterns::assign(&rows)?
             } else {
                 (rows, Vec::new())
@@ -215,7 +251,10 @@ impl Compactor {
         .await
         .map_err(|e| CompactError::Task(e.to_string()))??;
 
-        let pool = self.pools.place(&mut self.env.random.clone()).clone();
+        let pool = self
+            .pools
+            .place_in(settings.storage_pool.as_ref(), &mut self.env.random.clone())
+            .clone();
         let file_id = FileId::random(&mut self.env.random.clone());
         let data_key = layout::data_file(&job.partition, file_id);
         pool.store()

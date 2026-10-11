@@ -127,7 +127,7 @@ async fn run_native(
         &request.query,
         &ctx,
         RunOptions {
-            rollups: request.rollups,
+            rollups: request.rollups && crate::params::features(state, &ctx.tenant).rollups(),
             readable: Some(Arc::new(move |dataset: &DatasetName| {
                 reader.may_read(dataset.as_str())
             })),

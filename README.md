@@ -435,8 +435,10 @@ object has its fields stored under `body.*` next to the text, so
 rather than parsing the line again (QL-10); the tenant settings
 `parse_json_bodies` (on by default) and `parse_logfmt_bodies` (off)
 choose what is parsed. The tenant setting `encryption_key` names the
-key, in the nodes' keyring, the tenant's data is sealed under (SE-2,
-CT-7):
+key, in the nodes' keyring, the tenant's data is sealed under (SE-2),
+`storage_pool` the pool compaction places its files in, and
+`features` switches `patterns`, `promotion`, `advisor` and `rollups`
+off for the tenant, each on by default (CT-7):
 
 ```
 curl -X POST localhost:8080/v1/logs \

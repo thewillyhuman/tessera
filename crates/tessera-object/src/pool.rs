@@ -208,6 +208,16 @@ impl Pools {
             .ok_or_else(|| PoolError::Unknown(id.clone()))
     }
 
+    /// Chooses the pool for a new object of a tenant placed in
+    /// `preferred` (CT-7): that pool while it accepts placements, by
+    /// weight otherwise, as [`Pools::place`] does.
+    pub fn place_in(&self, preferred: Option<&PoolId>, random: &mut impl Random) -> &Pool {
+        preferred
+            .and_then(|id| self.pools.get(id))
+            .filter(|pool| pool.accepts_placements())
+            .unwrap_or_else(|| self.place(random))
+    }
+
     /// Chooses the pool for a new object, in proportion to the weights of
     /// the active pools. Falls back to the root pool when no pool is
     /// eligible, so that writes never stop for lack of placement.
@@ -257,6 +267,31 @@ mod tests {
 
     use super::*;
     use crate::MemoryStore;
+
+    /// CT-7: a tenant's pool takes its objects while it accepts them.
+    #[test]
+    fn a_preferred_pool_is_used_while_it_accepts_placements() {
+        let mut pools = Pools::new(pool("root"), Arc::new(MemoryStore::new()));
+        pools
+            .add(pool("cold"), Arc::new(MemoryStore::new()), 1)
+            .unwrap();
+        let mut random = SeededRandom::new(3);
+        assert_eq!(
+            pools.place_in(Some(&pool("cold")), &mut random).id(),
+            &pool("cold")
+        );
+        pools.set_weight(&pool("cold"), 0).unwrap();
+        assert_eq!(
+            pools.place_in(Some(&pool("gone")), &mut random).id(),
+            &pool("root"),
+            "unknown: by weight"
+        );
+        assert_eq!(
+            pools.place_in(Some(&pool("cold")), &mut random).id(),
+            &pool("root"),
+            "retired: by weight"
+        );
+    }
 
     fn pool(id: &str) -> PoolId {
         PoolId::new(id).unwrap()

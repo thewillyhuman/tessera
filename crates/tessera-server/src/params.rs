@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
-use tessera_catalog::{Principal, TenantName};
+use tessera_catalog::{Features, Principal, TenantName};
 use tessera_exec::QueryLimits;
 use tessera_types::{DatasetName, TenantId, Timestamp};
 
@@ -167,6 +167,18 @@ pub(crate) fn prices(state: &AppState) -> BTreeMap<String, f64> {
             Some(((*setting).to_owned(), value))
         })
         .collect()
+}
+
+/// The feature switches of `tenant` (CT-7); all on for a tenant the
+/// catalog does not know.
+pub(crate) fn features(state: &AppState, tenant: &TenantId) -> Features {
+    state
+        .catalog
+        .cached()
+        .state()
+        .tenant(tenant)
+        .map(|t| t.settings.features)
+        .unwrap_or_default()
 }
 
 /// The limits a query of `tenant` runs under (QE-18): the node's

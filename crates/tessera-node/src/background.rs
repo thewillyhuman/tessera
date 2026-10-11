@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tessera_catalog::{Catalog, ControlStores, Table};
+use tessera_catalog::{Catalog, ControlStores, Table, TenantSettingsSource};
 use tessera_cluster::{Load, Membership};
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan};
@@ -89,12 +89,14 @@ struct Backlog {
 /// Runs the background work forever. Failures are logged and retried on
 /// the next round.
 pub async fn run(background: Background) {
+    let tenants: Arc<dyn TenantSettingsSource> = background.catalog.clone();
     let compactor = Compactor::new(
         Arc::clone(&background.pools),
         Arc::clone(&background.format),
         background.env.clone(),
     )
-    .with_meter(Arc::clone(&background.meter));
+    .with_meter(Arc::clone(&background.meter))
+    .with_tenants(tenants);
     let mut ticks = tokio::time::interval(background.interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

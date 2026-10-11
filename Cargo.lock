@@ -3011,6 +3011,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "serde_json",
+ "tessera-catalog",
  "tessera-commit",
  "tessera-format",
  "tessera-ir",

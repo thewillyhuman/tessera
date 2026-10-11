@@ -109,6 +109,103 @@ async fn node(segments: &[&[u8]], start: Timestamp) -> Node {
     }
 }
 
+/// CT-7: compaction places a tenant's files in the pool its settings
+/// name and leaves pattern mining out when the tenant switched it off.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenants_files_go_to_its_pool_and_its_switches_hold() {
+    use tessera_catalog::{Features, TenantSettings, TenantSettingsSource};
+
+    struct Cold;
+
+    impl TenantSettingsSource for Cold {
+        fn settings_of(&self, _: &TenantId) -> TenantSettings {
+            TenantSettings {
+                storage_pool: Some(PoolId::new("cold").unwrap()),
+                features: Features {
+                    patterns: Some(false),
+                    ..Features::default()
+                },
+                ..TenantSettings::default()
+            }
+        }
+    }
+
+    let node = node(
+        &[&[1, 2], &[3, 4], &[5, 6], &[7, 8]],
+        Timestamp::from_nanos(0),
+    )
+    .await;
+    let cold = Arc::new(MemoryStore::new());
+    let mut pools = Pools::new(PoolId::new("root").unwrap(), node.store.clone());
+    pools
+        .add(PoolId::new("cold").unwrap(), cold.clone(), 1)
+        .unwrap();
+    let pools = Arc::new(pools);
+    let manifest = manifest(&node).await;
+    let before = manifest.snapshot().await.unwrap();
+    let job = plan(
+        manifest.id(),
+        before.state(),
+        node.env.clock.now(),
+        &Policy::default(),
+    )
+    .unwrap();
+    let compactor = Compactor::new(
+        Arc::clone(&pools),
+        Arc::new(ParquetFormat::default()),
+        node.env.clone(),
+    )
+    .with_tenants(Arc::new(Cold));
+    let outcome = compactor
+        .run(
+            &manifest,
+            &job,
+            &LayoutRecord::default_for(job.partition.kind),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
+    let Outcome::Replaced { output, .. } = outcome else {
+        panic!("expected a replacement, got {outcome:?}");
+    };
+    let after = manifest.snapshot().await.unwrap();
+    let file = after.state().file(output).unwrap().clone();
+    assert_eq!(file.pool.as_str(), "cold", "placed in the tenant's pool");
+    let key = layout::data_file(&file.partition, file.file_id);
+    assert!(
+        cold.get(&key).await.is_ok(),
+        "the file is in the cold store"
+    );
+    assert!(
+        !file.columns.iter().any(|c| c.name == "pattern_id"),
+        "no pattern column: {:?}",
+        file.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let format: Arc<dyn tessera_format::FileFormat> = Arc::new(ParquetFormat::default());
+    let view = view::read(
+        &pools,
+        &format,
+        &node.env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        Kind::Log,
+        Window::DEFAULT_LENGTH,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        view.rows
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum::<usize>(),
+        8
+    );
+}
+
 async fn manifest(node: &Node) -> Manifest {
     let partitions = list_partitions(&*node.store, &TenantId::DEFAULT, &dataset(), Kind::Log)
         .await

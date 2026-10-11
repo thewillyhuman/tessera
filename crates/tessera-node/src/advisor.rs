@@ -74,6 +74,7 @@ pub async fn run(advisor: Advisor) {
             .state()
             .tenants()
             .filter(|t| t.status == TenantStatus::Active && t.id != TenantId::SYSTEM)
+            .filter(|t| t.settings.features.advisor())
             .map(|t| t.id.clone())
             .collect();
         for tenant in tenants {

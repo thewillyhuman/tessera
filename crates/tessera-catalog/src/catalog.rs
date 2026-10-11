@@ -19,7 +19,8 @@ use tessera_types::{Env, KeyPolicy, PoolId, TenantId, WorkKind};
 
 use crate::state::{pool_key, put_record, setting_key, slots_key, tenant_key};
 use crate::{
-    CatalogState, InvalidSettings, PoolConfig, Tenant, TenantName, TenantSettings, TenantStatus,
+    CatalogState, InvalidSettings, PoolConfig, Tenant, TenantName, TenantSettings,
+    TenantSettingsSource, TenantStatus,
 };
 
 /// Why a catalog operation failed.
@@ -567,6 +568,17 @@ fn drop_grace(state: &CatalogState) -> Duration {
         .setting(Catalog::DROP_GRACE_SETTING)
         .and_then(|seconds| seconds.parse().ok())
         .map_or(Catalog::DEFAULT_DROP_GRACE, Duration::from_secs)
+}
+
+/// A tenant's settings as the catalog last read them (CT-7).
+impl TenantSettingsSource for Catalog {
+    fn settings_of(&self, tenant: &TenantId) -> TenantSettings {
+        self.cached()
+            .state()
+            .tenant(tenant)
+            .map(|t| t.settings.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// The tenant's `encryption_key` setting names the key its data is

@@ -19,5 +19,6 @@ pub use control::{
 };
 pub use state::{CatalogState, PoolConfig};
 pub use tenant::{
-    InvalidSettings, InvalidTenantName, Tenant, TenantName, TenantSettings, TenantStatus,
+    Features, InvalidSettings, InvalidTenantName, Tenant, TenantName, TenantSettings,
+    TenantSettingsSource, TenantStatus,
 };

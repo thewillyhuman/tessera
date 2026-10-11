@@ -8,6 +8,7 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+tessera-catalog.workspace = true
 tessera-format.workspace = true
 tessera-ir.workspace = true
 tessera-kernels.workspace = true
