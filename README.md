@@ -204,8 +204,9 @@ dataset whose queries filter on an attribute adopt it as the leading
 sort column and rewrite its files without intervention.
 
 Gaps left in M8: the cost model
-estimates selectivity from the workload and guesses cardinality,
-there are no per-column sketches (AD-6); the storage term of the cost
+estimates selectivity from the workload, or for an equality from the
+distinct values the files counted, exact up to 65,536 per file, with
+no quantile sketches (AD-6); the storage term of the cost
 counts only the compression a layout has shown on files already in
 it; a
 promoted column is read from `_overflow` by the tail and by files

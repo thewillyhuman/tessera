@@ -75,6 +75,10 @@ pub struct ColumnStats {
     pub max: Option<Scalar>,
     /// How many values are null.
     pub null_count: u64,
+    /// Distinct non-null values, exact up to a cap past which the cap
+    /// stands for "many" (AD-6); none when the type cannot be compared.
+    #[serde(default)]
+    pub distinct: Option<u64>,
 }
 
 /// A data file's manifest entry.
@@ -156,6 +160,7 @@ mod tests {
                 min: None,
                 max: None,
                 null_count: 3,
+                distinct: None,
             }],
             indexes: Vec::new(),
         }

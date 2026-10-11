@@ -204,6 +204,7 @@ mod tests {
                 min: Some(Scalar::Int(severity.0)),
                 max: Some(Scalar::Int(severity.1)),
                 null_count: 0,
+                distinct: None,
             }],
             indexes: Vec::new(),
         }

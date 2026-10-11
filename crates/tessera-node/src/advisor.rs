@@ -251,12 +251,19 @@ async fn file_summaries(
     let mut files = Vec::new();
     for partition in list_partitions(&*advisor.store, tenant, dataset, kind).await? {
         let snapshot = manifests.open(&partition).snapshot().await?;
-        files.extend(snapshot.state().files().map(|f| FileSummary {
-            size_bytes: f.size_bytes,
-            sort_key: f.sort_key.clone(),
-            epoch: f.layout_epoch,
-            rows: f.row_count,
-            window_start: partition.window.start(),
+        files.extend(snapshot.state().files().map(|f| {
+            FileSummary {
+                size_bytes: f.size_bytes,
+                distinct: f
+                    .columns
+                    .iter()
+                    .filter_map(|c| c.distinct.map(|d| (c.name.clone(), d)))
+                    .collect(),
+                sort_key: f.sort_key.clone(),
+                epoch: f.layout_epoch,
+                rows: f.row_count,
+                window_start: partition.window.start(),
+            }
         }));
     }
     Ok(files)
