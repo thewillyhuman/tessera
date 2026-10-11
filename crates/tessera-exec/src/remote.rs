@@ -11,7 +11,7 @@
 use arrow::array::RecordBatch;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use tessera_ir::Scan;
+use tessera_ir::{Plan, Scan};
 use tessera_types::{FileId, FileMeta, NodeId};
 
 /// The files of one scan that one node reads.
@@ -20,6 +20,18 @@ pub struct LeafTask {
     /// The scan, with its predicates, projection and time range.
     pub scan: Scan,
     /// The files to read.
+    pub files: Vec<FileMeta>,
+}
+
+/// A stage of a plan that one node runs over its share of a scan's
+/// files (QE-14): a plan whose one scan reads `files` and nothing else,
+/// a partial aggregate, top-k or limit over them, whose output the
+/// coordinator merges with the other shares'.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StageTask {
+    /// The plan fragment to run.
+    pub plan: Plan,
+    /// The files its scan reads.
     pub files: Vec<FileMeta>,
 }
 
@@ -51,4 +63,20 @@ pub trait RemoteScan: Send + Sync {
         peer: &'a Peer,
         task: &'a LeafTask,
     ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>>;
+
+    /// Runs the stage `task` on `peer` and returns its output (QE-14).
+    /// A transport or a peer that cannot answers with an error, and
+    /// the stage runs on the coordinator instead.
+    fn stage<'a>(
+        &'a self,
+        peer: &'a Peer,
+        task: &'a StageTask,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        let _ = (peer, task);
+        Box::pin(async {
+            Err(RemoteError(
+                "stages are not supported by this transport".into(),
+            ))
+        })
+    }
 }

@@ -16,6 +16,7 @@
 //! [`ROOT_SERVICE`], [`TRACE_START`], [`TRACE_DURATION_NS`]) and per
 //! span from the tree ([`NEST_LEFT`], [`NEST_RIGHT`], [`NEST_PARENT`]).
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
@@ -122,7 +123,7 @@ pub fn trace_group_schema() -> SchemaRef {
 
 /// A relation between a span on the right side of a structural
 /// operator and the spans on its left.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Relation {
     /// `>>`: the right span has a left span among its ancestors.
     Descendant,
@@ -151,7 +152,7 @@ impl Relation {
 }
 
 /// A structural operator: a relation and how it selects spans.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Structural {
     /// The relation.
     pub relation: Relation,
@@ -173,7 +174,7 @@ impl fmt::Display for Structural {
 }
 
 /// A statistic over the spans of one spanset.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum SpanAggregate {
     /// The number of spans.
     Count,
@@ -202,7 +203,7 @@ impl SpanAggregate {
 }
 
 /// A spanset expression.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Spanset {
     /// `{ condition }`: the spans where the condition holds, every span
     /// for `None`. One spanset, or none when no span matches.

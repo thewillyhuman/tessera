@@ -52,7 +52,7 @@ pub enum PlanError {
 }
 
 /// Which rows a join keeps (DM-2).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum JoinKind {
     /// The rows with a match on both sides.
     Inner,
@@ -72,7 +72,7 @@ impl fmt::Display for JoinKind {
 
 /// One side of a join: the rows and the name that qualifies their
 /// columns in the output, so that both sides may have a `timestamp`.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct JoinSide {
     /// The rows.
     pub plan: Box<Plan>,
@@ -92,7 +92,7 @@ impl JoinSide {
 }
 
 /// An expression with the name it is output under.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct NamedExpr {
     /// The expression.
     pub expr: Expr,
@@ -112,7 +112,7 @@ impl NamedExpr {
 }
 
 /// An aggregate function application.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct AggregateExpr {
     /// The function, by registry name.
     pub function: String,
@@ -123,7 +123,7 @@ pub struct AggregateExpr {
 }
 
 /// One key of an ordering.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct SortKey {
     /// The sorted expression.
     pub expr: Expr,
@@ -254,7 +254,7 @@ impl Scan {
 
 /// How a parser stage derives labels from text (`Extract`, section
 /// 10.2; `LogQL` section 9.4).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum ExtractStage {
     /// A JSON object: every property becomes a label, nested objects
     /// flattened with `_`.
@@ -284,7 +284,7 @@ impl fmt::Display for ExtractStage {
 
 /// A function over the samples of one series in a sliding window
 /// (`RangeVector`, section 10.2), with `LogQL` and `PromQL` semantics.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum RangeFunction {
     /// Samples in the window.
     CountOverTime,
@@ -340,7 +340,7 @@ impl fmt::Display for RangeFunction {
 /// Which labels identify a series in a range vector: `by` keeps the
 /// named labels, `without` drops them. Samples of rows whose remaining
 /// labels agree merge into one series, as `LogQL` groups range functions.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SeriesGrouping {
     /// `by` when true, `without` otherwise.
     pub by: bool,
@@ -374,7 +374,7 @@ pub fn range_vector_schema() -> SchemaRef {
 }
 
 /// A node of the operator tree.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Plan {
     /// Read a dataset.
     Scan(Scan),
@@ -395,6 +395,29 @@ pub enum Plan {
     /// Group rows and aggregate each group. With no keys, one group.
     Aggregate {
         /// The input.
+        input: Box<Plan>,
+        /// The grouping keys, output first.
+        group_by: Vec<NamedExpr>,
+        /// The aggregates, output after the keys.
+        aggregates: Vec<AggregateExpr>,
+    },
+    /// The first half of an aggregation split across nodes (QE-14):
+    /// group rows and give each group's running state, the keys first,
+    /// then each aggregate's state columns ([`state_column`]).
+    PartialAggregate {
+        /// The input.
+        input: Box<Plan>,
+        /// The grouping keys, output first.
+        group_by: Vec<NamedExpr>,
+        /// The aggregates whose states are output after the keys.
+        aggregates: Vec<AggregateExpr>,
+    },
+    /// The second half: fold the states of a `PartialAggregate`, the
+    /// node's input, into each group's results, as `Aggregate` would
+    /// have given them from the rows. The keys are the state rows'
+    /// key columns.
+    FinalAggregate {
+        /// The states, a `PartialAggregate` or rows in its schema.
         input: Box<Plan>,
         /// The grouping keys, output first.
         group_by: Vec<NamedExpr>,
@@ -499,6 +522,7 @@ pub enum Plan {
     /// Constant rows, for queries without a table.
     Values {
         /// The schema of the rows.
+        #[serde(with = "schema_ref")]
         schema: SchemaRef,
         /// The rows, one literal per column.
         rows: Vec<Vec<Literal>>,
@@ -599,6 +623,8 @@ impl Plan {
             Plan::Filter { input, .. }
             | Plan::Project { input, .. }
             | Plan::Aggregate { input, .. }
+            | Plan::PartialAggregate { input, .. }
+            | Plan::FinalAggregate { input, .. }
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. }
             | Plan::TopK { input, .. }
@@ -660,6 +686,8 @@ impl Plan {
                 if passed { keys } else { Vec::new() }
             }
             Plan::Aggregate { .. }
+            | Plan::PartialAggregate { .. }
+            | Plan::FinalAggregate { .. }
             | Plan::Union { .. }
             | Plan::Join { .. }
             | Plan::Values { .. }
@@ -738,6 +766,16 @@ impl Plan {
                 }
                 Ok(Arc::new(Schema::new(fields)))
             }
+            Plan::PartialAggregate {
+                input,
+                group_by,
+                aggregates,
+            } => partial_aggregate_schema(input, group_by, aggregates, registry),
+            Plan::FinalAggregate {
+                input,
+                group_by,
+                aggregates,
+            } => final_aggregate_schema(input, group_by, aggregates, registry),
             Plan::Union { inputs } => {
                 let first = inputs.first().ok_or(PlanError::EmptyUnion)?;
                 let schema = first.schema(registry)?;
@@ -823,7 +861,17 @@ impl Plan {
                 group_by,
                 aggregates,
                 ..
-            } => fmt_aggregate(f, pad, group_by, aggregates),
+            } => fmt_aggregate(f, pad, "Aggregate", group_by, aggregates),
+            Plan::PartialAggregate {
+                group_by,
+                aggregates,
+                ..
+            } => fmt_aggregate(f, pad, "PartialAggregate", group_by, aggregates),
+            Plan::FinalAggregate {
+                group_by,
+                aggregates,
+                ..
+            } => fmt_aggregate(f, pad, "FinalAggregate", group_by, aggregates),
             Plan::Sort { keys, .. } => {
                 let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
                 writeln!(f, "{pad}Sort: {}", shown.join(", "))
@@ -1048,6 +1096,7 @@ fn fmt_scan(f: &mut fmt::Formatter<'_>, pad: &str, scan: &Scan) -> fmt::Result {
 fn fmt_aggregate(
     f: &mut fmt::Formatter<'_>,
     pad: &str,
+    label: &str,
     group_by: &[NamedExpr],
     aggregates: &[AggregateExpr],
 ) -> fmt::Result {
@@ -1064,7 +1113,7 @@ fn fmt_aggregate(
         .collect();
     writeln!(
         f,
-        "{pad}Aggregate: group_by=[{}] aggregates=[{}]",
+        "{pad}{label}: group_by=[{}] aggregates=[{}]",
         keys.join(", "),
         aggs.join(", ")
     )
@@ -1156,6 +1205,118 @@ pub fn aggregate_type(
         ))
         .into()
     })
+}
+
+/// The schema of a `PartialAggregate`: the keys, then each aggregate's
+/// state columns.
+fn partial_aggregate_schema(
+    input: &Plan,
+    group_by: &[NamedExpr],
+    aggregates: &[AggregateExpr],
+    registry: &Registry,
+) -> Result<SchemaRef, PlanError> {
+    let input = input.schema(registry)?;
+    let mut fields = Vec::with_capacity(group_by.len() + aggregates.len());
+    for key in group_by {
+        let t = expr_type(&key.expr, &input, registry)?;
+        fields.push(Field::new(&key.name, t, true));
+    }
+    for aggregate in aggregates {
+        for (i, t) in aggregate_state_types(aggregate, &input, registry)?
+            .into_iter()
+            .enumerate()
+        {
+            fields.push(Field::new(state_column(&aggregate.name, i), t, true));
+        }
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The schema of a `FinalAggregate`: the keys as the states carry
+/// them, then each aggregate's result typed over the rows the partial
+/// aggregate read.
+fn final_aggregate_schema(
+    input: &Plan,
+    group_by: &[NamedExpr],
+    aggregates: &[AggregateExpr],
+    registry: &Registry,
+) -> Result<SchemaRef, PlanError> {
+    let Plan::PartialAggregate { input: rows, .. } = input else {
+        return Err(
+            TypeError::Mismatch("a final aggregate reads a partial aggregate".into()).into(),
+        );
+    };
+    let states = input.schema(registry)?;
+    let rows = rows.schema(registry)?;
+    let mut fields = Vec::with_capacity(group_by.len() + aggregates.len());
+    for key in group_by {
+        let t = expr_type(&key.expr, &states, registry)?;
+        fields.push(Field::new(&key.name, t, true));
+    }
+    for aggregate in aggregates {
+        fields.push(Field::new(
+            &aggregate.name,
+            aggregate_type(aggregate, &rows, registry)?,
+            true,
+        ));
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The columns of an aggregate's running state, as a `PartialAggregate`
+/// gives it and a `FinalAggregate` folds it (QE-14): counts and sums
+/// as floats, an average as its sum and weight, a variance as its
+/// weight, mean and second moment, a quantile as every value seen,
+/// an extreme as the value so far. Each kernel accumulator gives and
+/// takes exactly these.
+///
+/// # Errors
+///
+/// If the function does not type over `input`, or cannot be merged
+/// across nodes.
+pub fn aggregate_state_types(
+    aggregate: &AggregateExpr,
+    input: &Schema,
+    registry: &Registry,
+) -> Result<Vec<DataType>, PlanError> {
+    let output = aggregate_type(aggregate, input, registry)?;
+    let floats = |n: usize| vec![DataType::Float64; n];
+    match aggregate.function.as_str() {
+        "count" | "count_raw" | "sum" | "sum_raw" => Ok(floats(1)),
+        "avg" | "avg_raw" => Ok(floats(2)),
+        "stddev" | "stddev_raw" | "stdvar" | "stdvar_raw" => Ok(floats(3)),
+        "quantile" => Ok(vec![DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Float64,
+            true,
+        )))]),
+        "min" | "max" => Ok(vec![output]),
+        other => Err(TypeError::Mismatch(format!("{other} cannot be merged across nodes")).into()),
+    }
+}
+
+/// The name of the `i`-th state column of the aggregate output as
+/// `name`.
+#[must_use]
+pub fn state_column(name: &str, i: usize) -> String {
+    format!("{name}:state{i}")
+}
+
+/// `SchemaRef` through serde, for the plan of a stage sent to another
+/// node (QE-14).
+mod schema_ref {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{Schema, SchemaRef};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(schema: &SchemaRef, serializer: S) -> Result<S::Ok, S::Error> {
+        schema.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SchemaRef, D::Error> {
+        Schema::deserialize(deserializer).map(Arc::new)
+    }
 }
 
 impl fmt::Display for Plan {

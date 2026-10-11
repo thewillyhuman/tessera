@@ -10,6 +10,7 @@
 //! range), so the expression refers to inputs by index and holds only
 //! what the evaluator needs.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use crate::plan::SeriesGrouping;
 pub const LOOKBACK: Duration = Duration::from_secs(300);
 
 /// A binary operator between vectors or scalars.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum PromOp {
     /// `+`.
     Add,
@@ -97,7 +98,7 @@ impl PromOp {
 }
 
 /// How the series of two vectors pair up.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Matching {
     /// `on` when true, `ignoring` otherwise.
     pub on: bool,
@@ -109,7 +110,7 @@ pub struct Matching {
 
 /// `group_left` or `group_right`: which side may have several series
 /// per match, and the labels copied from the other side.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Group {
     /// `group_left` when true, `group_right` otherwise.
     pub left: bool,
@@ -118,7 +119,7 @@ pub struct Group {
 }
 
 /// An aggregation operator.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum PromAggregate {
     /// `sum`.
     Sum,
@@ -174,7 +175,7 @@ impl PromAggregate {
 }
 
 /// A `PromQL` expression.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum PromExpr {
     /// A selector over input `input`: an instant vector, or a range
     /// vector when `range` is set; shifted back by `offset` (which may

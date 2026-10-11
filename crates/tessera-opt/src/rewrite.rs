@@ -258,15 +258,9 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
         },
         Plan::Filter { input, predicate } => f(*input).filter(predicate),
         Plan::Project { input, exprs } => f(*input).project(exprs),
-        Plan::Aggregate {
-            input,
-            group_by,
-            aggregates,
-        } => Plan::Aggregate {
-            input: Box::new(f(*input)),
-            group_by,
-            aggregates,
-        },
+        aggregate @ (Plan::Aggregate { .. }
+        | Plan::PartialAggregate { .. }
+        | Plan::FinalAggregate { .. }) => rebuild_aggregation(aggregate, f),
         Plan::Sort { input, keys } => f(*input).sort(keys),
         Plan::Limit {
             input,
@@ -332,6 +326,40 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
             end,
             step,
         },
+    }
+}
+
+/// The aggregate nodes of [`rebuild_inputs`], whole or split (QE-14).
+fn rebuild_aggregation(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
+    match plan {
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::Aggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggregates,
+        },
+        Plan::PartialAggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::PartialAggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggregates,
+        },
+        Plan::FinalAggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::FinalAggregate {
+            input: Box::new(f(*input)),
+            group_by,
+            aggregates,
+        },
+        other => other,
     }
 }
 

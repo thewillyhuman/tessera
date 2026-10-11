@@ -20,11 +20,26 @@ use crate::memory::MemoryPool;
 use crate::operator::sort::emit;
 use crate::operator::{Flow, Operator, Sink};
 
+/// Which half of an aggregation the operator does (QE-14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Rows in, results out.
+    Full,
+    /// Rows in, states out: the keys, then each aggregate's state
+    /// columns, for a `Final` operator elsewhere.
+    Partial,
+    /// States in, results out.
+    Final,
+}
+
 /// Grouped aggregation in a hash table.
 pub struct HashAggregate {
     group_by: Vec<NamedExpr>,
     aggregates: Vec<AggregateExpr>,
     weighted: bool,
+    mode: Mode,
+    /// How many state columns each aggregate takes, in `Final` mode.
+    state_widths: Vec<usize>,
     schema: SchemaRef,
     memory: Arc<MemoryPool>,
     grouper: Option<Grouper>,
@@ -52,7 +67,98 @@ impl HashAggregate {
         schema: SchemaRef,
         memory: Arc<MemoryPool>,
     ) -> Result<Self, ExecError> {
+        Self::build(
+            Mode::Full,
+            group_by,
+            aggregates,
+            weighted,
+            input,
+            input,
+            schema,
+            memory,
+        )
+    }
+
+    /// The first half of an aggregation split across nodes (QE-14):
+    /// as [`HashAggregate::new`], but `schema` is the states' (keys,
+    /// then each aggregate's state columns) and the operator emits them.
+    ///
+    /// # Errors
+    ///
+    /// If an aggregate function is unknown or cannot be merged.
+    pub fn partial(
+        group_by: Vec<NamedExpr>,
+        aggregates: Vec<AggregateExpr>,
+        weighted: bool,
+        input: &SchemaRef,
+        schema: SchemaRef,
+        memory: Arc<MemoryPool>,
+    ) -> Result<Self, ExecError> {
+        Self::build(
+            Mode::Partial,
+            group_by,
+            aggregates,
+            weighted,
+            input,
+            input,
+            schema,
+            memory,
+        )
+    }
+
+    /// The second half: folds states in the `states` schema, which a
+    /// partial operator produced from rows in the `rows` schema, into
+    /// the results `schema`. The keys are the states' key columns.
+    ///
+    /// # Errors
+    ///
+    /// If an aggregate function is unknown or cannot be merged.
+    pub fn merging(
+        group_by: Vec<NamedExpr>,
+        aggregates: Vec<AggregateExpr>,
+        rows: &SchemaRef,
+        states: &SchemaRef,
+        schema: SchemaRef,
+        memory: Arc<MemoryPool>,
+    ) -> Result<Self, ExecError> {
+        Self::build(
+            Mode::Final,
+            group_by,
+            aggregates,
+            false,
+            rows,
+            states,
+            schema,
+            memory,
+        )
+    }
+
+    /// `args` types the aggregates' arguments, `keys` the group keys.
+    #[allow(clippy::too_many_arguments, reason = "every part of one operator")]
+    fn build(
+        mode: Mode,
+        group_by: Vec<NamedExpr>,
+        aggregates: Vec<AggregateExpr>,
+        weighted: bool,
+        args: &SchemaRef,
+        keys: &SchemaRef,
+        schema: SchemaRef,
+        memory: Arc<MemoryPool>,
+    ) -> Result<Self, ExecError> {
         let registry = tessera_ir::Registry::builtin();
+        let state_widths = if mode == Mode::Final {
+            aggregates
+                .iter()
+                .map(|a| {
+                    tessera_ir::aggregate_state_types(a, args, &registry)
+                        .map(|types| types.len())
+                        .map_err(|e| ExecError::Unsupported(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let input = args;
         let accumulators = aggregates
             .iter()
             .map(|a| {
@@ -80,7 +186,7 @@ impl HashAggregate {
             let key_types = group_by
                 .iter()
                 .map(|k| {
-                    tessera_ir::expr_type(&k.expr, input, &registry)
+                    tessera_ir::expr_type(&k.expr, keys, &registry)
                         .map_err(|e| ExecError::Unsupported(e.to_string()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -90,6 +196,8 @@ impl HashAggregate {
             group_by,
             aggregates,
             weighted,
+            mode,
+            state_widths,
             schema,
             memory,
             grouper,
@@ -125,20 +233,32 @@ impl Operator for HashAggregate {
             }
             None => vec![0; rows.num_rows()],
         };
-        let sample_rates = if self.weighted {
-            rows.column_by_name(SAMPLE_RATE)
-                .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
-                .cloned()
+        if self.mode == Mode::Final {
+            // The states follow the keys, each aggregate's in turn.
+            let mut offset = self.group_by.len();
+            for (width, accumulator) in self.state_widths.iter().zip(&mut self.accumulators) {
+                let states = rows.columns().get(offset..offset + width).ok_or_else(|| {
+                    ExecError::Unsupported("aggregate states are missing columns".into())
+                })?;
+                accumulator.merge(&groups, states)?;
+                offset += width;
+            }
         } else {
-            None
-        };
-        for (aggregate, accumulator) in self.aggregates.iter().zip(&mut self.accumulators) {
-            let values = aggregate
-                .args
-                .first()
-                .map(|arg| evaluate(arg, &rows))
-                .transpose()?;
-            accumulator.update(&groups, values.as_ref(), sample_rates.as_ref())?;
+            let sample_rates = if self.weighted {
+                rows.column_by_name(SAMPLE_RATE)
+                    .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                    .cloned()
+            } else {
+                None
+            };
+            for (aggregate, accumulator) in self.aggregates.iter().zip(&mut self.accumulators) {
+                let values = aggregate
+                    .args
+                    .first()
+                    .map(|arg| evaluate(arg, &rows))
+                    .transpose()?;
+                accumulator.update(&groups, values.as_ref(), sample_rates.as_ref())?;
+            }
         }
         let needed = self.groups() * BYTES_PER_GROUP * (1 + self.aggregates.len());
         if needed > self.reserved {
@@ -155,7 +275,11 @@ impl Operator for HashAggregate {
             None => Vec::new(),
         };
         for accumulator in &mut self.accumulators {
-            columns.push(accumulator.finish(groups)?);
+            if self.mode == Mode::Partial {
+                columns.extend(accumulator.state(groups)?);
+            } else {
+                columns.push(accumulator.finish(groups)?);
+            }
         }
         let result = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
         self.memory.release(self.reserved);
@@ -312,5 +436,110 @@ mod tests {
             MemoryPool::unbounded(),
         );
         assert!(result.is_err());
+    }
+
+    /// QE-14: the states of two partial operators, folded by a final
+    /// one, give what one full operator gives.
+    #[test]
+    fn partial_states_fold_into_the_full_result() {
+        let group_by = vec![NamedExpr::new(
+            Expr::column("severity_number").binary(BinaryOp::GtEq, Expr::literal(10)),
+            "high",
+        )];
+        let aggregates = vec![
+            AggregateExpr {
+                function: "count".into(),
+                args: vec![],
+                name: "n".into(),
+            },
+            AggregateExpr {
+                function: "avg".into(),
+                args: vec![Expr::column("severity_number")],
+                name: "mean".into(),
+            },
+            AggregateExpr {
+                function: "max".into(),
+                args: vec![Expr::column("body")],
+                name: "last_body".into(),
+            },
+        ];
+        let full_schema = output_schema(&group_by, &aggregates);
+        let mut full = HashAggregate::new(
+            group_by.clone(),
+            aggregates.clone(),
+            true,
+            &schema(),
+            full_schema.clone(),
+            MemoryPool::unbounded(),
+        )
+        .unwrap();
+        let expected = run(&mut full, vec![rows(&[1, 2, 3]), rows(&[4, 5])]);
+
+        let mut scan = Scan::all(TenantId::DEFAULT, DatasetName::new("t").unwrap(), Kind::Log);
+        scan.projection = Some(vec![
+            "timestamp".into(),
+            "severity_number".into(),
+            "body".into(),
+            "sample_rate".into(),
+        ]);
+        let partial_plan = Plan::PartialAggregate {
+            input: Box::new(Plan::Scan(scan)),
+            group_by: group_by.clone(),
+            aggregates: aggregates.clone(),
+        };
+        let states_schema = partial_plan.schema(&Registry::builtin()).unwrap();
+        assert_eq!(states_schema.fields().len(), 1 + 1 + 2 + 1);
+        let mut states = Vec::new();
+        for input in [vec![rows(&[1, 2, 3])], vec![rows(&[4, 5])]] {
+            let mut partial = HashAggregate::partial(
+                group_by.clone(),
+                aggregates.clone(),
+                true,
+                &schema(),
+                states_schema.clone(),
+                MemoryPool::unbounded(),
+            )
+            .unwrap();
+            states.extend(run(&mut partial, input));
+        }
+        let keys = vec![NamedExpr::new(Expr::column("high"), "high")];
+        let mut merging = HashAggregate::merging(
+            keys,
+            aggregates,
+            &schema(),
+            &states_schema,
+            full_schema,
+            MemoryPool::unbounded(),
+        )
+        .unwrap();
+        let got = run(&mut merging, states);
+        let sorted = |batches: &[RecordBatch]| -> Vec<(bool, f64, f64, String)> {
+            let mut out: Vec<_> = batches
+                .iter()
+                .flat_map(|b| {
+                    let high = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::BooleanArray>()
+                        .unwrap();
+                    let n = b.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+                    let mean = b.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+                    let body = b.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+                    (0..b.num_rows())
+                        .map(|i| {
+                            (
+                                high.value(i),
+                                n.value(i),
+                                mean.value(i),
+                                body.value(i).to_owned(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            out.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            out
+        };
+        assert_eq!(sorted(&got), sorted(&expected));
     }
 }

@@ -163,9 +163,21 @@ versions (10.8). The three-node test starts a cluster, scales it up,
 loses a node without a word and scales it down, with zero manual
 steps (OP-4).
 
-Gaps left in M6: aggregation and the other intermediate stages run on
-the coordinator over the rows the leaf tasks return (QE-14 asks for
-stages on worker nodes); there is no object byte
+An aggregate, a top-k or a limit over one scan runs in two stages
+(QE-14): the partial half on each query node that scans its share of
+the files, over its share alone, and the final half on the
+coordinator over the partial outputs, so that no node holds the
+whole input and the coordinator holds one partial result per node.
+The partial aggregate ships each group's running state (counts and
+sums, an average's sum and weight, a variance's moments, a quantile's
+values, an extreme) and the final one folds them; a peer that cannot
+run its stage has its share run on the coordinator (QE-17), and
+`EXPLAIN ANALYZE` reports each stage.
+
+Gaps left in M6: joins, trace grouping, sorts without a limit and
+PromQL evaluation still run on the coordinator over the rows the leaf
+tasks return, and a stage's output goes through the coordinator rather
+than between workers; there is no object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.

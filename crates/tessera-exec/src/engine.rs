@@ -23,7 +23,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
-use tessera_ir::{BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, PlanError, Registry};
+use tessera_ir::{
+    BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
+};
 use tessera_kernels::Grouper;
 use tessera_kernels::promql::Params;
 use tessera_manifest::{DatasetLogs, ManifestError, Manifests, View, view};
@@ -41,9 +43,9 @@ use crate::operator::{
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
-use crate::remote::{LeafTask, Peers, RemoteScan};
+use crate::remote::{LeafTask, Peers, RemoteScan, StageTask};
 use crate::rollups::RollupSource;
-use crate::scan::{self, ScanAnalysis};
+use crate::scan::{self, ScanAnalysis, Share};
 use crate::scheduler::{CpuPool, TaskError};
 use crate::system::SystemTables;
 use crate::workload::ScanUse;
@@ -95,6 +97,20 @@ pub struct Analysis {
     pub result_cached: bool,
     /// Bytes blocking operators spilled to local disk (QE-11).
     pub spilled_bytes: u64,
+    /// The stages split across nodes (QE-14), in plan order.
+    pub stages: Vec<StageAnalysis>,
+}
+
+/// A stage whose partial half ran on the nodes that scan its files
+/// (QE-14), for `EXPLAIN ANALYZE`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StageAnalysis {
+    /// What was split: `aggregate`, `top-k` or `limit`.
+    pub kind: &'static str,
+    /// Partial stages sent to peers.
+    pub remote: usize,
+    /// Partial stages a peer could not run, run here instead.
+    pub failed: usize,
 }
 
 /// The rows of a query and what producing them took.
@@ -309,6 +325,28 @@ impl Engine {
         self
     }
 
+    /// Runs a stage sent by another node (QE-14): its plan over its
+    /// files, under this node's own limits, and returns the output.
+    ///
+    /// # Errors
+    ///
+    /// If the plan is malformed, a file cannot be read or an operator
+    /// fails.
+    pub async fn stage(&self, task: &StageTask) -> Result<Vec<RecordBatch>, EngineError> {
+        let grant = Grant {
+            memory: MemoryPool::with_spill_dir(self.limits.memory_bytes, self.spill_dir.clone()),
+            scan_bytes: self.limits.scan_bytes,
+        };
+        let mut analysis = Analysis::default();
+        let share = Share {
+            files: task.files.clone(),
+            tail: Vec::new(),
+            analysis: ScanAnalysis::default(),
+        };
+        self.execute_in(&task.plan, &grant, &mut analysis, Some(&share))
+            .await
+    }
+
     /// Runs a leaf task sent by another node: reads its files and
     /// returns the rows in the scan's schema.
     ///
@@ -430,6 +468,7 @@ impl Engine {
                     scans: Vec::new(),
                     result_cached: true,
                     spilled_bytes: 0,
+                    stages: Vec::new(),
                 },
                 uses: Vec::new(),
                 fingerprint: 0,
@@ -491,9 +530,26 @@ impl Engine {
         grant: &'a Grant,
         analysis: &'a mut Analysis,
     ) -> futures::future::BoxFuture<'a, Result<Vec<RecordBatch>, EngineError>> {
+        self.execute_in(plan, grant, analysis, None)
+    }
+
+    /// Runs `plan` within `grant`; with `share`, as a stage whose scan
+    /// reads the share and nothing else (QE-14).
+    fn execute_in<'a>(
+        &'a self,
+        plan: &'a Plan,
+        grant: &'a Grant,
+        analysis: &'a mut Analysis,
+        share: Option<&'a Share>,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<RecordBatch>, EngineError>> {
         Box::pin(async move {
+            if share.is_none() {
+                if let Some(batches) = self.staged(plan, grant, analysis).await? {
+                    return Ok(batches);
+                }
+            }
             match plan {
-                Plan::Scan(scan) => self.scan_node(scan, grant, analysis).await,
+                Plan::Scan(scan) => self.scan_node(scan, grant, analysis, share).await,
                 Plan::Values { schema, rows } => Ok(vec![values(schema, rows)?]),
                 Plan::SystemTable { tenant, table } => {
                     let Some(provider) = &self.system_tables else {
@@ -509,7 +565,7 @@ impl Engine {
                 Plan::Union { inputs } => {
                     let mut batches = Vec::new();
                     for input in inputs {
-                        batches.extend(self.execute(input, grant, analysis).await?);
+                        batches.extend(self.execute_in(input, grant, analysis, share).await?);
                     }
                     Ok(batches)
                 }
@@ -527,9 +583,9 @@ impl Engine {
                     // Two phases (QL-13): the candidates' trace ids, then
                     // every span of those traces.
                     let ids = match candidates {
-                        Some(candidates) => {
-                            Some(trace_ids(&self.execute(candidates, grant, analysis).await?))
-                        }
+                        Some(candidates) => Some(trace_ids(
+                            &self.execute_in(candidates, grant, analysis, share).await?,
+                        )),
                         None => None,
                     };
                     let spans = match ids {
@@ -541,7 +597,7 @@ impl Engine {
                         )),
                         None => Cow::Borrowed(spans.as_ref()),
                     };
-                    let batches = self.execute(&spans, grant, analysis).await?;
+                    let batches = self.execute_in(&spans, grant, analysis, share).await?;
                     let operator =
                         Box::new(TraceGroup::new(spanset.clone(), Arc::clone(&grant.memory)));
                     self.pipe(operator, batches).await
@@ -555,7 +611,7 @@ impl Engine {
                 } => {
                     let mut series = Vec::with_capacity(inputs.len());
                     for input in inputs {
-                        let batches = self.execute(input, grant, analysis).await?;
+                        let batches = self.execute_in(input, grant, analysis, share).await?;
                         series.push(promql::series_of(&batches)?);
                     }
                     let params = Params {
@@ -572,11 +628,78 @@ impl Engine {
                 other => {
                     let input = other.inputs()[0];
                     let operator = self.operator(other, input, &grant.memory)?;
-                    let batches = self.execute(input, grant, analysis).await?;
+                    let batches = self.execute_in(input, grant, analysis, share).await?;
                     self.pipe(operator, batches).await
                 }
             }
         })
+    }
+
+    /// Runs `plan` as a partial stage on the nodes that scan its files
+    /// and a final one here (QE-14), when it is an aggregate, a top-k
+    /// or a limit over one scan and this node has peers: each peer
+    /// returns its share's partial result, this node's share runs here
+    /// with the tail, and the final operator folds them. A peer that
+    /// fails has its share run here. `None` when the plan is not one
+    /// to split.
+    async fn staged(
+        &self,
+        plan: &Plan,
+        grant: &Grant,
+        analysis: &mut Analysis,
+    ) -> Result<Option<Vec<RecordBatch>>, EngineError> {
+        let Some((_, transport)) = &self.peers else {
+            return Ok(None);
+        };
+        let Some(stage) = stage_of(plan, &self.registry) else {
+            return Ok(None);
+        };
+        let Some(scan) = fragment_scan(&stage.partial) else {
+            return Ok(None);
+        };
+        let limit = scan_limit(grant, analysis);
+        let mut scanned = ScanAnalysis::default();
+        let split = scan::split(self, scan, &mut scanned, limit).await?;
+        let partial = with_scan(&stage.partial, &split.scan);
+        let mut report = StageAnalysis {
+            kind: stage.kind,
+            remote: 0,
+            failed: 0,
+        };
+        let mut local = split.local;
+        let mut batches = Vec::new();
+        for (peer, files) in split.remote {
+            let task = StageTask {
+                plan: partial.clone(),
+                files,
+            };
+            report.remote += 1;
+            scanned.remote_tasks += 1;
+            match transport.stage(&peer, &task).await {
+                Ok(rows) => {
+                    scanned.files_remote += task.files.len();
+                    batches.extend(rows);
+                }
+                Err(error) => {
+                    tracing::warn!(peer = %peer.node, error = %error, "stage failed; running here");
+                    report.failed += 1;
+                    scanned.remote_failed += 1;
+                    local.extend(task.files);
+                }
+            }
+        }
+        let share = Share {
+            files: local,
+            tail: split.tail,
+            analysis: scanned,
+        };
+        batches.extend(
+            self.execute_in(&partial, grant, analysis, Some(&share))
+                .await?,
+        );
+        analysis.stages.push(report);
+        let operator = self.operator(&stage.final_plan, &partial, &grant.memory)?;
+        Ok(Some(self.pipe(operator, batches).await?))
     }
 
     /// A scan node: the scan runs within what the query's earlier scans
@@ -586,17 +709,14 @@ impl Engine {
         scan: &tessera_ir::Scan,
         grant: &Grant,
         analysis: &mut Analysis,
+        share: Option<&Share>,
     ) -> Result<Vec<RecordBatch>, EngineError> {
-        let limit = grant.scan_bytes.map(|bytes| scan::ScanLimit {
-            bytes,
-            spent: analysis
-                .scans
-                .iter()
-                .map(|s| s.bytes_read + s.bytes_from_tail)
-                .sum(),
-        });
-        let mut scanned = ScanAnalysis::default();
-        let result = scan::run(self, scan, &mut scanned, limit).await;
+        let limit = scan_limit(grant, analysis);
+        let mut scanned = share.map_or_else(ScanAnalysis::default, |s| s.analysis.clone());
+        let result = match share {
+            Some(share) => scan::read_share(self, scan, share, &mut scanned, limit).await,
+            None => scan::run(self, scan, &mut scanned, limit).await,
+        };
         analysis.scans.push(scanned);
         result
     }
@@ -633,18 +753,9 @@ impl Engine {
                 keep.clone(),
                 plan.schema(registry)?,
             )),
-            Plan::Aggregate {
-                group_by,
-                aggregates,
-                ..
-            } => Box::new(HashAggregate::new(
-                group_by.clone(),
-                aggregates.clone(),
-                input.weighted(registry)?,
-                &input.schema(registry)?,
-                plan.schema(registry)?,
-                Arc::clone(memory),
-            )?),
+            Plan::Aggregate { .. }
+            | Plan::PartialAggregate { .. }
+            | Plan::FinalAggregate { .. } => self.aggregation(plan, input, memory)?,
             Plan::Sort { keys, .. } => Box::new(Sort::new(
                 keys.clone(),
                 input.schema(registry)?,
@@ -693,6 +804,67 @@ impl Engine {
             | Plan::PromQL { .. } => {
                 return Err(EngineError::Exec(ExecError::Unsupported(
                     "not a single-input node".into(),
+                )));
+            }
+        })
+    }
+
+    /// The aggregate operator of `plan`, whole or one half of a split
+    /// one (QE-14).
+    fn aggregation(
+        &self,
+        plan: &Plan,
+        input: &Plan,
+        memory: &Arc<MemoryPool>,
+    ) -> Result<Box<dyn Operator>, EngineError> {
+        let registry = &self.registry;
+        Ok(match plan {
+            Plan::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => Box::new(HashAggregate::new(
+                group_by.clone(),
+                aggregates.clone(),
+                input.weighted(registry)?,
+                &input.schema(registry)?,
+                plan.schema(registry)?,
+                Arc::clone(memory),
+            )?),
+            Plan::PartialAggregate {
+                group_by,
+                aggregates,
+                ..
+            } => Box::new(HashAggregate::partial(
+                group_by.clone(),
+                aggregates.clone(),
+                input.weighted(registry)?,
+                &input.schema(registry)?,
+                plan.schema(registry)?,
+                Arc::clone(memory),
+            )?),
+            Plan::FinalAggregate {
+                input: states,
+                group_by,
+                aggregates,
+            } => {
+                let Plan::PartialAggregate { input: rows, .. } = states.as_ref() else {
+                    return Err(EngineError::Exec(ExecError::Unsupported(
+                        "a final aggregate reads a partial aggregate".into(),
+                    )));
+                };
+                Box::new(HashAggregate::merging(
+                    group_by.clone(),
+                    aggregates.clone(),
+                    &rows.schema(registry)?,
+                    &input.schema(registry)?,
+                    plan.schema(registry)?,
+                    Arc::clone(memory),
+                )?)
+            }
+            _ => {
+                return Err(EngineError::Exec(ExecError::Unsupported(
+                    "not an aggregate".into(),
                 )));
             }
         })
@@ -776,6 +948,165 @@ impl Engine {
             Ok::<_, ExecError>(sink.into_batches())
         });
         Ok(task.await??)
+    }
+}
+
+/// What a query may still read (QE-18), given what its earlier scans
+/// spent.
+fn scan_limit(grant: &Grant, analysis: &Analysis) -> Option<scan::ScanLimit> {
+    grant.scan_bytes.map(|bytes| scan::ScanLimit {
+        bytes,
+        spent: analysis
+            .scans
+            .iter()
+            .map(|s| s.bytes_read + s.bytes_from_tail)
+            .sum(),
+    })
+}
+
+/// A plan split in two (QE-14): the partial half every share of the
+/// scan runs, and the final half that folds their outputs.
+struct Stage {
+    kind: &'static str,
+    partial: Plan,
+    final_plan: Plan,
+}
+
+/// How `plan` splits, if it does: an aggregate whose functions merge
+/// becomes a partial and a final aggregate; a top-k or a limit without
+/// an offset is run on every share and once more over the union.
+fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
+    match plan {
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
+            let rows = input.schema(registry).ok()?;
+            for aggregate in aggregates {
+                tessera_ir::aggregate_state_types(aggregate, &rows, registry).ok()?;
+            }
+            let partial = Plan::PartialAggregate {
+                input: input.clone(),
+                group_by: group_by.clone(),
+                aggregates: aggregates.clone(),
+            };
+            let keys = group_by
+                .iter()
+                .map(|k| NamedExpr::new(Expr::column(&k.name), k.name.clone()))
+                .collect();
+            let final_plan = Plan::FinalAggregate {
+                input: Box::new(partial.clone()),
+                group_by: keys,
+                aggregates: aggregates.clone(),
+            };
+            Some(Stage {
+                kind: "aggregate",
+                partial,
+                final_plan,
+            })
+        }
+        Plan::TopK { .. } => Some(Stage {
+            kind: "top-k",
+            partial: plan.clone(),
+            final_plan: plan.clone(),
+        }),
+        Plan::Limit {
+            offset: 0,
+            count: Some(_),
+            ..
+        } => Some(Stage {
+            kind: "limit",
+            partial: plan.clone(),
+            final_plan: plan.clone(),
+        }),
+        _ => None,
+    }
+}
+
+/// The scan a stage's partial half reads, when the half is one node
+/// over a chain of row-wise operators over one scan that any node can
+/// run its share of; a scan that stops early on its own stays whole.
+fn fragment_scan(partial: &Plan) -> Option<&tessera_ir::Scan> {
+    let mut node = partial.inputs().into_iter().next()?;
+    loop {
+        match node {
+            Plan::Scan(scan) if scan.newest_first_limit.is_none() => return Some(scan),
+            Plan::Filter { input, .. }
+            | Plan::Project { input, .. }
+            | Plan::Extract { input, .. }
+            | Plan::Format { input, .. } => node = input,
+            _ => return None,
+        }
+    }
+}
+
+/// `plan`, a fragment [`fragment_scan`] accepted, with its scan
+/// replaced by `scan`.
+fn with_scan(plan: &Plan, scan: &tessera_ir::Scan) -> Plan {
+    let rebuilt = |input: &Plan| Box::new(with_scan(input, scan));
+    match plan {
+        Plan::Scan(_) => Plan::Scan(scan.clone()),
+        Plan::Filter { input, predicate } => Plan::Filter {
+            input: rebuilt(input),
+            predicate: predicate.clone(),
+        },
+        Plan::Project { input, exprs } => Plan::Project {
+            input: rebuilt(input),
+            exprs: exprs.clone(),
+        },
+        Plan::Extract {
+            input,
+            source,
+            stage,
+        } => Plan::Extract {
+            input: rebuilt(input),
+            source: source.clone(),
+            stage: stage.clone(),
+        },
+        Plan::Format {
+            input,
+            line,
+            labels,
+            drop,
+            keep,
+        } => Plan::Format {
+            input: rebuilt(input),
+            line: line.clone(),
+            labels: labels.clone(),
+            drop: drop.clone(),
+            keep: keep.clone(),
+        },
+        Plan::PartialAggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::PartialAggregate {
+            input: rebuilt(input),
+            group_by: group_by.clone(),
+            aggregates: aggregates.clone(),
+        },
+        Plan::TopK {
+            input,
+            keys,
+            k,
+            partition_by,
+        } => Plan::TopK {
+            input: rebuilt(input),
+            keys: keys.clone(),
+            k: *k,
+            partition_by: partition_by.clone(),
+        },
+        Plan::Limit {
+            input,
+            offset,
+            count,
+        } => Plan::Limit {
+            input: rebuilt(input),
+            offset: *offset,
+            count: *count,
+        },
+        other => other.clone(),
     }
 }
 

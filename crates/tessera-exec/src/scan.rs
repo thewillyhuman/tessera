@@ -119,6 +119,31 @@ fn within(analysis: &ScanAnalysis, limit: Option<ScanLimit>) -> Result<(), Engin
     }
 }
 
+/// A scan resolved to what is read where (QE-14, QE-15): the scan with
+/// the predicates that hide deleted rows, the tail rows already
+/// filtered, this node's files and each peer's.
+pub(crate) struct Split {
+    /// The scan every reader runs.
+    pub scan: Scan,
+    /// The tail rows, filtered, in the scan's schema.
+    pub tail: Vec<RecordBatch>,
+    /// The files this node reads.
+    pub local: Vec<FileMeta>,
+    /// The files each peer reads.
+    pub remote: Vec<(Peer, Vec<FileMeta>)>,
+}
+
+/// A stage's share of a scan (QE-14): the files it reads and the tail
+/// rows it was handed, nothing else of the dataset.
+pub(crate) struct Share {
+    /// The files to read.
+    pub files: Vec<FileMeta>,
+    /// Tail rows already filtered, in the scan's schema; none on a peer.
+    pub tail: Vec<RecordBatch>,
+    /// What resolving the scan found, which the share's reading adds to.
+    pub analysis: ScanAnalysis,
+}
+
 /// Runs `scan`, returning batches in the scan's schema: the tail from
 /// the segments, and the files from this node and from its peers,
 /// within `limit` when there is one.
@@ -128,6 +153,65 @@ pub(crate) async fn run(
     analysis: &mut ScanAnalysis,
     limit: Option<ScanLimit>,
 ) -> Result<Vec<RecordBatch>, EngineError> {
+    let split = split(engine, scan, analysis, limit).await?;
+    let scan = &split.scan;
+    let schema = scan.schema()?;
+    let mut output = split.tail;
+    let mut local = split.local;
+    for (peer, task_files) in split.remote {
+        let task = LeafTask {
+            scan: scan.clone(),
+            files: task_files,
+        };
+        analysis.remote_tasks += 1;
+        let Some((_, transport)) = &engine.peers else {
+            local.extend(task.files);
+            continue;
+        };
+        match transport.leaf(&peer, &task).await {
+            Ok(batches) => {
+                analysis.files_remote += task.files.len();
+                for rows in batches {
+                    let rows = reorder(&rows, &schema)?;
+                    analysis.rows_from_files += rows.num_rows();
+                    output.push(rows);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(peer = %peer.node, error = %error, "leaf task failed; reading here");
+                analysis.remote_failed += 1;
+                local.extend(task.files);
+            }
+        }
+    }
+    let from_files = read_files(engine, scan, local, &output, analysis, limit).await?;
+    output.extend(from_files);
+    Ok(output)
+}
+
+/// Reads a stage's `share` of `scan`: its tail rows and its files.
+pub(crate) async fn read_share(
+    engine: &Engine,
+    scan: &Scan,
+    share: &Share,
+    analysis: &mut ScanAnalysis,
+    limit: Option<ScanLimit>,
+) -> Result<Vec<RecordBatch>, EngineError> {
+    let mut output = share.tail.clone();
+    let from_files =
+        read_files(engine, scan, share.files.clone(), &output, analysis, limit).await?;
+    output.extend(from_files);
+    Ok(output)
+}
+
+/// Resolves `scan`: the partitions and files in range, the tail rows
+/// filtered, and the files split between this node and its peers.
+pub(crate) async fn split(
+    engine: &Engine,
+    scan: &Scan,
+    analysis: &mut ScanAnalysis,
+    limit: Option<ScanLimit>,
+) -> Result<Split, EngineError> {
     analysis.source = format!("{}/{}", scan.dataset, scan.kind);
     let scan = &without_deleted(engine, scan).await?;
     let schema = scan.schema()?;
@@ -174,36 +258,12 @@ pub(crate) async fn run(
     } else {
         assign(engine, files)
     };
-    let mut local = local;
-    for (peer, task_files) in remote {
-        let task = LeafTask {
-            scan: scan.clone(),
-            files: task_files,
-        };
-        analysis.remote_tasks += 1;
-        let Some((_, transport)) = &engine.peers else {
-            local.extend(task.files);
-            continue;
-        };
-        match transport.leaf(&peer, &task).await {
-            Ok(batches) => {
-                analysis.files_remote += task.files.len();
-                for rows in batches {
-                    let rows = reorder(&rows, &schema)?;
-                    analysis.rows_from_files += rows.num_rows();
-                    output.push(rows);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(peer = %peer.node, error = %error, "leaf task failed; reading here");
-                analysis.remote_failed += 1;
-                local.extend(task.files);
-            }
-        }
-    }
-    let from_files = read_files(engine, scan, local, &output, analysis, limit).await?;
-    output.extend(from_files);
-    Ok(output)
+    Ok(Split {
+        scan: scan.clone(),
+        tail: output,
+        local,
+        remote,
+    })
 }
 
 /// `scan` with the conjuncts that hide its table's deleted rows (SE-5),

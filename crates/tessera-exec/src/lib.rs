@@ -29,12 +29,12 @@ pub mod workload;
 
 pub use batch::Batch;
 pub use cache::{ResultCache, ResultKey};
-pub use engine::{Analysis, Engine, EngineError, QueryLimits, QueryOutput};
+pub use engine::{Analysis, Engine, EngineError, QueryLimits, QueryOutput, StageAnalysis};
 pub use memory::{MemoryPool, OutOfMemory};
 pub use operator::{CollectSink, Flow, Operator, Sink};
 pub use pipeline::Pipeline;
 pub use query::{QueryError, Readable, Response, RunOptions, explain_text, run_with};
-pub use remote::{LeafTask, Peer, Peers, RemoteError, RemoteScan};
+pub use remote::{LeafTask, Peer, Peers, RemoteError, RemoteScan, StageTask};
 pub use rollups::RollupSource;
 pub use scan::ScanAnalysis;
 pub use scheduler::{CpuPool, Task, TaskError};

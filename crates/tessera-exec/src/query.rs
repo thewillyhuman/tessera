@@ -218,6 +218,13 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
             analysis.spilled_bytes
         );
     }
+    for stage in &analysis.stages {
+        let _ = writeln!(
+            out,
+            "Stage {}: partial on {} peers, {} run here after a failure",
+            stage.kind, stage.remote, stage.failed
+        );
+    }
     for scan in &analysis.scans {
         let _ = writeln!(out, "Scan {}:", scan.source);
         let _ = writeln!(

@@ -226,7 +226,11 @@ async fn a_cluster_scales_up_survives_a_loss_and_scales_down() {
             tokio::runtime::Handle::current().block_on(async {
                 let mut peers = false;
                 for node in [&a, &b, &c] {
-                    peers |= explain(node).await.contains("peers:");
+                    // QE-14: the count's partial stage ran on the peers
+                    // that scanned the files.
+                    let text = explain(node).await;
+                    peers |=
+                        text.contains("peers:") && text.contains("Stage aggregate: partial on");
                 }
                 peers
             })

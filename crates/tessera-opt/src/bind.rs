@@ -133,15 +133,9 @@ fn bind_plan(plan: Plan) -> Plan {
             input: Box::new(bind_plan(*input)),
             exprs: exprs.into_iter().map(bind_named).collect(),
         },
-        Plan::Aggregate {
-            input,
-            group_by,
-            aggregates,
-        } => Plan::Aggregate {
-            input: Box::new(bind_plan(*input)),
-            group_by: group_by.into_iter().map(bind_named).collect(),
-            aggregates: aggregates.into_iter().map(bind_aggregate).collect(),
-        },
+        aggregate @ (Plan::Aggregate { .. }
+        | Plan::PartialAggregate { .. }
+        | Plan::FinalAggregate { .. }) => bind_aggregation(aggregate),
         Plan::Sort { input, keys } => {
             bind_plan(*input).sort(keys.into_iter().map(bind_key).collect())
         }
@@ -213,6 +207,42 @@ fn bind_grouped(plan: Plan) -> Plan {
             start,
             end,
             step,
+        },
+        other => bind_plan(other),
+    }
+}
+
+/// Binds an aggregate node and its input. The halves of a split
+/// aggregate (QE-14) come bound already: the engine makes them from a
+/// bound aggregate at run time.
+fn bind_aggregation(plan: Plan) -> Plan {
+    match plan {
+        Plan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::Aggregate {
+            input: Box::new(bind_plan(*input)),
+            group_by: group_by.into_iter().map(bind_named).collect(),
+            aggregates: aggregates.into_iter().map(bind_aggregate).collect(),
+        },
+        Plan::PartialAggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::PartialAggregate {
+            input: Box::new(bind_plan(*input)),
+            group_by,
+            aggregates,
+        },
+        Plan::FinalAggregate {
+            input,
+            group_by,
+            aggregates,
+        } => Plan::FinalAggregate {
+            input: Box::new(bind_plan(*input)),
+            group_by,
+            aggregates,
         },
         other => bind_plan(other),
     }

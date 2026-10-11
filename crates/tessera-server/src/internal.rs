@@ -2,7 +2,9 @@
 
 //! What nodes say to each other (sections 7.3 and 10.7), under
 //! `/internal/v1`: a leaf task to run (`POST /internal/v1/scan`, a JSON
-//! `LeafTask`, answered with the rows as an Arrow IPC stream) and a
+//! `LeafTask`, answered with the rows as an Arrow IPC stream), a stage
+//! to run over a share of a scan's files (`POST /internal/v1/stage`, a
+//! JSON `StageTask`, answered the same way; QE-14) and a
 //! batch to write (`POST /internal/v1/ingest`, an Arrow IPC stream with
 //! the tenant, dataset and kind in headers, answered once durable), and
 //! a membership exchange (`POST /internal/v1/gossip`, the caller's view
@@ -26,7 +28,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use futures::future::BoxFuture;
 use tessera_cluster::NodeRecord;
-use tessera_exec::{LeafTask, Peer, RemoteError, RemoteScan};
+use tessera_exec::{LeafTask, Peer, RemoteError, RemoteScan, StageTask};
+use tessera_ir::Registry;
 use tessera_types::{DatasetName, EventBatch, Kind, TenantId};
 
 use crate::{ApiError, AppState};
@@ -44,6 +47,7 @@ pub const KIND_HEADER: &str = "x-tessera-kind";
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/internal/v1/scan", post(scan))
+        .route("/internal/v1/stage", post(stage))
         .route("/internal/v1/ingest", post(ingest))
         .route("/internal/v1/gossip", post(gossip))
         .with_state(state)
@@ -111,6 +115,34 @@ async fn scan(
         .await
         .map_err(|e| ApiError::query(tessera_exec::QueryError::Engine(e), ""))?;
     let bytes = encode(&schema, &batches).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok((
+        [(header::CONTENT_TYPE, HeaderValue::from_static(ARROW_STREAM))],
+        bytes,
+    )
+        .into_response())
+}
+
+/// A stage sent by a coordinator (QE-14): its plan over its files, the
+/// output as an Arrow stream.
+async fn stage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    state.auth.check_cluster(&headers)?;
+    let task: StageTask = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::bad_request(format!("invalid stage task: {e}")))?;
+    let schema = task
+        .plan
+        .schema(&Registry::builtin())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let batches = state
+        .engine
+        .stage(&task)
+        .await
+        .map_err(|e| ApiError::query(tessera_exec::QueryError::Engine(e), ""))?;
+    let bytes = encode(&schema_of(&batches, schema), &batches)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok((
         [(header::CONTENT_TYPE, HeaderValue::from_static(ARROW_STREAM))],
         bytes,
@@ -306,6 +338,25 @@ impl RemoteScan for HttpRemote {
             Ok(batches)
         })
     }
+
+    fn stage<'a>(
+        &'a self,
+        peer: &'a Peer,
+        task: &'a StageTask,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            let body = serde_json::to_vec(task).map_err(|e| RemoteError(e.to_string()))?;
+            let url = format!("{}/internal/v1/stage", peer.http.trim_end_matches('/'));
+            let client = self.clone();
+            let bytes = tokio::task::spawn_blocking(move || {
+                client.post(&url, "application/json", &[], &body)
+            })
+            .await
+            .map_err(|e| RemoteError(e.to_string()))??;
+            let (_, batches) = decode(&bytes).map_err(|e| RemoteError(e.to_string()))?;
+            Ok(batches)
+        })
+    }
 }
 
 /// The schema of `batches`, or `fallback` when there are none.
@@ -454,6 +505,37 @@ mod tests {
         let (schema, batches) = decode(&bytes).unwrap();
         assert_eq!(schema, tessera_types::event::schema(Kind::Log));
         assert!(batches.is_empty(), "no files were named");
+
+        // QE-14: a stage answers with its partial output, here the state
+        // of a count over no files.
+        let stage = StageTask {
+            plan: tessera_ir::Plan::PartialAggregate {
+                input: Box::new(tessera_ir::Plan::Scan(Scan::all(
+                    TenantId::DEFAULT,
+                    DatasetName::new("prod").unwrap(),
+                    Kind::Log,
+                ))),
+                group_by: vec![],
+                aggregates: vec![tessera_ir::AggregateExpr {
+                    function: "count".into(),
+                    args: vec![],
+                    name: "n".into(),
+                }],
+            },
+            files: Vec::new(),
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/v1/stage")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&stage).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let (schema, batches) = decode(&bytes).unwrap();
+        assert_eq!(schema.fields()[0].name(), "n:state0");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
 
         let request = Request::builder()
             .method("POST")

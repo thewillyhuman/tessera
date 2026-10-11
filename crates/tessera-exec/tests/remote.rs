@@ -9,9 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use futures::future::BoxFuture;
-use tessera_exec::{CpuPool, Engine, LeafTask, Peer, Peers, QueryLimits, RemoteError, RemoteScan};
+use tessera_exec::{
+    CpuPool, Engine, LeafTask, Peer, Peers, QueryLimits, RemoteError, RemoteScan, StageAnalysis,
+    StageTask,
+};
 use tessera_format::ParquetFormat;
-use tessera_ir::{Plan, Registry, Scan};
+use tessera_ir::{AggregateExpr, Expr, NamedExpr, Plan, Registry, Scan, SortKey};
 use tessera_manifest::{intake, registry};
 use tessera_object::{MemoryStore, Pools};
 use tessera_opt::optimize;
@@ -129,7 +132,19 @@ impl Peers for HalfToPeer {
 struct PeerEngine {
     engine: Engine,
     tasks: Mutex<Vec<LeafTask>>,
+    stages: Mutex<Vec<StageTask>>,
     fail: bool,
+}
+
+impl PeerEngine {
+    fn new(engine: Engine, fail: bool) -> Arc<Self> {
+        Arc::new(PeerEngine {
+            engine,
+            tasks: Mutex::new(Vec::new()),
+            stages: Mutex::new(Vec::new()),
+            fail,
+        })
+    }
 }
 
 impl RemoteScan for PeerEngine {
@@ -145,6 +160,23 @@ impl RemoteScan for PeerEngine {
             }
             self.engine
                 .leaf(task)
+                .await
+                .map_err(|e| RemoteError(e.to_string()))
+        })
+    }
+
+    fn stage<'a>(
+        &'a self,
+        _peer: &'a Peer,
+        task: &'a StageTask,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            self.stages.lock().unwrap().push(task.clone());
+            if self.fail {
+                return Err(RemoteError("peer down".into()));
+            }
+            self.engine
+                .stage(task)
                 .await
                 .map_err(|e| RemoteError(e.to_string()))
         })
@@ -166,11 +198,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 #[tokio::test]
 async fn files_assigned_to_a_peer_are_read_there() {
     let (store, env) = populate().await;
-    let remote = Arc::new(PeerEngine {
-        engine: engine(&store, &env),
-        tasks: Mutex::new(Vec::new()),
-        fail: false,
-    });
+    let remote = PeerEngine::new(engine(&store, &env), false);
     let engine = engine(&store, &env).with_peers(
         Arc::new(HalfToPeer { peer: peer() }),
         Arc::clone(&remote) as Arc<dyn RemoteScan>,
@@ -195,11 +223,7 @@ async fn files_assigned_to_a_peer_are_read_there() {
 #[tokio::test]
 async fn a_failing_peer_is_read_around() {
     let (store, env) = populate().await;
-    let remote = Arc::new(PeerEngine {
-        engine: engine(&store, &env),
-        tasks: Mutex::new(Vec::new()),
-        fail: true,
-    });
+    let remote = PeerEngine::new(engine(&store, &env), true);
     let engine = engine(&store, &env).with_peers(
         Arc::new(HalfToPeer { peer: peer() }),
         Arc::clone(&remote) as Arc<dyn RemoteScan>,
@@ -220,4 +244,181 @@ async fn a_failing_peer_is_read_around() {
     let output = engine.run(&plan).await.unwrap();
     assert_eq!(output.analysis.scans[0].remote_tasks, 0);
     assert!(total_rows(&output.batches) >= 3);
+}
+
+/// The rows of `batches` as text, sorted, for comparing results whose
+/// row order is unspecified.
+fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
+    let mut rows: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows()).map(|i| {
+                b.columns()
+                    .iter()
+                    .map(|c| arrow::util::display::array_value_to_string(c, i).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn grouped_plan() -> Plan {
+    let scan = Scan::all(TenantId::DEFAULT, dataset(), Kind::Log);
+    let plan = Plan::Aggregate {
+        input: Box::new(Plan::Scan(scan)),
+        group_by: vec![NamedExpr::new(
+            Expr::column("timestamp").binary(
+                tessera_ir::BinaryOp::Lt,
+                Expr::literal(Timestamp::from_nanos(DAY)),
+            ),
+            "first_day",
+        )],
+        aggregates: vec![
+            AggregateExpr {
+                function: "count".into(),
+                args: vec![],
+                name: "n".into(),
+            },
+            AggregateExpr {
+                function: "max".into(),
+                args: vec![Expr::column("body")],
+                name: "last".into(),
+            },
+            AggregateExpr {
+                function: "avg".into(),
+                args: vec![Expr::column("sample_rate")],
+                name: "mean".into(),
+            },
+        ],
+    };
+    optimize(plan, &Registry::builtin()).unwrap()
+}
+
+/// QE-14: an aggregate's partial half runs on the peer over its files,
+/// its states come back, and the result is what one node gives.
+#[tokio::test]
+async fn an_aggregate_runs_its_partial_stage_on_the_peers() {
+    let (store, env) = populate().await;
+    let alone = engine(&store, &env);
+    let expected = alone.run(&grouped_plan()).await.unwrap();
+    assert!(expected.analysis.stages.is_empty(), "no peers, no stages");
+
+    let remote = PeerEngine::new(engine(&store, &env), false);
+    let engine = engine(&store, &env).with_peers(
+        Arc::new(HalfToPeer { peer: peer() }),
+        Arc::clone(&remote) as Arc<dyn RemoteScan>,
+    );
+    let output = engine.run(&grouped_plan()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    assert_eq!(output.num_rows(), 2, "one group per day");
+    assert_eq!(
+        output.analysis.stages,
+        vec![StageAnalysis {
+            kind: "aggregate",
+            remote: 1,
+            failed: 0,
+        }]
+    );
+    let stages = remote.stages.lock().unwrap();
+    assert_eq!(stages.len(), 1);
+    assert!(
+        matches!(stages[0].plan, Plan::PartialAggregate { .. }),
+        "{}",
+        stages[0].plan
+    );
+    assert!(
+        remote.tasks.lock().unwrap().is_empty(),
+        "no plain leaf task"
+    );
+    let scanned = &output.analysis.scans[0];
+    assert_eq!(scanned.files_remote, stages[0].files.len());
+    assert!(scanned.files_remote > 0 && scanned.files_read + scanned.files_remote == 4);
+    assert!(
+        tessera_exec::explain_text(&grouped_plan(), Some(&output.analysis))
+            .contains("Stage aggregate: partial on 1 peers, 0 run here after a failure")
+    );
+}
+
+/// QE-14, QE-17: a peer that cannot run its stage has its share run on
+/// the coordinator, and the result does not change.
+#[tokio::test]
+async fn a_failing_peer_has_its_stage_run_here() {
+    let (store, env) = populate().await;
+    let expected = engine(&store, &env).run(&grouped_plan()).await.unwrap();
+    let remote = PeerEngine::new(engine(&store, &env), true);
+    let engine = engine(&store, &env).with_peers(
+        Arc::new(HalfToPeer { peer: peer() }),
+        Arc::clone(&remote) as Arc<dyn RemoteScan>,
+    );
+    let output = engine.run(&grouped_plan()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    assert_eq!(output.analysis.stages[0].failed, 1);
+    assert_eq!(output.analysis.scans[0].files_read, 4);
+}
+
+/// QE-14: a top-k and a limit run on every share and once more over
+/// the union; an aggregate over a limit stays whole, since its input
+/// cannot be split.
+#[tokio::test]
+async fn top_k_and_limits_split_and_an_aggregate_over_a_limit_does_not() {
+    let (store, env) = populate().await;
+    let scan = || Plan::Scan(Scan::all(TenantId::DEFAULT, dataset(), Kind::Log));
+    let registry = Registry::builtin();
+    let top = optimize(
+        scan().top_k(
+            vec![SortKey::descending(Expr::column("timestamp"))],
+            3,
+            vec![],
+        ),
+        &registry,
+    )
+    .unwrap();
+    // Unoptimized: the optimizer turns a bare limit into a newest-first
+    // scan, which stays on one node.
+    let limited = scan().limit(0, Some(5));
+    let counted_after_limit = optimize(
+        Plan::Aggregate {
+            input: Box::new(scan().limit(0, Some(5))),
+            group_by: vec![],
+            aggregates: vec![AggregateExpr {
+                function: "count".into(),
+                args: vec![],
+                name: "n".into(),
+            }],
+        },
+        &registry,
+    )
+    .unwrap();
+    let alone = engine(&store, &env);
+    let remote = PeerEngine::new(engine(&store, &env), false);
+    let engine = engine(&store, &env).with_peers(
+        Arc::new(HalfToPeer { peer: peer() }),
+        Arc::clone(&remote) as Arc<dyn RemoteScan>,
+    );
+
+    let expected = alone.run(&top).await.unwrap();
+    let output = engine.run(&top).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    assert_eq!(output.num_rows(), 3);
+    assert_eq!(output.analysis.stages[0].kind, "top-k");
+
+    let output = engine.run(&limited).await.unwrap();
+    assert_eq!(output.num_rows(), 5);
+    assert_eq!(output.analysis.stages[0].kind, "limit");
+
+    let output = engine.run(&counted_after_limit).await.unwrap();
+    assert_eq!(
+        sorted_rows(&output.batches),
+        vec!["5.0".to_owned()],
+        "a weighted count"
+    );
+    assert!(
+        output.analysis.stages.is_empty(),
+        "{:?}",
+        output.analysis.stages
+    );
+    assert_eq!(remote.stages.lock().unwrap().len(), 2);
 }
