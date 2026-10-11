@@ -337,8 +337,9 @@ compaction remove them, one node collecting tombstones once every file
 beyond L1 is clean and thirty days have passed (SE-5). Redaction rules
 as tenant settings drop, hash or mask attributes and log bodies at
 ingest, before anything is written, whole or the parts a pattern
-matches (SE-4). A container image, a Helm
-chart and a CI image build (OP-10). Node records announce the newest
+matches (SE-4). A container image holding one statically linked
+binary, built against musl on a distroless base, a Helm
+chart and a CI image build that runs it (OP-10). Node records announce the newest
 data format a build reads, and a node refuses to start beside one that
 cannot read what it writes (OP-7).
 
@@ -373,7 +374,7 @@ material never enters the object store; the catalog holds names only.
 Gaps left in M10: no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a
-cluster, and the binary is not statically linked.
+cluster.
 
 ## Layout
 
