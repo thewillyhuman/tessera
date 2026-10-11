@@ -43,11 +43,26 @@ const LOG_LINGER: Duration = Duration::from_secs(1);
 /// are small, so they lose nothing as floats.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn metric_rows(snapshot: &Snapshot, node: NodeId, now: Timestamp) -> Vec<MetricRow> {
+pub fn metric_rows(
+    snapshot: &Snapshot,
+    commit_conflicts: u64,
+    node: NodeId,
+    now: Timestamp,
+) -> Vec<MetricRow> {
     let mut points: Vec<(String, f64, Option<String>)> = vec![
         (
             "tessera_ingest_queue_depth".into(),
             snapshot.ingest_queue_depth as f64,
+            None,
+        ),
+        (
+            "tessera_write_ack_seconds".into(),
+            snapshot.write_ack.as_secs_f64(),
+            None,
+        ),
+        (
+            "tessera_commit_conflicts_total".into(),
+            commit_conflicts as f64,
             None,
         ),
         (
@@ -117,7 +132,12 @@ pub async fn run_metrics(state: AppState, interval: Duration) {
     loop {
         ticks.tick().await;
         let now = state.env.clock.now();
-        let rows = metric_rows(&state.load.snapshot(), state.env.node, now);
+        let rows = metric_rows(
+            &state.load.snapshot(),
+            tessera_commit::conflicts(),
+            state.env.node,
+            now,
+        );
         let Ok(batch) = EventBatch::from_metrics(TenantId::SYSTEM, dataset.clone(), &rows) else {
             continue;
         };
@@ -283,14 +303,20 @@ mod tests {
     fn the_load_signals_become_gauges_labelled_by_node() {
         let snapshot = Snapshot {
             ingest_queue_depth: 2,
+            write_ack: Duration::from_millis(40),
             query_queue: Duration::from_millis(250),
             compaction_backlog: 1,
             intake_backlog: 0,
             evaluator_lag: Duration::from_secs(3),
             slots: BTreeMap::from([(WorkKind::Partition, 4), (WorkKind::Intake, 1)]),
         };
-        let rows = metric_rows(&snapshot, NodeId::from_u128(7), Timestamp::from_nanos(1));
-        assert_eq!(rows.len(), 7);
+        let rows = metric_rows(&snapshot, 3, NodeId::from_u128(7), Timestamp::from_nanos(1));
+        assert_eq!(rows.len(), 9);
+        let conflicts = rows
+            .iter()
+            .find(|r| r.name == "tessera_commit_conflicts_total")
+            .unwrap();
+        assert_eq!(conflicts.value, Some(3.0));
         let queue = rows
             .iter()
             .find(|r| r.name == "tessera_query_queue_seconds")

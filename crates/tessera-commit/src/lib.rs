@@ -15,7 +15,7 @@ pub mod state;
 
 pub use action::{Action, KvMutation, RemoveReason};
 pub use lease::{Lease, LeaseError, LeaseManager};
-pub use log::{CommitError, CommitLog, UpdateError};
+pub use log::{CommitError, CommitLog, UpdateError, conflicts};
 pub use record::{Commit, CommitId, DecodeError, FORMAT};
 pub use slot::{InvalidSlotCount, Slot, SlotCount};
 pub use state::{ApplyError, KvState, Snapshot, State};

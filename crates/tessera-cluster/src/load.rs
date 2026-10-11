@@ -26,6 +26,7 @@ use tessera_types::WorkKind;
 #[derive(Default)]
 pub struct Load {
     ingest_inflight: AtomicU64,
+    write_ack_nanos: AtomicU64,
     query_wait_nanos: AtomicU64,
     compaction_backlog: AtomicU64,
     intake_backlog: AtomicU64,
@@ -47,6 +48,9 @@ impl Drop for Inflight {
 pub struct Snapshot {
     /// Writes in flight.
     pub ingest_queue_depth: u64,
+    /// Smoothed time a durable write took to be acknowledged: the
+    /// writer log's latency (section 14.7).
+    pub write_ack: Duration,
     /// Smoothed time queries waited for a turn.
     pub query_queue: Duration,
     /// Compaction jobs deferred by the budget in the last round.
@@ -71,6 +75,17 @@ impl Load {
     pub fn ingest_started(self: &Arc<Self>) -> Inflight {
         self.ingest_inflight.fetch_add(1, Ordering::Relaxed);
         Inflight(Arc::clone(self))
+    }
+
+    /// Records how long a durable write took to be acknowledged,
+    /// smoothed like the query wait.
+    pub fn write_acked(&self, took: Duration) {
+        let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        let _ = self
+            .write_ack_nanos
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(old / 5 * 4 + took / 5)
+            });
     }
 
     /// Records how long a query waited for its turn, smoothed over the
@@ -115,6 +130,7 @@ impl Load {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             ingest_queue_depth: self.ingest_inflight.load(Ordering::Relaxed),
+            write_ack: Duration::from_nanos(self.write_ack_nanos.load(Ordering::Relaxed)),
             query_queue: Duration::from_nanos(self.query_wait_nanos.load(Ordering::Relaxed)),
             compaction_backlog: self.compaction_backlog.load(Ordering::Relaxed),
             intake_backlog: self.intake_backlog.load(Ordering::Relaxed),
@@ -142,6 +158,11 @@ impl Snapshot {
             "tessera_ingest_queue_depth",
             "Writes in flight on this node.",
             self.ingest_queue_depth.to_string(),
+        );
+        gauge(
+            "tessera_write_ack_seconds",
+            "Time the last durable writes took to be acknowledged, smoothed.",
+            format!("{:.6}", self.write_ack.as_secs_f64()),
         );
         gauge(
             "tessera_query_queue_seconds",
@@ -189,6 +210,22 @@ mod tests {
         assert_eq!(load.snapshot().ingest_queue_depth, 1);
         drop(second);
         assert_eq!(load.snapshot().ingest_queue_depth, 0);
+    }
+
+    #[test]
+    fn write_acks_are_smoothed() {
+        let load = Load::new();
+        load.write_acked(Duration::from_secs(1));
+        assert_eq!(load.snapshot().write_ack, Duration::from_millis(200));
+        for _ in 0..40 {
+            load.write_acked(Duration::from_secs(1));
+        }
+        assert!(load.snapshot().write_ack > Duration::from_millis(990));
+        assert!(
+            load.snapshot()
+                .prometheus_text()
+                .contains("tessera_write_ack_seconds 0.99")
+        );
     }
 
     #[test]

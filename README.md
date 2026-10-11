@@ -300,9 +300,8 @@ Gaps left in M10: no OIDC or mutual TLS (SE-1); no
 row-filter roles; no per-tenant encryption keys (SE-2); no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a
-cluster, and the binary is not statically linked; writer-log latency
-and the commit conflict rate are not measured, so their health rules
-are not shipped; redaction by a pattern over values is not
+cluster, and the binary is not statically linked; redaction by a
+pattern over values is not
 implemented; membership still comes from the registry alone, not
 gossip or DNS.
 

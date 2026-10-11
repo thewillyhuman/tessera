@@ -157,7 +157,9 @@ impl AppState {
         }
         match ack {
             AckMode::Durable => {
+                let started = std::time::Instant::now();
                 self.ingest.write(batch).await?;
+                self.load.write_acked(started.elapsed());
             }
             AckMode::Buffered => self.ingest.write_buffered(batch).await?,
         }

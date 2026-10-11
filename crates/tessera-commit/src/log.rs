@@ -13,6 +13,7 @@
 //! may not have been committed, and the caller must re-derive its intent
 //! from a fresh snapshot, as `update` does, rather than resend them.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -28,6 +29,17 @@ use crate::{Action, Commit, CommitId, FORMAT, Snapshot, State};
 const VERIFY_ATTEMPTS: u32 = 8;
 /// Backoff between read-back attempts, doubled each time.
 const VERIFY_BACKOFF: Duration = Duration::from_millis(10);
+
+/// How many times an update of any log on this node lost a version to
+/// another committer and retried (section 14.7): the commit conflict
+/// rate, read by the node's own metrics.
+static CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// The conflicts counted so far on this node.
+#[must_use]
+pub fn conflicts() -> u64 {
+    CONFLICTS.load(Ordering::Relaxed)
+}
 
 /// Why a commit-log operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -221,7 +233,11 @@ impl<S: State> CommitLog<S> {
             }
             match self.commit(&base, actions).await {
                 Ok(snapshot) => return Ok(snapshot),
-                Err(CommitError::Conflict { .. } | CommitError::Unknown { .. }) => {
+                Err(CommitError::Conflict { .. }) => {
+                    CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                    base = self.snapshot().await.map_err(UpdateError::Commit)?;
+                }
+                Err(CommitError::Unknown { .. }) => {
                     base = self.snapshot().await.map_err(UpdateError::Commit)?;
                 }
                 Err(error) => return Err(UpdateError::Commit(error)),
@@ -478,6 +494,28 @@ mod tests {
         assert_eq!(next.version(), Version::new(1));
         assert_eq!(next.state().get("a"), Some("1"));
         assert_eq!(log.snapshot().await.unwrap().version(), Version::new(1));
+    }
+
+    #[tokio::test]
+    async fn conflicting_updates_are_counted() {
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let first = log(Arc::clone(&store), 1);
+        let second = log(Arc::clone(&store), 2);
+        second.snapshot().await.unwrap();
+        first
+            .update(|_| Ok::<_, String>(vec![put("a", "1")]))
+            .await
+            .unwrap();
+        let before = conflicts();
+        second
+            .update(|_| Ok::<_, String>(vec![put("b", "2")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            conflicts(),
+            before + 1,
+            "the stale base lost once, then won"
+        );
     }
 
     #[tokio::test]

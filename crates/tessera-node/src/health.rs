@@ -38,10 +38,39 @@ fn rule(name: &str, metric: &str, condition: &str, hold_seconds: u64, severity: 
     rule
 }
 
+/// A default rule over how much a counter grew in the last two
+/// minutes, per node.
+fn growth_rule(name: &str, metric: &str, condition: &str, severity: &str) -> AlertRule {
+    let mut rule = rule(name, metric, condition, 300, severity);
+    rule.expr = format!(
+        "SELECT attr.node AS node, max(value) - min(value) AS value FROM metrics \
+         WHERE name = '{metric}' AND timestamp > now() - INTERVAL '2 minutes' \
+         GROUP BY attr.node HAVING max(value) - min(value) {condition}"
+    );
+    rule.annotations.insert(
+        "summary".into(),
+        format!("{metric} grew {condition} in two minutes on node {{{{node}}}}"),
+    );
+    rule
+}
+
 /// The default rules.
 #[must_use]
 pub fn default_rules() -> Vec<AlertRule> {
     vec![
+        rule(
+            "tessera_write_ack",
+            "tessera_write_ack_seconds",
+            "> 5",
+            300,
+            "warning",
+        ),
+        growth_rule(
+            "tessera_commit_conflicts",
+            "tessera_commit_conflicts_total",
+            "> 30",
+            "warning",
+        ),
         rule(
             "tessera_intake_backlog",
             "tessera_intake_backlog",
@@ -121,7 +150,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let env = Env::simulated(1, Timestamp::from_nanos(0));
         let controls = ControlStores::new(store, env);
-        assert_eq!(ensure_rules(&controls).await.unwrap(), 5);
+        assert_eq!(ensure_rules(&controls).await.unwrap(), 7);
         let control = controls.open(&TenantId::SYSTEM);
         let mut changed: AlertRule = serde_json::from_value(
             control
