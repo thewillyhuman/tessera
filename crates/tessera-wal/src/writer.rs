@@ -43,6 +43,9 @@ pub struct WriterLog {
     state: State,
     /// A write at `next` whose outcome is unknown.
     in_doubt: Option<EntryId>,
+    /// Where a write in doubt was found to have landed by the append
+    /// after it, until [`WriterLog::settle`] reports it.
+    landed: Option<Seq>,
 }
 
 impl WriterLog {
@@ -57,6 +60,7 @@ impl WriterLog {
             next: Seq::new(1),
             state: State::Open,
             in_doubt: None,
+            landed: None,
         }
     }
 
@@ -72,6 +76,7 @@ impl WriterLog {
             next,
             state: State::Open,
             in_doubt: None,
+            landed: None,
         }
     }
 
@@ -211,6 +216,9 @@ impl WriterLog {
     /// `Store` if the store still cannot be read, in which case the doubt
     /// remains; `Fenced` if a seal sits at the position.
     pub async fn settle(&mut self) -> Result<Option<Seq>, WalError> {
+        if let Some(seq) = self.landed.take() {
+            return Ok(Some(seq));
+        }
         let Some(id) = self.in_doubt else {
             return Ok(None);
         };
@@ -229,8 +237,14 @@ impl WriterLog {
         }
     }
 
+    /// Settles a write in doubt before another append, keeping where it
+    /// landed for the caller, whose own account of the write waits on
+    /// [`WriterLog::settle`].
     async fn resolve_doubt(&mut self) -> Result<(), WalError> {
-        self.settle().await.map(|_| ())
+        if let Some(seq) = self.settle().await? {
+            self.landed = Some(seq);
+        }
+        Ok(())
     }
 
     async fn resolve_existing(&mut self, seq: Seq, id: EntryId) -> Result<Seq, WalError> {
@@ -441,9 +455,11 @@ mod tests {
         assert!(log.has_doubt());
         store.set_blind(false);
         // The first write did land; the next append must go after it, not
-        // mistake it for a fence.
+        // mistake it for a fence, and still tell the caller where it went.
         assert_eq!(log.append_segment(&[batch()]).await.unwrap(), Seq::new(2));
         assert!(!log.is_fenced());
+        assert_eq!(log.settle().await.unwrap(), Some(Seq::new(1)));
+        assert_eq!(log.settle().await.unwrap(), None);
         assert_eq!(
             reader::list(&inner, log.writer_id()).await.unwrap(),
             [Seq::new(1), Seq::new(2)]

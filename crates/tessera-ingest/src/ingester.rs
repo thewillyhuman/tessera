@@ -294,18 +294,25 @@ impl Ingester {
         self.pending_bytes = 0;
         self.pending_since = None;
         let batches: Vec<EventBatch> = pending.iter().map(|(b, _)| b.clone()).collect();
-        let mut result = match self.settle().await {
-            Ok(()) => self.append(&batches).await,
+        let result = match self.settle().await {
+            Ok(()) => {
+                let mut result = self.append(&batches).await;
+                if matches!(result, Err(IngestError::Fenced)) {
+                    tracing::warn!(writer = %self.log.writer_id(), "writer log fenced by recovery; starting a new one");
+                    self.replace_log();
+                    result = self.append(&batches).await;
+                }
+                if matches!(result, Err(IngestError::NotStored(_))) && self.log.has_doubt() {
+                    self.in_doubt = Some(Doubt::Segment(batches));
+                }
+                result
+            }
+            // An earlier append, a flush record maybe, is still in doubt
+            // and keeps its place: nothing is appended, and these writes
+            // are refused, until it is settled. Taking its place would
+            // lose what it meant once it is found to have landed.
             Err(error) => Err(error),
         };
-        if matches!(result, Err(IngestError::Fenced)) {
-            tracing::warn!(writer = %self.log.writer_id(), "writer log fenced by recovery; starting a new one");
-            self.replace_log();
-            result = self.append(&batches).await;
-        }
-        if matches!(result, Err(IngestError::NotStored(_))) && self.log.has_doubt() {
-            self.in_doubt = Some(Doubt::Segment(batches));
-        }
         match result {
             Ok(seq) => {
                 for (batch, sender) in pending {
@@ -967,6 +974,74 @@ mod tests {
         assert_eq!(
             h.view_ids("prod").await,
             [0, 1, 2],
+            "every row exactly once"
+        );
+    }
+
+    /// A flush record in doubt keeps its doubt while the store stays
+    /// unreadable and writes keep coming: the segment they would have
+    /// made is refused, and once the store answers, the record is found
+    /// to have landed and its rows are not flushed again.
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_in_doubt_is_not_forgotten_by_a_refused_segment() {
+        let h = Harness::new();
+        let lying = Arc::new(LostResponseStore::new(
+            Arc::new(h.store.clone()),
+            tessera_object::Key::new("_wal").unwrap(),
+        ));
+        let mut ingester = h.ingester_on(
+            Arc::clone(&lying) as Arc<dyn ObjectStore>,
+            IngestConfig {
+                segment_bytes: 1,
+                ..config()
+            },
+        );
+        ingester
+            .write(batch("prod", 0..3))
+            .await
+            .wait()
+            .await
+            .unwrap();
+        // The flush record lands while the store is blind.
+        h.clock.advance(Duration::from_secs(120));
+        lying.set_blind(true);
+        ingester.tick().await;
+        // Still blind, rows arrive: the segment is refused, the doubt kept.
+        let mut ack = ingester.write(batch("prod", 3..4)).await;
+        h.clock.advance(Duration::from_secs(1));
+        ingester.tick().await;
+        assert!(
+            matches!(ack.try_now(), Some(Err(_))),
+            "refused while in doubt"
+        );
+        lying.set_blind(false);
+        h.clock.advance(Duration::from_secs(120));
+        ingester.tick().await;
+        ingester
+            .write(batch("prod", 4..5))
+            .await
+            .wait()
+            .await
+            .unwrap();
+        h.clock.advance(Duration::from_secs(120));
+        ingester.tick().await;
+        assert_eq!(
+            h.entry_kinds(&ingester).await,
+            ["segment", "flush", "segment", "flush"],
+            "one flush per set of rows"
+        );
+        intake::run(
+            Arc::new(h.store.clone()),
+            &h.env,
+            &TenantId::DEFAULT,
+            &DatasetName::new("prod").unwrap(),
+            ingester.writer_id(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            h.view_ids("prod").await,
+            [0, 1, 2, 4],
             "every row exactly once"
         );
     }
