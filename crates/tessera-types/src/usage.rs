@@ -20,6 +20,8 @@ pub struct Stored {
     pub service: Option<String>,
     /// The log pattern, for logs with one assigned.
     pub pattern_id: Option<i64>,
+    /// The pattern's template, for logs with one assigned.
+    pub pattern: Option<String>,
     /// The metric, span or event name, for those kinds.
     pub name: Option<String>,
     /// The rows of the group.

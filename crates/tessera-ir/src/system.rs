@@ -40,7 +40,7 @@ fn time(name: &str) -> Field {
 /// The columns of `system.usage` (CO-4) besides `timestamp` and `phase`:
 /// the column, the attribute of the `_system.usage` event it comes
 /// from, and whether it is a number.
-pub const USAGE_COLUMNS: [(&str, &str, bool); 15] = [
+pub const USAGE_COLUMNS: [(&str, &str, bool); 16] = [
     ("tenant", "attr.tenant", false),
     ("dataset", "attr.dataset", false),
     ("kind", "attr.kind", false),
@@ -55,8 +55,23 @@ pub const USAGE_COLUMNS: [(&str, &str, bool); 15] = [
     ("cpu_ms", "attr.cpu_ms", true),
     ("requests", "attr.requests", true),
     ("pattern_id", "attr.pattern_id", true),
+    ("pattern", "attr.pattern", false),
     ("name", "attr.name", false),
 ];
+
+/// The schema of `system.log_patterns` (section 13.2): each pattern of a
+/// dataset with the rows and bytes compaction has stored under it.
+#[must_use]
+pub fn log_patterns_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        text("tenant"),
+        text("dataset"),
+        int("pattern_id"),
+        text("pattern"),
+        Field::new("rows", DataType::Float64, true),
+        Field::new("bytes", DataType::Float64, true),
+    ]))
+}
 
 /// The schema of `system.usage`.
 #[must_use]

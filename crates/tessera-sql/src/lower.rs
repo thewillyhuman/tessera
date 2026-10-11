@@ -232,6 +232,8 @@ fn lower_query(
     };
     let (scope, mut plan) = if from.dataset.as_deref() == Some("system") && from.table == "usage" {
         usage_source(ctx)
+    } else if from.dataset.as_deref() == Some("system") && from.table == "log_patterns" {
+        log_patterns_source(ctx)
     } else if from.dataset.as_deref() == Some("system") {
         let schema = tessera_ir::system_table_schema(&from.table).ok_or_else(|| {
             Diagnostic::at(
@@ -316,6 +318,53 @@ fn usage_source(ctx: &BindContext) -> (Scope, Plan) {
             kind: None,
         },
         scan.project(exprs),
+    )
+}
+
+/// `system.log_patterns` (section 13.2): what compaction stored per
+/// pattern, summed over the usage events.
+fn log_patterns_source(ctx: &BindContext) -> (Scope, Plan) {
+    let (_, usage) = usage_source(ctx);
+    let column = |name: &str| Expr::column(name);
+    let stored = usage.filter(
+        column("phase")
+            .binary(BinaryOp::Eq, Expr::literal("stored"))
+            .binary(
+                BinaryOp::And,
+                Expr::IsNull {
+                    expr: Box::new(column("pattern_id")),
+                    negated: true,
+                },
+            ),
+    );
+    let plan = Plan::Aggregate {
+        input: Box::new(stored),
+        group_by: vec![
+            NamedExpr::new(column("tenant"), "tenant"),
+            NamedExpr::new(column("dataset"), "dataset"),
+            NamedExpr::new(column("pattern_id"), "pattern_id"),
+            NamedExpr::new(column("pattern"), "pattern"),
+        ],
+        aggregates: vec![
+            AggregateExpr {
+                function: "sum_raw".into(),
+                args: vec![column("events")],
+                name: "rows".into(),
+            },
+            AggregateExpr {
+                function: "sum_raw".into(),
+                args: vec![column("bytes")],
+                name: "bytes".into(),
+            },
+        ],
+    };
+    (
+        Scope {
+            schema: tessera_ir::log_patterns_schema(),
+            table: Some("log_patterns".into()),
+            kind: None,
+        },
+        plan,
     )
 }
 
@@ -710,6 +759,15 @@ impl Lowerer<'_> {
             if self.scope.column_type(single).is_some() {
                 return Ok(Expr::column(*single));
             }
+            // The pattern of a compacted log row (section 13.2): a column
+            // of compacted files, read like a path so that files without
+            // it read as null.
+            if *single == event::PATTERN_ID && self.scope.kind == Some(Kind::Log) {
+                return Ok(Expr::Path {
+                    path: event::PATTERN_ID.to_owned(),
+                    data_type: DataType::Int64,
+                });
+            }
             if let Some((prefix, _)) = single.split_once('.') {
                 if scopes.contains(&prefix) {
                     return Ok(path(single));
@@ -1007,6 +1065,31 @@ mod tests {
                 .message
                 .contains("unknown system table")
         );
+    }
+
+    #[test]
+    fn usage_and_log_patterns_read_the_system_tenant() {
+        let usage = lowered("SELECT phase, sum(bytes) AS b FROM system.usage GROUP BY phase");
+        let text = usage.to_string();
+        assert!(
+            text.contains("Scan: usage/event [all time) _system"),
+            "{text}"
+        );
+        assert!(text.contains("attr.bytes"), "{text}");
+        usage.schema(&Registry::builtin()).unwrap();
+        let patterns = lowered(
+            "SELECT pattern, rows FROM system.log_patterns WHERE dataset = 'prod' ORDER BY bytes DESC",
+        );
+        let text = patterns.to_string();
+        assert!(text.contains("Aggregate: group_by=[tenant AS tenant, dataset AS dataset, pattern_id AS pattern_id, pattern AS pattern]"), "{text}");
+        assert!(text.contains("(phase = 'stored')"), "{text}");
+        patterns.schema(&Registry::builtin()).unwrap();
+        let by_pattern = lowered("SELECT pattern_id, count(*) FROM logs GROUP BY pattern_id");
+        assert!(
+            by_pattern.to_string().contains("pattern_id"),
+            "{by_pattern}"
+        );
+        by_pattern.schema(&Registry::builtin()).unwrap();
     }
 
     #[test]

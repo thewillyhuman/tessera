@@ -35,6 +35,6 @@ pub use plan::{
     SeriesGrouping, SortKey, VALUE, range_vector_schema,
 };
 pub use promql::{Group, LOOKBACK, Matching, PromAggregate, PromExpr, PromOp};
-pub use system::{system_table_schema, usage_schema};
+pub use system::{log_patterns_schema, system_table_schema, usage_schema};
 pub use trace::{Relation, SpanAggregate, Spanset, Structural, trace_group_schema};
 pub use typing::{TypeError, expr_type};

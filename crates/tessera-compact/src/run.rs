@@ -20,7 +20,7 @@ use tessera_types::event::{EVENT_ID, NAME, PATTERN_ID};
 use tessera_types::{Env, FileId, FileMeta, FileSource, Kind, Meter, PartitionId, Stored};
 
 use crate::plan::Job;
-use crate::{CompactError, promote};
+use crate::{CompactError, patterns, promote};
 
 /// Runs compaction jobs against the pools.
 pub struct Compactor {
@@ -54,10 +54,15 @@ fn is_path(column: &str) -> bool {
 /// A group of stored rows: service, pattern and name.
 type StoredKey = (Option<String>, Option<i64>, Option<String>);
 
-/// What a compacted file stores per service and name (CO-2): the file's
-/// bytes shared out by rows.
+/// What a compacted file stores per service, pattern and name (CO-2):
+/// the file's bytes shared out by rows; `templates` names the patterns.
 #[must_use]
-pub fn stored_usage(rows: &RecordBatch, partition: &PartitionId, file_bytes: u64) -> Vec<Stored> {
+pub fn stored_usage(
+    rows: &RecordBatch,
+    partition: &PartitionId,
+    file_bytes: u64,
+    templates: &[(i64, String)],
+) -> Vec<Stored> {
     let text = |name: &str| {
         rows.column_by_name(name)
             .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned())
@@ -98,6 +103,12 @@ pub fn stored_usage(rows: &RecordBatch, partition: &PartitionId, file_bytes: u64
             dataset: partition.dataset.clone(),
             kind: partition.kind,
             service,
+            pattern: pattern_id.and_then(|id| {
+                templates
+                    .iter()
+                    .find(|(known, _)| *known == id)
+                    .map(|(_, template)| template.clone())
+            }),
             pattern_id,
             name,
             rows: count,
@@ -167,8 +178,13 @@ impl Compactor {
         let (written, duplicates, stored) = tokio::task::spawn_blocking(move || {
             let (rows, duplicates) = deduplicate(&batches)?;
             let (rows, _) = promote::promote(&rows, &wanted, promote::MAX_DEDICATED)?;
+            let (rows, templates) = if partition.kind == Kind::Log {
+                patterns::assign(&rows)?
+            } else {
+                (rows, Vec::new())
+            };
             let written = format.write(std::slice::from_ref(&rows), &layout)?;
-            let stored = stored_usage(&rows, &partition, written.bytes.len() as u64);
+            let stored = stored_usage(&rows, &partition, written.bytes.len() as u64, &templates);
             Ok::<_, CompactError>((written, duplicates, stored))
         })
         .await

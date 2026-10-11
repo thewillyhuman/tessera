@@ -607,3 +607,37 @@ async fn promoted_attribute_columns_serve_paths_and_prune_by_statistics() {
         "every file's attr.n stays below 201"
     );
 }
+
+#[tokio::test]
+async fn compacted_logs_carry_stable_pattern_ids() {
+    let (store, env) = populate().await;
+    compact_all(&store, &env).await;
+    let engine = engine(&store, &env);
+    let ctx = tessera_ir::BindContext {
+        tenant: TenantId::DEFAULT,
+        dataset: dataset(),
+        now: env.clock.now(),
+    };
+    let response = tessera_exec::query::run(
+        &engine,
+        &tessera_sql::SqlFrontend,
+        "SELECT pattern_id, count(*) AS n FROM logs GROUP BY pattern_id ORDER BY n DESC",
+        &ctx,
+    )
+    .await
+    .unwrap();
+    let tessera_exec::Response::Rows(output) = response else {
+        panic!("rows");
+    };
+    let ids = column::<Int64Array>(&output.batches, "pattern_id");
+    let counts = column::<Float64Array>(&output.batches, "n");
+    assert_eq!(
+        output.num_rows(),
+        2,
+        "`<*> on day <*>` in files, null in the tail"
+    );
+    assert!(!ids[0].is_null(0), "every compacted row has a pattern");
+    assert!((counts[0].value(0) - 18.0).abs() < f64::EPSILON);
+    assert!(ids[0].is_null(1), "tail rows have none yet");
+    assert!((counts[0].value(1) - 3.0).abs() < f64::EPSILON);
+}

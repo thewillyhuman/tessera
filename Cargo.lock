@@ -2568,6 +2568,7 @@ dependencies = [
  "tessera-manifest",
  "tessera-object",
  "tessera-opt",
+ "tessera-sql",
  "tessera-types",
  "tessera-wal",
  "thiserror",

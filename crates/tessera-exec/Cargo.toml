@@ -25,6 +25,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
+tessera-sql.workspace = true
 tessera-compact.workspace = true
 tessera-wal.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

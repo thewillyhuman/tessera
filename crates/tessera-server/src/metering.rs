@@ -225,6 +225,9 @@ pub fn stored_usage(stored: &[Stored]) -> Vec<Usage> {
             if let Some(pattern) = s.pattern_id {
                 extra.insert("pattern_id", Scalar::Int(pattern));
             }
+            if let Some(template) = &s.pattern {
+                extra.insert("pattern", Scalar::Text(template.clone()));
+            }
             if let Some(name) = &s.name {
                 extra.insert("name", Scalar::Text(name.clone()));
             }

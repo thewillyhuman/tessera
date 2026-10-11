@@ -16,6 +16,7 @@
 //! milestones.
 
 pub mod gc;
+pub mod patterns;
 pub mod plan;
 pub mod promote;
 pub mod run;
