@@ -2403,6 +2403,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-advisor"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tessera-manifest",
+ "tessera-types",
+]
+
+[[package]]
 name = "tessera-catalog"
 version = "0.1.0"
 dependencies = [
