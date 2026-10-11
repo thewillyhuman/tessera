@@ -43,7 +43,7 @@ use tessera_types::event::{
 };
 use tessera_types::{Kind, TimeRange, Timestamp};
 
-use crate::params::{Scope, parse_step, parse_time, scope};
+use crate::params::{Need, Scope, parse_step, parse_time, scope};
 use crate::{ApiError, AppState};
 
 /// The Tempo router.
@@ -266,7 +266,7 @@ async fn search(
     headers: HeaderMap,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers)?;
+    let scope = scope(&state, &headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(&params, now)?;
@@ -707,7 +707,7 @@ async fn trace_response(
     id: &str,
     params: &Params,
 ) -> Result<Option<TracesData>, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let id = parse_trace_id(id)?;
     let now = state.env.clock.now();
@@ -790,7 +790,7 @@ async fn discovery_rows(
     headers: &HeaderMap,
     params: &Params,
 ) -> Result<Vec<RecordBatch>, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
@@ -1048,7 +1048,7 @@ async fn metrics_common(
     params: &Params,
     instant: bool,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;

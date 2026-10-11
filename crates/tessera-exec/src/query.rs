@@ -5,9 +5,11 @@
 //! `EXPLAIN ANALYZE` runs it and reports what each scan did (QE-4, QE-8).
 
 use std::fmt::Write;
+use std::sync::Arc;
 
 use tessera_ir::{BindContext, ControlStatement, Diagnostic, Frontend, Plan, Statement};
 use tessera_opt::{OptError, optimize};
+use tessera_types::DatasetName;
 
 use crate::engine::{Analysis, Engine, EngineError, QueryOutput};
 use crate::workload;
@@ -24,6 +26,12 @@ pub enum QueryError {
     /// Running the plan failed.
     #[error("{0}")]
     Engine(#[from] EngineError),
+    /// The caller may not read a dataset the query scans (SE-1).
+    #[error("dataset {dataset} may not be read with these credentials")]
+    Forbidden {
+        /// The dataset.
+        dataset: DatasetName,
+    },
 }
 
 /// What a statement produced.
@@ -44,17 +52,25 @@ pub enum Response {
     Control(ControlStatement),
 }
 
+/// Which datasets a caller may read.
+pub type Readable = Arc<dyn Fn(&DatasetName) -> bool + Send + Sync>;
+
 /// What a caller may change about how a query runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct RunOptions {
     /// Whether a matching aggregation may read a rollup instead of the
     /// raw rows (AD-13); on unless the caller turns it off.
     pub rollups: bool,
+    /// The datasets the caller may read (SE-1); every one when absent.
+    pub readable: Option<Readable>,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        RunOptions { rollups: true }
+        RunOptions {
+            rollups: true,
+            readable: None,
+        }
     }
 }
 
@@ -118,6 +134,13 @@ async fn plan_of(
     options: RunOptions,
 ) -> Result<Plan, QueryError> {
     let plan = optimize(plan, engine.registry())?;
+    if let Some(readable) = &options.readable {
+        if let Some(scan) = scans(&plan).into_iter().find(|s| !readable(&s.dataset)) {
+            return Err(QueryError::Forbidden {
+                dataset: scan.dataset.clone(),
+            });
+        }
+    }
     let Some(source) = engine.rollups().filter(|_| options.rollups) else {
         return Ok(plan);
     };
@@ -130,6 +153,14 @@ async fn plan_of(
         return Ok(plan);
     }
     Ok(optimize(substituted, engine.registry())?)
+}
+
+/// Every scan in `plan`.
+fn scans(plan: &Plan) -> Vec<&tessera_ir::Scan> {
+    match plan {
+        Plan::Scan(scan) => vec![scan],
+        other => other.inputs().into_iter().flat_map(scans).collect(),
+    }
 }
 
 /// The text of an `EXPLAIN`: the plan, then one block per scan when

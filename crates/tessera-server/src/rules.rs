@@ -28,7 +28,7 @@ use tessera_types::{TenantId, Timestamp};
 
 use crate::AppState;
 use crate::error::ApiError;
-use crate::params::{parse_step, scope};
+use crate::params::{Need, parse_step, scope};
 
 /// The route rules loaded from files notify.
 pub const DEFAULT_ROUTE: &str = "default";
@@ -108,7 +108,7 @@ async fn load(
     body: &[u8],
     language: Language,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Admin).await?;
     let file: GroupFile = serde_yaml_ng::from_slice(body)
         .map_err(|e| ApiError::bad_request(format!("invalid rule group: {e}")))?;
     let group = group_name(namespace, &file.name);
@@ -193,7 +193,7 @@ async fn remove(
     namespace: &str,
     group: &str,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Admin).await?;
     let group = group_name(namespace, group);
     let control = state.controls.open(&scope.tenant);
     let (removed, _) = control
@@ -324,7 +324,7 @@ fn success(data: &Value) -> Response {
 
 async fn prometheus_rules(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let answer = async {
-        let scope = scope(&state, &headers)?;
+        let scope = scope(&state, &headers, Need::Read).await?;
         let groups = groups_of(&state, &scope.tenant).await?;
         Ok::<_, ApiError>(success(&json!({
             "groups": groups.iter().map(group_json).collect::<Vec<_>>()
@@ -335,7 +335,7 @@ async fn prometheus_rules(State(state): State<AppState>, headers: HeaderMap) -> 
 
 async fn prometheus_alerts(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let answer = async {
-        let scope = scope(&state, &headers)?;
+        let scope = scope(&state, &headers, Need::Read).await?;
         let groups = groups_of(&state, &scope.tenant).await?;
         let mut alerts = Vec::new();
         for group in &groups {
@@ -359,7 +359,7 @@ async fn files_of(
     namespace: Option<&str>,
     language: Language,
 ) -> Result<BTreeMap<String, Vec<GroupFile>>, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let groups = groups_of(state, &scope.tenant).await?;
     let mut files: BTreeMap<String, Vec<GroupFile>> = BTreeMap::new();
     for group in groups {

@@ -20,8 +20,8 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResp
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse;
 use prost::Message;
 use tessera_ingest::otlp;
-use tessera_types::{DatasetName, TenantId};
 
+use crate::params::{Need, scope};
 use crate::{ApiError, AppState};
 
 /// The header naming the dataset a request writes to.
@@ -88,12 +88,12 @@ async fn export_logs(
         Encoding::Json => otlp::parse_json(&body),
     }
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let dataset = dataset(&headers)?;
+    let scope = scope(&state, &headers, Need::Write).await?;
     let now = state.env.clock.now();
     let batch = otlp::to_batch(
         &request,
-        TenantId::DEFAULT,
-        dataset,
+        scope.tenant,
+        scope.dataset,
         now,
         &mut state.env.random.clone(),
     )
@@ -120,9 +120,9 @@ async fn export_traces(
         Encoding::Json => otlp::traces::parse_json(&body),
     }
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let dataset = dataset(&headers)?;
+    let scope = scope(&state, &headers, Need::Write).await?;
     let now = state.env.clock.now();
-    let batches = otlp::traces::to_batches(&request, TenantId::DEFAULT, dataset, now)
+    let batches = otlp::traces::to_batches(&request, scope.tenant, scope.dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for batch in batches {
         state.write(batch).await?;
@@ -144,9 +144,9 @@ async fn export_metrics(
         Encoding::Json => otlp::metrics::parse_json(&body),
     }
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let dataset = dataset(&headers)?;
+    let scope = scope(&state, &headers, Need::Write).await?;
     let now = state.env.clock.now();
-    let batch = otlp::metrics::to_batch(&request, TenantId::DEFAULT, dataset, now)
+    let batch = otlp::metrics::to_batch(&request, scope.tenant, scope.dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if let Some(batch) = batch {
         state.write(batch).await?;
@@ -155,20 +155,6 @@ async fn export_metrics(
         encoding,
         ExportMetricsServiceResponse::default().encode_to_vec(),
     ))
-}
-
-fn dataset(headers: &HeaderMap) -> Result<DatasetName, ApiError> {
-    match headers.get(DATASET_HEADER) {
-        None => Ok(
-            DatasetName::new("default").unwrap_or_else(|_| unreachable!("a literal valid name"))
-        ),
-        Some(value) => {
-            let text = value
-                .to_str()
-                .map_err(|_| ApiError::bad_request("dataset header is not text"))?;
-            DatasetName::new(text).map_err(|e| ApiError::bad_request(e.to_string()))
-        }
-    }
 }
 
 #[cfg(test)]

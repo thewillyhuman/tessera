@@ -32,7 +32,7 @@ use tessera_promql::{Lowered, PromqlFrontend, RangeParams, ResultKind, parse, se
 use tessera_types::event::{EXTRACTED, TIMESTAMP};
 use tessera_types::{TimeRange, Timestamp};
 
-use crate::params::{Scope, parse_step, parse_time, scope};
+use crate::params::{Need, Scope, parse_step, parse_time, scope};
 use crate::{ApiError, AppState};
 
 /// The Prometheus router.
@@ -117,7 +117,7 @@ async fn write(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers)?;
+    let scope = scope(&state, &headers, Need::Write).await?;
     let request = remote_write::decode(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let now = state.env.clock.now();
     let batch = remote_write::to_batch(&request, scope.tenant, scope.dataset, now)
@@ -304,7 +304,7 @@ async fn query_common(
     raw: &[u8],
     instant: bool,
 ) -> Result<Value, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let params = Params::parse(raw);
     let now = state.env.clock.now();
@@ -377,7 +377,7 @@ async fn discovery_rows(
     headers: &HeaderMap,
     params: &Params,
 ) -> Result<Vec<BTreeMap<String, String>>, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let end = params.time("end", now, now)?;

@@ -17,25 +17,34 @@
 //! | `POST /api/v1/tenants/{name}/restore`  | Restore a dropped tenant        |
 //!
 //! Errors follow the shape described in the crate's error module.
+//! | `GET /api/v1/tenants/{name}/keys`      | List API keys, without secrets |
+//! | `POST /api/v1/tenants/{name}/keys`     | Issue: `{name, roles?, expires_in_seconds?}` |
+//! | `DELETE /api/v1/tenants/{name}/keys/{id}` | Revoke                       |
 //!
-//! Authentication (SE-1) is not implemented yet; `tessera run` binds the
-//! API to the loopback interface.
+//! Everything but liveness needs a cluster administrator (CT-5): a key
+//! of the `_system` tenant with the admin role, or anonymous access
+//! where it is enabled.
 
-use axum::Json;
-use axum::Router;
+use std::time::Duration;
+
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRequest, Path, State};
+use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
-use serde::Deserialize;
-use tessera_catalog::{CatalogError, Tenant, TenantName, TenantSettings};
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use tessera_catalog::{
+    AccessRole, ApiKey, CatalogError, Table, Tenant, TenantName, TenantSettings,
+};
+use tessera_types::Timestamp;
 
 use crate::{ApiError, AppState};
 
 /// The administration router.
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
         .route("/api/v1/tenants", get(list_tenants).post(create_tenant))
         .route(
             "/api/v1/tenants/{name}",
@@ -45,7 +54,165 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/tenants/{name}/suspend", post(suspend_tenant))
         .route("/api/v1/tenants/{name}/resume", post(resume_tenant))
         .route("/api/v1/tenants/{name}/restore", post(restore_tenant))
+        .route(
+            "/api/v1/tenants/{name}/keys",
+            get(list_keys).post(issue_key),
+        )
+        .route("/api/v1/tenants/{name}/keys/{id}", delete(revoke_key))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_cluster_admin,
+        ))
+        .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
+}
+
+/// Lets a request through when it comes from a cluster administrator.
+async fn require_cluster_admin(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let principal = crate::auth::principal(&state, request.headers()).await?;
+    if !principal.cluster_admin {
+        return Err(ApiError::forbidden(
+            "cluster administration needs a _system admin key",
+        ));
+    }
+    Ok(next.run(request).await)
+}
+
+/// The body of `POST /api/v1/tenants/{name}/keys`.
+#[derive(Deserialize)]
+struct IssueKey {
+    name: String,
+    #[serde(default = "reader")]
+    roles: Vec<String>,
+    #[serde(default)]
+    expires_in_seconds: Option<u64>,
+}
+
+fn reader() -> Vec<String> {
+    vec![AccessRole::READER.to_owned()]
+}
+
+/// A key as listed: the record without its secret hash.
+#[derive(Serialize)]
+struct KeyView {
+    id: String,
+    name: String,
+    roles: Vec<String>,
+    created_at: Timestamp,
+    expires_at: Option<Timestamp>,
+}
+
+impl From<ApiKey> for KeyView {
+    fn from(key: ApiKey) -> Self {
+        KeyView {
+            id: key.id,
+            name: key.name,
+            roles: key.roles,
+            created_at: key.created_at,
+            expires_at: key.expires_at,
+        }
+    }
+}
+
+/// A key as issued: the view plus the text shown once.
+#[derive(Serialize)]
+struct IssuedView {
+    key: String,
+    #[serde(flatten)]
+    view: KeyView,
+}
+
+fn tenant_of(state: &AppState, name: &str) -> Result<Tenant, ApiError> {
+    let name = self::name(name)?;
+    state
+        .catalog
+        .cached()
+        .state()
+        .tenant_by_name(&name)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found(format!("unknown tenant {name}")))
+}
+
+async fn issue_key(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Body(request): Body<IssueKey>,
+) -> Result<(StatusCode, Json<IssuedView>), ApiError> {
+    let tenant = tenant_of(&state, &name)?;
+    let now = state.env.clock.now();
+    let expires_at = request
+        .expires_in_seconds
+        .and_then(|s| now.checked_add(Duration::from_secs(s)));
+    let issued = tessera_catalog::auth::issue(
+        &tenant.name,
+        &request.name,
+        request.roles,
+        expires_at,
+        now,
+        &mut state.env.random.clone(),
+    );
+    let document =
+        serde_json::to_value(&issued.record).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    state
+        .controls
+        .open(&tenant.id)
+        .put(Table::ApiKeys, &issued.record.id, document)
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))?;
+    tracing::info!(tenant = %tenant.name, key = %issued.record.id, name = %issued.record.name, "api key issued");
+    Ok((
+        StatusCode::CREATED,
+        Json(IssuedView {
+            key: issued.text,
+            view: issued.record.into(),
+        }),
+    ))
+}
+
+async fn list_keys(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<KeyView>>, ApiError> {
+    let tenant = tenant_of(&state, &name)?;
+    let rows = state
+        .controls
+        .open(&tenant.id)
+        .rows(Table::ApiKeys)
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))?;
+    Ok(Json(
+        rows.into_iter()
+            .filter_map(|row| serde_json::from_value::<ApiKey>(row.value).ok())
+            .map(KeyView::from)
+            .collect(),
+    ))
+}
+
+async fn revoke_key(
+    State(state): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let tenant = tenant_of(&state, &name)?;
+    let control = state.controls.open(&tenant.id);
+    if control
+        .get(Table::ApiKeys, &id)
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("unknown key {id}")));
+    }
+    control
+        .delete(Table::ApiKeys, &id)
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))?;
+    state.auth.forget(&id);
+    tracing::info!(tenant = %tenant.name, key = %id, "api key revoked");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// A request body, with malformed JSON reported in the API's error shape.

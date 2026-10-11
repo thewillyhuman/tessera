@@ -34,7 +34,7 @@ use tessera_opt::optimize;
 use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SEVERITY_TEXT, TIMESTAMP, VALUE_LABELS};
 use tessera_types::{EventBatch, Id128, Kind, LogRow, TimeRange, Timestamp};
 
-use crate::params::{Scope, parse_step, parse_time, scope};
+use crate::params::{Need, Scope, parse_step, parse_time, scope};
 use crate::{ApiError, AppState};
 
 /// The Loki router.
@@ -282,7 +282,7 @@ async fn query_common(
     params: QueryParams,
     instant: bool,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let query = params
@@ -376,7 +376,7 @@ async fn discovery_rows(
     headers: &HeaderMap,
     params: &QueryParams,
 ) -> Result<Vec<Row>, ApiError> {
-    let scope = scope(state, headers)?;
+    let scope = scope(state, headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
@@ -583,7 +583,7 @@ async fn push(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers)?;
+    let scope = scope(&state, &headers, Need::Write).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -659,7 +659,7 @@ async fn tail(
     Query(params): Query<QueryParams>,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers)?;
+    let scope = scope(&state, &headers, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let query = params
         .query

@@ -32,7 +32,9 @@ use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::DatasetLogs;
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
-use tessera_server::{AppState, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows};
+use tessera_server::{
+    AppState, Auth, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows,
+};
 use tessera_types::{Env, Meter, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -83,6 +85,10 @@ pub struct Config {
     pub advise: Duration,
     /// The ingester's tunables.
     pub ingest: IngestConfig,
+    /// Whether requests without an API key are served as a cluster
+    /// administrator (CT-5); on for a single node, off for a cluster
+    /// that anyone can reach.
+    pub allow_anonymous: bool,
 }
 
 impl Config {
@@ -104,6 +110,7 @@ impl Config {
             eval: evaluator::DEFAULT_INTERVAL,
             advise: advisor::DEFAULT_INTERVAL,
             ingest: IngestConfig::default(),
+            allow_anonymous: true,
         }
     }
 }
@@ -209,7 +216,7 @@ impl Node {
         };
         let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
-        let (state, engine, controls) = shared.app_state(ingest.clone());
+        let (state, engine, controls) = shared.app_state(ingest.clone(), config.allow_anonymous);
         shared.evaluate_rules(
             &config,
             leases.as_ref(),
@@ -431,7 +438,11 @@ impl Shared {
 
     /// The handlers' shared state: the engine with its peers and system
     /// tables, the control stores and the cluster links.
-    fn app_state(&self, ingest: IngestHandle) -> (AppState, Arc<Engine>, Arc<ControlStores>) {
+    fn app_state(
+        &self,
+        ingest: IngestHandle,
+        allow_anonymous: bool,
+    ) -> (AppState, Arc<Engine>, Arc<ControlStores>) {
         let remote = HttpRemote::new();
         let controls = Arc::new(ControlStores::new(
             Arc::clone(&self.store),
@@ -471,6 +482,7 @@ impl Shared {
                 preferred_ingesters: PREFERRED_INGESTERS,
             })),
             budgets: Arc::new(Ledger::new()),
+            auth: Arc::new(Auth::new(allow_anonymous)),
         };
         (state, engine, controls)
     }

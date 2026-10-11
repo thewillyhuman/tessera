@@ -4,7 +4,9 @@
 //! that says whether to retry. 503 means the object store or the ingest
 //! service is unavailable and the request may be retried; 429 that the
 //! tenant is over a limit and may retry later; 409 is a conflict with
-//! the current state; 404 an unknown name; 400 a malformed request.
+//! the current state; 404 an unknown name; 403 credentials that do not
+//! allow the request; 401 no usable credentials; 400 a malformed
+//! request.
 
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -75,6 +77,24 @@ impl ApiError {
         }
     }
 
+    /// The request carries no usable credentials.
+    #[must_use]
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    /// The credentials do not allow the request.
+    #[must_use]
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     /// The tenant is over a limit; the client may retry later.
     #[must_use]
     pub fn too_many_requests(message: impl Into<String>) -> Self {
@@ -92,6 +112,7 @@ impl ApiError {
         match error {
             QueryError::Syntax(diagnostic) => ApiError::bad_request(diagnostic.describe(text)),
             QueryError::Plan(error) => ApiError::bad_request(error.to_string()),
+            QueryError::Forbidden { .. } => ApiError::forbidden(error.to_string()),
             QueryError::Engine(
                 error @ (EngineError::Manifest(_)
                 | EngineError::Format(_)

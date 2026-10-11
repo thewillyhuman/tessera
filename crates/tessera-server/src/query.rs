@@ -11,6 +11,8 @@
 //! strings, binary columns hexadecimal, and the `_overflow` column is
 //! returned as the JSON object it holds.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -22,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tessera_exec::{Response, RunOptions, explain_text, query};
 use tessera_ir::BindContext;
 use tessera_sql::SqlFrontend;
-use tessera_types::{DatasetName, TenantId};
+use tessera_types::DatasetName;
 
 use crate::encode::{ColumnJson, rows_json};
 use crate::{ApiError, AppState};
@@ -85,7 +87,7 @@ async fn run_query(State(state): State<AppState>, headers: HeaderMap, body: Byte
             return ApiError::bad_request(format!("invalid request: {error}")).into_response();
         }
     };
-    match run_native(&state, request).await {
+    match run_native(&state, &headers, request).await {
         Ok(response) => response.into_response(),
         Err(error) => error.into_response(),
     }
@@ -93,6 +95,7 @@ async fn run_query(State(state): State<AppState>, headers: HeaderMap, body: Byte
 
 async fn run_native(
     state: &AppState,
+    headers: &HeaderMap,
     request: QueryRequest,
 ) -> Result<Json<QueryResponse>, ApiError> {
     if request.language != "sql" {
@@ -105,13 +108,15 @@ async fn run_native(
         Some(name) => DatasetName::new(name).map_err(|e| ApiError::bad_request(e.to_string()))?,
         None => DatasetName::new("default").unwrap_or_else(|_| unreachable!("a valid name")),
     };
+    let principal = crate::auth::principal(state, headers).await?;
     let ctx = BindContext {
-        tenant: TenantId::DEFAULT,
+        tenant: crate::params::tenant(state, headers, &principal)?,
         dataset,
         now: state.env.clock.now(),
     };
     let _turn = state.admit_query(&ctx.tenant).await?;
     let started = std::time::Instant::now();
+    let reader = principal.clone();
     let response = query::run_with(
         &state.engine,
         &SqlFrontend,
@@ -119,6 +124,9 @@ async fn run_native(
         &ctx,
         RunOptions {
             rollups: request.rollups,
+            readable: Some(Arc::new(move |dataset: &DatasetName| {
+                reader.may_read(dataset.as_str())
+            })),
         },
     )
     .await
@@ -140,6 +148,7 @@ async fn run_native(
             explain: explain_text(&plan, analysis.as_ref()),
         },
         Response::Control(statement) => {
+            crate::params::allow(&principal, crate::params::Need::Admin, "")?;
             let message = crate::control::execute(state, &ctx.tenant, statement).await?;
             QueryResponse::Rows {
                 columns: vec![ColumnJson {

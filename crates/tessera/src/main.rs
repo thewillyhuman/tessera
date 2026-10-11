@@ -38,12 +38,12 @@ struct RunArgs {
     /// The directory that acts as the root pool.
     #[arg(long, default_value = "./tessera-data")]
     data_dir: PathBuf,
-    /// Where the HTTP API listens. Loopback by default: there is no
-    /// authentication yet.
+    /// Where the HTTP API listens. Loopback by default, since requests
+    /// without an API key are served unless --no-anonymous is given.
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
-    /// Where the `PostgreSQL` wire protocol listens. Loopback by default:
-    /// there is no authentication yet.
+    /// Where the `PostgreSQL` wire protocol listens. Loopback by default,
+    /// for the same reason as --listen.
     #[arg(long, default_value = "127.0.0.1:5432")]
     pg_listen: SocketAddr,
     /// The roles this node runs, comma-separated: ingest, query, compact,
@@ -54,6 +54,11 @@ struct RunArgs {
     /// listen address is not one they can use, such as 0.0.0.0.
     #[arg(long)]
     advertise: Option<String>,
+    /// Refuse requests without an API key. By default a request without
+    /// one acts as a cluster administrator, which suits a single node on
+    /// the loopback interface and nothing anyone else can reach.
+    #[arg(long)]
+    no_anonymous: bool,
 }
 
 #[tokio::main]
@@ -72,6 +77,7 @@ async fn main() -> ExitCode {
                 pg_listen: args.pg_listen,
                 roles: args.roles.into_iter().collect(),
                 advertise: args.advertise,
+                allow_anonymous: !args.no_anonymous,
                 ..tessera_node::Config::single_node(args.data_dir)
             })
             .await

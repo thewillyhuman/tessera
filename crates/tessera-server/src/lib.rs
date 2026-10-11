@@ -12,6 +12,7 @@
 //! rule about tenants or data lives here.
 
 pub mod admin;
+pub mod auth;
 mod budgets;
 mod control;
 pub mod encode;
@@ -41,6 +42,7 @@ use tessera_ingest::IngestHandle;
 use tessera_object::Pools;
 use tessera_types::{Env, EventBatch, TenantId};
 
+pub use auth::Auth;
 pub use error::ApiError;
 pub use internal::HttpRemote;
 pub use metering::IngestMeter;
@@ -83,6 +85,8 @@ pub struct AppState {
     /// What the tenants and teams have used of their budgets today
     /// (section 13.4).
     pub budgets: Arc<Ledger>,
+    /// How requests are authenticated (CT-5, SE-1).
+    pub auth: Arc<auth::Auth>,
 }
 
 impl AppState {
@@ -232,6 +236,7 @@ impl AppState {
             env,
             cluster: None,
             budgets: Arc::new(Ledger::new()),
+            auth: Arc::new(auth::Auth::new(true)),
         }
     }
 }
