@@ -44,6 +44,12 @@ pub fn leases() -> Key {
     key(&["_cluster", "leases"])
 }
 
+/// Prefix of the node registry (section 14.1).
+#[must_use]
+pub fn nodes() -> Key {
+    key(&["_cluster", "nodes"])
+}
+
 /// The node registry entry of one node.
 #[must_use]
 pub fn node(node: NodeId) -> Key {

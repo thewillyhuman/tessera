@@ -15,6 +15,7 @@ tessera-types = { path = "crates/tessera-types" }
 tessera-object = { path = "crates/tessera-object" }
 tessera-commit = { path = "crates/tessera-commit" }
 tessera-catalog = { path = "crates/tessera-catalog" }
+tessera-cluster = { path = "crates/tessera-cluster" }
 tessera-format = { path = "crates/tessera-format" }
 tessera-wal = { path = "crates/tessera-wal" }
 tessera-manifest = { path = "crates/tessera-manifest" }

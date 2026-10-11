@@ -2312,6 +2312,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-cluster"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "tessera-object",
+ "tessera-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "tessera-commit"
 version = "0.1.0"
 dependencies = [

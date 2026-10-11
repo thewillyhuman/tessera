@@ -1,0 +1,24 @@
+[package]
+name = "tessera-cluster"
+description = "Tessera cluster: node roles, the node registry, membership and admission control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-object.workspace = true
+tessera-types.workspace = true
+
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true
