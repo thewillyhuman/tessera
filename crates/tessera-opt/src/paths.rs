@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
+use tessera_ir::trace::TRACE_FIELDS;
 use tessera_ir::{Expr, JoinSide, PathColumn, Plan, split_qualifier};
 
 use crate::rewrite::rebuild_inputs;
@@ -18,9 +19,6 @@ use crate::rewrite::rebuild_inputs;
 pub fn promote_paths(plan: Plan) -> Plan {
     let mut paths = BTreeMap::new();
     collect_plan(&plan, &mut paths);
-    if paths.is_empty() {
-        return plan;
-    }
     let columns: Vec<PathColumn> = paths
         .into_iter()
         .map(|(path, data_type)| PathColumn { path, data_type })
@@ -61,6 +59,24 @@ fn assign(plan: Plan, columns: &[PathColumn]) -> Plan {
                 right: side(right),
                 on,
                 kind,
+            }
+        }
+        Plan::TraceGroup {
+            candidates,
+            spans,
+            spanset,
+        } => {
+            // The spans carry the shape a completed trace stores (QL-14)
+            // where a file has it, read like a path: null elsewhere.
+            let mut stored = columns.to_vec();
+            stored.extend(TRACE_FIELDS.iter().map(|(name, data_type)| PathColumn {
+                path: (*name).to_owned(),
+                data_type: data_type.clone(),
+            }));
+            Plan::TraceGroup {
+                candidates: candidates.map(|c| Box::new(assign(*c, columns))),
+                spans: Box::new(assign(*spans, &stored)),
+                spanset,
             }
         }
         other => rebuild_inputs(other, |input| assign(input, columns)),
@@ -247,5 +263,40 @@ mod tests {
             schema.field_with_name("attr.n").unwrap().data_type(),
             &DataType::Int64
         );
+    }
+
+    /// QL-14: a trace group's span scan asks for the stored shape
+    /// columns; its candidate scan does not.
+    #[test]
+    fn a_trace_group_reads_the_stored_shape_from_its_spans() {
+        let scan = || {
+            Plan::Scan(Scan::all(
+                TenantId::DEFAULT,
+                DatasetName::new("prod").unwrap(),
+                Kind::Span,
+            ))
+        };
+        let plan = promote_paths(Plan::TraceGroup {
+            candidates: Some(Box::new(scan())),
+            spans: Box::new(scan()),
+            spanset: tessera_ir::Spanset::Filter(None),
+        });
+        let Plan::TraceGroup {
+            candidates, spans, ..
+        } = plan
+        else {
+            panic!("trace group")
+        };
+        let paths = |plan: &Plan| match plan {
+            Plan::Scan(scan) => scan
+                .paths
+                .iter()
+                .map(|p| p.path.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("scan: {other}"),
+        };
+        assert!(paths(&candidates.unwrap()).is_empty());
+        assert_eq!(paths(&spans).len(), 7);
+        assert!(paths(&spans).contains(&"nest_left".to_owned()));
     }
 }

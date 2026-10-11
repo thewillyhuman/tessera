@@ -64,6 +64,18 @@ pub const TRACE_COLUMNS: [&str; 7] = [
     NEST_PARENT,
 ];
 
+/// The trace-level columns with their types, in the order a trace group
+/// adds them and a completed trace stores them (QL-14).
+pub const TRACE_FIELDS: [(&str, DataType); 7] = [
+    (TRACE_START, DataType::Timestamp(TimeUnit::Nanosecond, None)),
+    (TRACE_DURATION_NS, DataType::Int64),
+    (ROOT_NAME, DataType::Utf8),
+    (ROOT_SERVICE, DataType::Utf8),
+    (NEST_LEFT, DataType::Int64),
+    (NEST_RIGHT, DataType::Int64),
+    (NEST_PARENT, DataType::Int64),
+];
+
 /// The span columns a trace group carries through.
 pub const SPAN_COLUMNS: [&str; 10] = [
     TRACE_ID,

@@ -180,9 +180,17 @@ struct Trace {
 }
 
 impl Trace {
+    /// The trace of `spans`: its shape as a completed trace stored it
+    /// (QL-14) when every span carries the stored columns, computed
+    /// from the spans otherwise (QL-13).
     fn new(spans: &RecordBatch) -> Result<Self, ExecError> {
-        let shape = trace::shape(spans)?;
-        let rows = trace::with_trace_columns(spans, &shape)?;
+        let (shape, rows) = if let Some(stored) = trace::Shape::from_stored(spans)? {
+            (stored, spans.clone())
+        } else {
+            let shape = trace::shape(spans)?;
+            let rows = trace::with_trace_columns(spans, &shape)?;
+            (shape, rows)
+        };
         Ok(Trace {
             rows,
             parent: shape.parent,
@@ -554,6 +562,7 @@ impl Output {
 mod tests {
     use std::collections::BTreeMap;
 
+    use arrow::compute::take_record_batch;
     use tessera_ir::trace_group_schema;
     use tessera_types::event::{DURATION_NS, NAME, SPAN_ID, STATUS_CODE, Scalar};
     use tessera_types::{
@@ -1040,5 +1049,53 @@ mod tests {
         assert_eq!(memory.used(), 0);
         let mut empty = TraceGroup::new(name_is("db"), memory);
         assert!(run(&mut empty, vec![]).is_empty());
+    }
+
+    /// QL-14: spans that carry a stored shape are not numbered again;
+    /// the stored numbers, however they came, are the ones answered.
+    #[test]
+    fn a_stored_shape_is_read_rather_than_computed() {
+        let all = spans();
+        let trace_1 = {
+            let ids = fixed(&all, TRACE_ID).unwrap();
+            let keep: Vec<u32> = (0..all.num_rows())
+                .filter(|&i| ids.value(i)[0] == 1)
+                .map(|i| u32::try_from(i).unwrap())
+                .collect();
+            take_record_batch(&all, &UInt32Array::from(keep)).unwrap()
+        };
+        let mut shape = trace::shape(&trace_1).unwrap();
+        for numbers in &mut shape.nested {
+            numbers.0 += 100;
+            numbers.1 += 100;
+            if numbers.2 >= 0 {
+                numbers.2 += 100;
+            }
+        }
+        let stored = trace::with_trace_columns(&trace_1, &shape).unwrap();
+        let mut operator = TraceGroup::new(Spanset::Filter(None), MemoryPool::unbounded());
+        let out = run(&mut operator, vec![stored]);
+        let batch = concat_batches(&trace_group_schema(), &out).unwrap();
+        let left = batch
+            .column_by_name(NEST_LEFT)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(
+            left.values().iter().all(|l| *l > 100),
+            "the stored numbers: {:?}",
+            left.values()
+        );
+        let mut operator = TraceGroup::new(Spanset::Filter(None), MemoryPool::unbounded());
+        let out = run(&mut operator, vec![spans()]);
+        let batch = concat_batches(&trace_group_schema(), &out).unwrap();
+        let left = batch
+            .column_by_name(NEST_LEFT)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(left.values().iter().all(|l| *l < 100), "computed");
     }
 }

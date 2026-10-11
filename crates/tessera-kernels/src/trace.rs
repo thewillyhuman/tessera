@@ -18,9 +18,10 @@ use arrow::array::{
     TimestampNanosecondArray,
 };
 use arrow::compute::{SortColumn, lexsort_to_indices, take_record_batch};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{Field, Schema};
 use tessera_ir::trace::{
-    NEST_LEFT, NEST_PARENT, NEST_RIGHT, ROOT_NAME, ROOT_SERVICE, TRACE_DURATION_NS, TRACE_START,
+    NEST_LEFT, NEST_PARENT, NEST_RIGHT, ROOT_NAME, ROOT_SERVICE, TRACE_DURATION_NS, TRACE_FIELDS,
+    TRACE_START,
 };
 use tessera_types::event::{DURATION_NS, NAME, PARENT_SPAN_ID, SPAN_ID, TIMESTAMP, TRACE_ID};
 
@@ -164,17 +165,6 @@ pub fn service_name(overflow: &str) -> Option<String> {
     }
 }
 
-/// The trace-level columns, in the order they are added.
-const TRACE_FIELDS: [(&str, DataType); 7] = [
-    (TRACE_START, DataType::Timestamp(TimeUnit::Nanosecond, None)),
-    (TRACE_DURATION_NS, DataType::Int64),
-    (ROOT_NAME, DataType::Utf8),
-    (ROOT_SERVICE, DataType::Utf8),
-    (NEST_LEFT, DataType::Int64),
-    (NEST_RIGHT, DataType::Int64),
-    (NEST_PARENT, DataType::Int64),
-];
-
 /// `spans` with the trace-level columns of `shape` added, one value for
 /// every row, replacing columns of those names the rows already carry.
 ///
@@ -199,6 +189,74 @@ pub fn with_trace_columns(spans: &RecordBatch, shape: &Shape) -> Result<RecordBa
         )),
     ];
     replace_trace_columns(spans, values)
+}
+
+impl Shape {
+    /// The shape stored with `spans` by a completed trace (QL-14), when
+    /// every span carries the stored columns; none when some span has
+    /// none, as the spans of an incomplete trace and of files below L3
+    /// do, and the shape must be computed.
+    ///
+    /// # Errors
+    ///
+    /// If a stored column has another type than the one written.
+    pub fn from_stored(spans: &RecordBatch) -> Result<Option<Shape>, KernelError> {
+        let n = spans.num_rows();
+        let longs = |name: &str| -> Result<Option<&Int64Array>, KernelError> {
+            match spans.column_by_name(name) {
+                None => Ok(None),
+                Some(column) => column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .map(Some)
+                    .ok_or_else(|| KernelError::Unsupported(format!("{name} is not Int64"))),
+            }
+        };
+        let (Some(left), Some(right), Some(parent), Some(duration)) = (
+            longs(NEST_LEFT)?,
+            longs(NEST_RIGHT)?,
+            longs(NEST_PARENT)?,
+            longs(TRACE_DURATION_NS)?,
+        ) else {
+            return Ok(None);
+        };
+        let Some(start) = spans
+            .column_by_name(TRACE_START)
+            .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>())
+        else {
+            return Ok(None);
+        };
+        if n == 0
+            || [left.null_count(), right.null_count(), parent.null_count()]
+                .iter()
+                .any(|nulls| *nulls > 0)
+            || start.null_count() > 0
+            || duration.null_count() > 0
+        {
+            return Ok(None);
+        }
+        let text = |name: &str| {
+            spans
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                .filter(|a| !a.is_null(0))
+                .map(|a| a.value(0).to_owned())
+        };
+        let by_left: HashMap<i64, usize> = (0..n).map(|i| (left.value(i), i)).collect();
+        Ok(Some(Shape {
+            parent: (0..n)
+                .map(|i| by_left.get(&parent.value(i)).copied())
+                .collect(),
+            nested: (0..n)
+                .map(|i| (left.value(i), right.value(i), parent.value(i)))
+                .collect(),
+            start: start.value(0),
+            duration: duration.value(0),
+            root_name: text(ROOT_NAME),
+            root_service: text(ROOT_SERVICE),
+            has_root: (0..n).any(|i| parent.value(i) == -1),
+        }))
+    }
 }
 
 /// What a completed trace stores per span, or nothing for a span of a
@@ -453,5 +511,46 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(services.value(1), "api");
+    }
+
+    /// QL-14: the shape read back from the stored columns is the one
+    /// `complete` computed; a trace with a null stored column has none.
+    #[test]
+    fn a_stored_shape_reads_back_as_computed() {
+        use tessera_types::{DatasetName, EventBatch, SpanRow, TenantId, Timestamp};
+
+        let span = |trace: u8, id: u8, parent: Option<u8>, at: i64| SpanRow {
+            timestamp: Timestamp::from_nanos(at),
+            observed_timestamp: Timestamp::from_nanos(at),
+            event_id: [id; 16],
+            trace_id: [trace; 16],
+            span_id: [id; 8],
+            parent_span_id: parent.map(|p| [p; 8]),
+            name: "s".into(),
+            duration_ns: 10,
+            ..SpanRow::default()
+        };
+        let rows = EventBatch::from_spans(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            &[
+                span(1, 1, None, 1_000),
+                span(1, 2, Some(1), 1_100),
+                span(1, 3, Some(1), 1_050),
+                span(2, 4, Some(9), 2_000),
+            ],
+        )
+        .unwrap()
+        .rows()
+        .clone();
+        assert_eq!(Shape::from_stored(&rows).unwrap(), None, "nothing stored");
+        let (stored, _) = complete(&rows, 0, 10_000).unwrap();
+        let whole = stored.slice(0, 3);
+        let read = Shape::from_stored(&whole).unwrap().expect("stored");
+        assert_eq!(read, shape(&whole).unwrap());
+        assert_eq!(read.parent, [None, Some(0), Some(0)]);
+        assert!(read.has_root);
+        let orphan = stored.slice(3, 1);
+        assert_eq!(Shape::from_stored(&orphan).unwrap(), None, "null columns");
     }
 }

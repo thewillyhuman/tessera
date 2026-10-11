@@ -7,16 +7,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, FixedSizeBinaryArray, Int64Array, StringArray};
+use tessera_compact::{Compactor, Policy, TRACE_COMPLETION_HORIZON, plan};
 use tessera_exec::{CpuPool, Engine, QueryLimits, QueryOutput};
 use tessera_format::ParquetFormat;
 use tessera_ir::trace::{MATCHED, ROOT_SERVICE};
 use tessera_ir::{BinaryOp, Expr, Plan, Registry, Relation, Scan, Spanset, Structural};
-use tessera_manifest::{intake, registry};
-use tessera_object::{MemoryStore, Pools};
+use tessera_manifest::{LayoutRecord, Manifest, intake, list_partitions, registry};
+use tessera_object::{MemoryStore, ObjectStore, Pools};
 use tessera_opt::optimize;
 use tessera_types::event::{NAME, SPAN_ID, Scalar, TRACE_ID};
 use tessera_types::{
-    DatasetName, Env, EventBatch, Kind, PoolId, Seq, SpanRow, TenantId, Timestamp, Window,
+    DatasetName, Env, EventBatch, Kind, Level, PoolId, Seq, SpanRow, TenantId, Timestamp, Window,
 };
 use tessera_wal::{EntryBody, FlushTarget, WriterLog, write_l1_files};
 
@@ -30,7 +31,8 @@ fn trace(trace: u8, start: i64) -> EventBatch {
     let span = |id: u8, parent: Option<u8>, name: &str, service: &str, offset: i64| SpanRow {
         timestamp: Timestamp::from_nanos(start + offset),
         observed_timestamp: Timestamp::from_nanos(start + 100),
-        event_id: [trace ^ id; 16],
+        // Unique across traces: compaction deduplicates by event id.
+        event_id: [trace * 16 + id; 16],
         trace_id: [trace; 16],
         span_id: [id; 8],
         parent_span_id: parent.map(|p| [p; 8]),
@@ -273,5 +275,96 @@ async fn no_candidates_means_no_span_scan() {
         output.analysis.scans.len(),
         1,
         "the span scan is skipped when no trace is a candidate"
+    );
+}
+
+/// Rewrites every span partition to L3, past the completion horizon,
+/// so that the files store the shape of their whole traces (QL-14).
+async fn complete_all(store: &Arc<MemoryStore>, env: &Env) {
+    let pools = Arc::new(Pools::new(PoolId::new("root").unwrap(), store.clone()));
+    let compactor = Compactor::new(pools, Arc::new(ParquetFormat::default()), env.clone());
+    let policy = Policy {
+        min_inputs: 1,
+        ..Policy::default()
+    };
+    let root: Arc<dyn ObjectStore> = store.clone();
+    for partition in list_partitions(&*root, &TenantId::DEFAULT, &dataset(), Kind::Span)
+        .await
+        .unwrap()
+    {
+        let manifest = Manifest::open(root.clone(), partition.clone(), env.clone());
+        let later = partition
+            .window
+            .end()
+            .checked_add(TRACE_COMPLETION_HORIZON + std::time::Duration::from_secs(1))
+            .unwrap();
+        // L2 first, then the retire to L3.
+        for _ in 0..2 {
+            let snapshot = manifest.snapshot().await.unwrap();
+            let Some(job) = plan(&partition, snapshot.state(), later, &policy) else {
+                break;
+            };
+            compactor
+                .run(
+                    &manifest,
+                    &job,
+                    &LayoutRecord::default_for(Kind::Span),
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        let snapshot = manifest.snapshot().await.unwrap();
+        assert!(snapshot.state().files().all(|f| f.level == Level::L3));
+    }
+}
+
+/// AD-8 and QL-14: a structural query answers the same from the shape
+/// L3 files store as from the tree it builds itself.
+#[tokio::test]
+async fn completed_files_answer_structural_queries_alike() {
+    let (store, env) = populate().await;
+    let query = || {
+        group(Spanset::Structural {
+            left: Box::new(name_is("GET /")),
+            op: Structural {
+                relation: Relation::Descendant,
+                negated: false,
+                union: false,
+            },
+            right: Box::new(name_is("cache")),
+        })
+    };
+    let before = run(&engine(&store, &env), query()).await;
+    complete_all(&store, &env).await;
+    let after = run(&engine(&store, &env), query()).await;
+    assert_eq!(ids(&after), ids(&before));
+    assert_eq!(ids(&after), vec![(1, 3), (2, 3), (3, 3), (4, 3)]);
+    let nested = |output: &QueryOutput| -> Vec<(u8, i64)> {
+        let mut out = Vec::new();
+        for batch in &output.batches {
+            let spans = batch
+                .column_by_name(SPAN_ID)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            let left = batch
+                .column_by_name("nest_left")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                out.push((spans.value(i)[0], left.value(i)));
+            }
+        }
+        out
+    };
+    assert_eq!(
+        nested(&after),
+        nested(&before),
+        "the stored numbers are the computed ones"
     );
 }
