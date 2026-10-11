@@ -73,11 +73,13 @@ pub struct Admission {
 }
 
 /// A query's turn; dropping it frees the slot.
+#[derive(Debug)]
 pub struct QueryPermit {
     _permit: OwnedSemaphorePermit,
 }
 
 /// A write's bytes in flight; dropping it frees them.
+#[derive(Debug)]
 pub struct IngestPermit {
     _permit: OwnedSemaphorePermit,
 }
@@ -193,10 +195,16 @@ mod tests {
             admission.admit_ingest(&tenant("a"), 5),
             Err(Rejected::IngestFull { .. })
         ));
-        assert!(admission.admit_ingest(&tenant("b"), 10).is_ok(), "per tenant");
+        assert!(
+            admission.admit_ingest(&tenant("b"), 10).is_ok(),
+            "per tenant"
+        );
         assert!(matches!(
             admission.admit_ingest(&tenant("a"), 11),
-            Err(Rejected::TooLarge { bytes: 11, limit: 10 })
+            Err(Rejected::TooLarge {
+                bytes: 11,
+                limit: 10
+            })
         ));
         drop(held);
         assert!(admission.admit_ingest(&tenant("a"), 10).is_ok());

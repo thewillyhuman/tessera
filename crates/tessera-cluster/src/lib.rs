@@ -10,10 +10,12 @@
 //! the registry alone in this release; gossip and DNS seeds (section
 //! 14.1) can be added without changing what membership promises.
 
+pub mod admission;
 pub mod membership;
 pub mod registry;
 pub mod role;
 
+pub use admission::{Admission, IngestPermit, Limits, QueryPermit, Rejected};
 pub use membership::Membership;
 pub use registry::{NodeRecord, Registry, RegistryError};
 pub use role::{Role, UnknownRole};
