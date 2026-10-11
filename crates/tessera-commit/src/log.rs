@@ -22,7 +22,6 @@ use futures::stream::{self, BoxStream};
 use tessera_object::{BoxError, Key, ObjectError, ObjectStore};
 use tessera_types::{Env, Version};
 
-use crate::checkpoint::CheckpointRecord;
 use crate::{Action, Commit, CommitId, FORMAT, Snapshot, State};
 
 /// How many times a lost write is read back before giving up.
@@ -261,10 +260,10 @@ impl<S: State> CommitLog<S> {
     /// recoverable by listing.
     pub async fn checkpoint(&self, snapshot: &Snapshot<S>) -> Result<(), CommitError> {
         let version = snapshot.version();
-        let record = CheckpointRecord::new(version, snapshot.state().clone());
+        let encoded = snapshot.state().encode_checkpoint(version);
         match self
             .store
-            .put_if_absent(&self.checkpoint_key(version), record.encode().into())
+            .put_if_absent(&self.checkpoint_key(version), encoded.into())
             .await
         {
             Ok(()) | Err(ObjectError::AlreadyExists { .. }) => {}
@@ -289,12 +288,27 @@ impl<S: State> CommitLog<S> {
         };
         let key = self.checkpoint_key(version);
         let bytes = self.store.get(&key).await?;
-        let (found, state) = CheckpointRecord::<S>::decode(&bytes).map_err(|e| corrupt(&key, e))?;
-        if found != version {
-            let reason = CorruptReason(format!("checkpoint claims version {found}"));
-            return Err(corrupt(&key, reason));
-        }
+        let state = S::decode_checkpoint(version, &bytes).map_err(|e| corrupt(&key, e))?;
         Ok(Snapshot::new(version, state))
+    }
+
+    /// The version of the newest checkpoint, if any: the hint's, else
+    /// the newest listed.
+    ///
+    /// # Errors
+    ///
+    /// If the checkpoints cannot be listed.
+    pub async fn checkpoint_version(&self) -> Result<Option<Version>, CommitError> {
+        match self.hinted_checkpoint().await {
+            Some(version) => Ok(Some(version)),
+            None => self.newest_listed_checkpoint().await,
+        }
+    }
+
+    /// The store the log lives in.
+    #[must_use]
+    pub fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
     }
 
     /// The checkpoint the hint names, if the hint is readable and the
@@ -350,7 +364,13 @@ impl<S: State> CommitLog<S> {
             .expect("log key components are valid")
     }
 
-    fn checkpoint_key(&self, version: Version) -> Key {
+    /// The key of the checkpoint at `version`.
+    ///
+    /// # Panics
+    ///
+    /// Never: a version is a valid key component.
+    #[must_use]
+    pub fn checkpoint_key(&self, version: Version) -> Key {
         self.checkpoint_prefix()
             .join(&version.to_string())
             .expect("log key components are valid")
@@ -429,11 +449,6 @@ fn apply_all<S: State>(state: &mut S, commit: &Commit, key: &Key) -> Result<(), 
     }
     Ok(())
 }
-
-/// A plain-text reason for a corrupt object.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct CorruptReason(String);
 
 fn corrupt(key: &Key, source: impl std::error::Error + Send + Sync + 'static) -> CommitError {
     CommitError::Corrupt {

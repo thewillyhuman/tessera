@@ -299,6 +299,12 @@ async fn compact_and_collect(
                     duplicates,
                 } => {
                     tracing::info!(%tenant, %dataset, %kind, window = %partition.window, inputs, %output, rows, duplicates, "compacted");
+                    // A checkpoint after every rewrite (CL-3, MF-5): a cold
+                    // reader folds the few commits since it, and a range
+                    // read fetches only the row groups it needs.
+                    if let Err(error) = manifest.checkpoint().await {
+                        tracing::warn!(%tenant, %dataset, %kind, window = %partition.window, error = %error, "manifest checkpoint failed");
+                    }
                 }
                 Outcome::Superseded => {
                     tracing::info!(%tenant, %dataset, %kind, window = %partition.window, "compaction superseded");

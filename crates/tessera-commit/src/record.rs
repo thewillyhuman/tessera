@@ -89,6 +89,18 @@ pub enum DecodeError {
         /// The newest format this release reads.
         supported: u32,
     },
+    /// A checkpoint claims another version than the one it is filed
+    /// under.
+    #[error("checkpoint claims version {claimed}, filed under {expected}")]
+    WrongVersion {
+        /// The version in the object.
+        claimed: Version,
+        /// The version of its key.
+        expected: Version,
+    },
+    /// A checkpoint in a state's own encoding does not decode.
+    #[error("checkpoint does not decode: {0}")]
+    Encoding(String),
 }
 
 impl Commit {

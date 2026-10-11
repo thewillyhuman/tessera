@@ -21,7 +21,10 @@ simulation harness; `tessera run` serving an HTTP administration API.
 **M1, write path: done, with gaps listed below.** OTLP logs over HTTP;
 writer logs with segments, flush records, seal and end; L1 Parquet
 files; the writer registry; partition manifests with idempotent
-adoption; intake; recovery of dead writers; the consistent view; an
+adoption, checkpointed as Parquet tables sorted by time that a reader
+scans by range request and applies the later commits to, so that no
+node holds a whole manifest (MF-5); intake; recovery of dead writers;
+the consistent view; an
 ingester with linger, memtable, flush and log rotation; a simulation
 scenario that checks the view invariant (VW-1) under faults, crashes
 and duplicate owners.

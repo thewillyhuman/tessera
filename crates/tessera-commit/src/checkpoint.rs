@@ -8,9 +8,14 @@
 //! `{prefix}/_hint` names the newest checkpoint; it is a hint (P2): if it is
 //! missing or wrong, the checkpoints are listed instead.
 //!
-//! Checkpoints are whole-state objects. The tiering of CL-3 (a base plus
-//! incremental checkpoints) is deferred until a log whose state is large
-//! enough to need it exists; the format version leaves room for it.
+//! Checkpoints are whole-state objects, JSON unless a state encodes
+//! itself otherwise through [`State::encode_checkpoint`]: a partition
+//! manifest writes Parquet, which a reader scans in part by range
+//! (MF-5). The tiering of CL-3 (a base plus incremental checkpoints)
+//! is deferred until a log whose state is large enough to need it
+//! exists; the format version leaves room for it.
+//!
+//! [`State::encode_checkpoint`]: crate::State::encode_checkpoint
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -26,21 +31,25 @@ pub(crate) struct CheckpointRecord<S> {
     state: S,
 }
 
+/// A record over a borrowed state, for encoding without a clone.
+#[derive(Serialize)]
+struct BorrowedRecord<'a, S> {
+    format: u32,
+    version: Version,
+    state: &'a S,
+}
+
 impl<S: Serialize + DeserializeOwned> CheckpointRecord<S> {
-    pub(crate) fn new(version: Version, state: S) -> Self {
-        CheckpointRecord {
+    fn new_borrowed(version: Version, state: &S) -> BorrowedRecord<'_, S> {
+        BorrowedRecord {
             format: FORMAT,
             version,
             state,
         }
     }
 
-    pub(crate) fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("a checkpoint always serializes")
-    }
-
     /// Parses a checkpoint object into its version and state.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<(Version, S), DecodeError> {
+    fn decode(bytes: &[u8]) -> Result<(Version, S), DecodeError> {
         let record: CheckpointRecord<S> = serde_json::from_slice(bytes)?;
         if record.format > FORMAT {
             return Err(DecodeError::UnsupportedFormat {
@@ -50,6 +59,33 @@ impl<S: Serialize + DeserializeOwned> CheckpointRecord<S> {
         }
         Ok((record.version, record.state))
     }
+}
+
+/// `state` at `version` as a JSON checkpoint object: what a state
+/// encodes as unless it says otherwise.
+pub fn encode_json<S: Serialize + DeserializeOwned>(version: Version, state: &S) -> Vec<u8> {
+    serde_json::to_vec(&CheckpointRecord::<S>::new_borrowed(version, state))
+        .expect("a checkpoint always serializes")
+}
+
+/// The state in a JSON checkpoint object written at `version`.
+///
+/// # Errors
+///
+/// If the object does not parse, was written by a newer release or
+/// claims another version.
+pub fn decode_json<S: Serialize + DeserializeOwned>(
+    version: Version,
+    bytes: &[u8],
+) -> Result<S, DecodeError> {
+    let (found, state) = CheckpointRecord::<S>::decode(bytes)?;
+    if found != version {
+        return Err(DecodeError::WrongVersion {
+            claimed: found,
+            expected: version,
+        });
+    }
+    Ok(state)
 }
 
 #[cfg(test)]

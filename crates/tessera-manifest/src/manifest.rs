@@ -13,12 +13,17 @@ use std::sync::Arc;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tessera_commit::{
-    Action, ApplyError, CommitError, CommitLog, RemoveReason, Snapshot, State, UpdateError,
+    Action, ApplyError, CommitError, CommitLog, DecodeError, RemoveReason, Snapshot, State,
+    UpdateError,
 };
-use tessera_object::{ObjectStore, layout};
+use tessera_format::{Bound, FileFormat, ParquetFormat, ScanRequest, ScanStats};
+use tessera_object::{Key, ObjectStore, layout};
+
+use crate::checkpoint;
+use tessera_types::event::Scalar;
 use tessera_types::{
-    DatasetName, Env, FileId, FileMeta, Kind, PartitionId, Seq, TenantId, Timestamp, Window,
-    WriterId,
+    DatasetName, Env, FileId, FileMeta, Kind, PartitionId, Seq, TenantId, TimeRange, Timestamp,
+    Version, Window, WriterId,
 };
 
 /// Why a manifest operation failed.
@@ -61,6 +66,9 @@ pub enum ManifestError {
     /// The object store failed.
     #[error(transparent)]
     Store(#[from] tessera_object::ObjectError),
+    /// A checkpoint could not be read as Parquet (MF-5).
+    #[error("checkpoint: {0}")]
+    Format(#[from] tessera_format::FormatError),
 }
 
 impl From<UpdateError<ManifestError>> for ManifestError {
@@ -127,9 +135,41 @@ impl ManifestState {
     pub fn tombstones(&self) -> impl Iterator<Item = &Tombstone> {
         self.removed.values()
     }
+
+    /// Adds `file`, as a checkpoint row folds back.
+    pub(crate) fn add_file(&mut self, file: FileMeta) {
+        self.files.insert(file.file_id, file);
+    }
+
+    /// Sets a writer's position, as a checkpoint row folds back.
+    pub(crate) fn set_position(&mut self, writer: WriterId, seq: Seq) {
+        self.positions.insert(writer, seq);
+    }
+
+    /// Adds `tombstone`, as a checkpoint row folds back.
+    pub(crate) fn add_tombstone(&mut self, tombstone: Tombstone) {
+        self.removed.insert(tombstone.meta.file_id, tombstone);
+    }
+
+    /// Marks the partition dropped, as a checkpoint row folds back.
+    pub(crate) fn mark_dropped(&mut self) {
+        self.dropped = true;
+    }
 }
 
 impl State for ManifestState {
+    /// A manifest's checkpoint is Parquet (MF-5), so that a reader can
+    /// scan it in part by range.
+    fn encode_checkpoint(&self, version: Version) -> Vec<u8> {
+        crate::checkpoint::encode(self, version).unwrap_or_else(|error| {
+            unreachable!("a manifest state always encodes as a checkpoint: {error}")
+        })
+    }
+
+    fn decode_checkpoint(version: Version, bytes: &[u8]) -> Result<Self, DecodeError> {
+        crate::checkpoint::decode(version, bytes)
+    }
+
     fn apply(&mut self, action: &Action) -> Result<(), ApplyError> {
         match action {
             Action::AddFile(meta) => {
@@ -334,6 +374,155 @@ impl Manifest {
     pub async fn checkpoint(&self) -> Result<(), ManifestError> {
         let snapshot = self.log.snapshot().await?;
         Ok(self.log.checkpoint(&snapshot).await?)
+    }
+
+    /// The files of the partition that can overlap `range`, with the
+    /// writer positions and the dropped mark, at the latest version
+    /// (MF-5): the checkpoint's row groups whose files can overlap the
+    /// range are fetched by range request, the rest left unread, and
+    /// the commits after the checkpoint applied. Without a checkpoint
+    /// the log is folded whole.
+    ///
+    /// # Errors
+    ///
+    /// If the checkpoint, a commit or the store cannot be read.
+    pub async fn read_in(&self, range: TimeRange) -> Result<Partial, ManifestError> {
+        let Some(version) = self.log.checkpoint_version().await? else {
+            let snapshot = self.log.snapshot().await?;
+            return Ok(Partial::of(
+                snapshot.version(),
+                snapshot.state(),
+                range,
+                None,
+            ));
+        };
+        let key = self.log.checkpoint_key(version);
+        let store = Arc::clone(self.log.store());
+        let size = store.head(&key).await?.size;
+        let reader = ParquetFormat::default().open(Arc::clone(&store), key.clone(), size);
+        let bounds = vec![
+            Bound {
+                column: checkpoint::first_timestamp_column().to_owned(),
+                min: None,
+                max: Some(Scalar::Int(range.end.as_nanos().saturating_sub(1))),
+            },
+            Bound {
+                column: checkpoint::last_timestamp_column().to_owned(),
+                min: Some(Scalar::Int(range.start.as_nanos())),
+                max: None,
+            },
+        ];
+        let fetched = reader
+            .fetch(ScanRequest {
+                projection: None,
+                bounds,
+                filter: None,
+                row_groups: None,
+                overflow_whole: false,
+            })
+            .await?;
+        let stats = fetched.stats();
+        let batches = fetched.decode()?;
+        let mut partial = Partial {
+            version,
+            files: BTreeMap::new(),
+            positions: BTreeMap::new(),
+            dropped: false,
+            read: Some(stats),
+        };
+        for batch in &batches {
+            for row in checkpoint::rows(batch).map_err(|e| corrupt(&key, e))? {
+                match row {
+                    checkpoint::Row::File(file) => {
+                        if checkpoint::overlaps(file.min_timestamp, file.max_timestamp, range) {
+                            partial.files.insert(file.file_id, file);
+                        }
+                    }
+                    checkpoint::Row::Position(writer, seq) => {
+                        partial.positions.insert(writer, seq);
+                    }
+                    checkpoint::Row::Dropped => partial.dropped = true,
+                    checkpoint::Row::Tombstone(_) | checkpoint::Row::Version(_) => {}
+                }
+            }
+        }
+        let mut tail = self.log.tail(version);
+        while let Some(commit) = tail.try_next().await? {
+            partial.version = commit.version;
+            for action in &commit.actions {
+                partial.apply(action, range);
+            }
+        }
+        Ok(partial)
+    }
+}
+
+/// What a range read of a manifest gives (MF-5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Partial {
+    /// The version read through.
+    pub version: Version,
+    /// The files that can overlap the range, in id order.
+    pub files: BTreeMap<FileId, FileMeta>,
+    /// Every writer's position.
+    pub positions: BTreeMap<WriterId, Seq>,
+    /// Whether the partition is dropped.
+    pub dropped: bool,
+    /// What the checkpoint read cost; none when the log was folded
+    /// whole.
+    pub read: Option<ScanStats>,
+}
+
+impl Partial {
+    /// The part of `state` within `range`.
+    fn of(
+        version: Version,
+        state: &ManifestState,
+        range: TimeRange,
+        read: Option<ScanStats>,
+    ) -> Self {
+        Partial {
+            version,
+            files: state
+                .files()
+                .filter(|f| range.overlaps_closed(f.min_timestamp, f.max_timestamp))
+                .map(|f| (f.file_id, f.clone()))
+                .collect(),
+            positions: state.positions().collect(),
+            dropped: state.is_dropped(),
+            read,
+        }
+    }
+
+    /// Applies a commit's action to what is held: files outside the
+    /// range are of no interest, positions and the drop always are.
+    fn apply(&mut self, action: &Action, range: TimeRange) {
+        match action {
+            Action::AddFile(meta) => {
+                if range.overlaps_closed(meta.min_timestamp, meta.max_timestamp) {
+                    self.files.insert(meta.file_id, (**meta).clone());
+                }
+            }
+            Action::RemoveFile { file_id, .. } => {
+                self.files.remove(file_id);
+            }
+            Action::AdvanceWriter { writer, through } => {
+                let position = self.positions.entry(*writer).or_insert(Seq::ZERO);
+                *position = (*position).max(*through);
+            }
+            Action::DropPartition => {
+                self.dropped = true;
+                self.files.clear();
+            }
+            Action::Forget { .. } | Action::Kv(_) => {}
+        }
+    }
+}
+
+fn corrupt(key: &Key, source: impl std::error::Error + Send + Sync + 'static) -> ManifestError {
+    ManifestError::Corrupt {
+        key: key.clone(),
+        source: Box::new(source),
     }
 }
 
@@ -669,5 +858,124 @@ mod tests {
         assert!(state.state().is_dropped());
         assert_eq!(state.state().files().count(), 0);
         assert_eq!(state.state().tombstones().count(), 1);
+    }
+
+    fn file_at(id: u128, writer: WriterId, through: u64, seconds: i64) -> FileMeta {
+        let mut meta = file(id, &partition(0), writer, through);
+        meta.min_timestamp = Timestamp::from_nanos(seconds * 1_000_000_000);
+        meta.max_timestamp = Timestamp::from_nanos((seconds + 1) * 1_000_000_000);
+        meta
+    }
+
+    fn seconds(start: i64, end: i64) -> TimeRange {
+        TimeRange::new(
+            Timestamp::from_nanos(start * 1_000_000_000),
+            Timestamp::from_nanos(end * 1_000_000_000),
+        )
+    }
+
+    fn ids(partial: &Partial) -> Vec<FileId> {
+        partial.files.keys().copied().collect()
+    }
+
+    #[tokio::test]
+    async fn a_range_read_folds_the_checkpoint_and_the_commits_after_it() {
+        let store = MemoryStore::new();
+        let manifest = Manifest::open(Arc::new(store.clone()), partition(0), env(1));
+        let writer = WriterId::from_u128(1);
+        manifest
+            .adopt(
+                writer,
+                Seq::new(2),
+                &[file_at(1, writer, 1, 10), file_at(2, writer, 2, 100)],
+            )
+            .await
+            .unwrap();
+        manifest.checkpoint().await.unwrap();
+        manifest
+            .adopt(writer, Seq::new(3), &[file_at(3, writer, 3, 20)])
+            .await
+            .unwrap();
+        let cold = Manifest::open(Arc::new(store.clone()), partition(0), env(2));
+        let partial = cold.read_in(seconds(0, 50)).await.unwrap();
+        assert_eq!(partial.version, cold.snapshot().await.unwrap().version());
+        assert_eq!(
+            ids(&partial),
+            vec![FileId::from_u128(1), FileId::from_u128(3)]
+        );
+        assert_eq!(partial.positions.get(&writer), Some(&Seq::new(3)));
+        assert!(partial.read.is_some());
+        assert!(!partial.dropped);
+    }
+
+    #[tokio::test]
+    async fn a_range_read_without_a_checkpoint_folds_the_log() {
+        let store = MemoryStore::new();
+        let manifest = Manifest::open(Arc::new(store), partition(0), env(1));
+        let writer = WriterId::from_u128(1);
+        manifest
+            .adopt(
+                writer,
+                Seq::new(2),
+                &[file_at(1, writer, 1, 10), file_at(2, writer, 2, 100)],
+            )
+            .await
+            .unwrap();
+        let partial = manifest.read_in(seconds(50, 500)).await.unwrap();
+        assert_eq!(ids(&partial), vec![FileId::from_u128(2)]);
+        assert_eq!(partial.positions.get(&writer), Some(&Seq::new(2)));
+        assert_eq!(partial.read, None);
+    }
+
+    #[tokio::test]
+    async fn a_range_read_fetches_only_the_row_groups_that_can_overlap() {
+        let store = MemoryStore::new();
+        let manifest = Manifest::open(Arc::new(store.clone()), partition(0), env(1));
+        let writer = WriterId::from_u128(1);
+        let files: Vec<FileMeta> = (1..=8)
+            .map(|i| {
+                file_at(
+                    i,
+                    writer,
+                    u64::try_from(i).unwrap(),
+                    i64::try_from(i).unwrap() * 100,
+                )
+            })
+            .collect();
+        manifest.adopt(writer, Seq::new(8), &files).await.unwrap();
+        let snapshot = manifest.snapshot().await.unwrap();
+        let bytes = checkpoint::encode_with(snapshot.state(), snapshot.version(), 1).unwrap();
+        store
+            .put(
+                &manifest.log.checkpoint_key(snapshot.version()),
+                bytes.into(),
+            )
+            .await
+            .unwrap();
+        let partial = manifest.read_in(seconds(300, 302)).await.unwrap();
+        assert_eq!(ids(&partial), vec![FileId::from_u128(3)]);
+        let read = partial.read.unwrap();
+        assert_eq!(
+            read.row_groups, 10,
+            "eight files, the version and the position"
+        );
+        assert!(read.row_groups_read < read.row_groups, "{read:?}");
+        assert_eq!(partial.positions.get(&writer), Some(&Seq::new(8)));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_partition_reads_as_dropped_in_any_range() {
+        let store = MemoryStore::new();
+        let manifest = Manifest::open(Arc::new(store), partition(0), env(1));
+        let writer = WriterId::from_u128(1);
+        manifest
+            .adopt(writer, Seq::new(1), &[file_at(1, writer, 1, 10)])
+            .await
+            .unwrap();
+        manifest.checkpoint().await.unwrap();
+        manifest.drop_partition().await.unwrap();
+        let partial = manifest.read_in(seconds(0, 1000)).await.unwrap();
+        assert!(partial.dropped);
+        assert!(partial.files.is_empty());
     }
 }

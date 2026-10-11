@@ -8,6 +8,7 @@
 //! the position up to which the writer's segments are represented by
 //! those files.
 
+pub mod checkpoint;
 pub mod dataset;
 pub mod intake;
 pub mod manifest;
@@ -18,7 +19,7 @@ pub mod view;
 pub use dataset::{
     Advice, Alternative, DatasetLog, DatasetLogError, DatasetLogs, LayoutRecord, Tombstone,
 };
-pub use manifest::{Manifest, ManifestError, ManifestState, list_partitions};
+pub use manifest::{Manifest, ManifestError, ManifestState, Partial, list_partitions};
 pub use manifests::Manifests;
 pub use registry::Registration;
 pub use view::{Sources, View, ViewSources, read_sources};

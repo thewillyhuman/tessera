@@ -44,6 +44,11 @@ pub struct ViewSources {
     /// The last entry read of each writer's log: where a consumer that
     /// folded this view resumes from the live logs (section 11.7).
     pub positions: BTreeMap<WriterId, Seq>,
+    /// Row groups of the manifest checkpoints consulted (MF-5).
+    pub manifest_row_groups: usize,
+    /// Row groups of them fetched: the ones whose files could overlap
+    /// the range.
+    pub manifest_row_groups_read: usize,
 }
 
 /// The rows of a view and where they came from.
@@ -111,13 +116,23 @@ pub async fn sources(
             w.start(),
             Timestamp::from_nanos(w.end().as_nanos().saturating_sub(1)),
         );
-        let snapshot = manifests.open(partition).snapshot().await?;
-        sources
-            .manifests
-            .insert(partition.clone(), snapshot.version());
-        positions.insert(w, snapshot.state().positions().collect());
+        // A partition outside the range contributes its positions only:
+        // an empty range reads the checkpoint's header rows and no file
+        // row group (MF-5).
+        let wanted = if in_range {
+            time_range
+        } else {
+            TimeRange::new(Timestamp::MAX, Timestamp::MAX)
+        };
+        let partial = manifests.open(partition).read_in(wanted).await?;
+        sources.manifests.insert(partition.clone(), partial.version);
+        if let Some(read) = partial.read {
+            sources.manifest_row_groups += read.row_groups;
+            sources.manifest_row_groups_read += read.row_groups_read;
+        }
+        positions.insert(w, partial.positions);
         if in_range {
-            files.extend(snapshot.state().files().cloned());
+            files.extend(partial.files.into_values());
         }
     }
     sources.files = files.len();

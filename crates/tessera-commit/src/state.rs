@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tessera_types::Version;
 
-use crate::{Action, KvMutation};
+use crate::{Action, DecodeError, KvMutation};
 
 /// Why an action could not be applied to a state. Since every action was
 /// valid when committed, this means the log or the state is corrupt.
@@ -34,6 +34,22 @@ pub trait State: Clone + Default + Serialize + DeserializeOwned + Send + Sync + 
     /// If the action cannot apply to this state, which only a corrupt log
     /// can cause.
     fn apply(&mut self, action: &Action) -> Result<(), ApplyError>;
+
+    /// The state as the checkpoint object at `version` (CL-3): JSON
+    /// unless the state overrides it, as a manifest does with Parquet so
+    /// that a reader scans its checkpoint in part (MF-5).
+    fn encode_checkpoint(&self, version: Version) -> Vec<u8> {
+        crate::checkpoint::encode_json(version, self)
+    }
+
+    /// The state in the checkpoint object filed under `version`.
+    ///
+    /// # Errors
+    ///
+    /// If the object does not decode or claims another version.
+    fn decode_checkpoint(version: Version, bytes: &[u8]) -> Result<Self, DecodeError> {
+        crate::checkpoint::decode_json(version, bytes)
+    }
 }
 
 /// The state of a log at one version.
