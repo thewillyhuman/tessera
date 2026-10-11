@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axum::http::HeaderMap;
+use axum::http::request::Parts;
 use tessera_catalog::{Principal, TenantName};
 use tessera_exec::QueryLimits;
 use tessera_types::{DatasetName, TenantId, Timestamp};
@@ -43,20 +44,17 @@ pub(crate) struct Scope {
     pub principal: Principal,
 }
 
-/// The scope of a request with `headers`, allowed `need`.
+/// The scope of the request `parts` belong to, allowed `need`.
 ///
 /// # Errors
 ///
 /// 401 or 403 from authentication; 403 when the principal may not act
 /// for the tenant or lacks what `need` asks; 400 for a bad name.
-pub(crate) async fn scope(
-    state: &AppState,
-    headers: &HeaderMap,
-    need: Need,
-) -> Result<Scope, ApiError> {
-    let principal = auth::principal(state, headers).await?;
-    let tenant = tenant(state, headers, &principal)?;
-    let dataset = match headers
+pub(crate) async fn scope(state: &AppState, parts: &Parts, need: Need) -> Result<Scope, ApiError> {
+    let principal = auth::principal(state, parts).await?;
+    let tenant = tenant(state, &parts.headers, &principal)?;
+    let dataset = match parts
+        .headers
         .get("x-tessera-dataset")
         .and_then(|v| v.to_str().ok())
     {

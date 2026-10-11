@@ -12,6 +12,7 @@
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -80,16 +81,16 @@ fn export_response(encoding: Encoding, protobuf: Vec<u8>) -> Response {
 async fn export_logs(
     State(state): State<AppState>,
     Query(params): Query<WriteParams>,
-    headers: HeaderMap,
+    parts: Parts,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let encoding = encoding(&headers)?;
+    let encoding = encoding(&parts.headers)?;
     let request = match encoding {
         Encoding::Protobuf => otlp::parse_protobuf(&body),
         Encoding::Json => otlp::parse_json(&body),
     }
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let scope = scope(&state, &headers, Need::Write).await?;
+    let scope = scope(&state, &parts, Need::Write).await?;
     let now = state.env.clock.now();
     let batch = otlp::to_batch(
         &request,
@@ -113,16 +114,16 @@ async fn export_logs(
 async fn export_traces(
     State(state): State<AppState>,
     Query(params): Query<WriteParams>,
-    headers: HeaderMap,
+    parts: Parts,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let encoding = encoding(&headers)?;
+    let encoding = encoding(&parts.headers)?;
     let request = match encoding {
         Encoding::Protobuf => otlp::traces::parse_protobuf(&body),
         Encoding::Json => otlp::traces::parse_json(&body),
     }
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let scope = scope(&state, &headers, Need::Write).await?;
+    let scope = scope(&state, &parts, Need::Write).await?;
     let now = state.env.clock.now();
     let batches = otlp::traces::to_batches(&request, scope.tenant, scope.dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -138,16 +139,16 @@ async fn export_traces(
 async fn export_metrics(
     State(state): State<AppState>,
     Query(params): Query<WriteParams>,
-    headers: HeaderMap,
+    parts: Parts,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let encoding = encoding(&headers)?;
+    let encoding = encoding(&parts.headers)?;
     let request = match encoding {
         Encoding::Protobuf => otlp::metrics::parse_protobuf(&body),
         Encoding::Json => otlp::metrics::parse_json(&body),
     }
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let scope = scope(&state, &headers, Need::Write).await?;
+    let scope = scope(&state, &parts, Need::Write).await?;
     let now = state.env.clock.now();
     let batch = otlp::metrics::to_batch(&request, scope.tenant, scope.dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;

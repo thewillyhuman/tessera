@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
+use axum::http::request::Parts;
 use tessera_catalog::auth::{self as keys, ApiKey};
 use tessera_catalog::{AccessRole, Principal, Table, TenantName, TenantStatus};
 
@@ -132,15 +133,15 @@ impl Auth {
     }
 }
 
-/// The principal of a request with `headers`.
+/// The principal of the request `parts` belong to.
 ///
 /// # Errors
 ///
 /// 401 without usable credentials where anonymous access is off, or
 /// with a key that is unknown, expired or wrong; 403 for a key of a
 /// tenant that is not active.
-pub async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
-    match bearer(headers) {
+pub async fn principal(state: &AppState, parts: &Parts) -> Result<Principal, ApiError> {
+    match bearer(&parts.headers) {
         Some(text) if keys::parse(text).is_some() => with_key(state, text).await,
         Some(text) => with_token(state, text).await,
         None => anonymous(state),

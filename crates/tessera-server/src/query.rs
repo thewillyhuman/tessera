@@ -17,7 +17,8 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, header};
+use axum::http::header;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use serde::{Deserialize, Serialize};
@@ -73,13 +74,14 @@ enum QueryResponse {
 
 /// Dispatches on the content type: JSON is the native query, anything
 /// else Prometheus' form-encoded instant query.
-async fn run_query(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> HttpResponse {
-    let json = headers
+async fn run_query(State(state): State<AppState>, parts: Parts, body: Bytes) -> HttpResponse {
+    let json = parts
+        .headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.to_ascii_lowercase().starts_with("application/json"));
     if !json {
-        return crate::prometheus::instant_query_raw(&state, &headers, &body).await;
+        return crate::prometheus::instant_query_raw(&state, &parts, &body).await;
     }
     let request: QueryRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -87,7 +89,7 @@ async fn run_query(State(state): State<AppState>, headers: HeaderMap, body: Byte
             return ApiError::bad_request(format!("invalid request: {error}")).into_response();
         }
     };
-    match run_native(&state, &headers, request).await {
+    match run_native(&state, &parts, request).await {
         Ok(response) => response.into_response(),
         Err(error) => error.into_response(),
     }
@@ -95,7 +97,7 @@ async fn run_query(State(state): State<AppState>, headers: HeaderMap, body: Byte
 
 async fn run_native(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     request: QueryRequest,
 ) -> Result<Json<QueryResponse>, ApiError> {
     if request.language != "sql" {
@@ -108,9 +110,9 @@ async fn run_native(
         Some(name) => DatasetName::new(name).map_err(|e| ApiError::bad_request(e.to_string()))?,
         None => DatasetName::new("default").unwrap_or_else(|_| unreachable!("a valid name")),
     };
-    let principal = crate::auth::principal(state, headers).await?;
+    let principal = crate::auth::principal(state, parts).await?;
     let mut ctx = BindContext::new(
-        crate::params::tenant(state, headers, &principal)?,
+        crate::params::tenant(state, &parts.headers, &principal)?,
         dataset,
         state.env.clock.now(),
     );

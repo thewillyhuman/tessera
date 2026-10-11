@@ -12,7 +12,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::http::request::Parts;
 use axum::routing::post;
 use serde::Serialize;
 use serde_json::Value;
@@ -39,10 +39,10 @@ pub struct Accepted {
 async fn ingest_events(
     State(state): State<AppState>,
     Query(params): Query<WriteParams>,
-    headers: HeaderMap,
+    parts: Parts,
     body: Bytes,
 ) -> Result<Json<Accepted>, ApiError> {
-    let scope = scope(&state, &headers, Need::Write).await?;
+    let scope = scope(&state, &parts, Need::Write).await?;
     let text = std::str::from_utf8(&body)
         .map_err(|_| ApiError::bad_request("the body must be UTF-8 JSON lines"))?;
     let now = state.env.clock.now();

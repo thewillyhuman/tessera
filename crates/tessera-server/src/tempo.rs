@@ -19,6 +19,7 @@ use arrow::array::{
     TimestampNanosecondArray,
 };
 use axum::extract::{Path, Query, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -260,10 +261,10 @@ fn paths_of(name: &str) -> Vec<String> {
 
 async fn search(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers, Need::Read).await?;
+    let scope = scope(&state, &parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(&params, now)?;
@@ -709,11 +710,11 @@ fn wants_protobuf(headers: &HeaderMap) -> bool {
 /// The trace by id of `id` in the request's range.
 async fn trace_response(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     id: &str,
     params: &Params,
 ) -> Result<Option<TracesData>, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let id = parse_trace_id(id)?;
     let now = state.env.clock.now();
@@ -731,14 +732,14 @@ async fn trace_response(
 
 async fn trace_by_id(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(id): Path<String>,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let Some(trace) = trace_response(&state, &headers, &id, &params).await? else {
+    let Some(trace) = trace_response(&state, &parts, &id, &params).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    Ok(if wants_protobuf(&headers) {
+    Ok(if wants_protobuf(&parts.headers) {
         protobuf(trace.encode_to_vec())
     } else {
         Json(
@@ -750,14 +751,14 @@ async fn trace_by_id(
 
 async fn trace_by_id_v2(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(id): Path<String>,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let Some(trace) = trace_response(&state, &headers, &id, &params).await? else {
+    let Some(trace) = trace_response(&state, &parts, &id, &params).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    Ok(if wants_protobuf(&headers) {
+    Ok(if wants_protobuf(&parts.headers) {
         // Tempo's TraceByIDResponse: field 1 the trace, field 2 the status
         // (0, complete).
         let inner = trace.encode_to_vec();
@@ -793,10 +794,10 @@ fn protobuf(bytes: Vec<u8>) -> Response {
 /// matches, else the newest spans of the range.
 async fn discovery_rows(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     params: &Params,
 ) -> Result<Vec<RecordBatch>, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
@@ -924,21 +925,21 @@ fn tag_values(batches: &[RecordBatch], name: &str) -> BTreeSet<(String, String)>
 
 async fn tags_v1(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let batches = discovery_rows(&state, &headers, &params).await?;
+    let batches = discovery_rows(&state, &parts, &params).await?;
     let names: BTreeSet<String> = tag_names(&batches).into_values().flatten().collect();
     Ok(Json(json!({ "tagNames": names })).into_response())
 }
 
 async fn tag_values_v1(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(tag): Path<String>,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let batches = discovery_rows(&state, &headers, &params).await?;
+    let batches = discovery_rows(&state, &parts, &params).await?;
     // An unscoped name reads both the span's and the resource's attributes.
     let name = if tag.contains(':') || INTRINSICS.contains(&tag.as_str()) {
         tag
@@ -954,10 +955,10 @@ async fn tag_values_v1(
 
 async fn tags_v2(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let batches = discovery_rows(&state, &headers, &params).await?;
+    let batches = discovery_rows(&state, &parts, &params).await?;
     let mut names = tag_names(&batches);
     names.insert(
         "intrinsic",
@@ -982,11 +983,11 @@ async fn tags_v2(
 
 async fn tag_values_v2(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(tag): Path<String>,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    let batches = discovery_rows(&state, &headers, &params).await?;
+    let batches = discovery_rows(&state, &parts, &params).await?;
     let values: Vec<Value> = tag_values(&batches, &tag)
         .into_iter()
         .map(|(kind, value)| json!({ "type": kind, "value": value }))
@@ -1052,11 +1053,11 @@ fn label_values(labels: &[String], key: &[Option<String>], function: &str) -> Ve
 
 async fn metrics_common(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     params: &Params,
     instant: bool,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
@@ -1123,18 +1124,18 @@ fn default_step(start: Timestamp, end: Timestamp) -> Duration {
 
 async fn metrics_query_range(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    metrics_common(&state, &headers, &params, false).await
+    metrics_common(&state, &parts, &params, false).await
 }
 
 async fn metrics_query_instant(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
-    metrics_common(&state, &headers, &params, true).await
+    metrics_common(&state, &parts, &params, true).await
 }
 
 #[cfg(test)]

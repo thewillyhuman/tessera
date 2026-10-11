@@ -52,8 +52,9 @@ impl Exporter {
     /// The tenant and dataset a request's metadata names, checked for
     /// writing.
     async fn scope<T>(&self, request: &Request<T>) -> Result<Scope, Status> {
-        let headers = request.metadata().clone().into_headers();
-        scope(&self.state, &headers, Need::Write)
+        let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+        parts.headers = request.metadata().clone().into_headers();
+        scope(&self.state, &parts, Need::Write)
             .await
             .map_err(|e| status_of(&e))
     }

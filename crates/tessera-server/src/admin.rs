@@ -81,13 +81,14 @@ async fn require_cluster_admin(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let principal = crate::auth::principal(&state, request.headers()).await?;
+    let (parts, body) = request.into_parts();
+    let principal = crate::auth::principal(&state, &parts).await?;
     if !principal.cluster_admin {
         return Err(ApiError::forbidden(
             "cluster administration needs a _system admin key",
         ));
     }
-    let mut request = request;
+    let mut request = Request::from_parts(parts, body);
     request.extensions_mut().insert(principal);
     Ok(next.run(request).await)
 }

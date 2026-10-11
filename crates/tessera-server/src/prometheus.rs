@@ -19,7 +19,8 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, RawForm, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
@@ -114,10 +115,10 @@ async fn answer(f: impl Future<Output = Result<Value, ApiError>>) -> Response {
 /// once its samples are durable (IN-10).
 async fn write(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers, Need::Write).await?;
+    let scope = scope(&state, &parts, Need::Write).await?;
     let request = remote_write::decode(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let now = state.env.clock.now();
     let batch = remote_write::to_batch(&request, scope.tenant, scope.dataset, now)
@@ -296,11 +297,11 @@ fn result_data(lowered: &Lowered, rows: Vec<Row>, instant: bool, time: Timestamp
 
 async fn query_common(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     raw: &[u8],
     instant: bool,
 ) -> Result<Value, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let params = Params::parse(raw);
     let now = state.env.clock.now();
@@ -343,37 +344,33 @@ async fn query_common(
 
 async fn instant_query(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     RawForm(raw): RawForm,
 ) -> Response {
-    instant_query_raw(&state, &headers, &raw).await
+    instant_query_raw(&state, &parts, &raw).await
 }
 
 /// An instant query from its raw parameters, for the shared POST route.
-pub(crate) async fn instant_query_raw(
-    state: &AppState,
-    headers: &HeaderMap,
-    raw: &[u8],
-) -> Response {
-    answer(query_common(state, headers, raw, true)).await
+pub(crate) async fn instant_query_raw(state: &AppState, parts: &Parts, raw: &[u8]) -> Response {
+    answer(query_common(state, parts, raw, true)).await
 }
 
 async fn range_query(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     RawForm(raw): RawForm,
 ) -> Response {
-    answer(query_common(&state, &headers, &raw, false)).await
+    answer(query_common(&state, &parts, &raw, false)).await
 }
 
 /// The label sets the selectors of `match[]` admit in the range: the
 /// newest rows of each selector, labelled.
 async fn discovery_rows(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     params: &Params,
 ) -> Result<Vec<BTreeMap<String, String>>, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let end = params.time("end", now, now)?;
@@ -421,30 +418,22 @@ async fn discovery_rows(
     Ok(sets.into_iter().collect())
 }
 
-async fn series(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawForm(raw): RawForm,
-) -> Response {
+async fn series(State(state): State<AppState>, parts: Parts, RawForm(raw): RawForm) -> Response {
     answer(async {
         let params = Params::parse(&raw);
         if params.matches.is_empty() {
             return Err(ApiError::bad_request("no match[] parameter provided"));
         }
-        let sets = discovery_rows(&state, &headers, &params).await?;
+        let sets = discovery_rows(&state, &parts, &params).await?;
         Ok(json!(sets))
     })
     .await
 }
 
-async fn labels(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    RawForm(raw): RawForm,
-) -> Response {
+async fn labels(State(state): State<AppState>, parts: Parts, RawForm(raw): RawForm) -> Response {
     answer(async {
         let params = Params::parse(&raw);
-        let names: BTreeSet<String> = discovery_rows(&state, &headers, &params)
+        let names: BTreeSet<String> = discovery_rows(&state, &parts, &params)
             .await?
             .into_iter()
             .flat_map(BTreeMap::into_keys)
@@ -456,13 +445,13 @@ async fn labels(
 
 async fn label_values(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(name): Path<String>,
     RawForm(raw): RawForm,
 ) -> Response {
     answer(async {
         let params = Params::parse(&raw);
-        let values: BTreeSet<String> = discovery_rows(&state, &headers, &params)
+        let values: BTreeSet<String> = discovery_rows(&state, &parts, &params)
             .await?
             .into_iter()
             .filter_map(|mut set| set.remove(&name))

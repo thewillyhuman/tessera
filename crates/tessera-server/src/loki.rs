@@ -20,7 +20,8 @@ use std::time::Duration;
 use arrow::array::{Array, Float64Array, RecordBatch, StringArray, TimestampNanosecondArray};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, RawForm, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -275,11 +276,11 @@ fn success(data: Value) -> Response {
 
 async fn query_common(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     params: QueryParams,
     instant: bool,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let query = params
@@ -345,18 +346,18 @@ fn default_step(start: Timestamp, end: Timestamp) -> Duration {
 
 async fn instant_query(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     RawForm(raw): RawForm,
 ) -> Result<Response, ApiError> {
-    query_common(&state, &headers, params(&raw)?, true).await
+    query_common(&state, &parts, params(&raw)?, true).await
 }
 
 async fn range_query(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     RawForm(raw): RawForm,
 ) -> Result<Response, ApiError> {
-    query_common(&state, &headers, params(&raw)?, false).await
+    query_common(&state, &parts, params(&raw)?, false).await
 }
 
 /// The parameters of a request: the query string of a GET or the form
@@ -370,10 +371,10 @@ fn params(raw: &[u8]) -> Result<QueryParams, ApiError> {
 /// selector (or of everything) in the time range.
 async fn discovery_rows(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     params: &QueryParams,
 ) -> Result<Vec<Row>, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
@@ -415,10 +416,10 @@ async fn discovery_rows(
 
 async fn labels(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<QueryParams>,
 ) -> Result<Response, ApiError> {
-    let names: BTreeSet<String> = discovery_rows(&state, &headers, &params)
+    let names: BTreeSet<String> = discovery_rows(&state, &parts, &params)
         .await?
         .into_iter()
         .flat_map(|r| r.labels.into_keys())
@@ -428,11 +429,11 @@ async fn labels(
 
 async fn label_values(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(name): Path<String>,
     Query(params): Query<QueryParams>,
 ) -> Result<Response, ApiError> {
-    let values: BTreeSet<String> = discovery_rows(&state, &headers, &params)
+    let values: BTreeSet<String> = discovery_rows(&state, &parts, &params)
         .await?
         .into_iter()
         .filter_map(|mut r| r.labels.remove(&name))
@@ -442,11 +443,11 @@ async fn label_values(
 
 async fn series(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     RawForm(raw): RawForm,
 ) -> Result<Response, ApiError> {
     let params = params(&raw)?;
-    let sets: BTreeSet<BTreeMap<String, String>> = discovery_rows(&state, &headers, &params)
+    let sets: BTreeSet<BTreeMap<String, String>> = discovery_rows(&state, &parts, &params)
         .await?
         .into_iter()
         .map(|r| r.labels)
@@ -456,10 +457,10 @@ async fn series(
 
 async fn index_stats(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<QueryParams>,
 ) -> Result<Response, ApiError> {
-    let rows = discovery_rows(&state, &headers, &params).await?;
+    let rows = discovery_rows(&state, &parts, &params).await?;
     let streams: BTreeSet<&BTreeMap<String, String>> = rows.iter().map(|r| &r.labels).collect();
     let bytes: usize = rows
         .iter()
@@ -477,7 +478,7 @@ async fn index_stats(
 #[allow(clippy::cast_precision_loss)]
 async fn index_volume(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<QueryParams>,
 ) -> Result<Response, ApiError> {
     let now = state.env.clock.now();
@@ -486,7 +487,7 @@ async fn index_volume(
         .target_labels
         .as_ref()
         .map(|t| t.split(',').map(|s| s.trim().to_owned()).collect());
-    let rows = discovery_rows(&state, &headers, &params).await?;
+    let rows = discovery_rows(&state, &parts, &params).await?;
     let mut volume: BTreeMap<BTreeMap<String, String>, usize> = BTreeMap::new();
     for row in rows {
         let key: BTreeMap<String, String> = match &targets {
@@ -511,10 +512,10 @@ async fn index_volume(
 
 async fn detected_fields(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<QueryParams>,
 ) -> Result<Response, ApiError> {
-    let rows = discovery_rows(&state, &headers, &params).await?;
+    let rows = discovery_rows(&state, &parts, &params).await?;
     let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for row in &rows {
         for (name, value) in &row.labels {
@@ -541,10 +542,10 @@ async fn detected_fields(
 
 async fn detected_labels(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<QueryParams>,
 ) -> Result<Response, ApiError> {
-    let rows = discovery_rows(&state, &headers, &params).await?;
+    let rows = discovery_rows(&state, &parts, &params).await?;
     let mut values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for row in &rows {
         for (name, value) in &row.labels {
@@ -577,11 +578,12 @@ struct PushStream {
 
 async fn push(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers, Need::Write).await?;
-    let content_type = headers
+    let scope = scope(&state, &parts, Need::Write).await?;
+    let content_type = parts
+        .headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -652,11 +654,11 @@ async fn push(
 /// the selector as it becomes visible.
 async fn tail(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Query(params): Query<QueryParams>,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let scope = scope(&state, &headers, Need::Read).await?;
+    let scope = scope(&state, &parts, Need::Read).await?;
     let _turn = state.admit_query(&scope.tenant).await?;
     let query = params
         .query

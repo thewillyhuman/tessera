@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
@@ -103,12 +104,12 @@ fn group_name(namespace: &str, group: &str) -> String {
 /// Loads a rule file into the control store, replacing the group.
 async fn load(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     namespace: &str,
     body: &[u8],
     language: Language,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers, Need::Admin).await?;
+    let scope = scope(state, parts, Need::Admin).await?;
     let file: GroupFile = serde_yaml_ng::from_slice(body)
         .map_err(|e| ApiError::bad_request(format!("invalid rule group: {e}")))?;
     let group = group_name(namespace, &file.name);
@@ -189,11 +190,11 @@ fn check_expression(language: Language, expr: &str) -> Result<(), ApiError> {
 /// Removes a group from the control store.
 async fn remove(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     namespace: &str,
     group: &str,
 ) -> Result<Response, ApiError> {
-    let scope = scope(state, headers, Need::Admin).await?;
+    let scope = scope(state, parts, Need::Admin).await?;
     let group = group_name(namespace, group);
     let control = state.controls.open(&scope.tenant);
     let (removed, _) = control
@@ -345,9 +346,9 @@ fn success(data: &Value) -> Response {
     axum::Json(json!({ "status": "success", "data": data })).into_response()
 }
 
-async fn prometheus_rules(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn prometheus_rules(State(state): State<AppState>, parts: Parts) -> Response {
     let answer = async {
-        let scope = scope(&state, &headers, Need::Read).await?;
+        let scope = scope(&state, &parts, Need::Read).await?;
         let groups = groups_of(&state, &scope.tenant).await?;
         Ok::<_, ApiError>(success(&json!({
             "groups": groups.iter().map(group_json).collect::<Vec<_>>()
@@ -356,9 +357,9 @@ async fn prometheus_rules(State(state): State<AppState>, headers: HeaderMap) -> 
     answer.await.unwrap_or_else(IntoResponse::into_response)
 }
 
-async fn prometheus_alerts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn prometheus_alerts(State(state): State<AppState>, parts: Parts) -> Response {
     let answer = async {
-        let scope = scope(&state, &headers, Need::Read).await?;
+        let scope = scope(&state, &parts, Need::Read).await?;
         let groups = groups_of(&state, &scope.tenant).await?;
         let mut alerts = Vec::new();
         for group in &groups {
@@ -378,11 +379,11 @@ async fn prometheus_alerts(State(state): State<AppState>, headers: HeaderMap) ->
 /// The groups of a namespace as rule files, keyed by namespace.
 async fn files_of(
     state: &AppState,
-    headers: &HeaderMap,
+    parts: &Parts,
     namespace: Option<&str>,
     language: Language,
 ) -> Result<BTreeMap<String, Vec<GroupFile>>, ApiError> {
-    let scope = scope(state, headers, Need::Read).await?;
+    let scope = scope(state, parts, Need::Read).await?;
     let groups = groups_of(state, &scope.tenant).await?;
     let mut files: BTreeMap<String, Vec<GroupFile>> = BTreeMap::new();
     for group in groups {
@@ -429,10 +430,10 @@ fn yaml(files: &BTreeMap<String, Vec<GroupFile>>) -> Response {
 
 async fn prometheus_namespace(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(namespace): Path<String>,
 ) -> Response {
-    match files_of(&state, &headers, Some(&namespace), Language::Promql).await {
+    match files_of(&state, &parts, Some(&namespace), Language::Promql).await {
         Ok(files) => yaml(&files),
         Err(e) => e.into_response(),
     }
@@ -440,27 +441,27 @@ async fn prometheus_namespace(
 
 async fn load_promql(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(namespace): Path<String>,
     body: Bytes,
 ) -> Response {
-    load(&state, &headers, &namespace, &body, Language::Promql)
+    load(&state, &parts, &namespace, &body, Language::Promql)
         .await
         .unwrap_or_else(IntoResponse::into_response)
 }
 
 async fn delete_promql(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path((namespace, group)): Path<(String, String)>,
 ) -> Response {
-    remove(&state, &headers, &namespace, &group)
+    remove(&state, &parts, &namespace, &group)
         .await
         .unwrap_or_else(IntoResponse::into_response)
 }
 
-async fn loki_rules(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match files_of(&state, &headers, None, Language::Logql).await {
+async fn loki_rules(State(state): State<AppState>, parts: Parts) -> Response {
+    match files_of(&state, &parts, None, Language::Logql).await {
         Ok(files) => yaml(&files),
         Err(e) => e.into_response(),
     }
@@ -468,10 +469,10 @@ async fn loki_rules(State(state): State<AppState>, headers: HeaderMap) -> Respon
 
 async fn loki_namespace(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(namespace): Path<String>,
 ) -> Response {
-    match files_of(&state, &headers, Some(&namespace), Language::Logql).await {
+    match files_of(&state, &parts, Some(&namespace), Language::Logql).await {
         Ok(files) => yaml(&files),
         Err(e) => e.into_response(),
     }
@@ -479,21 +480,21 @@ async fn loki_namespace(
 
 async fn load_logql(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path(namespace): Path<String>,
     body: Bytes,
 ) -> Response {
-    load(&state, &headers, &namespace, &body, Language::Logql)
+    load(&state, &parts, &namespace, &body, Language::Logql)
         .await
         .unwrap_or_else(IntoResponse::into_response)
 }
 
 async fn delete_logql(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    parts: Parts,
     Path((namespace, group)): Path<(String, String)>,
 ) -> Response {
-    remove(&state, &headers, &namespace, &group)
+    remove(&state, &parts, &namespace, &group)
         .await
         .unwrap_or_else(IntoResponse::into_response)
 }
