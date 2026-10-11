@@ -8,9 +8,6 @@
 //! Roles and the rest of the start-up configuration of OP-11 arrive with
 //! their milestones.
 
-mod background;
-mod run;
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -59,7 +56,7 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Run(args) => {
-            run::run(run::Config {
+            tessera_node::run(tessera_node::Config {
                 data_dir: args.data_dir,
                 listen: args.listen,
                 pg_listen: args.pg_listen,

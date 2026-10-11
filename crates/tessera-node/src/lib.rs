@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! `tessera run`: opens the root pool, the catalog, the ingest service,
-//! the query engine and the HTTP API, keeps the catalog fresh and
-//! checkpointed, runs intake, recovery, compaction and garbage
+//! One Tessera node (AR-1): opens the root pool, the catalog, the ingest
+//! service, the query engine and the HTTP API, keeps the catalog fresh
+//! and checkpointed, runs intake, recovery, compaction and garbage
 //! collection in the background, and stops cleanly on Ctrl-C.
+
+mod background;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -101,7 +103,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
 
     let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat);
     let pools = Arc::new(Pools::new(pool.clone(), Arc::clone(&store)));
-    let compactor = tokio::spawn(crate::background::run(crate::background::Background {
+    let compactor = tokio::spawn(background::run(background::Background {
         store: Arc::clone(&store),
         env: env.clone(),
         catalog: Arc::clone(&catalog),

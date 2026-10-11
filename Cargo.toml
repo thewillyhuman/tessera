@@ -31,6 +31,7 @@ tessera-logql = { path = "crates/tessera-logql" }
 tessera-traceql = { path = "crates/tessera-traceql" }
 tessera-promql = { path = "crates/tessera-promql" }
 tessera-server = { path = "crates/tessera-server" }
+tessera-node = { path = "crates/tessera-node" }
 
 [workspace.lints.rust]
 # RS-1: `unsafe` is confined to named modules with documented invariants.

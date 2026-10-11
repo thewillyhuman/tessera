@@ -1,0 +1,28 @@
+[package]
+name = "tessera-node"
+description = "Tessera node: wires the roles, the background work and the APIs of one process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-catalog.workspace = true
+tessera-compact.workspace = true
+tessera-exec.workspace = true
+tessera-format.workspace = true
+tessera-ingest.workspace = true
+tessera-manifest.workspace = true
+tessera-object.workspace = true
+tessera-server.workspace = true
+tessera-types.workspace = true
+tessera-wal.workspace = true
+
+axum = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "rt", "signal", "sync", "time"] }
+tracing = "0.1"
+
+[lints]
+workspace = true

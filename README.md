@@ -133,7 +133,8 @@ crates/
   tessera-traceql   TraceQL lexer, parser and lowering
   tessera-promql    PromQL lexer, parser and lowering
   tessera-server    HTTP administration, OTLP ingest, remote write, SQL over HTTP, PostgreSQL wire protocol, Loki, Tempo and Prometheus APIs
-  tessera           the binary
+  tessera-node      one node: wires the roles, the background work and the APIs of a process
+  tessera           the binary: the command line over tessera-node
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
 compat/sql/         SQL differential tests against SQLite
 compat/logql/       LogQL differential tests against a Loki instance

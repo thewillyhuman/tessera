@@ -2284,19 +2284,8 @@ dependencies = [
 name = "tessera"
 version = "0.1.0"
 dependencies = [
- "axum",
  "clap",
- "tessera-catalog",
- "tessera-compact",
- "tessera-exec",
- "tessera-format",
- "tessera-ingest",
- "tessera-manifest",
- "tessera-object",
- "tessera-server",
- "tessera-types",
- "tessera-wal",
- "thiserror",
+ "tessera-node",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2518,6 +2507,26 @@ dependencies = [
  "tessera-wal",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "tessera-node"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "tessera-catalog",
+ "tessera-compact",
+ "tessera-exec",
+ "tessera-format",
+ "tessera-ingest",
+ "tessera-manifest",
+ "tessera-object",
+ "tessera-server",
+ "tessera-types",
+ "tessera-wal",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
