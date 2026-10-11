@@ -19,6 +19,7 @@ pub mod bodies;
 pub mod eval;
 pub mod extract;
 pub mod group;
+pub mod histogram;
 pub mod naming;
 pub mod promql;
 pub mod redact;

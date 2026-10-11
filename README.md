@@ -255,8 +255,9 @@ Gaps left in M9: `system.usage` has not been reconciled against
 object-store billing (the exit criterion); unit prices and cost are
 not shown (CO-4); `EXCEPT ERRORS` sees the error spans of the files
 being compacted only, and traces referenced by alert events are not
-exempt; histograms and sketches are not merged when downsampling
-(CO-7, CO-8); the budget ledger counts per node, so a tenant served by
+exempt; sketches are not merged when downsampling, and classic
+histograms whose bounds differ keep the interval's last point (CO-8);
+the budget ledger counts per node, so a tenant served by
 several ingesters gets up to that many budgets; teams have no query
 budget, since queries carry no principal; Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded

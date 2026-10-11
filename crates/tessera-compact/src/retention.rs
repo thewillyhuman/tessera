@@ -6,7 +6,8 @@
 //! rows and sets `sample_rate` on the survivors so weighted aggregates
 //! stay unbiased (CO-6), choosing by trace for spans so a trace is kept
 //! or dropped whole (CO-7). Downsampling keeps one row per series and
-//! interval with count, sum, min, max and last (CO-8).
+//! interval with count, sum, min, max and last, and the histograms of
+//! an interval's delta points merged into the kept row (CO-8).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +23,9 @@ use tessera_ir::Expr;
 use tessera_kernels::evaluate_predicate;
 use tessera_kernels::sample::sample;
 use tessera_types::Kind;
-use tessera_types::event::{SERIES_ID, STATUS_CODE, TIMESTAMP, TRACE_ID, VALUE};
+use tessera_types::event::{
+    HISTOGRAM, SERIES_ID, STATUS_CODE, TEMPORALITY, TIMESTAMP, TRACE_ID, VALUE,
+};
 
 use crate::CompactError;
 
@@ -142,11 +145,16 @@ struct Group {
     sum: f64,
     min: f64,
     max: f64,
+    /// The rows with a histogram of delta temporality, which merge.
+    histograms: Vec<usize>,
 }
 
 /// Folds the matching metric rows into one per series and interval
 /// (CO-8): the last row of the interval, its timestamp aligned to the
-/// interval, with the count, sum, min and max of the values alongside.
+/// interval, with the count, sum, min and max of the values alongside,
+/// and the histograms of the interval's delta points merged into it.
+/// Cumulative points already cover the interval, so the last one
+/// stands as it is.
 fn downsample(
     rows: &RecordBatch,
     matches: &BooleanArray,
@@ -166,6 +174,12 @@ fn downsample(
     let values = rows
         .column_by_name(VALUE)
         .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
+    let histograms = rows
+        .column_by_name(HISTOGRAM)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let temporalities = rows
+        .column_by_name(TEMPORALITY)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
     let mut groups: BTreeMap<(Vec<u8>, i64), Group> = BTreeMap::new();
     let mut untouched: Vec<u32> = Vec::new();
     for i in 0..rows.num_rows() {
@@ -185,8 +199,13 @@ fn downsample(
                 sum: 0.0,
                 min: f64::INFINITY,
                 max: f64::NEG_INFINITY,
+                histograms: Vec::new(),
             });
         group.count += 1;
+        let delta = temporalities.is_some_and(|t| t.is_valid(i) && t.value(i) == "delta");
+        if delta && histograms.is_some_and(|h| h.is_valid(i)) {
+            group.histograms.push(i);
+        }
         if let Some(v) = value {
             group.sum += v;
             group.min = group.min.min(v);
@@ -200,38 +219,96 @@ fn downsample(
     let folded = u64::try_from(rows.num_rows() - untouched.len())
         .unwrap_or(0)
         .saturating_sub(u64::try_from(groups.len()).unwrap_or(0));
-    let mut kept: Vec<u32> = untouched;
-    let mut stats: Vec<Option<(u64, f64, f64, f64)>> = vec![None; kept.len()];
-    let mut aligned: Vec<Option<i64>> = vec![None; kept.len()];
-    for ((_, bucket), group) in &groups {
-        kept.push(u32::try_from(group.last).unwrap_or(u32::MAX));
-        stats.push(Some((group.count, group.sum, group.min, group.max)));
-        aligned.push(Some(*bucket));
-    }
-    let indices = UInt32Array::from(kept);
+    let Kept {
+        indices,
+        stats,
+        aligned,
+        merged,
+    } = kept_rows(untouched, &groups, histograms);
     let taken: Vec<ArrayRef> = rows
         .columns()
         .iter()
         .map(|c| take(c.as_ref(), &indices, None))
         .collect::<Result<_, _>>()?;
-    let mut batch = RecordBatch::try_new(rows.schema(), taken)?;
+    let batch = RecordBatch::try_new(rows.schema(), taken)?;
     // Align the kept row's time to its interval.
-    if let Ok(index) = batch.schema().index_of(TIMESTAMP) {
-        let current = batch
-            .column(index)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .cloned();
-        if let Some(current) = current {
-            let times: TimestampNanosecondArray = (0..batch.num_rows())
+    let batch = replace_column::<TimestampNanosecondArray>(batch, TIMESTAMP, |current| {
+        Arc::new(
+            (0..current.len())
                 .map(|i| Some(aligned[i].unwrap_or_else(|| current.value(i))))
-                .collect();
-            let mut columns = batch.columns().to_vec();
-            columns[index] = Arc::new(times);
-            batch = RecordBatch::try_new(batch.schema(), columns)?;
-        }
-    }
+                .collect::<TimestampNanosecondArray>(),
+        )
+    })?;
+    // Give the kept row the interval's merged histogram, where there is one.
+    let batch = replace_column::<StringArray>(batch, HISTOGRAM, |current| {
+        Arc::new(
+            (0..current.len())
+                .map(|i| {
+                    merged[i]
+                        .clone()
+                        .or_else(|| current.is_valid(i).then(|| current.value(i).to_owned()))
+                })
+                .collect::<StringArray>(),
+        )
+    })?;
     Ok((with_downsample_columns(&batch, &stats)?, folded))
+}
+
+/// The rows a downsample keeps: the untouched ones, then one per
+/// group, with what each kept group row carries.
+struct Kept {
+    indices: UInt32Array,
+    stats: Vec<Option<(u64, f64, f64, f64)>>,
+    aligned: Vec<Option<i64>>,
+    merged: Vec<Option<String>>,
+}
+
+fn kept_rows(
+    untouched: Vec<u32>,
+    groups: &BTreeMap<(Vec<u8>, i64), Group>,
+    histograms: Option<&StringArray>,
+) -> Kept {
+    let mut kept = untouched;
+    let mut stats: Vec<Option<(u64, f64, f64, f64)>> = vec![None; kept.len()];
+    let mut aligned: Vec<Option<i64>> = vec![None; kept.len()];
+    let mut merged: Vec<Option<String>> = vec![None; kept.len()];
+    for ((_, bucket), group) in groups {
+        kept.push(u32::try_from(group.last).unwrap_or(u32::MAX));
+        stats.push(Some((group.count, group.sum, group.min, group.max)));
+        aligned.push(Some(*bucket));
+        merged.push(
+            histograms
+                .filter(|_| group.histograms.len() > 1)
+                .and_then(|h| {
+                    let points: Vec<&str> = group.histograms.iter().map(|&i| h.value(i)).collect();
+                    tessera_kernels::histogram::merge(&points)
+                }),
+        );
+    }
+    Kept {
+        indices: UInt32Array::from(kept),
+        stats,
+        aligned,
+        merged,
+    }
+}
+
+/// `batch` with column `name` replaced by what `make` makes of it;
+/// unchanged when the column is absent or not of type `A`.
+fn replace_column<A: Array + 'static>(
+    batch: RecordBatch,
+    name: &str,
+    make: impl FnOnce(&A) -> ArrayRef,
+) -> Result<RecordBatch, CompactError> {
+    let Ok(index) = batch.schema().index_of(name) else {
+        return Ok(batch);
+    };
+    let Some(current) = batch.column(index).as_any().downcast_ref::<A>() else {
+        return Ok(batch);
+    };
+    let mut columns = batch.columns().to_vec();
+    columns[index] = make(current);
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 /// `rows` with the four downsample columns, from `stats` where given
@@ -500,5 +577,61 @@ mod tests {
             .unwrap()
             .clone();
         assert!((0..4).any(|i| (maxs.value(i) - 59.0).abs() < f64::EPSILON));
+    }
+
+    /// CO-8: the delta histogram points of an interval merge into the
+    /// kept row; cumulative points keep the last one as it is.
+    #[test]
+    fn delta_histograms_merge_into_the_kept_row() {
+        use tessera_types::event::{HISTOGRAM, Temporality};
+
+        let points = |temporality: Temporality| -> RecordBatch {
+            let rows: Vec<MetricRow> = (0..6u8)
+                .map(|i| MetricRow {
+                    timestamp: Timestamp::from_nanos(i64::from(i) * 1_000_000_000),
+                    name: "latency".into(),
+                    metric_type: MetricType::Histogram,
+                    temporality,
+                    histogram: Some(format!(
+                        r#"{{"count":1,"sum":{i}.0,"bounds":[10.0,20.0],"counts":[{},{},0]}}"#,
+                        u8::from(i % 2 == 0),
+                        u8::from(i % 2 == 1)
+                    )),
+                    series_id: [7; 16],
+                    ..MetricRow::default()
+                })
+                .collect();
+            EventBatch::from_metrics(TenantId::DEFAULT, DatasetName::new("p").unwrap(), &rows)
+                .unwrap()
+                .rows()
+                .clone()
+        };
+        let retain = Retain {
+            downsample: Some(Duration::from_secs(30)),
+            ..Retain::default()
+        };
+        let histogram_of = |kept: &RecordBatch| -> serde_json::Value {
+            let column = kept
+                .column_by_name(HISTOGRAM)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone();
+            serde_json::from_str(column.value(0)).unwrap()
+        };
+        let (kept, _) = apply(&points(Temporality::Delta), Kind::Metric, &retain).unwrap();
+        assert_eq!(kept.num_rows(), 1);
+        let merged = histogram_of(&kept);
+        assert_eq!(merged["counts"], serde_json::json!([3, 3, 0]));
+        assert_eq!(merged["count"], 6);
+        assert_eq!(merged["sum"], 15.0);
+        let (kept, _) = apply(&points(Temporality::Cumulative), Kind::Metric, &retain).unwrap();
+        let last = histogram_of(&kept);
+        assert_eq!(
+            last["count"], 1,
+            "a cumulative point already covers the interval"
+        );
+        assert_eq!(last["sum"], 5.0, "the last point");
     }
 }
