@@ -17,7 +17,10 @@ use tessera_ir::{
     AggregateExpr, AlertDefinition, BinaryOp, BindContext, ControlStatement, Diagnostic, Expr,
     Literal, NamedExpr, Plan, Registry, Scan, SortKey, Span, Statement,
 };
-use tessera_types::{DatasetName, Kind, TenantId, Timestamp, event};
+use tessera_types::{
+    DatasetName, Kind, RetentionAction, RetentionClause, RetentionPolicy, TenantId, Timestamp,
+    event,
+};
 
 use crate::ast;
 
@@ -58,6 +61,17 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
         })),
         ast::Statement::ExplainAlert { name } => {
             Ok(Statement::Control(ControlStatement::ExplainAlert {
+                name: name.clone(),
+            }))
+        }
+        ast::Statement::CreateRetentionPolicy(policy) => lower_retention_policy(policy),
+        ast::Statement::DropRetentionPolicy { name } => {
+            Ok(Statement::Control(ControlStatement::DropRetentionPolicy {
+                name: name.clone(),
+            }))
+        }
+        ast::Statement::ExplainRetention { name } => {
+            Ok(Statement::Control(ControlStatement::ExplainRetention {
                 name: name.clone(),
             }))
         }
@@ -177,6 +191,60 @@ fn literal(expr: &ast::Expr, ctx: &BindContext) -> Result<Literal, Diagnostic> {
             "control statements take literals only",
         )),
     }
+}
+
+/// `CREATE RETENTION POLICY` as the record the control store keeps.
+fn lower_retention_policy(policy: &ast::CreateRetentionPolicy) -> Result<Statement, Diagnostic> {
+    let mut clauses = Vec::new();
+    for clause in &policy.clauses {
+        let actions = clause
+            .actions
+            .iter()
+            .map(retention_action)
+            .collect::<Result<Vec<_>, _>>()?;
+        clauses.push(RetentionClause {
+            condition: clause.condition.as_ref().map(|(_, text)| text.clone()),
+            actions,
+        });
+    }
+    Ok(Statement::Control(ControlStatement::CreateRetentionPolicy(
+        RetentionPolicy {
+            name: policy.name.clone(),
+            dataset: policy.dataset.clone(),
+            clauses,
+            enabled: true,
+        },
+    )))
+}
+
+/// A retention action with its durations read.
+fn retention_action(action: &ast::RetentionActionAst) -> Result<RetentionAction, Diagnostic> {
+    let seconds = |(text, span): &(String, Span)| {
+        interval(text)
+            .map(|d| d.as_secs())
+            .ok_or_else(|| Diagnostic::at(*span, format!("invalid duration {text}")))
+    };
+    Ok(match action {
+        ast::RetentionActionAst::Sample { rate, after } => {
+            let fraction: f64 = rate
+                .0
+                .parse()
+                .ok()
+                .filter(|r| *r > 0.0 && *r <= 1.0)
+                .ok_or_else(|| Diagnostic::at(rate.1, "SAMPLE keeps a fraction between 0 and 1"))?;
+            RetentionAction::Sample {
+                rate: fraction,
+                after_seconds: seconds(after)?,
+            }
+        }
+        ast::RetentionActionAst::Drop { after } => RetentionAction::Drop {
+            after_seconds: seconds(after)?,
+        },
+        ast::RetentionActionAst::Downsample { interval, after } => RetentionAction::Downsample {
+            interval_seconds: seconds(interval)?,
+            after_seconds: seconds(after)?,
+        },
+    })
 }
 
 /// A duration option of `CREATE ALERT`, as written.
@@ -1090,6 +1158,64 @@ mod tests {
             "{by_pattern}"
         );
         by_pattern.schema(&Registry::builtin()).unwrap();
+    }
+
+    #[test]
+    fn retention_policies_lower_with_their_clauses() {
+        let ControlStatement::CreateRetentionPolicy(policy) = control(
+            "CREATE RETENTION POLICY trim_noise ON prod AS \
+             WHEN kind = 'log' AND severity_number < 13 AND value_score < 0.01 \
+               THEN SAMPLE 0.05 AFTER INTERVAL '3 days', DROP AFTER INTERVAL '30 days' \
+             WHEN kind = 'metric' THEN DOWNSAMPLE TO INTERVAL '5 minutes' AFTER 30d \
+             ELSE DROP AFTER INTERVAL '90 days'",
+        ) else {
+            panic!("not a policy");
+        };
+        assert_eq!(policy.name, "trim_noise");
+        assert_eq!(policy.dataset, "prod");
+        assert!(policy.enabled);
+        assert_eq!(policy.clauses.len(), 3);
+        assert_eq!(
+            policy.clauses[0].condition.as_deref(),
+            Some("kind = 'log' AND severity_number < 13 AND value_score < 0.01")
+        );
+        assert_eq!(
+            policy.clauses[0].actions,
+            [
+                RetentionAction::Sample {
+                    rate: 0.05,
+                    after_seconds: 3 * 86_400
+                },
+                RetentionAction::Drop {
+                    after_seconds: 30 * 86_400
+                }
+            ]
+        );
+        assert_eq!(
+            policy.clauses[1].actions,
+            [RetentionAction::Downsample {
+                interval_seconds: 300,
+                after_seconds: 30 * 86_400
+            }]
+        );
+        assert!(policy.clauses[2].condition.is_none());
+        assert_eq!(
+            control("DROP RETENTION POLICY trim_noise"),
+            ControlStatement::DropRetentionPolicy {
+                name: "trim_noise".into()
+            }
+        );
+        assert_eq!(
+            control("EXPLAIN RETENTION trim_noise"),
+            ControlStatement::ExplainRetention {
+                name: "trim_noise".into()
+            }
+        );
+        assert!(
+            error("CREATE RETENTION POLICY p ON prod AS ELSE SAMPLE 2 AFTER 1d")
+                .message
+                .contains("between 0 and 1")
+        );
     }
 
     #[test]

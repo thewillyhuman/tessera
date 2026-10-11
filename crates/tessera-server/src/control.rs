@@ -2,8 +2,9 @@
 
 //! Control statements carried out against the tenant's control store
 //! (section 9.5, CS-3): `CREATE ALERT`, `DROP ALERT`, `EXPLAIN ALERT`,
-//! `EXPLAIN LAYOUT` and `INSERT`, `UPDATE` and `DELETE` on the `system`
-//! tables. Each
+//! `EXPLAIN LAYOUT`, `CREATE RETENTION POLICY`, `DROP RETENTION POLICY`,
+//! `EXPLAIN RETENTION` and `INSERT`, `UPDATE` and `DELETE` on the
+//! `system` tables. Each
 //! statement is one transaction (CS-1); the typed tables are checked
 //! against their record before anything is stored.
 
@@ -15,7 +16,7 @@ use tessera_catalog::{ControlError, ControlStore, Row, Table, Transaction};
 use tessera_eval::{Acknowledgment, AlertRule, NotificationRoute, Silence, mode_of};
 use tessera_ir::{ControlStatement, Literal};
 use tessera_manifest::DatasetLog;
-use tessera_types::{DatasetName, Kind, TenantId};
+use tessera_types::{DatasetName, Kind, RetentionPolicy, TenantId};
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -79,6 +80,23 @@ pub async fn execute(
         }
         ControlStatement::ExplainLayout { dataset } => {
             explain_layout(state, tenant, &dataset).await
+        }
+        ControlStatement::CreateRetentionPolicy(policy) => {
+            create_retention_policy(&control, &policy).await
+        }
+        ControlStatement::DropRetentionPolicy { name } => {
+            drop_retention_policy(&control, &name).await
+        }
+        ControlStatement::ExplainRetention { name } => {
+            let document = control
+                .get(Table::RetentionPolicies, &name)
+                .await
+                .map_err(control_error)?
+                .ok_or_else(|| ApiError::bad_request(format!("unknown retention policy {name}")))?;
+            let policy: RetentionPolicy = serde_json::from_value(document).map_err(|e| {
+                ApiError::bad_request(format!("retention policy {name} does not decode: {e}"))
+            })?;
+            explain_retention(state, tenant, &policy).await
         }
         ControlStatement::Insert { table, rows } => {
             insert(&control, writable(&table)?, &rows).await
@@ -233,6 +251,144 @@ async fn explain_layout(
             for driver in &advice.drivers {
                 let _ = writeln!(out, "    driven by {driver}");
             }
+        }
+    }
+    Ok(out)
+}
+
+/// `CREATE RETENTION POLICY`: the policy as a row keyed by its name.
+async fn create_retention_policy(
+    control: &ControlStore,
+    policy: &RetentionPolicy,
+) -> Result<String, ApiError> {
+    let mut document = serde_json::to_value(policy).map_err(|e| internal(&e))?;
+    document["key"] = Value::String(policy.name.clone());
+    control
+        .transact(|txn| {
+            if txn.get(Table::RetentionPolicies, &policy.name)?.is_some() {
+                return Err(ControlError::Rejected(format!(
+                    "retention policy {} exists; DROP RETENTION POLICY it first",
+                    policy.name
+                )));
+            }
+            txn.put(Table::RetentionPolicies, &policy.name, &document);
+            Ok(())
+        })
+        .await
+        .map_err(control_error)?;
+    Ok(format!("CREATE RETENTION POLICY {}", policy.name))
+}
+
+/// `DROP RETENTION POLICY`.
+async fn drop_retention_policy(control: &ControlStore, name: &str) -> Result<String, ApiError> {
+    control
+        .transact(|txn| {
+            if txn.get(Table::RetentionPolicies, name)?.is_none() {
+                return Err(ControlError::Rejected(format!(
+                    "unknown retention policy {name}"
+                )));
+            }
+            txn.delete(Table::RetentionPolicies, name);
+            Ok(())
+        })
+        .await
+        .map_err(control_error)?;
+    Ok(format!("DROP RETENTION POLICY {name}"))
+}
+
+/// `EXPLAIN RETENTION` (CO-9): per clause and action, the partitions
+/// old enough today, with their rows and bytes, and what the action
+/// would remove. A clause's row conditions are not evaluated here, so
+/// a clause on `kind` narrows the kinds and anything else is taken as
+/// matching every row of the kinds it names. The estimates round.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+async fn explain_retention(
+    state: &AppState,
+    tenant: &TenantId,
+    policy: &RetentionPolicy,
+) -> Result<String, ApiError> {
+    let dataset =
+        DatasetName::new(&policy.dataset).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let store = Arc::clone(state.pools.root().store());
+    let now = state.env.clock.now();
+    let mut partitions: Vec<(Kind, u64, u64, u64)> = Vec::new();
+    for kind in Kind::ALL {
+        for partition in tessera_manifest::list_partitions(&*store, tenant, &dataset, kind)
+            .await
+            .map_err(unavailable)?
+        {
+            let manifest = tessera_manifest::Manifest::open(
+                Arc::clone(&store),
+                partition.clone(),
+                state.env.clone(),
+            );
+            let snapshot = manifest.snapshot().await.map_err(unavailable)?;
+            let (rows, bytes) = snapshot
+                .state()
+                .files()
+                .fold((0, 0), |(r, b), f| (r + f.row_count, b + f.size_bytes));
+            let age = now
+                .duration_since(partition.window.end())
+                .map_or(0, |d| d.as_secs());
+            partitions.push((kind, age, rows, bytes));
+        }
+    }
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "retention policy {} on {}: {}",
+        policy.name,
+        policy.dataset,
+        if policy.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    for (i, clause) in policy.clauses.iter().enumerate() {
+        let kinds: Vec<Kind> = Kind::ALL
+            .into_iter()
+            .filter(|k| {
+                clause
+                    .condition
+                    .as_deref()
+                    .is_none_or(|c| !c.contains("kind = ") || c.contains(&format!("kind = '{k}'")))
+            })
+            .collect();
+        let _ = writeln!(
+            out,
+            "clause {}: {}",
+            i + 1,
+            clause.condition.as_deref().map_or_else(
+                || "ELSE".to_owned(),
+                |c| format!("WHEN {c} (row conditions estimated at partition level)")
+            )
+        );
+        for action in &clause.actions {
+            let after = action.after_seconds();
+            let due: Vec<&(Kind, u64, u64, u64)> = partitions
+                .iter()
+                .filter(|(k, age, _, _)| kinds.contains(k) && *age >= after)
+                .collect();
+            let rows: u64 = due.iter().map(|p| p.2).sum();
+            let bytes: u64 = due.iter().map(|p| p.3).sum();
+            let (removed_rows, saved_bytes) = match action {
+                tessera_types::RetentionAction::Sample { rate, .. } => (
+                    (rows as f64 * (1.0 - rate)) as u64,
+                    (bytes as f64 * (1.0 - rate)) as u64,
+                ),
+                tessera_types::RetentionAction::Drop { .. } => (rows, bytes),
+                tessera_types::RetentionAction::Downsample { .. } => (0, bytes / 2),
+            };
+            let _ = writeln!(
+                out,
+                "  {action}: {} partitions due today, {rows} rows, {bytes} bytes; would remove about {removed_rows} rows and save about {saved_bytes} bytes",
+                due.len()
+            );
         }
     }
     Ok(out)
@@ -468,6 +624,57 @@ mod tests {
         assert_eq!(result(&value), "DROP ALERT errors");
         let (status, _) = sql(&state, "DROP ALERT errors").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "gone");
+    }
+
+    #[tokio::test]
+    async fn retention_policies_are_created_explained_and_dropped() {
+        let state = crate::testing::state().await;
+        let (status, value) = sql(
+            &state,
+            "CREATE RETENTION POLICY trim ON prod AS \
+             WHEN kind = 'log' AND severity_number < 13 THEN SAMPLE 0.1 AFTER 3d, DROP AFTER 30d \
+             ELSE DROP AFTER 90d",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(result(&value), "CREATE RETENTION POLICY trim");
+        let (status, _) = sql(
+            &state,
+            "CREATE RETENTION POLICY trim ON prod AS ELSE DROP AFTER 1d",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "exists");
+        let (status, value) = sql(&state, "EXPLAIN RETENTION trim").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let text = result(&value);
+        assert!(
+            text.starts_with("retention policy trim on prod: enabled"),
+            "{text}"
+        );
+        assert!(
+            text.contains("clause 1: WHEN kind = 'log' AND severity_number < 13"),
+            "{text}"
+        );
+        assert!(
+            text.contains("SAMPLE 0.1 AFTER 259200s: 0 partitions due today"),
+            "{text}"
+        );
+        assert!(text.contains("clause 2: ELSE"), "{text}");
+        let (_, value) = sql(&state, "SELECT key FROM system.retention_policies").await;
+        assert_eq!(value["rows"][0][0], "trim");
+        let (_, value) = sql(
+            &state,
+            "UPDATE system.retention_policies SET enabled = false WHERE key = 'trim'",
+        )
+        .await;
+        assert_eq!(result(&value), "UPDATE 1");
+        let (_, value) = sql(&state, "EXPLAIN RETENTION trim").await;
+        assert!(result(&value).contains(": disabled"));
+        let (status, value) = sql(&state, "DROP RETENTION POLICY trim").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(result(&value), "DROP RETENTION POLICY trim");
+        let (status, _) = sql(&state, "EXPLAIN RETENTION trim").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

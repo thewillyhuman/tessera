@@ -34,6 +34,18 @@ pub enum Statement {
         /// The dataset, if named.
         dataset: Option<String>,
     },
+    /// `CREATE RETENTION POLICY name ON dataset AS clauses`.
+    CreateRetentionPolicy(CreateRetentionPolicy),
+    /// `DROP RETENTION POLICY name`.
+    DropRetentionPolicy {
+        /// The policy.
+        name: String,
+    },
+    /// `EXPLAIN RETENTION name`.
+    ExplainRetention {
+        /// The policy.
+        name: String,
+    },
     /// `INSERT INTO table (columns) VALUES (...), ...`.
     Insert {
         /// The table.
@@ -338,5 +350,50 @@ pub enum ExprKind {
         expr: Box<Expr>,
         /// The type name, lowercased.
         type_name: String,
+    },
+}
+
+/// `CREATE RETENTION POLICY name ON dataset AS WHEN cond THEN actions
+/// [WHEN ...] [ELSE actions]`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CreateRetentionPolicy {
+    /// The policy's name.
+    pub name: String,
+    /// The dataset.
+    pub dataset: String,
+    /// The clauses in order.
+    pub clauses: Vec<RetentionClauseAst>,
+}
+
+/// One `WHEN ... THEN ...` or `ELSE ...` of a retention policy.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RetentionClauseAst {
+    /// The condition and its text, none for `ELSE`.
+    pub condition: Option<(Expr, String)>,
+    /// The actions.
+    pub actions: Vec<RetentionActionAst>,
+}
+
+/// One action of a retention clause, durations as written.
+#[derive(Clone, PartialEq, Debug)]
+pub enum RetentionActionAst {
+    /// `SAMPLE rate AFTER duration`.
+    Sample {
+        /// The fraction kept, as written.
+        rate: (String, Span),
+        /// The age.
+        after: (String, Span),
+    },
+    /// `DROP AFTER duration`.
+    Drop {
+        /// The age.
+        after: (String, Span),
+    },
+    /// `DOWNSAMPLE TO duration AFTER duration`.
+    Downsample {
+        /// The interval.
+        interval: (String, Span),
+        /// The age.
+        after: (String, Span),
     },
 }

@@ -9,7 +9,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use tessera_types::{DatasetName, TenantId, Timestamp};
+use tessera_types::{DatasetName, RetentionPolicy, TenantId, Timestamp};
 
 use crate::expr::Literal;
 use crate::plan::Plan;
@@ -143,6 +143,20 @@ pub enum ControlStatement {
     ExplainLayout {
         /// The dataset.
         dataset: DatasetName,
+    },
+    /// `CREATE RETENTION POLICY ... ON dataset AS WHEN ... THEN ...`
+    /// (section 13.3).
+    CreateRetentionPolicy(RetentionPolicy),
+    /// `DROP RETENTION POLICY name`.
+    DropRetentionPolicy {
+        /// The policy.
+        name: String,
+    },
+    /// `EXPLAIN RETENTION name`: what the policy would remove and save
+    /// (CO-9).
+    ExplainRetention {
+        /// The policy.
+        name: String,
     },
     /// `INSERT INTO system.<table> (columns) VALUES (...), ...`.
     Insert {

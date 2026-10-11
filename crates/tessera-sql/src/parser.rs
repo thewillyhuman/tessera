@@ -9,7 +9,8 @@
 use tessera_ir::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CreateAlert, Expr, ExprKind, OrderItem, Query, SelectItem, Statement, TableRef,
+    BinaryOp, CreateAlert, CreateRetentionPolicy, Expr, ExprKind, OrderItem, Query,
+    RetentionActionAst, RetentionClauseAst, SelectItem, Statement, TableRef,
 };
 use crate::lexer::{Spanned, Token, tokenize};
 
@@ -153,6 +154,10 @@ impl Parser<'_> {
                 let (name, _) = self.identifier()?;
                 return Ok(Statement::ExplainAlert { name });
             }
+            if self.eat_keyword("retention") {
+                let (name, _) = self.identifier()?;
+                return Ok(Statement::ExplainRetention { name });
+            }
             if self.eat_keyword("layout") {
                 let dataset = match self.peek() {
                     Some(Spanned {
@@ -168,12 +173,23 @@ impl Parser<'_> {
             return Ok(Statement::Explain { analyze, query });
         }
         if self.eat_keyword("create") {
+            if self.eat_keyword("retention") {
+                self.expect_keyword("policy")?;
+                return self
+                    .create_retention_policy()
+                    .map(Statement::CreateRetentionPolicy);
+            }
             self.expect_keyword("alert")?;
             return self
                 .create_alert()
                 .map(|alert| Statement::CreateAlert(Box::new(alert)));
         }
         if self.eat_keyword("drop") {
+            if self.eat_keyword("retention") {
+                self.expect_keyword("policy")?;
+                let (name, _) = self.identifier()?;
+                return Ok(Statement::DropRetentionPolicy { name });
+            }
             self.expect_keyword("alert")?;
             let (name, _) = self.identifier()?;
             return Ok(Statement::DropAlert { name });
@@ -234,6 +250,94 @@ impl Parser<'_> {
             query,
             query_text: self.text[start..end].to_owned(),
         })
+    }
+
+    /// After `CREATE RETENTION POLICY`: `name ON dataset AS` then the
+    /// clauses.
+    fn create_retention_policy(&mut self) -> Result<CreateRetentionPolicy, Diagnostic> {
+        let (name, _) = self.identifier()?;
+        self.expect_keyword("on")?;
+        let (dataset, _) = self.identifier()?;
+        self.expect_keyword("as")?;
+        let mut clauses = Vec::new();
+        loop {
+            if self.eat_keyword("when") {
+                let start = self.span_here().start;
+                let condition = self.expr()?;
+                let end = self
+                    .tokens
+                    .get(self.at.saturating_sub(1))
+                    .map_or(start, |t| t.span.end);
+                let text = self.text[start..end].to_owned();
+                self.expect_keyword("then")?;
+                clauses.push(RetentionClauseAst {
+                    condition: Some((condition, text)),
+                    actions: self.retention_actions()?,
+                });
+            } else if self.eat_keyword("else") {
+                clauses.push(RetentionClauseAst {
+                    condition: None,
+                    actions: self.retention_actions()?,
+                });
+                break;
+            } else {
+                break;
+            }
+        }
+        if clauses.is_empty() {
+            return Err(self.unexpected("expected WHEN or ELSE"));
+        }
+        Ok(CreateRetentionPolicy {
+            name,
+            dataset,
+            clauses,
+        })
+    }
+
+    /// `action [, action]*` of a retention clause.
+    fn retention_actions(&mut self) -> Result<Vec<RetentionActionAst>, Diagnostic> {
+        let mut actions = vec![self.retention_action()?];
+        while self.eat_symbol(",") {
+            actions.push(self.retention_action()?);
+        }
+        Ok(actions)
+    }
+
+    fn retention_action(&mut self) -> Result<RetentionActionAst, Diagnostic> {
+        if self.eat_keyword("sample") {
+            let rate = match self.advance() {
+                Some(Spanned {
+                    token: Token::Number(n),
+                    span,
+                }) => (n, span),
+                _ => return Err(self.unexpected("expected the fraction to keep")),
+            };
+            self.expect_keyword("after")?;
+            let after = self.interval_text()?;
+            return Ok(RetentionActionAst::Sample { rate, after });
+        }
+        if self.eat_keyword("drop") {
+            self.expect_keyword("after")?;
+            let after = self.interval_text()?;
+            return Ok(RetentionActionAst::Drop { after });
+        }
+        if self.eat_keyword("downsample") {
+            self.expect_keyword("to")?;
+            let interval = self.interval_text()?;
+            self.expect_keyword("after")?;
+            let after = self.interval_text()?;
+            return Ok(RetentionActionAst::Downsample { interval, after });
+        }
+        Err(self.unexpected("expected SAMPLE, DROP or DOWNSAMPLE"))
+    }
+
+    /// A duration written as `INTERVAL '...'` or bare, as in `CREATE
+    /// ALERT`.
+    fn interval_text(&mut self) -> Result<(String, Span), Diagnostic> {
+        if self.eat_keyword("interval") {
+            return self.string();
+        }
+        self.duration_text()
     }
 
     /// A bare name or a string.
@@ -841,14 +945,19 @@ const RESERVED: [&str; 22] = [
     "in", "is", "like", "ilike", "between", "asc", "desc", "having", "explain", "analyze",
 ];
 
-/// Keywords of `CREATE ALERT` options, which end a duration's unit.
-const ALERT_KEYWORDS: [&str; 6] = [
+/// Keywords of `CREATE ALERT` options and retention clauses, which end a
+/// duration's unit.
+const ALERT_KEYWORDS: [&str; 10] = [
     "severity",
     "for",
     "every",
     "notify",
     "labels",
     "annotations",
+    "when",
+    "else",
+    "then",
+    "after",
 ];
 
 /// Keywords that end a select item, so a bare name before them is not an
