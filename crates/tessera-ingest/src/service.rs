@@ -42,6 +42,32 @@ impl IngestHandle {
         ack.await.map_err(|_| IngestError::Stopped)?.wait().await
     }
 
+    /// Hands `batch` to the ingester and returns once it holds it, before
+    /// the segment is stored (IN-10): for callers that prefer latency to
+    /// durability. A segment write that then fails is logged, not
+    /// reported.
+    ///
+    /// # Errors
+    ///
+    /// `Stopped` if the service is shutting down.
+    pub async fn write_buffered(
+        &self,
+        batch: tessera_types::EventBatch,
+    ) -> Result<(), IngestError> {
+        let (reply, ack) = oneshot::channel();
+        self.commands
+            .send(Command::Write(batch, reply))
+            .await
+            .map_err(|_| IngestError::Stopped)?;
+        let ack = ack.await.map_err(|_| IngestError::Stopped)?;
+        tokio::spawn(async move {
+            if let Err(error) = ack.wait().await {
+                tracing::warn!(error = %error, "a write acknowledged as buffered was lost");
+            }
+        });
+        Ok(())
+    }
+
     /// Flushes everything, ends the writer log and stops the task.
     ///
     /// # Errors

@@ -106,6 +106,40 @@ pub(crate) fn tenant(
     Ok(tenant)
 }
 
+/// When a write is acknowledged (IN-10).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AckMode {
+    /// Once the rows are durable in the object store: the default.
+    #[default]
+    Durable,
+    /// Once the node holds the rows, before their segment is stored.
+    Buffered,
+}
+
+/// The query parameters of an ingest request.
+#[derive(Debug, Default, serde::Deserialize)]
+pub(crate) struct WriteParams {
+    /// `durable` (the default) or `buffered` (IN-10).
+    ack: Option<String>,
+}
+
+impl WriteParams {
+    /// The acknowledgement the request asks for.
+    ///
+    /// # Errors
+    ///
+    /// 400 for a value other than `durable` or `buffered`.
+    pub(crate) fn ack(&self) -> Result<AckMode, ApiError> {
+        match self.ack.as_deref() {
+            None | Some("durable") => Ok(AckMode::Durable),
+            Some("buffered") => Ok(AckMode::Buffered),
+            Some(other) => Err(ApiError::bad_request(format!(
+                "ack must be durable or buffered, not {other}"
+            ))),
+        }
+    }
+}
+
 /// The tenants `principal` may name in a query as `tenant.dataset.table`
 /// (CT-9), by name: every tenant for a cluster administrator, its own
 /// otherwise.

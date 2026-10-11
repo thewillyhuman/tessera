@@ -49,6 +49,7 @@ pub use auth::Auth;
 pub use error::ApiError;
 pub use internal::HttpRemote;
 pub use metering::IngestMeter;
+pub use params::AckMode;
 pub use rollups::RollupEntries;
 pub use system::SystemTableRows;
 
@@ -107,6 +108,17 @@ impl AppState {
     /// If a budget refuses the write, the tenant is over its limit of
     /// bytes in flight, or the write fails here.
     pub async fn write(&self, batch: EventBatch) -> Result<(), ApiError> {
+        self.write_with(batch, AckMode::Durable).await
+    }
+
+    /// [`Self::write`], acknowledged as `ack` says (IN-10). A batch
+    /// forwarded to a preferred ingester is acknowledged durable by it
+    /// whatever `ack` says.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`].
+    pub async fn write_with(&self, batch: EventBatch, ack: AckMode) -> Result<(), ApiError> {
         let _inflight = self.load.ingest_started();
         let batch = if batch.tenant() == &TenantId::SYSTEM {
             batch
@@ -140,7 +152,12 @@ impl AppState {
                 }
             }
         }
-        self.ingest.write(batch).await?;
+        match ack {
+            AckMode::Durable => {
+                self.ingest.write(batch).await?;
+            }
+            AckMode::Buffered => self.ingest.write_buffered(batch).await?,
+        }
         Ok(())
     }
 

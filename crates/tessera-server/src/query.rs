@@ -363,6 +363,47 @@ mod tests {
         );
     }
 
+    /// IN-10: a buffered acknowledgement returns before the segment is
+    /// stored, and the rows follow the next durable write.
+    #[tokio::test]
+    async fn buffered_acks_return_before_the_segment_is_stored() {
+        let app = crate::router(crate::testing::state().await);
+        let write = |uri: &str, lines: &[&str]| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(crate::otlp::DATASET_HEADER, "prod")
+                .body(Body::from(serde_json::to_vec(&export(lines)).unwrap()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(write("/v1/logs?ack=buffered", &["first"]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(write("/v1/logs?ack=nope", &["x"]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = app
+            .clone()
+            .oneshot(write("/v1/logs", &["second"]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let (status, value) = post(
+            &app,
+            serde_json::json!({ "dataset": "prod", "query": "SELECT count(*) FROM logs" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"][0][0], 2.0, "both writes are visible");
+    }
+
     #[tokio::test]
     async fn errors_are_bad_requests_with_positions() {
         let app = crate::router(crate::testing::state().await);

@@ -11,7 +11,7 @@
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -21,7 +21,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse
 use prost::Message;
 use tessera_ingest::otlp;
 
-use crate::params::{Need, scope};
+use crate::params::{Need, WriteParams, scope};
 use crate::{ApiError, AppState};
 
 /// The header naming the dataset a request writes to.
@@ -79,6 +79,7 @@ fn export_response(encoding: Encoding, protobuf: Vec<u8>) -> Response {
 
 async fn export_logs(
     State(state): State<AppState>,
+    Query(params): Query<WriteParams>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -99,7 +100,7 @@ async fn export_logs(
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if let Some(batch) = batch {
-        state.write(batch).await?;
+        state.write_with(batch, params.ack()?).await?;
     }
     Ok(export_response(
         encoding,
@@ -111,6 +112,7 @@ async fn export_logs(
 /// before the request is answered (IN-10).
 async fn export_traces(
     State(state): State<AppState>,
+    Query(params): Query<WriteParams>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -125,7 +127,7 @@ async fn export_traces(
     let batches = otlp::traces::to_batches(&request, scope.tenant, scope.dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for batch in batches {
-        state.write(batch).await?;
+        state.write_with(batch, params.ack()?).await?;
     }
     Ok(export_response(
         encoding,
@@ -135,6 +137,7 @@ async fn export_traces(
 
 async fn export_metrics(
     State(state): State<AppState>,
+    Query(params): Query<WriteParams>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -149,7 +152,7 @@ async fn export_metrics(
     let batch = otlp::metrics::to_batch(&request, scope.tenant, scope.dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if let Some(batch) = batch {
-        state.write(batch).await?;
+        state.write_with(batch, params.ack()?).await?;
     }
     Ok(export_response(
         encoding,

@@ -406,7 +406,10 @@ of their own and its links stay with the span. Metrics go to
 `/v1/metrics`, one row per data point, or over Prometheus remote
 write at `/api/v1/write`. An OpenTelemetry Collector's `otlphttp`
 exporter pointed at `http://localhost:8080` works as is for logs,
-traces and metrics.
+traces and metrics. A write is acknowledged once its rows are durable
+in the object store; `?ack=buffered` on an OTLP endpoint acknowledges
+once the node holds them, before their segment is stored, for callers
+that prefer latency to durability (IN-10).
 
 Queries are SQL, over HTTP or over the PostgreSQL protocol. A dataset
 is one table, `events`, holding every kind of event on one set of
