@@ -163,6 +163,9 @@ pub struct TenantSettings {
     pub query_budget: Option<Budget>,
     /// Ingest budgets per team, by the value of the team attribute.
     pub team_ingest_budgets: BTreeMap<String, Budget>,
+    /// Query budgets per team, by the team of the role a query runs
+    /// under (section 13.4); their action is alert or reject.
+    pub team_query_budgets: BTreeMap<String, Budget>,
     /// What is dropped, hashed or masked at ingest (SE-4); a patch
     /// with any rules replaces them all.
     pub redactions: Vec<Redaction>,
@@ -247,8 +250,8 @@ pub enum InvalidSettings {
     /// A budget is not valid.
     #[error("{setting}: {reason}")]
     Budget {
-        /// Which setting: `ingest_budget`, `query_budget` or
-        /// `team_ingest_budgets.<team>`.
+        /// Which setting: `ingest_budget`, `query_budget`,
+        /// `team_ingest_budgets.<team>` or `team_query_budgets.<team>`.
         setting: String,
         /// Why.
         reason: InvalidBudget,
@@ -297,6 +300,12 @@ impl TenantSettings {
                 .chain(&patch.team_ingest_budgets)
                 .map(|(team, budget)| (team.clone(), *budget))
                 .collect(),
+            team_query_budgets: self
+                .team_query_budgets
+                .iter()
+                .chain(&patch.team_query_budgets)
+                .map(|(team, budget)| (team.clone(), *budget))
+                .collect(),
             redactions: if patch.redactions.is_empty() {
                 self.redactions.clone()
             } else {
@@ -333,6 +342,12 @@ impl TenantSettings {
             budget(
                 format!("team_ingest_budgets.{team}"),
                 team_budget.validate_for_ingest(),
+            )?;
+        }
+        for (team, team_budget) in &self.team_query_budgets {
+            budget(
+                format!("team_query_budgets.{team}"),
+                team_budget.validate_for_queries(),
             )?;
         }
         for rule in &self.redactions {

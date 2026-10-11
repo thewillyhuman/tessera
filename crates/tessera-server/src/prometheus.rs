@@ -104,7 +104,9 @@ async fn query_exemplars(
             .ok_or_else(|| ApiError::bad_request("invalid parameter \"query\": empty"))?
             .to_owned();
         let scope = scope(&state, &parts, Need::Read).await?;
-        let _turn = state.admit_query(&scope.tenant).await?;
+        let _turn = state
+            .admit_query(&scope.tenant, scope.principal.team())
+            .await?;
         let now = state.env.clock.now();
         let end = params.time("end", now, now)?;
         let start = params.time(
@@ -378,6 +380,7 @@ async fn run(state: &AppState, scope: &Scope, plan: Plan) -> Result<Vec<RecordBa
         "promql",
         "api",
         started.elapsed(),
+        scope.principal.team(),
     );
     Ok(output.batches)
 }
@@ -480,7 +483,9 @@ async fn query_common(
     instant: bool,
 ) -> Result<Value, ApiError> {
     let scope = scope(state, parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let params = Params::parse(raw);
     let now = state.env.clock.now();
     let query = params.required("query")?;
@@ -549,7 +554,9 @@ async fn discovery_rows(
     params: &Params,
 ) -> Result<Vec<BTreeMap<String, String>>, ApiError> {
     let scope = scope(state, parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let now = state.env.clock.now();
     let end = params.time("end", now, now)?;
     let start = params.time(

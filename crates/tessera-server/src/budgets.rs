@@ -145,44 +145,72 @@ pub async fn share_budgets(state: &AppState) -> Result<(), String> {
     Ok(())
 }
 
-pub fn admit_query(state: &AppState, tenant: &TenantId) -> Result<(), ApiError> {
-    let Some(budget) = settings(state, tenant).and_then(|s| s.query_budget) else {
+pub fn admit_query(
+    state: &AppState,
+    tenant: &TenantId,
+    team: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(settings) = settings(state, tenant) else {
         return Ok(());
     };
-    let account = Account {
-        tenant: tenant.clone(),
-        phase: Phase::Query,
-        team: None,
-    };
-    if budget.action == BudgetAction::Reject
-        && state
-            .budgets
-            .exhausted(&account, &budget, state.env.clock.now())
-    {
-        return Err(ApiError::too_many_requests(format!(
-            "query budget of {} bytes per day reached; retry tomorrow",
-            budget.bytes_per_day
-        )));
+    let now = state.env.clock.now();
+    for (account, budget) in query_accounts(tenant, team, &settings) {
+        if budget.action == BudgetAction::Reject && state.budgets.exhausted(&account, &budget, now)
+        {
+            return Err(ApiError::too_many_requests(format!(
+                "query budget of {} bytes per day reached for {}; retry tomorrow",
+                budget.bytes_per_day,
+                whose(&account)
+            )));
+        }
     }
     Ok(())
 }
 
-/// Counts the bytes a query scanned against the tenant's query budget.
-pub fn charge_query(state: &AppState, tenant: &TenantId, bytes: u64) {
-    let Some(budget) = settings(state, tenant).and_then(|s| s.query_budget) else {
+/// Counts the bytes a query scanned against the tenant's query budget
+/// and the budget of `team`, the team of the role it ran under.
+pub fn charge_query(state: &AppState, tenant: &TenantId, team: Option<&str>, bytes: u64) {
+    let Some(settings) = settings(state, tenant) else {
         return;
     };
-    let account = Account {
+    let now = state.env.clock.now();
+    let mut crossings = Vec::new();
+    for (account, budget) in query_accounts(tenant, team, &settings) {
+        let charge = state.budgets.charge(&account, &budget, bytes, now);
+        note(&mut crossings, &account, &budget, &charge, "");
+    }
+    metering::record(state, &crossings);
+}
+
+/// The accounts a query of `team` in `tenant` is charged to: the
+/// tenant's when it has a query budget, then the team's when it has
+/// one (section 13.4).
+fn query_accounts(
+    tenant: &TenantId,
+    team: Option<&str>,
+    settings: &TenantSettings,
+) -> Vec<(Account, Budget)> {
+    let account = |team: Option<String>| Account {
         tenant: tenant.clone(),
         phase: Phase::Query,
-        team: None,
+        team,
     };
-    let charge = state
-        .budgets
-        .charge(&account, &budget, bytes, state.env.clock.now());
-    let mut crossings = Vec::new();
-    note(&mut crossings, &account, &budget, &charge, "");
-    metering::record(state, &crossings);
+    let mut accounts = Vec::new();
+    if let Some(budget) = settings.query_budget {
+        accounts.push((account(None), budget));
+    }
+    if let Some((team, budget)) = team.and_then(|t| settings.team_query_budgets.get_key_value(t)) {
+        accounts.push((account(Some(team.clone())), *budget));
+    }
+    accounts
+}
+
+/// Whose budget an account is: the team's, or the tenant's.
+fn whose(account: &Account) -> String {
+    match &account.team {
+        Some(team) => format!("team {team}"),
+        None => "the tenant".to_owned(),
+    }
 }
 
 fn settings(state: &AppState, tenant: &TenantId) -> Option<TenantSettings> {
@@ -215,13 +243,10 @@ fn stricter(a: Option<BudgetAction>, b: Option<BudgetAction>) -> Option<BudgetAc
 /// The error for a request refused by `budget`, if `charge` says so.
 fn refused(account: &Account, budget: &Budget, charge: &Charge) -> Option<ApiError> {
     (charge.action == Some(BudgetAction::Reject)).then(|| {
-        let whose = match &account.team {
-            Some(team) => format!("team {team}"),
-            None => "the tenant".to_owned(),
-        };
         ApiError::too_many_requests(format!(
-            "ingest budget of {} bytes per day reached for {whose}; retry tomorrow",
-            budget.bytes_per_day
+            "ingest budget of {} bytes per day reached for {}; retry tomorrow",
+            budget.bytes_per_day,
+            whose(account)
         ))
     })
 }

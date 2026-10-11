@@ -149,6 +149,7 @@ async fn run(
         "logql",
         "api",
         started.elapsed(),
+        scope.principal.team(),
     );
     Ok((lowered, output.batches))
 }
@@ -286,7 +287,9 @@ async fn query_common(
     instant: bool,
 ) -> Result<Response, ApiError> {
     let scope = scope(state, parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let now = state.env.clock.now();
     let query = params
         .query
@@ -380,7 +383,9 @@ async fn discovery_rows(
     params: &QueryParams,
 ) -> Result<Vec<Row>, ApiError> {
     let scope = scope(state, parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
     let selector = params
@@ -694,7 +699,9 @@ async fn tail(
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let scope = scope(&state, &parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let query = params
         .query
         .clone()

@@ -70,6 +70,10 @@ pub struct Role {
     /// reads every row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_filter: Option<String>,
+    /// The team the queries of the role's principals are charged to
+    /// (section 13.4); none charges the tenant alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
 }
 
 impl Role {
@@ -92,6 +96,7 @@ impl Role {
                 write: every,
                 admin: true,
                 row_filter: None,
+                team: None,
             }),
             Role::READER => Some(Role {
                 name: name.into(),
@@ -99,6 +104,7 @@ impl Role {
                 write: Vec::new(),
                 admin: false,
                 row_filter: None,
+                team: None,
             }),
             Role::WRITER => Some(Role {
                 name: name.into(),
@@ -106,6 +112,7 @@ impl Role {
                 write: every,
                 admin: false,
                 row_filter: None,
+                team: None,
             }),
             _ => None,
         }
@@ -278,6 +285,13 @@ impl Principal {
         Some(filters)
     }
 
+    /// The team the principal's queries are charged to (section 13.4):
+    /// that of the first of its roles naming one.
+    #[must_use]
+    pub fn team(&self) -> Option<&str> {
+        self.roles.iter().find_map(|r| r.team.as_deref())
+    }
+
     /// Whether the principal may write `dataset` of its tenant.
     #[must_use]
     pub fn may_write(&self, dataset: &str) -> bool {
@@ -318,6 +332,7 @@ mod tests {
             write: Vec::new(),
             admin: false,
             row_filter: Some(condition.into()),
+            team: None,
         };
         let a = filtered("a", "attr.team = 'a'");
         let b = filtered("b", "attr.team = 'b'");
@@ -327,6 +342,7 @@ mod tests {
             write: Vec::new(),
             admin: false,
             row_filter: None,
+            team: None,
         };
         let names = |roles: &[&str]| roles.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
         let both = Principal::with_roles(
@@ -413,6 +429,7 @@ mod tests {
             write: Vec::new(),
             admin: false,
             row_filter: None,
+            team: None,
         };
         let principal = Principal::of(TenantId::DEFAULT, &key, &[payments]);
         assert!(principal.may_read("prod"));

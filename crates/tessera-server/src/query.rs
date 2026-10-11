@@ -118,7 +118,7 @@ async fn run_native(
     );
     ctx.tenants = crate::params::tenants(state, &principal);
     ctx.prices = crate::params::prices(state);
-    let _turn = state.admit_query(&ctx.tenant).await?;
+    let _turn = state.admit_query(&ctx.tenant, principal.team()).await?;
     let started = std::time::Instant::now();
     let reader = principal.clone();
     let response = query::run_with(
@@ -146,6 +146,7 @@ async fn run_native(
                 "ad hoc",
                 started.elapsed(),
                 output.fingerprint,
+                principal.team(),
             );
             let (columns, rows) = rows_json(&output.schema, &output.batches)?;
             QueryResponse::Rows { columns, rows }

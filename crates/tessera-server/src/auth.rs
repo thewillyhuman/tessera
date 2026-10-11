@@ -394,6 +394,96 @@ mod tests {
         created["key"].as_str().unwrap().to_owned()
     }
 
+    /// Section 13.4: a query runs under the team of its key's role and
+    /// is refused once that team's query budget is used up, while a
+    /// key of another team goes on.
+    #[tokio::test]
+    async fn team_query_budgets_charge_the_roles_team() {
+        let sql = |text: &str| json!({ "dataset": "default", "query": text });
+        let mut keys = (String::new(), String::new());
+        let state = locked(async |state| {
+            let logs = crate::otlp::testing::export(&["a", "b"]);
+            let (status, body) = call(
+                state,
+                "POST",
+                "/v1/logs",
+                None,
+                &[],
+                Some(serde_json::to_value(&logs).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            for team in ["ads", "search"] {
+                let (status, body) = call(
+                    state,
+                    "POST",
+                    "/api/v1/query",
+                    None,
+                    &[],
+                    Some(sql(&format!(
+                        "INSERT INTO system.roles (name, read, team) VALUES ('{team}', '[\"*\"]', '{team}')"
+                    ))),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+            }
+            state
+                .catalog
+                .alter_tenant(
+                    &TenantName::new("default").unwrap(),
+                    tessera_catalog::TenantSettings {
+                        team_query_budgets: std::collections::BTreeMap::from([(
+                            "ads".to_owned(),
+                            tessera_types::Budget {
+                                bytes_per_day: 1,
+                                action: tessera_types::BudgetAction::Reject,
+                            },
+                        )]),
+                        ..tessera_catalog::TenantSettings::default()
+                    },
+                )
+                .await
+                .unwrap();
+            keys = (
+                issue(state, "default", "ads-key", &["ads"]).await,
+                issue(state, "default", "search-key", &["search"]).await,
+            );
+        })
+        .await;
+        let (ads, search) = keys;
+        let count = |key: String| {
+            let state = state.clone();
+            async move {
+                call(
+                    &state,
+                    "POST",
+                    "/api/v1/query",
+                    Some(&key),
+                    &[],
+                    Some(sql("SELECT count(*) FROM logs")),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            count(ads.clone()).await.0,
+            StatusCode::OK,
+            "the query that reaches the team's budget runs"
+        );
+        let (status, body) = count(ads).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("team ads"),
+            "{body}"
+        );
+        assert_eq!(count(search.clone()).await.0, StatusCode::OK);
+        assert_eq!(
+            count(search).await.0,
+            StatusCode::OK,
+            "another team's key is not charged to ads"
+        );
+    }
+
     /// SE-1: a key whose role carries a row filter reads the rows that
     /// pass it alone, on the SQL and the Loki paths; a filter that is
     /// no condition is refused when the role is stored.

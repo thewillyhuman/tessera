@@ -189,8 +189,12 @@ impl AppState {
     ///
     /// If the tenant's query budget refuses the query, or its queries
     /// are all busy for longer than the queue allows.
-    pub async fn admit_query(&self, tenant: &TenantId) -> Result<Option<QueryPermit>, ApiError> {
-        budgets::admit_query(self, tenant)?;
+    pub async fn admit_query(
+        &self,
+        tenant: &TenantId,
+        team: Option<&str>,
+    ) -> Result<Option<QueryPermit>, ApiError> {
+        budgets::admit_query(self, tenant, team)?;
         match &self.cluster {
             Some(cluster) => {
                 let waited = std::time::Instant::now();
@@ -405,7 +409,7 @@ mod tests {
         state.write(logs()).await.unwrap();
         assert!(
             state
-                .admit_query(&TenantId::DEFAULT)
+                .admit_query(&TenantId::DEFAULT, None)
                 .await
                 .unwrap()
                 .is_none()
@@ -422,7 +426,7 @@ mod tests {
             ..Limits::default()
         };
         let state = clustered(AppState::in_memory().await, &[Role::Query], vec![], limits);
-        let _held = state.admit_query(&TenantId::DEFAULT).await.unwrap();
+        let _held = state.admit_query(&TenantId::DEFAULT, None).await.unwrap();
         let query = serde_json::json!({ "dataset": "prod", "query": "SELECT 1" });
         let request = Request::builder()
             .method("POST")

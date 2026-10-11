@@ -116,6 +116,7 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("read"),
             text("write"),
             Field::new("admin", DataType::Boolean, true),
+            text("team"),
         ],
         "rollups" => vec![
             text("name"),

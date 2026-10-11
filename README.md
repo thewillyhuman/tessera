@@ -235,8 +235,9 @@ with `sample_rate` scaled on the survivors (CO-6, CO-7), downsampling
 metrics to count, sum, min, max and last per series and interval
 (CO-8), and dropping by age alone removes whole partitions; nothing
 is reduced by value without an enabled policy (CO-10). Budgets per
-tenant and team for ingest, and per tenant for queries, as tenant
-settings; once a budget is reached, what arrives beyond it is
+tenant and team for ingest and for queries, a query's team being that
+of the role its key runs under, as tenant settings; once a budget is
+reached, what arrives beyond it is
 admitted and recorded once a day (the default), sampled at ingest, or
 refused with 429, and a query is refused before it runs (13.4).
 Rollups: `CREATE ROLLUP name [EVERY d] [INTO dataset] AS` a grouped
@@ -255,8 +256,7 @@ being compacted only, and traces referenced by alert events are not
 exempt; sketches are not merged when downsampling, and classic
 histograms whose bounds differ keep the interval's last point (CO-8);
 the budget ledger starts empty when every node restarts, not from
-`system.usage`; teams have no query
-budget, since queries carry no principal; Prometheus recording rules
+`system.usage`; Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a
 query reads their samples, not a rollup; a rollup starts at

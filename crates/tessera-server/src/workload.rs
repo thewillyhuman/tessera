@@ -20,7 +20,8 @@ use crate::AppState;
 /// The dataset of the `_system` tenant that holds the log.
 pub const DATASET: &str = "queries";
 
-/// Records what `plan` asked of its scans, as `analysis` saw it.
+/// Records what `plan` asked of its scans, as `analysis` saw it, for a
+/// query run under `team`.
 pub fn record(
     state: &AppState,
     plan: &Plan,
@@ -28,6 +29,7 @@ pub fn record(
     language: &str,
     source: &str,
     latency: Duration,
+    team: Option<&str>,
 ) {
     record_uses(
         state,
@@ -36,11 +38,14 @@ pub fn record(
         source,
         latency,
         tessera_exec::cache::fingerprint(plan),
+        team,
     );
 }
 
 /// Records `uses`, one event each, and the query's usage (CO-3), except
-/// for the `_system` tenant, whose own queries are not logged.
+/// for the `_system` tenant, whose own queries are not logged; the
+/// bytes scanned are charged to the tenant's query budget and to
+/// `team`'s.
 pub fn record_uses(
     state: &AppState,
     uses: Vec<ScanUse>,
@@ -48,6 +53,7 @@ pub fn record_uses(
     source: &str,
     latency: Duration,
     fingerprint: u64,
+    team: Option<&str>,
 ) {
     let now = state.env.clock.now();
     let metered: Vec<ScanUse> = uses
@@ -64,7 +70,7 @@ pub fn record_uses(
         *scanned.entry(&scan.tenant).or_default() += scan.bytes_scanned;
     }
     for (tenant, bytes) in scanned {
-        crate::budgets::charge_query(state, tenant, bytes);
+        crate::budgets::charge_query(state, tenant, team, bytes);
     }
     let mut random = state.env.random.clone();
     let rows: Vec<EventRow> = uses

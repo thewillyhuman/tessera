@@ -162,6 +162,7 @@ async fn run(state: &AppState, scope: &Scope, plan: Plan) -> Result<Vec<RecordBa
         "traceql",
         "api",
         started.elapsed(),
+        scope.principal.team(),
     );
     Ok(output.batches)
 }
@@ -268,7 +269,9 @@ async fn search(
     Query(params): Query<Params>,
 ) -> Result<Response, ApiError> {
     let scope = scope(&state, &parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(&params, now)?;
     let query = params.q.clone().filter(|q| !q.trim().is_empty());
@@ -719,7 +722,9 @@ async fn trace_response(
     params: &Params,
 ) -> Result<Option<TracesData>, ApiError> {
     let scope = scope(state, parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let id = parse_trace_id(id)?;
     let now = state.env.clock.now();
     let range = if params.start.is_some() || params.end.is_some() {
@@ -802,7 +807,9 @@ async fn discovery_rows(
     params: &Params,
 ) -> Result<Vec<RecordBatch>, ApiError> {
     let scope = scope(state, parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
     let Some(query) = params.q.as_deref().filter(|q| !q.trim().is_empty()) else {
@@ -1063,7 +1070,9 @@ async fn metrics_common(
     instant: bool,
 ) -> Result<Response, ApiError> {
     let scope = scope(state, parts, Need::Read).await?;
-    let _turn = state.admit_query(&scope.tenant).await?;
+    let _turn = state
+        .admit_query(&scope.tenant, scope.principal.team())
+        .await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
     let query = params

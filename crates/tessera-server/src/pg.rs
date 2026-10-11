@@ -128,6 +128,7 @@ impl PgServer {
                     "ad hoc",
                     started.elapsed(),
                     output.fingerprint,
+                    principal.team(),
                 );
                 let fields = Arc::new(fields(&output.schema, format));
                 let rows = encode_rows(&fields, &output.batches)?;
