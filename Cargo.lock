@@ -2662,10 +2662,12 @@ dependencies = [
 name = "tessera-node"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "axum",
  "futures",
  "serde_json",
  "tempfile",
+ "tessera-advisor",
  "tessera-catalog",
  "tessera-cluster",
  "tessera-commit",
@@ -2674,9 +2676,11 @@ dependencies = [
  "tessera-exec",
  "tessera-format",
  "tessera-ingest",
+ "tessera-ir",
  "tessera-manifest",
  "tessera-object",
  "tessera-server",
+ "tessera-sql",
  "tessera-types",
  "tessera-wal",
  "thiserror",

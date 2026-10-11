@@ -8,6 +8,7 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+tessera-advisor.workspace = true
 tessera-catalog.workspace = true
 tessera-cluster.workspace = true
 tessera-commit.workspace = true
@@ -20,9 +21,13 @@ tessera-manifest.workspace = true
 tessera-object.workspace = true
 tessera-server.workspace = true
 tessera-types.workspace = true
+tessera-ir.workspace = true
+tessera-sql.workspace = true
 tessera-wal.workspace = true
 
+arrow = { version = "60", default-features = false }
 axum = "0.8"
+serde_json = "1"
 futures = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["net", "rt", "signal", "sync", "time"] }

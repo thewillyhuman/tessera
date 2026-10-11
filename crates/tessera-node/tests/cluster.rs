@@ -67,6 +67,7 @@ impl Cluster {
             renewal: Duration::from_millis(50),
             background: Duration::from_millis(200),
             eval: Duration::from_millis(200),
+            advise: Duration::from_millis(500),
             ingest: IngestConfig {
                 linger: Duration::ZERO,
                 flush_bytes: 1,

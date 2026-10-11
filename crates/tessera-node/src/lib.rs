@@ -9,6 +9,7 @@
 //! test can run several in one process; [`run`] is the binary's loop
 //! from start to Ctrl-C.
 
+mod advisor;
 mod background;
 mod evaluator;
 mod heartbeat;
@@ -46,6 +47,8 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the ingester does its time-based work.
 const INGEST_TICK: Duration = Duration::from_millis(50);
+/// The dataset of the `_system` tenant that holds the workload log.
+pub const WORKLOAD_DATASET: &str = "queries";
 /// How many ingesters a dataset's writes are spread over (IN-9). The
 /// spec lets the set grow with the dataset's volume; two is the start.
 const PREFERRED_INGESTERS: usize = 2;
@@ -75,6 +78,8 @@ pub struct Config {
     pub background: Duration,
     /// How often the `eval` role evaluates its rule groups.
     pub eval: Duration,
+    /// How often the advisor runs on the `compact` role.
+    pub advise: Duration,
     /// The ingester's tunables.
     pub ingest: IngestConfig,
 }
@@ -96,6 +101,7 @@ impl Config {
             renewal: LeaseManager::DEFAULT_RENEWAL,
             background: background::DEFAULT_INTERVAL,
             eval: evaluator::DEFAULT_INTERVAL,
+            advise: advisor::DEFAULT_INTERVAL,
             ingest: IngestConfig::default(),
         }
     }
@@ -206,10 +212,11 @@ impl Node {
             &config,
             leases.as_ref(),
             &state,
-            engine,
+            Arc::clone(&engine),
             &controls,
             &mut loops,
         );
+        shared.advise_layouts(&config, leases.as_ref(), engine, &controls, &mut loops);
         let membership = shared.membership;
         let (stop_servers, servers) = serve(state.clone(), listener, pg_listener);
         Ok(Node {
@@ -448,6 +455,31 @@ impl Shared {
             })),
         };
         (state, engine, controls)
+    }
+
+    /// Starts the advisor's loop on a compact node (section 8), over the
+    /// datasets whose partition slots this node owns.
+    fn advise_layouts(
+        &self,
+        config: &Config,
+        leases: Option<&Arc<Leases>>,
+        engine: Arc<Engine>,
+        controls: &Arc<ControlStores>,
+        loops: &mut Vec<JoinHandle<()>>,
+    ) {
+        let Some(leases) = leases.filter(|_| config.roles.contains(&Role::Compact)) else {
+            return;
+        };
+        loops.push(tokio::spawn(advisor::run(advisor::Advisor {
+            store: Arc::clone(&self.store),
+            env: self.env.clone(),
+            catalog: Arc::clone(&self.catalog),
+            controls: Arc::clone(controls),
+            datasets: Arc::new(DatasetLogs::new(Arc::clone(&self.store), self.env.clone())),
+            engine,
+            owned: leases.owned.clone(),
+            interval: config.advise,
+        })));
     }
 
     /// Starts the `eval` role's loop over the rule groups this node owns
