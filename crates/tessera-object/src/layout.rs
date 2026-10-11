@@ -11,6 +11,7 @@
 //! any pool
 //!   _wal/{writer_id}/{seq:012}                   writer log entries
 //!   {tenant}/_control/_log/{version:020}         tenant control store
+//!   {tenant}/_eval/{group}/{part}/_log/{version:020}    rule state log
 //!   {tenant}/{dataset}/_log/{version:020}        dataset log
 //!   {tenant}/{dataset}/_writers/{writer_id}      writer registry
 //!   {tenant}/{dataset}/p/{kind}/{window}/_log/{version:020}       partition manifest log
@@ -72,6 +73,14 @@ pub fn writer_log_entry(writer: WriterId, seq: Seq) -> Key {
 #[must_use]
 pub fn control_log(tenant: &TenantId) -> Key {
     key(&[tenant.as_str(), "_control"])
+}
+
+/// Prefix of the state log of one partition of a rule group (CQ-12).
+/// The group name is restricted to key characters by the control
+/// store's validation.
+#[must_use]
+pub fn eval_log(tenant: &TenantId, group: &str, part: u32) -> Key {
+    key(&[tenant.as_str(), "_eval", group, &part.to_string()])
 }
 
 /// Prefix of a dataset's log.

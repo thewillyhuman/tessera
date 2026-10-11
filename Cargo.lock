@@ -2500,6 +2500,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-eval"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tessera-catalog",
+ "tessera-commit",
+ "tessera-object",
+ "tessera-types",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "tessera-exec"
 version = "0.1.0"
 dependencies = [

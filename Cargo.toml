@@ -30,6 +30,7 @@ tessera-search = { path = "crates/tessera-search" }
 tessera-logql = { path = "crates/tessera-logql" }
 tessera-traceql = { path = "crates/tessera-traceql" }
 tessera-promql = { path = "crates/tessera-promql" }
+tessera-eval = { path = "crates/tessera-eval" }
 tessera-server = { path = "crates/tessera-server" }
 tessera-node = { path = "crates/tessera-node" }
 
