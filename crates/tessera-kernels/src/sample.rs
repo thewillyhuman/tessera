@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, RecordBatch,
+    TimestampNanosecondArray,
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
-use tessera_types::event::{EVENT_ID, SAMPLE_RATE, TRACE_ID};
+use tessera_types::event::{EVENT_ID, SAMPLE_RATE, SERIES_ID, TIMESTAMP, TRACE_ID};
 use tessera_types::{Kind, stable_hash};
 
 /// What sampling kept.
@@ -49,23 +50,36 @@ pub fn sample(
     matches: &BooleanArray,
     rate: f64,
 ) -> Result<Sampled, ArrowError> {
-    let identity = if kind == Kind::Span {
-        TRACE_ID
-    } else {
-        EVENT_ID
+    let identity = match kind {
+        Kind::Span => TRACE_ID,
+        Kind::Metric => SERIES_ID,
+        _ => EVENT_ID,
     };
     let ids = rows
         .column_by_name(identity)
         .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
+    // A metric sample's identity is its series and its time.
+    let times = (kind == Kind::Metric)
+        .then(|| rows.column_by_name(TIMESTAMP))
+        .flatten()
+        .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>());
     let threshold = (rate * 1_000_000.0) as u64;
     let keep: BooleanArray = (0..rows.num_rows())
         .map(|i| {
             if !matches.value(i) {
                 return Some(true);
             }
-            let key = ids
-                .filter(|a| !a.is_null(i))
-                .map_or(i as u64, |a| stable_hash(a.value(i)));
+            let key = match ids.filter(|a| !a.is_null(i)) {
+                Some(a) => match times {
+                    Some(times) => {
+                        let mut bytes = a.value(i).to_vec();
+                        bytes.extend_from_slice(&times.value(i).to_le_bytes());
+                        stable_hash(&bytes)
+                    }
+                    None => stable_hash(a.value(i)),
+                },
+                None => i as u64,
+            };
             Some(key % 1_000_000 < threshold)
         })
         .collect();

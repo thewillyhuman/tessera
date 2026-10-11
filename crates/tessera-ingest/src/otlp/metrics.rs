@@ -24,7 +24,7 @@ use tessera_types::{
     DatasetName, EventBatch, MetricRow, MetricType, Temporality, TenantId, Timestamp, series_id,
 };
 
-use super::{OtlpError, flatten_all, hash16, nanos};
+use super::{OtlpError, flatten_all, nanos};
 
 /// Parses the protobuf encoding of an export request.
 ///
@@ -110,14 +110,10 @@ impl Shape<'_> {
         flatten_all("attr", attributes, &mut all);
         let timestamp = if time == 0 { self.now } else { nanos(time) };
         let series_id = series_id(&self.metric.name, &all);
-        let mut identity = Vec::with_capacity(24);
-        identity.extend_from_slice(&series_id);
-        identity.extend_from_slice(&timestamp.as_nanos().to_le_bytes());
         let exemplar = exemplars.first();
         MetricRow {
             timestamp,
             observed_timestamp: self.now,
-            event_id: hash16(&identity),
             trace_id: exemplar.and_then(|e| e.trace_id.as_slice().try_into().ok()),
             span_id: exemplar.and_then(|e| e.span_id.as_slice().try_into().ok()),
             name: self.metric.name.clone(),
@@ -381,9 +377,10 @@ mod tests {
             .unwrap();
         assert_eq!(series.value(1), series.value(2), "same name and labels");
         assert_ne!(series.value(1), series.value(3), "another method");
-        let ids = batch.rows().column_by_name(EVENT_ID).unwrap();
-        let ids = ids.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
-        assert_ne!(ids.value(1), ids.value(2), "another time");
+        assert!(
+            batch.rows().column_by_name(EVENT_ID).is_none(),
+            "a sample is identified by its series and time, nothing stored"
+        );
         let attributes: Attributes = serde_json::from_str(&text(&batch, OVERFLOW, 0)).unwrap();
         assert_eq!(
             attributes["resource.service.name"],

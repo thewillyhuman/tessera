@@ -40,7 +40,6 @@ fn points() -> EventBatch {
             rows.push(MetricRow {
                 timestamp: Timestamp::from_nanos(i64::from(i) * 15 * S),
                 observed_timestamp: Timestamp::from_nanos(100 * S),
-                event_id: [i + if job == "api" { 0 } else { 10 }; 16],
                 name: "http.requests".into(),
                 metric_type: MetricType::Sum,
                 unit: "{requests}".into(),

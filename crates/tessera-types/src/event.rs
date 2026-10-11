@@ -29,7 +29,10 @@ pub const TIMESTAMP: &str = "timestamp";
 pub const OBSERVED_TIMESTAMP: &str = "observed_timestamp";
 /// The signal, as its lowercase name.
 pub const KIND: &str = "kind";
-/// Identity for deduplication (section 7.5), 16 bytes.
+/// Identity for deduplication (section 7.5), 16 bytes. Metric rows have
+/// none stored: a sample is identified by its series and its time,
+/// which the rows already carry, and sixteen bytes per sample would
+/// cost more than every other column together.
 pub const EVENT_ID: &str = "event_id";
 /// Correlation with a trace, 16 bytes.
 pub const TRACE_ID: &str = "trace_id";
@@ -106,11 +109,15 @@ fn build_schema(kind: Kind) -> Schema {
         Field::new(TIMESTAMP, ns.clone(), false),
         Field::new(OBSERVED_TIMESTAMP, ns, false),
         Field::new(KIND, DataType::Utf8, false),
-        Field::new(EVENT_ID, DataType::FixedSizeBinary(16), false),
+    ];
+    if kind != Kind::Metric {
+        fields.push(Field::new(EVENT_ID, DataType::FixedSizeBinary(16), false));
+    }
+    fields.extend([
         Field::new(TRACE_ID, DataType::FixedSizeBinary(16), true),
         Field::new(SPAN_ID, DataType::FixedSizeBinary(8), true),
         Field::new(SAMPLE_RATE, DataType::Float64, false),
-    ];
+    ]);
     match kind {
         Kind::Log => fields.extend([
             Field::new(SEVERITY_NUMBER, DataType::Int32, true),
@@ -462,7 +469,6 @@ impl EventBatch {
             timestamps(points.iter().map(|p| p.timestamp)),
             timestamps(points.iter().map(|p| p.observed_timestamp)),
             Arc::new(StringArray::from(vec![Kind::Metric.as_str(); points.len()])),
-            fixed(points.iter().map(|p| Some(&p.event_id[..])), 16)?,
             fixed(
                 points.iter().map(|p| p.trace_id.as_ref().map(|id| &id[..])),
                 16,
@@ -832,8 +838,6 @@ pub struct MetricRow {
     pub timestamp: Timestamp,
     /// Ingest time.
     pub observed_timestamp: Timestamp,
-    /// Identity for deduplication.
-    pub event_id: [u8; 16],
     /// An exemplar's trace, if any.
     pub trace_id: Option<[u8; 16]>,
     /// An exemplar's span, if any.
@@ -938,19 +942,20 @@ mod tests {
                 .map(|f| f.name().as_str())
                 .take(7)
                 .collect();
-            assert_eq!(
-                names,
-                [
-                    TIMESTAMP,
-                    OBSERVED_TIMESTAMP,
-                    KIND,
-                    EVENT_ID,
-                    TRACE_ID,
-                    SPAN_ID,
-                    SAMPLE_RATE
-                ],
-                "{kind}"
-            );
+            // Metrics store no event id: a sample is its series and time.
+            let shared: Vec<&str> = [
+                TIMESTAMP,
+                OBSERVED_TIMESTAMP,
+                KIND,
+                EVENT_ID,
+                TRACE_ID,
+                SPAN_ID,
+                SAMPLE_RATE,
+            ]
+            .into_iter()
+            .filter(|c| kind != Kind::Metric || *c != EVENT_ID)
+            .collect();
+            assert_eq!(&names[..shared.len()], shared.as_slice(), "{kind}");
             assert_eq!(schema.fields().last().unwrap().name(), OVERFLOW, "{kind}");
         }
     }
@@ -1086,7 +1091,6 @@ mod tests {
         let point = MetricRow {
             timestamp: Timestamp::from_nanos(100),
             observed_timestamp: Timestamp::from_nanos(105),
-            event_id: [2; 16],
             name: "http.server.duration".into(),
             metric_type: MetricType::Sum,
             unit: "ms".into(),

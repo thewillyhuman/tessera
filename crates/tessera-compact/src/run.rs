@@ -10,13 +10,14 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
+    TimestampNanosecondArray,
 };
 use arrow::compute::{concat_batches, filter_record_batch};
 use tessera_format::FileFormat;
 use tessera_format::layout::SERVICE;
 use tessera_manifest::{LayoutRecord, Manifest, Tombstone};
 use tessera_object::{ObjectStore, Pools, layout};
-use tessera_types::event::{EVENT_ID, NAME, PATTERN_ID};
+use tessera_types::event::{EVENT_ID, NAME, PATTERN_ID, SERIES_ID, TIMESTAMP};
 use tessera_types::{Env, FileId, FileMeta, FileSource, Kind, Level, Meter, PartitionId, Stored};
 
 use crate::plan::Job;
@@ -286,21 +287,50 @@ fn deduplicate(batches: &[RecordBatch]) -> Result<(RecordBatch, u64), CompactErr
         .map(RecordBatch::schema)
         .ok_or(tessera_format::FormatError::Empty)?;
     let all = concat_batches(&schema, batches)?;
-    let Some(ids) = all
-        .column_by_name(EVENT_ID)
-        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
-    else {
-        return Ok((all, 0));
-    };
-    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(ids.len());
-    let keep: BooleanArray = (0..ids.len())
-        .map(|i| ids.is_null(i) || seen.insert(ids.value(i)))
+    let keys = identities(&all);
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(keys.len());
+    let keep: BooleanArray = keys
+        .iter()
+        .map(|key| key.as_deref().is_none_or(|k| seen.insert(k)))
         .collect();
     let duplicates = keep.false_count() as u64;
     if duplicates == 0 {
         return Ok((all, 0));
     }
     Ok((filter_record_batch(&all, &keep)?, duplicates))
+}
+
+/// The identity of every row: its event id, or for metrics, which store
+/// none, its series and its time; nothing for a row without either.
+fn identities(rows: &RecordBatch) -> Vec<Option<Vec<u8>>> {
+    if let Some(ids) = rows
+        .column_by_name(EVENT_ID)
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+    {
+        return (0..ids.len())
+            .map(|i| (!ids.is_null(i)).then(|| ids.value(i).to_vec()))
+            .collect();
+    }
+    let series = rows
+        .column_by_name(SERIES_ID)
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
+    let times = rows
+        .column_by_name(TIMESTAMP)
+        .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>());
+    let (Some(series), Some(times)) = (series, times) else {
+        return vec![None; rows.num_rows()];
+    };
+    (0..rows.num_rows())
+        .map(|i| {
+            if series.is_null(i) {
+                return None;
+            }
+            let mut key = Vec::with_capacity(24);
+            key.extend_from_slice(series.value(i));
+            key.extend_from_slice(&times.value(i).to_le_bytes());
+            Some(key)
+        })
+        .collect()
 }
 
 #[cfg(test)]

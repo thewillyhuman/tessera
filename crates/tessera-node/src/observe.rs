@@ -43,12 +43,7 @@ const LOG_LINGER: Duration = Duration::from_secs(1);
 /// are small, so they lose nothing as floats.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn metric_rows(
-    snapshot: &Snapshot,
-    node: NodeId,
-    now: Timestamp,
-    random: &mut impl Random,
-) -> Vec<MetricRow> {
+pub fn metric_rows(snapshot: &Snapshot, node: NodeId, now: Timestamp) -> Vec<MetricRow> {
     let mut points: Vec<(String, f64, Option<String>)> = vec![
         (
             "tessera_ingest_queue_depth".into(),
@@ -100,7 +95,6 @@ pub fn metric_rows(
             MetricRow {
                 timestamp: now,
                 observed_timestamp: now,
-                event_id: random.next_u128().to_be_bytes(),
                 name,
                 metric_type: MetricType::Gauge,
                 value: Some(value),
@@ -123,12 +117,7 @@ pub async fn run_metrics(state: AppState, interval: Duration) {
     loop {
         ticks.tick().await;
         let now = state.env.clock.now();
-        let rows = metric_rows(
-            &state.load.snapshot(),
-            state.env.node,
-            now,
-            &mut state.env.random.clone(),
-        );
+        let rows = metric_rows(&state.load.snapshot(), state.env.node, now);
         let Ok(batch) = EventBatch::from_metrics(TenantId::SYSTEM, dataset.clone(), &rows) else {
             continue;
         };
@@ -285,7 +274,7 @@ pub async fn run_logs(state: AppState, mut receiver: mpsc::Receiver<LogRow>) {
 
 #[cfg(test)]
 mod tests {
-    use tessera_types::{SeededRandom, WorkKind};
+    use tessera_types::WorkKind;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
@@ -300,12 +289,7 @@ mod tests {
             evaluator_lag: Duration::from_secs(3),
             slots: BTreeMap::from([(WorkKind::Partition, 4), (WorkKind::Intake, 1)]),
         };
-        let rows = metric_rows(
-            &snapshot,
-            NodeId::from_u128(7),
-            Timestamp::from_nanos(1),
-            &mut SeededRandom::new(1),
-        );
+        let rows = metric_rows(&snapshot, NodeId::from_u128(7), Timestamp::from_nanos(1));
         assert_eq!(rows.len(), 7);
         let queue = rows
             .iter()

@@ -158,13 +158,9 @@ pub fn to_batch(
         let id = series_id(name, &attributes);
         for sample in &series.samples {
             let timestamp = Timestamp::from_nanos(sample.timestamp.saturating_mul(1_000_000));
-            let mut identity = Vec::with_capacity(24);
-            identity.extend_from_slice(&id);
-            identity.extend_from_slice(&timestamp.as_nanos().to_le_bytes());
             rows.push(MetricRow {
                 timestamp,
                 observed_timestamp: now,
-                event_id: crate::otlp::hash16(&identity),
                 name: name.to_owned(),
                 metric_type,
                 unit: metadata.map(|m| m.unit.clone()).unwrap_or_default(),

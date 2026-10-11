@@ -368,7 +368,6 @@ mod tests {
         let points: Vec<MetricRow> = (0..60u8)
             .map(|i| MetricRow {
                 timestamp: Timestamp::from_nanos(i64::from(i) * 1_000_000_000),
-                event_id: [i; 16],
                 name: "cpu".into(),
                 metric_type: MetricType::Gauge,
                 value: Some(f64::from(i)),
