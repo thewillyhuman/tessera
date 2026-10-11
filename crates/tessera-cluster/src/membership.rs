@@ -7,9 +7,10 @@
 //! The view is a hint: it may lag the registry by a refresh interval and
 //! may name a node that just died. Every use of it falls back to doing
 //! the work locally. The registry says who is a member; gossip says how
-//! recently each was seen, a node's newest heartbeat winning wherever
-//! it came from, and names a node that registered since the last
-//! listing until the next one confirms it.
+//! recently each member was seen, a node's newest heartbeat winning
+//! wherever it came from. A node gossip names that the registry does
+//! not list is ignored: it withdrew, and its record would otherwise
+//! circulate among the peers until it aged out.
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
@@ -37,8 +38,7 @@ impl Membership {
 
     /// Replaces the view with `records`, as the registry listed them,
     /// keeping the fresher heartbeat gossip may know of a listed node.
-    /// A node the listing lacks is gone: withdrawn, or not registered
-    /// yet, in which case gossip names it again.
+    /// A node the listing lacks is gone.
     pub fn replace(&self, records: Vec<NodeRecord>) {
         let mut view = self
             .records
@@ -55,8 +55,10 @@ impl Membership {
         *view = next;
     }
 
-    /// Folds `records`, as a peer gossiped them, into the view: a node's
-    /// newest heartbeat wins, and this node's own record stays its own.
+    /// Folds `records`, as a peer gossiped them, into the view: a known
+    /// node's newest heartbeat wins, this node's own record stays its
+    /// own, and a node the view does not know is ignored, since the
+    /// registry, not the peers, says who is a member.
     pub fn merge(&self, records: Vec<NodeRecord>) {
         let mut view = self
             .records
@@ -66,13 +68,10 @@ impl Membership {
             if record.node == self.env.node {
                 continue;
             }
-            match view.iter_mut().find(|r| r.node == record.node) {
-                Some(known) => {
-                    if record.heartbeat_at > known.heartbeat_at {
-                        *known = record;
-                    }
+            if let Some(known) = view.iter_mut().find(|r| r.node == record.node) {
+                if record.heartbeat_at > known.heartbeat_at {
+                    *known = record;
                 }
-                None => view.push(record),
             }
         }
     }
@@ -285,11 +284,23 @@ mod tests {
         };
         let view = Membership::new(env, at(1, 1_000));
         view.merge(vec![at(2, 999), at(1, 0)]);
-        assert_eq!(view.records().len(), 2);
+        assert_eq!(view.records().len(), 1, "an unlisted node is not a member");
         assert_eq!(
             view.records()[0].heartbeat_at,
             Timestamp::from_nanos(1_000_000_000_000),
             "the own record is not overwritten"
+        );
+        view.replace(vec![at(1, 1_000), at(2, 990)]);
+        view.merge(vec![at(2, 999)]);
+        let two = view
+            .records()
+            .into_iter()
+            .find(|r| r.node == NodeId::from_u128(2))
+            .unwrap();
+        assert_eq!(
+            two.heartbeat_at.as_nanos(),
+            999 * 1_000_000_000,
+            "gossip refreshes a member"
         );
         view.merge(vec![at(2, 998)]);
         let two = view
@@ -317,13 +328,13 @@ mod tests {
         view.merge(vec![at(4, 999)]);
         assert_eq!(
             view.records().len(),
-            4,
-            "gossip names a node before the listing"
+            3,
+            "a withdrawn node gossiped back stays out"
         );
         assert_eq!(view.gossip_peers(0, 1).len(), 1);
         assert_eq!(
             view.gossip_peers(0, 5).len(),
-            3,
+            2,
             "the live peers, never itself"
         );
         view.replace(vec![at(1, 1_000)]);

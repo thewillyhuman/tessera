@@ -501,10 +501,14 @@ mod tests {
             node: tessera_types::NodeId::random(&mut state.env.random.fork()),
             ..record(&state, &[Role::Query], "http://other.invalid")
         };
+        let older = NodeRecord {
+            heartbeat_at: Timestamp::from_nanos(other.heartbeat_at.as_nanos() - 1_000_000_000),
+            ..other.clone()
+        };
         let state = clustered(
             state,
             &[Role::Query, Role::Ingest],
-            vec![],
+            vec![older],
             Limits::default(),
         );
         let app = router(state.clone());
@@ -520,10 +524,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let view: Vec<NodeRecord> = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(view.len(), 2, "own record and the gossiped one");
-        assert!(view.iter().any(|r| r.node == other.node));
+        assert_eq!(view.len(), 2, "own record and the listed peer");
+        let peer = view.iter().find(|r| r.node == other.node).unwrap();
+        assert_eq!(peer.heartbeat_at, other.heartbeat_at, "refreshed by gossip");
         assert!(view.iter().any(|r| r.node == state.env.node));
-        let membership = &state.cluster.as_ref().unwrap().membership;
-        assert_eq!(membership.live_ids(Role::Query).len(), 2);
     }
 }

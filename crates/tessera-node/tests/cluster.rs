@@ -97,8 +97,19 @@ fn dataset() -> DatasetName {
 /// Pushes `batches` batches of two lines each through `node`, Loki
 /// style, so that a batch becomes a file of its own.
 async fn push(node: &Node, batches: usize, tag: &str) {
-    let url = format!("http://{}/loki/api/v1/push", node.http_address());
-    let now = node.env().clock.now().as_nanos();
+    push_at(
+        node.http_address(),
+        node.env().clock.now().as_nanos(),
+        batches,
+        tag,
+    )
+    .await;
+}
+
+/// Pushes `batches` batches of two lines each, timestamped from `now`,
+/// to the node at `address`.
+async fn push_at(address: SocketAddr, now: i64, batches: usize, tag: &str) {
+    let url = format!("http://{address}/loki/api/v1/push");
     for batch in 0..batches {
         let values: Vec<serde_json::Value> = (0..2)
             .map(|i| {
@@ -268,4 +279,57 @@ async fn a_cluster_scales_up_survives_a_loss_and_scales_down() {
     push(&b, 5, "b2").await;
     assert!((count(&b).await - 50.0).abs() < f64::EPSILON);
     b.stop().await;
+}
+
+/// OP-7 and section 14.4: a rolling restart under load, each node
+/// replaced in turn while writes keep arriving through another, loses
+/// nothing and doubles nothing, and every node counts the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rolling_restart_under_load_loses_nothing() {
+    let cluster = Cluster::new();
+    let a = cluster.start(&Role::ALL).await;
+    for _ in 0..SLOTS.ilog2() {
+        a.state()
+            .catalog
+            .double_slots(WorkKind::Partition)
+            .await
+            .unwrap();
+    }
+    let b = cluster.start(&Role::ALL).await;
+    let c = cluster.start(&Role::ALL).await;
+    let mut nodes = vec![a, b, c];
+    let settled = |nodes: &[Node]| {
+        let views = nodes
+            .iter()
+            .all(|n| n.membership().live_ids(Role::Ingest).len() == 3);
+        views && slots_are_shared(&nodes.iter().collect::<Vec<_>>())
+    };
+    eventually("three nodes share the slots", PATIENCE, || settled(&nodes)).await;
+    let mut expected = 0.0;
+    for round in 0..3i64 {
+        // The oldest node leaves while writes keep arriving through the
+        // next one; its replacement joins before the load ends.
+        let leaving = nodes.remove(0);
+        let through = nodes[0].http_address();
+        let now = nodes[0].env().clock.now().as_nanos() + round * 1_000_000;
+        let tag = format!("round{round}");
+        let load = tokio::spawn(async move { push_at(through, now, 10, &tag).await });
+        leaving.stop().await;
+        nodes.push(cluster.start(&Role::ALL).await);
+        load.await.unwrap();
+        expected += 20.0;
+        eventually("the replacement shares the slots", PATIENCE, || {
+            settled(&nodes)
+        })
+        .await;
+        for node in &nodes {
+            assert!(
+                (count(node).await - expected).abs() < f64::EPSILON,
+                "round {round}: every node counts {expected}, nothing lost or doubled"
+            );
+        }
+    }
+    for node in nodes {
+        node.stop().await;
+    }
 }

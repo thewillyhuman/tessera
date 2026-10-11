@@ -49,9 +49,9 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// `POST /internal/v1/gossip`: folds the caller's view into this node's
-/// and answers with this node's view; a node outside any cluster
-/// answers nothing.
+/// `POST /internal/v1/gossip`: folds the caller's view into this node's,
+/// refreshing the members it knows, and answers with this node's view;
+/// a node outside any cluster answers nothing.
 async fn gossip(
     State(state): State<AppState>,
     Json(records): Json<Vec<NodeRecord>>,
