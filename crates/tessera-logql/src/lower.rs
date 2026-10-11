@@ -22,7 +22,7 @@ use tessera_types::{Kind, TimeRange, Timestamp, event};
 
 use crate::ast::{
     AggregateOp, BinaryOp, CompareOp, Conversion, FilterValue, Grouping, LabelFilter, LineOp,
-    LogQuery, MatchOp, Matcher, MetricExpr, Query, Stage,
+    LogQuery, MatchOp, Matcher, MetricExpr, Query, Stage, VectorMatching,
 };
 
 /// The time parameters of a query, from the API that received it.
@@ -426,14 +426,15 @@ fn metric_plan(
             op,
             grouping,
             inner,
-            span,
-        } => aggregate_plan(*op, grouping.as_ref(), inner, *span, ctx, params),
+            ..
+        } => aggregate_plan(*op, grouping.as_ref(), inner, ctx, params),
         MetricExpr::Binary {
             op,
             left,
             right,
+            matching,
             span,
-        } => binary_plan(*op, left, right, *span, ctx, params),
+        } => binary_plan(*op, left, right, matching.as_ref(), *span, ctx, params),
     }
 }
 
@@ -535,7 +536,6 @@ fn aggregate_plan(
     op: AggregateOp,
     grouping: Option<&Grouping>,
     inner: &MetricExpr,
-    span: Span,
     ctx: &BindContext,
     params: RangeParams,
 ) -> Result<Plan, Diagnostic> {
@@ -548,7 +548,7 @@ fn aggregate_plan(
         AggregateOp::Stddev => "stddev_raw",
         AggregateOp::Stdvar => "stdvar_raw",
         AggregateOp::Topk(k) | AggregateOp::Bottomk(k) => {
-            return ranked_plan(op, k, grouping, inner, span, ctx, params);
+            return ranked_plan(op, k, grouping, inner, ctx, params);
         }
     };
     let input = group_labels(metric_plan(inner, ctx, params)?, grouping);
@@ -628,7 +628,6 @@ fn ranked_plan(
     k: usize,
     grouping: Option<&Grouping>,
     inner: &MetricExpr,
-    span: Span,
     ctx: &BindContext,
     params: RangeParams,
 ) -> Result<Plan, Diagnostic> {
@@ -637,12 +636,11 @@ fn ranked_plan(
         Some(g) if g.by => {
             partition_by.extend(g.labels.iter().map(|l| label(l, DataType::Utf8)));
         }
-        Some(_) => {
-            return Err(Diagnostic::at(
-                span,
-                "topk and bottomk group with `by`; `without` is not supported yet",
-            ));
-        }
+        // `without`: the series' remaining labels, as one set.
+        Some(g) => partition_by.push(call(
+            "labels_without",
+            vec![Expr::column(EXTRACTED), Expr::literal(g.labels.join(","))],
+        )),
         None => {}
     }
     Ok(Plan::TopK {
@@ -674,30 +672,74 @@ fn operator(op: BinaryOp) -> (tessera_ir::BinaryOp, bool) {
 }
 
 /// Two vectors matched one to one on their step and their labels, as
-/// `LogQL` matches vectors without `on` or `ignoring`: arithmetic
-/// combines the two values, a comparison keeps the left rows that
-/// pass. A series without a match on the other side drops out.
+/// Two vectors matched at each step on their label sets: every label,
+/// the `on` labels alone, or all but the `ignoring` ones. One to one,
+/// the result carries the labels matched on; under `group_left` or
+/// `group_right` it carries the many side's labels and the included
+/// ones of the other. Arithmetic combines the two values, a comparison
+/// keeps the left rows that pass. A series without a match on the
+/// other side drops out; several on one side multiply rather than fail
+/// as in Loki.
 fn vector_binary_plan(
     op: BinaryOp,
     left: &MetricExpr,
     right: &MetricExpr,
+    matching: Option<&VectorMatching>,
     ctx: &BindContext,
     params: RangeParams,
 ) -> Result<Plan, Diagnostic> {
+    let restricted = |labels: Expr| match matching {
+        None => labels,
+        Some(m) => call(
+            if m.on {
+                "labels_only"
+            } else {
+                "labels_without"
+            },
+            vec![labels, Expr::literal(m.labels.join(","))],
+        ),
+    };
     let joined = Plan::Join {
         left: JoinSide::new(metric_plan(left, ctx, params)?, "l"),
         right: JoinSide::new(metric_plan(right, ctx, params)?, "r"),
         on: vec![
             (Expr::column(TIMESTAMP), Expr::column(TIMESTAMP)),
-            (Expr::column(EXTRACTED), Expr::column(EXTRACTED)),
+            (
+                restricted(Expr::column(EXTRACTED)),
+                restricted(Expr::column(EXTRACTED)),
+            ),
         ],
         kind: JoinKind::Inner,
+    };
+    let labels = match matching.and_then(|m| m.group.as_ref()) {
+        None => restricted(Expr::column("l._extracted")),
+        Some((left_many, include)) => {
+            let (many, one) = if *left_many {
+                ("l._extracted", "r._extracted")
+            } else {
+                ("r._extracted", "l._extracted")
+            };
+            if include.is_empty() {
+                Expr::column(many)
+            } else {
+                call(
+                    "labels_merge",
+                    vec![
+                        Expr::column(many),
+                        call(
+                            "labels_only",
+                            vec![Expr::column(one), Expr::literal(include.join(","))],
+                        ),
+                    ],
+                )
+            }
+        }
     };
     let (l, r) = (Expr::column("l.value"), Expr::column("r.value"));
     let keep = |value: Expr| {
         vec![
             NamedExpr::new(Expr::column("l.timestamp"), TIMESTAMP),
-            NamedExpr::new(Expr::column("l._extracted"), EXTRACTED),
+            NamedExpr::new(labels.clone(), EXTRACTED),
             NamedExpr::new(value, VALUE),
         ]
     };
@@ -715,6 +757,7 @@ fn binary_plan(
     op: BinaryOp,
     left: &MetricExpr,
     right: &MetricExpr,
+    matching: Option<&VectorMatching>,
     span: Span,
     ctx: &BindContext,
     params: RangeParams,
@@ -723,7 +766,7 @@ fn binary_plan(
         (Some(l), Some(r)) => return fold_scalars(op, l, r, span),
         (None, Some(s)) => (left, s, false),
         (Some(s), None) => (right, s, true),
-        (None, None) => return vector_binary_plan(op, left, right, ctx, params),
+        (None, None) => return vector_binary_plan(op, left, right, matching, ctx, params),
     };
     let input = metric_plan(vector, ctx, params)?;
     let (a, b) = if flipped {
@@ -885,6 +928,41 @@ mod tests {
         );
     }
 
+    /// QL-7: `on` and `ignoring` match on a label subset, the result
+    /// carrying the labels matched on; a group modifier carries the
+    /// many side's labels and the included ones of the other.
+    #[test]
+    fn vectors_match_on_a_label_subset() {
+        let on = lowered(
+            r#"sum by (app) (rate({a="b"}[1m])) / on(app) sum by (app) (rate({c="d"}[1m]))"#,
+            30,
+        );
+        assert!(
+            on.plan.to_string().starts_with(
+                "Project: l.timestamp AS timestamp, labels_only(l._extracted, 'app') AS _extracted, (l.value / r.value) AS value
+  \
+                 Join inner: l.timestamp = r.timestamp AND l.(labels_only(_extracted, 'app')) = r.(labels_only(_extracted, 'app'))
+"
+            ),
+            "{}",
+            on.plan
+        );
+        let many = lowered(
+            r#"rate({a="b"}[1m]) / ignoring(pod) group_left(env) sum by (app) (rate({c="d"}[1m]))"#,
+            30,
+        );
+        assert!(
+            many.plan.to_string().starts_with(
+                "Project: l.timestamp AS timestamp, labels_merge(l._extracted, labels_only(r._extracted, 'env')) AS _extracted, (l.value / r.value) AS value
+  \
+                 Join inner: l.timestamp = r.timestamp AND l.(labels_without(_extracted, 'pod')) = r.(labels_without(_extracted, 'pod'))
+"
+            ),
+            "{}",
+            many.plan
+        );
+    }
+
     #[test]
     fn unsupported_constructs_are_reported_with_positions() {
         let e = lower(
@@ -913,13 +991,14 @@ mod tests {
             "{}",
             grouped.plan
         );
-        let e = lower(
-            &parse(r#"topk without (app) (2, rate({a="b"}[1m]))"#).unwrap(),
-            &ctx(),
-            params(0),
-        )
-        .unwrap_err();
-        assert!(e.message.contains("without"));
+        let rest = lowered(r#"topk without (app) (2, rate({a="b"}[1m]))"#, 30);
+        assert!(
+            rest.plan.to_string().starts_with(
+                "TopK: k=2 order=[value DESC] per=[timestamp, labels_without(_extracted, 'app')]"
+            ),
+            "{}",
+            rest.plan
+        );
         let out = lowered(r#"stddev by (app) (rate({a="b"}[1m]))"#, 30);
         assert!(
             out.plan

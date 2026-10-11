@@ -69,8 +69,7 @@ differential suite agrees with Loki 3.3.2 on every case in both
 directions; the deviations found are documented in the `tessera-logql`
 crate.
 
-Gaps left in M3: push over protobuf (JSON only); the vector matching
-modifiers `on`, `ignoring` and the group modifiers, and `topk without`,
+Gaps left in M3: push over protobuf (JSON only); the `bool` modifier
 in LogQL; sort keys on attribute columns and ingest-time
 grouping of compaction inputs (CP-2) wait for column promotion (M8);
 L3, retention sampling and log patterns wait for M9; Grafana itself has

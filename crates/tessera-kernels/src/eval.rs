@@ -8,7 +8,7 @@
 //! meet in float, and `NULL` takes the other side's type. Logic is
 //! three-valued; a predicate treats an unknown result as false.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -543,6 +543,9 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
         }
         ("ip_matches", [text, pattern]) => ip_matches(text, pattern),
         ("log2_bucket", [value]) => log2_bucket(value),
+        ("labels_only", [labels, names]) => restrict_labels(labels, names, true),
+        ("labels_without", [labels, names]) => restrict_labels(labels, names, false),
+        ("labels_merge", [labels, others]) => merge_labels(labels, others),
         ("links_match", [links, field, value]) => links_match(links, field, value),
         ("coalesce", [first, rest @ ..]) => {
             let mut acc = first.clone();
@@ -613,6 +616,64 @@ fn ip_matches(text: &Value, pattern: &Value) -> Result<Value, KernelError> {
         .map(|s| s.map(|s| matcher.matches(s)))
         .collect();
     Ok(text.with_array(Arc::new(hits)))
+}
+
+/// A label set, a JSON object of name to text, with the labels named
+/// in the constant `names` (comma-separated) kept when `keep`, dropped
+/// otherwise; text that is not an object reads as no labels.
+fn restrict_labels(labels: &Value, names: &Value, keep: bool) -> Result<Value, KernelError> {
+    let function = if keep {
+        "labels_only"
+    } else {
+        "labels_without"
+    };
+    let names: BTreeSet<String> = constant_text(names, function)?
+        .split(',')
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .collect();
+    map_text(labels, |text| {
+        let mut object = label_object(text);
+        object.retain(|name, _| names.contains(name) == keep);
+        serde_json::Value::Object(object).to_string()
+    })
+}
+
+/// Two label sets merged, the second's labels winning.
+fn merge_labels(labels: &Value, others: &Value) -> Result<Value, KernelError> {
+    let rows = labels.array().len().max(others.array().len());
+    let constant = labels.is_constant() && others.is_constant();
+    let labels = labels.cast(&DataType::Utf8)?.into_column(rows)?;
+    let others = others.cast(&DataType::Utf8)?.into_column(rows)?;
+    let (Some(labels), Some(others)) = (
+        labels.as_any().downcast_ref::<StringArray>(),
+        others.as_any().downcast_ref::<StringArray>(),
+    ) else {
+        return Err(KernelError::Unsupported("labels_merge needs text".into()));
+    };
+    let merged: StringArray = labels
+        .iter()
+        .zip(others.iter())
+        .map(|(a, b)| {
+            let mut object = a.map(label_object).unwrap_or_default();
+            object.extend(b.map(label_object).unwrap_or_default());
+            Some(serde_json::Value::Object(object).to_string())
+        })
+        .collect();
+    let array: ArrayRef = Arc::new(merged);
+    Ok(if constant {
+        Value::Constant(array)
+    } else {
+        Value::Column(array)
+    })
+}
+
+/// The object `text` holds, or none for anything else.
+fn label_object(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::from_str(text) {
+        Ok(serde_json::Value::Object(object)) => object,
+        _ => serde_json::Map::new(),
+    }
 }
 
 /// The power of two at or above each value, `TraceQL`'s histogram
@@ -849,6 +910,53 @@ mod tests {
         let after = Expr::column("timestamp")
             .binary(BinaryOp::Gt, Expr::literal(Timestamp::from_nanos(150)));
         assert_eq!(booleans(&after), vec![false, true, true]);
+    }
+
+    /// QL-7: label sets restricted and merged, for vector matching.
+    #[test]
+    fn label_sets_are_restricted_and_merged() {
+        let labels = || Expr::literal(r#"{"app":"a","env":"p","pod":"x"}"#);
+        let call = |name: &str, args: Vec<Expr>| Expr::Call {
+            name: name.into(),
+            args,
+        };
+        let text = |expr: &Expr| {
+            let out = evaluate(expr, &batch()).unwrap();
+            out.as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_owned()
+        };
+        assert_eq!(
+            text(&call(
+                "labels_only",
+                vec![labels(), Expr::literal("app, env")]
+            )),
+            r#"{"app":"a","env":"p"}"#
+        );
+        assert_eq!(
+            text(&call(
+                "labels_without",
+                vec![labels(), Expr::literal("app")]
+            )),
+            r#"{"env":"p","pod":"x"}"#
+        );
+        assert_eq!(
+            text(&call(
+                "labels_merge",
+                vec![labels(), Expr::literal(r#"{"env":"q","zone":"z"}"#)]
+            )),
+            r#"{"app":"a","env":"q","pod":"x","zone":"z"}"#,
+            "the second set wins"
+        );
+        assert_eq!(
+            text(&call(
+                "labels_only",
+                vec![Expr::literal("not json"), Expr::literal("app")]
+            )),
+            "{}"
+        );
     }
 
     #[test]

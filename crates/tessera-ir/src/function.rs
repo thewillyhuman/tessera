@@ -165,6 +165,13 @@ fn text_predicate(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+fn texts_to_text(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [DataType::Utf8, DataType::Utf8] => Some(DataType::Utf8),
+        _ => None,
+    }
+}
+
 fn text_to_float(args: &[DataType]) -> Option<DataType> {
     match args {
         [DataType::Utf8] => Some(DataType::Float64),
@@ -291,6 +298,21 @@ const SCALARS: &[ScalarFunction] = &[
     ScalarFunction {
         name: "log2_bucket",
         return_type: numeric_to_float,
+    },
+    // Label sets as JSON objects (`_extracted`): the labels named in a
+    // comma-separated constant kept or dropped, and two sets merged
+    // with the second winning, for `LogQL`'s vector matching (QL-7).
+    ScalarFunction {
+        name: "labels_only",
+        return_type: texts_to_text,
+    },
+    ScalarFunction {
+        name: "labels_without",
+        return_type: texts_to_text,
+    },
+    ScalarFunction {
+        name: "labels_merge",
+        return_type: texts_to_text,
     },
 ];
 
@@ -433,6 +455,12 @@ mod tests {
             Some(DataType::Float64)
         );
         assert_eq!((bucket.return_type)(&[DataType::Utf8]), None);
+        let only = registry.scalar("labels_only").unwrap();
+        assert_eq!(
+            (only.return_type)(&[DataType::Utf8, DataType::Utf8]),
+            Some(DataType::Utf8)
+        );
+        assert_eq!((only.return_type)(&[DataType::Utf8]), None);
     }
 
     #[test]

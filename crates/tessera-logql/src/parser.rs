@@ -13,7 +13,7 @@ use tessera_ir::{Diagnostic, Span};
 
 use crate::ast::{
     AggregateOp, BinaryOp, CompareOp, Conversion, FilterValue, Grouping, LabelFilter, LineOp,
-    LogQuery, MatchOp, Matcher, MetricExpr, Query, Stage,
+    LogQuery, MatchOp, Matcher, MetricExpr, Query, Stage, VectorMatching,
 };
 use crate::lexer::{Spanned, Token, tokenize};
 
@@ -536,11 +536,13 @@ impl Parser {
             }
             let start = self.span_here();
             self.at += 1;
+            let matching = self.vector_matching()?;
             let right = self.metric_expr(precedence + 1)?;
             left = MetricExpr::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
+                matching,
                 span: Span::new(start.start, self.previous_end()),
             };
         }
@@ -692,6 +694,33 @@ impl Parser {
         } else {
             return Ok(None);
         };
+        let labels = self.label_list()?;
+        Ok(Some(Grouping { by, labels }))
+    }
+
+    /// `on (...)` or `ignoring (...)` after a binary operator, then
+    /// `group_left` or `group_right` with an optional label list.
+    fn vector_matching(&mut self) -> Result<Option<VectorMatching>, Diagnostic> {
+        let on = if self.eat_ident("on") {
+            true
+        } else if self.eat_ident("ignoring") {
+            false
+        } else {
+            return Ok(None);
+        };
+        let labels = self.label_list()?;
+        let group = if self.eat_ident("group_left") {
+            Some((true, self.optional_label_list()?))
+        } else if self.eat_ident("group_right") {
+            Some((false, self.optional_label_list()?))
+        } else {
+            None
+        };
+        Ok(Some(VectorMatching { on, labels, group }))
+    }
+
+    /// `(a, b)`, possibly empty.
+    fn label_list(&mut self) -> Result<Vec<String>, Diagnostic> {
         self.expect_symbol("(")?;
         let mut labels = Vec::new();
         while !self.is_symbol(")") {
@@ -701,7 +730,16 @@ impl Parser {
             }
         }
         self.expect_symbol(")")?;
-        Ok(Some(Grouping { by, labels }))
+        Ok(labels)
+    }
+
+    /// A label list when a parenthesis follows, else none.
+    fn optional_label_list(&mut self) -> Result<Vec<String>, Diagnostic> {
+        if self.is_symbol("(") {
+            self.label_list()
+        } else {
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -841,6 +879,46 @@ mod tests {
             panic!()
         };
         assert_eq!(*value, FilterValue::Bytes(1024.0 * 1024.0));
+    }
+
+    #[test]
+    fn parses_vector_matching_modifiers() {
+        let m = metric(
+            r#"sum by (app) (rate({a="b"}[1m])) / on(app) group_left(env) sum by (app, env) (rate({c="d"}[1m]))"#,
+        );
+        let MetricExpr::Binary {
+            op: BinaryOp::Div,
+            matching,
+            ..
+        } = m
+        else {
+            panic!("{m:?}")
+        };
+        assert_eq!(
+            matching,
+            Some(VectorMatching {
+                on: true,
+                labels: vec!["app".into()],
+                group: Some((true, vec!["env".into()])),
+            })
+        );
+        let m = metric(r#"rate({a="b"}[1m]) > ignoring(pod) rate({c="d"}[1m])"#);
+        let MetricExpr::Binary { matching, .. } = m else {
+            panic!("{m:?}")
+        };
+        assert_eq!(
+            matching,
+            Some(VectorMatching {
+                on: false,
+                labels: vec!["pod".into()],
+                group: None,
+            })
+        );
+        let m = metric(r#"rate({a="b"}[1m]) + rate({c="d"}[1m])"#);
+        let MetricExpr::Binary { matching, .. } = m else {
+            panic!("{m:?}")
+        };
+        assert_eq!(matching, None);
     }
 
     #[test]

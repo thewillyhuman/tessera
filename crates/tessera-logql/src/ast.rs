@@ -267,11 +267,27 @@ pub enum MetricExpr {
         left: Box<MetricExpr>,
         /// The right side.
         right: Box<MetricExpr>,
+        /// How the two sides' series match; none matches on every
+        /// label.
+        matching: Option<VectorMatching>,
         /// Where it was written.
         span: Span,
     },
     /// A number.
     Scalar(f64),
+}
+
+/// `on`/`ignoring` after a binary operator, with an optional
+/// `group_left`/`group_right`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct VectorMatching {
+    /// `on` when true, `ignoring` otherwise.
+    pub on: bool,
+    /// The labels.
+    pub labels: Vec<String>,
+    /// `group_left` (true) or `group_right` (false), with the labels of
+    /// the one side included in the result, when written.
+    pub group: Option<(bool, Vec<String>)>,
 }
 
 /// A parsed query.
