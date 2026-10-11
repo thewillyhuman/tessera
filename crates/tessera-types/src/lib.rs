@@ -20,8 +20,8 @@ pub mod work;
 
 pub use env::Env;
 pub use event::{
-    Attributes, EventBatch, EventRow, InvalidBatch, LogRow, Scalar, SpanKind, SpanRow, StatusCode,
-    label_name,
+    Attributes, EventBatch, EventRow, InvalidBatch, LogRow, MetricRow, MetricType, Scalar,
+    SpanKind, SpanRow, StatusCode, Temporality, label_name, series_id,
 };
 pub use file::{ColumnStats, FileMeta, FileSource, IndexKind, IndexRef, Level};
 pub use hash::stable_hash;

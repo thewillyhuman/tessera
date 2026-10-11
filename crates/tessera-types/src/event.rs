@@ -15,8 +15,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -59,10 +59,30 @@ pub const STATUS_MESSAGE: &str = "status_message";
 /// Span links (DM-9): a JSON list of objects with `trace_id` and
 /// `span_id` as hex and the link's flattened attributes.
 pub const LINKS: &str = "links";
+/// The metric type, as its lowercase name (`gauge`, `sum`, `histogram`,
+/// `exp_histogram`, `summary`).
+pub const METRIC_TYPE: &str = "metric_type";
+/// The unit of a metric, as the producer wrote it (`ms`, `By`, ...);
+/// empty when unknown.
+pub const UNIT: &str = "unit";
+/// The value of a gauge or sum data point.
+pub const VALUE: &str = "value";
+/// The buckets of a histogram, exponential histogram or summary data
+/// point, as a JSON object (section 4.2's `histogram` struct).
+pub const HISTOGRAM: &str = "histogram";
+/// The aggregation temporality of a sum or histogram (`delta`,
+/// `cumulative`, `unspecified`).
+pub const TEMPORALITY: &str = "temporality";
+/// Whether a sum only grows.
+pub const IS_MONOTONIC: &str = "is_monotonic";
+/// The identity of a series: a digest of the metric name and its
+/// sorted attributes, 16 bytes.
+pub const SERIES_ID: &str = "series_id";
 /// Attributes without a dedicated column, as a JSON object.
 pub const OVERFLOW: &str = "_overflow";
-/// The value column of a metric result (`RangeVector`, section 10.2).
-pub const VALUE_LABELS: &str = "value";
+/// The value column of a metric result (`RangeVector`, section 10.2):
+/// the same name as a stored metric's value.
+pub const VALUE_LABELS: &str = VALUE;
 /// Labels derived at query time by a parser stage (`LogQL` `json`,
 /// `logfmt`, ...), as a JSON object of label name to text. Never stored;
 /// only plans add it.
@@ -103,7 +123,17 @@ fn build_schema(kind: Kind) -> Schema {
             Field::new(STATUS_MESSAGE, DataType::Utf8, true),
             Field::new(LINKS, DataType::Utf8, true),
         ]),
-        Kind::Metric | Kind::Event | Kind::Alert => {
+        Kind::Metric => fields.extend([
+            Field::new(NAME, DataType::Utf8, true),
+            Field::new(METRIC_TYPE, DataType::Utf8, true),
+            Field::new(UNIT, DataType::Utf8, true),
+            Field::new(VALUE, DataType::Float64, true),
+            Field::new(HISTOGRAM, DataType::Utf8, true),
+            Field::new(TEMPORALITY, DataType::Utf8, true),
+            Field::new(IS_MONOTONIC, DataType::Boolean, true),
+            Field::new(SERIES_ID, DataType::FixedSizeBinary(16), true),
+        ]),
+        Kind::Event | Kind::Alert => {
             fields.push(Field::new(NAME, DataType::Utf8, true));
         }
     }
@@ -386,6 +416,64 @@ impl EventBatch {
         })
     }
 
+    /// A batch of metric data points.
+    ///
+    /// # Errors
+    ///
+    /// `Empty` if there are no rows; `Arrow` if a column cannot be built.
+    pub fn from_metrics(
+        tenant: TenantId,
+        dataset: DatasetName,
+        points: &[MetricRow],
+    ) -> Result<Self, InvalidBatch> {
+        if points.is_empty() {
+            return Err(InvalidBatch::Empty);
+        }
+        let strings = |f: &dyn Fn(&MetricRow) -> Option<&str>| -> ArrayRef {
+            Arc::new(StringArray::from(points.iter().map(f).collect::<Vec<_>>()))
+        };
+        let columns: Vec<ArrayRef> = vec![
+            timestamps(points.iter().map(|p| p.timestamp)),
+            timestamps(points.iter().map(|p| p.observed_timestamp)),
+            Arc::new(StringArray::from(vec![Kind::Metric.as_str(); points.len()])),
+            fixed(points.iter().map(|p| Some(&p.event_id[..])), 16)?,
+            fixed(
+                points.iter().map(|p| p.trace_id.as_ref().map(|id| &id[..])),
+                16,
+            )?,
+            fixed(
+                points.iter().map(|p| p.span_id.as_ref().map(|id| &id[..])),
+                8,
+            )?,
+            Arc::new(Float64Array::from(vec![1.0; points.len()])),
+            strings(&|p| Some(p.name.as_str())),
+            strings(&|p| Some(p.metric_type.as_str())),
+            strings(&|p| Some(p.unit.as_str())),
+            Arc::new(Float64Array::from(
+                points.iter().map(|p| p.value).collect::<Vec<_>>(),
+            )),
+            strings(&|p| p.histogram.as_deref()),
+            strings(&|p| Some(p.temporality.as_str())),
+            Arc::new(BooleanArray::from(
+                points.iter().map(|p| p.is_monotonic).collect::<Vec<_>>(),
+            )),
+            fixed(points.iter().map(|p| Some(&p.series_id[..])), 16)?,
+            Arc::new(StringArray::from(
+                points
+                    .iter()
+                    .map(|p| overflow(&p.attributes))
+                    .collect::<Vec<_>>(),
+            )),
+        ];
+        let rows = RecordBatch::try_new(schema(Kind::Metric), columns)?;
+        Ok(EventBatch {
+            tenant,
+            dataset,
+            kind: Kind::Metric,
+            rows,
+        })
+    }
+
     /// The tenant the events belong to.
     #[must_use]
     pub fn tenant(&self) -> &TenantId {
@@ -612,6 +700,138 @@ pub struct EventRow {
     pub attributes: Attributes,
 }
 
+/// The type of a metric (section 4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MetricType {
+    /// A value sampled at a time.
+    #[default]
+    Gauge,
+    /// A sum over time, cumulative or delta.
+    Sum,
+    /// Counts in explicit buckets.
+    Histogram,
+    /// Counts in exponential buckets.
+    ExpHistogram,
+    /// Quantiles computed by the producer.
+    Summary,
+}
+
+impl MetricType {
+    /// Every type.
+    pub const ALL: [MetricType; 5] = [
+        MetricType::Gauge,
+        MetricType::Sum,
+        MetricType::Histogram,
+        MetricType::ExpHistogram,
+        MetricType::Summary,
+    ];
+
+    /// The lowercase name stored in the `metric_type` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetricType::Gauge => "gauge",
+            MetricType::Sum => "sum",
+            MetricType::Histogram => "histogram",
+            MetricType::ExpHistogram => "exp_histogram",
+            MetricType::Summary => "summary",
+        }
+    }
+
+    /// The type with the given stored name, if any.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        MetricType::ALL.into_iter().find(|t| t.as_str() == name)
+    }
+}
+
+/// The aggregation temporality of a sum or histogram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Temporality {
+    /// Not stated by the producer.
+    #[default]
+    Unspecified,
+    /// Each point covers the interval since the previous one.
+    Delta,
+    /// Each point covers the interval since the start time.
+    Cumulative,
+}
+
+impl Temporality {
+    /// The lowercase name stored in the `temporality` column.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Temporality::Unspecified => "unspecified",
+            Temporality::Delta => "delta",
+            Temporality::Cumulative => "cumulative",
+        }
+    }
+
+    /// The temporality with OpenTelemetry's number `code`; `Unspecified`
+    /// for an unknown number.
+    #[must_use]
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            1 => Temporality::Delta,
+            2 => Temporality::Cumulative,
+            _ => Temporality::Unspecified,
+        }
+    }
+}
+
+/// The identity of a series (section 4.5): a digest of the metric name
+/// and the sorted attributes.
+#[must_use]
+pub fn series_id(name: &str, attributes: &Attributes) -> [u8; 16] {
+    let mut canonical = String::from(name);
+    for (path, value) in attributes {
+        canonical.push('\0');
+        canonical.push_str(path);
+        canonical.push('=');
+        canonical.push_str(&serde_json::to_string(value).unwrap_or_default());
+    }
+    let a = crate::stable_hash(canonical.as_bytes());
+    let b = crate::stable_hash(&a.to_le_bytes());
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&a.to_le_bytes());
+    out[8..].copy_from_slice(&b.to_le_bytes());
+    out
+}
+
+/// One metric data point, before it is turned into a column of a batch.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct MetricRow {
+    /// Sample time.
+    pub timestamp: Timestamp,
+    /// Ingest time.
+    pub observed_timestamp: Timestamp,
+    /// Identity for deduplication.
+    pub event_id: [u8; 16],
+    /// An exemplar's trace, if any.
+    pub trace_id: Option<[u8; 16]>,
+    /// An exemplar's span, if any.
+    pub span_id: Option<[u8; 8]>,
+    /// The metric name, as received.
+    pub name: String,
+    /// The type.
+    pub metric_type: MetricType,
+    /// The unit, as received; empty when unknown.
+    pub unit: String,
+    /// The value of a gauge or sum point.
+    pub value: Option<f64>,
+    /// The JSON of a histogram, exponential histogram or summary point.
+    pub histogram: Option<String>,
+    /// The temporality.
+    pub temporality: Temporality,
+    /// Whether a sum only grows.
+    pub is_monotonic: Option<bool>,
+    /// The series identity.
+    pub series_id: [u8; 16],
+    /// Flattened attributes.
+    pub attributes: Attributes,
+}
+
 fn timestamps(values: impl Iterator<Item = Timestamp>) -> ArrayRef {
     Arc::new(TimestampNanosecondArray::from(
         values.map(Timestamp::as_nanos).collect::<Vec<_>>(),
@@ -799,6 +1019,86 @@ mod tests {
         assert!(rows.column_by_name(STATUS_MESSAGE).unwrap().is_null(1));
         assert!(rows.column_by_name(LINKS).unwrap().is_valid(0));
         assert!(rows.column_by_name(OVERFLOW).unwrap().is_null(1));
+    }
+
+    #[test]
+    fn the_metric_schema_has_the_metric_columns() {
+        let schema = schema(Kind::Metric);
+        for column in [
+            NAME,
+            METRIC_TYPE,
+            UNIT,
+            VALUE,
+            HISTOGRAM,
+            TEMPORALITY,
+            IS_MONOTONIC,
+            SERIES_ID,
+        ] {
+            assert!(schema.column_with_name(column).is_some(), "{column}");
+        }
+        assert!(schema.column_with_name(BODY).is_none());
+        assert_eq!(
+            MetricType::parse("exp_histogram"),
+            Some(MetricType::ExpHistogram)
+        );
+        assert_eq!(Temporality::from_code(2), Temporality::Cumulative);
+        assert_eq!(Temporality::from_code(9), Temporality::Unspecified);
+    }
+
+    #[test]
+    fn series_ids_depend_on_the_name_and_every_attribute() {
+        let a: Attributes = BTreeMap::from([("attr.job".to_owned(), Scalar::Text("api".into()))]);
+        let mut b = a.clone();
+        b.insert("attr.instance".to_owned(), Scalar::Text("x".into()));
+        assert_eq!(series_id("up", &a), series_id("up", &a));
+        assert_ne!(series_id("up", &a), series_id("up", &b));
+        assert_ne!(series_id("up", &a), series_id("down", &a));
+    }
+
+    #[test]
+    fn builds_a_metric_batch() {
+        let point = MetricRow {
+            timestamp: Timestamp::from_nanos(100),
+            observed_timestamp: Timestamp::from_nanos(105),
+            event_id: [2; 16],
+            name: "http.server.duration".into(),
+            metric_type: MetricType::Sum,
+            unit: "ms".into(),
+            value: Some(12.5),
+            temporality: Temporality::Cumulative,
+            is_monotonic: Some(true),
+            series_id: [7; 16],
+            attributes: BTreeMap::from([("attr.method".to_owned(), Scalar::Text("GET".into()))]),
+            ..MetricRow::default()
+        };
+        let histogram = MetricRow {
+            metric_type: MetricType::Histogram,
+            value: None,
+            histogram: Some(r#"{"count":2}"#.into()),
+            is_monotonic: None,
+            ..point.clone()
+        };
+        let batch = EventBatch::from_metrics(tenant(), dataset(), &[point, histogram]).unwrap();
+        assert_eq!(batch.kind(), Kind::Metric);
+        let rows = batch.rows();
+        let value = rows.column_by_name(VALUE).unwrap();
+        let value = value.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((value.value(0) - 12.5).abs() < f64::EPSILON);
+        assert!(value.is_null(1));
+        assert!(rows.column_by_name(HISTOGRAM).unwrap().is_null(0));
+        assert!(rows.column_by_name(HISTOGRAM).unwrap().is_valid(1));
+        let kind = rows.column_by_name(METRIC_TYPE).unwrap();
+        let kind = kind.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(kind.value(1), "histogram");
+        let monotonic = rows.column_by_name(IS_MONOTONIC).unwrap();
+        let monotonic = monotonic.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(monotonic.value(0));
+        assert!(monotonic.is_null(1));
+        assert!(rows.column_by_name(SERIES_ID).unwrap().is_valid(0));
+        assert!(matches!(
+            EventBatch::from_metrics(tenant(), dataset(), &[]),
+            Err(InvalidBatch::Empty)
+        ));
     }
 
     #[test]
