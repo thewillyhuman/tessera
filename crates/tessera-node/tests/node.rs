@@ -291,7 +291,9 @@ async fn a_keyed_tenants_data_is_sealed_at_rest() {
         answer["rows"][0][0], 20.0,
         "read from the sealed tail: {answer}"
     );
-    eventually("the rows reach a file", || {
+    // A flushed file reaches queries once the background intake has run,
+    // every five seconds by default; allow for that.
+    common::eventually("the rows reach a file", Duration::from_secs(15), || {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let explain = query("EXPLAIN ANALYZE SELECT count(*) FROM logs").await;
@@ -310,7 +312,11 @@ async fn a_keyed_tenants_data_is_sealed_at_rest() {
     let mut encrypted_files = 0;
     for path in walkdir(dir.path()) {
         let text = path.to_string_lossy().into_owned();
-        let bytes = std::fs::read(&path).unwrap();
+        // The node keeps running: an object may be gone, or half written,
+        // between the listing and the read.
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
         let extension = path.extension().and_then(|e| e.to_str());
         if text.contains("/_wal/")
