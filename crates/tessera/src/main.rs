@@ -60,6 +60,7 @@ async fn main() -> ExitCode {
                 data_dir: args.data_dir,
                 listen: args.listen,
                 pg_listen: args.pg_listen,
+                ingest: tessera_ingest::IngestConfig::default(),
             })
             .await
         }
