@@ -171,13 +171,13 @@ impl AppState {
             env.clone(),
             config,
             pool.clone(),
-            Arc::new(ParquetFormat),
+            Arc::new(ParquetFormat::default()),
         );
         let (ingest, _task) = tessera_ingest::spawn(ingester, Duration::from_millis(1));
         let pools = Arc::new(Pools::new(pool, Arc::new(store)));
         let engine = Engine::new(
             Arc::clone(&pools),
-            Arc::new(ParquetFormat),
+            Arc::new(ParquetFormat::default()),
             env.clone(),
             CpuPool::new(2),
             QueryLimits::default(),
@@ -186,7 +186,7 @@ impl AppState {
             catalog: Arc::new(catalog),
             ingest,
             pools,
-            format: Arc::new(ParquetFormat),
+            format: Arc::new(ParquetFormat::default()),
             engine: Arc::new(engine),
             env,
             cluster: None,

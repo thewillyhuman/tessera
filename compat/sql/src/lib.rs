@@ -159,7 +159,7 @@ impl Fixture {
                 &FlushTarget {
                     store: store.clone(),
                     pool: PoolId::new("root").expect("valid id"),
-                    format: Arc::new(ParquetFormat),
+                    format: Arc::new(ParquetFormat::default()),
                 },
                 &env,
                 log.writer_id(),
@@ -198,7 +198,7 @@ impl Fixture {
         let pools = Pools::new(PoolId::new("root").expect("valid id"), store);
         let engine = Engine::new(
             Arc::new(pools),
-            Arc::new(ParquetFormat),
+            Arc::new(ParquetFormat::default()),
             env.clone(),
             CpuPool::new(2),
             QueryLimits::default(),

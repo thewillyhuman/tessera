@@ -106,8 +106,8 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
         );
         let _ = writeln!(
             out,
-            "  bytes: {} in {} requests",
-            scan.bytes_read, scan.requests
+            "  bytes: {} in {} requests, {} footers from cache",
+            scan.bytes_read, scan.requests, scan.footers_cached
         );
         let _ = writeln!(
             out,
@@ -168,7 +168,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         Engine::new(
             Arc::new(Pools::new(PoolId::new("root").unwrap(), store)),
-            Arc::new(ParquetFormat),
+            Arc::new(ParquetFormat::default()),
             Env::simulated(1, Timestamp::UNIX_EPOCH),
             CpuPool::new(1),
             QueryLimits::default(),

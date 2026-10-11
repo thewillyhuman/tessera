@@ -73,7 +73,7 @@ async fn engine() -> Engine {
     let pools = Pools::new(PoolId::new("root").unwrap(), store);
     Engine::new(
         Arc::new(pools),
-        Arc::new(tessera_format::ParquetFormat),
+        Arc::new(tessera_format::ParquetFormat::default()),
         env,
         CpuPool::new(2),
         QueryLimits::default(),

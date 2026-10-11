@@ -205,7 +205,7 @@ mod tests {
         FlushTarget {
             store: Arc::new(store.clone()),
             pool: PoolId::new("root").unwrap(),
-            format: Arc::new(ParquetFormat),
+            format: Arc::new(ParquetFormat::default()),
         }
     }
 

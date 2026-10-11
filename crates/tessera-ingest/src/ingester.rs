@@ -537,13 +537,13 @@ mod tests {
                 self.env.clone(),
                 config,
                 PoolId::new("root").unwrap(),
-                Arc::new(ParquetFormat),
+                Arc::new(ParquetFormat::default()),
             )
         }
 
         async fn view_ids(&self, dataset: &str) -> Vec<u8> {
             let pools = Pools::new(PoolId::new("root").unwrap(), Arc::new(self.store.clone()));
-            let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat);
+            let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
             let view = view::read(
                 &pools,
                 &format,

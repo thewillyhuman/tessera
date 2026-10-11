@@ -270,7 +270,7 @@ mod tests {
     }
 
     fn format() -> Arc<dyn FileFormat> {
-        Arc::new(ParquetFormat)
+        Arc::new(ParquetFormat::default())
     }
 
     /// Rows with distinct ids `from..from+count` on `day`.

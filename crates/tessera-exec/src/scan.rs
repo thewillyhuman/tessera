@@ -60,6 +60,8 @@ pub struct ScanAnalysis {
     pub bytes_read: u64,
     /// Range requests made.
     pub requests: usize,
+    /// Files whose footer came from the cache instead of a request.
+    pub footers_cached: usize,
     /// Segments read for the tail.
     pub segments: usize,
     /// Rows produced from files.
@@ -81,6 +83,7 @@ impl ScanAnalysis {
         self.row_groups_read += stats.row_groups_read;
         self.bytes_read += stats.bytes_read;
         self.requests += stats.requests;
+        self.footers_cached += usize::from(stats.footer_cached);
     }
 }
 

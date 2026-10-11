@@ -131,7 +131,7 @@ mod tests {
             env,
             config,
             PoolId::new("root").unwrap(),
-            Arc::new(ParquetFormat),
+            Arc::new(ParquetFormat::default()),
         );
         let writer = ingester.writer_id();
         let (handle, _task) = spawn(ingester, Duration::from_millis(1));

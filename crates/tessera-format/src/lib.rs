@@ -9,6 +9,7 @@
 //! a [`FileReader`] that fetches only the row groups and columns a query
 //! needs ([`scan`]).
 
+pub mod footer;
 pub mod layout;
 pub mod parquet;
 mod prune;
@@ -26,6 +27,7 @@ use bytes::Bytes;
 use tessera_object::{Key, ObjectStore};
 use tessera_types::{ColumnStats, IndexRef, Timestamp};
 
+pub use crate::footer::FooterCache;
 pub use crate::layout::{DEFAULT_ROW_GROUP_ROWS, Layout};
 pub use crate::parquet::ParquetFormat;
 pub use crate::reader::ParquetReader;

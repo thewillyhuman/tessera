@@ -74,7 +74,7 @@ async fn populate() -> (Arc<MemoryStore>, Env) {
     let target = FlushTarget {
         store: store.clone(),
         pool: PoolId::new("root").unwrap(),
-        format: Arc::new(ParquetFormat),
+        format: Arc::new(ParquetFormat::default()),
     };
     let segments = [
         vec![trace(1, 1_000), trace(2, 2_000)],
@@ -122,7 +122,7 @@ fn engine(store: &Arc<MemoryStore>, env: &Env) -> Engine {
     let pools = Pools::new(PoolId::new("root").unwrap(), store.clone());
     Engine::new(
         Arc::new(pools),
-        Arc::new(ParquetFormat),
+        Arc::new(ParquetFormat::default()),
         env.clone(),
         CpuPool::new(2),
         QueryLimits::default(),

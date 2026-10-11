@@ -75,7 +75,7 @@ async fn populate() -> (Arc<MemoryStore>, Env) {
     let target = FlushTarget {
         store: store.clone(),
         pool: PoolId::new("root").unwrap(),
-        format: Arc::new(ParquetFormat),
+        format: Arc::new(ParquetFormat::default()),
     };
     let segments = [
         vec![batch(0, 0, 6), batch(1, 100, 6)],
@@ -125,7 +125,7 @@ fn engine(store: &Arc<MemoryStore>, env: &Env) -> Engine {
     let pools = Pools::new(PoolId::new("root").unwrap(), store.clone());
     Engine::new(
         Arc::new(pools),
-        Arc::new(ParquetFormat),
+        Arc::new(ParquetFormat::default()),
         env.clone(),
         CpuPool::new(2),
         QueryLimits::default(),
@@ -318,7 +318,7 @@ async fn an_empty_dataset_yields_no_rows_and_no_errors() {
 async fn compact_all(store: &Arc<MemoryStore>, env: &Env) {
     use tessera_compact::{Compactor, Policy, plan};
     let pools = Arc::new(Pools::new(PoolId::new("root").unwrap(), store.clone()));
-    let compactor = Compactor::new(pools, Arc::new(ParquetFormat), env.clone());
+    let compactor = Compactor::new(pools, Arc::new(ParquetFormat::default()), env.clone());
     let policy = Policy {
         min_inputs: 1,
         ..Policy::default()
@@ -387,4 +387,41 @@ async fn sidecar_indexes_skip_files_and_row_groups() {
     let output = run(&engine, Plan::Scan(scan()).filter(like)).await;
     assert_eq!(output.num_rows(), 9, "six in the file, three in the tail");
     assert_eq!(output.analysis.scans[0].files_skipped_by_index, 1);
+}
+
+#[tokio::test]
+async fn footers_are_read_once_when_the_format_keeps_them() {
+    let (store, env) = populate().await;
+    let pools = Pools::new(PoolId::new("root").unwrap(), store.clone());
+    let engine = Engine::new(
+        Arc::new(pools),
+        Arc::new(ParquetFormat::with_footer_cache(16)),
+        env.clone(),
+        CpuPool::new(2),
+        QueryLimits::default(),
+    );
+    let first = run(&engine, Plan::Scan(scan())).await;
+    let cold = &first.analysis.scans[0];
+    assert_eq!(cold.footers_cached, 0, "nothing kept before the first read");
+    let second = run(&engine, Plan::Scan(scan())).await;
+    let warm = &second.analysis.scans[0];
+    assert_eq!(warm.footers_cached, warm.files_read, "every footer kept");
+    assert!(
+        warm.requests < cold.requests,
+        "{} < {}",
+        warm.requests,
+        cold.requests
+    );
+    assert_eq!(
+        second
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        first
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+    );
 }

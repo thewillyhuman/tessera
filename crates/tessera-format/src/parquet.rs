@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use tessera_object::{Key, ObjectStore};
 
+use crate::footer::FooterCache;
 use crate::layout::Layout;
 use crate::reader::ParquetReader;
 use crate::scan::FileReader;
@@ -30,10 +31,27 @@ use crate::{FileFormat, FormatError, Written};
 use tessera_types::{IndexKind, IndexRef};
 
 /// Parquet with zstd page compression.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ParquetFormat;
+#[derive(Clone, Debug, Default)]
+pub struct ParquetFormat {
+    footers: Option<Arc<FooterCache>>,
+}
 
 impl ParquetFormat {
+    /// The format keeping the footers of the files it opens, at most
+    /// `capacity` of them (section 10.8).
+    #[must_use]
+    pub fn with_footer_cache(capacity: usize) -> Self {
+        ParquetFormat {
+            footers: Some(Arc::new(FooterCache::new(capacity))),
+        }
+    }
+
+    /// The footer cache, if this format keeps one.
+    #[must_use]
+    pub fn footers(&self) -> Option<&Arc<FooterCache>> {
+        self.footers.as_ref()
+    }
+
     fn properties() -> WriterProperties {
         WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
@@ -102,7 +120,11 @@ impl FileFormat for ParquetFormat {
     }
 
     fn open(&self, store: Arc<dyn ObjectStore>, key: Key, size: u64) -> Box<dyn FileReader> {
-        Box::new(ParquetReader::new(store, key, size))
+        let reader = ParquetReader::new(store, key, size);
+        Box::new(match &self.footers {
+            Some(footers) => reader.with_footers(Arc::clone(footers)),
+            None => reader,
+        })
     }
 
     fn read(&self, bytes: Bytes) -> Result<Vec<RecordBatch>, FormatError> {
@@ -237,7 +259,7 @@ mod tests {
 
     #[test]
     fn a_file_round_trips_sorted_by_time() {
-        let written = ParquetFormat
+        let written = ParquetFormat::default()
             .write(
                 &[batch(&[log(30, "c"), log(10, "a")]), batch(&[log(20, "b")])],
                 &Layout::l1(),
@@ -249,7 +271,7 @@ mod tests {
             (Timestamp::from_nanos(10), Timestamp::from_nanos(30))
         );
         assert_eq!(written.sort_key, ["timestamp"]);
-        let read = ParquetFormat.read(written.bytes).unwrap();
+        let read = ParquetFormat::default().read(written.bytes).unwrap();
         let rows = concat_batches(&read[0].schema(), &read).unwrap();
         assert_eq!(rows.num_rows(), 3);
         let bodies = rows
@@ -268,7 +290,7 @@ mod tests {
 
     #[test]
     fn statistics_cover_every_column() {
-        let written = ParquetFormat
+        let written = ParquetFormat::default()
             .write(&[batch(&[log(5, "zzz"), log(1, "aaa")])], &Layout::l1())
             .unwrap();
         let body = written.columns.iter().find(|c| c.name == BODY).unwrap();
@@ -292,7 +314,9 @@ mod tests {
             .map(|i| log(i, "the same body every time"))
             .collect();
         let raw: usize = batch(&rows).get_array_memory_size();
-        let written = ParquetFormat.write(&[batch(&rows)], &Layout::l1()).unwrap();
+        let written = ParquetFormat::default()
+            .write(&[batch(&rows)], &Layout::l1())
+            .unwrap();
         assert!(
             written.bytes.len() * 4 < raw,
             "{} bytes for {raw} in memory",
@@ -303,7 +327,7 @@ mod tests {
     #[test]
     fn empty_and_mixed_inputs_are_rejected() {
         assert!(matches!(
-            ParquetFormat.write(&[], &Layout::l1()),
+            ParquetFormat::default().write(&[], &Layout::l1()),
             Err(FormatError::Empty)
         ));
         let log = batch(&[log(1, "x")]);
@@ -315,11 +339,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ParquetFormat.write(&[log, other.clone()], &Layout::l1()),
+            ParquetFormat::default().write(&[log, other.clone()], &Layout::l1()),
             Err(FormatError::MixedSchemas)
         ));
         assert!(matches!(
-            ParquetFormat.write(&[other], &Layout::l1()),
+            ParquetFormat::default().write(&[other], &Layout::l1()),
             Err(FormatError::NoTimestamp)
         ));
     }
@@ -327,11 +351,11 @@ mod tests {
     #[test]
     fn garbage_is_unreadable_not_a_panic() {
         assert!(matches!(
-            ParquetFormat.read(Bytes::from_static(b"not parquet")),
+            ParquetFormat::default().read(Bytes::from_static(b"not parquet")),
             Err(FormatError::Unreadable(_))
         ));
         assert!(matches!(
-            ParquetFormat.read(Bytes::new()),
+            ParquetFormat::default().read(Bytes::new()),
             Err(FormatError::Unreadable(_))
         ));
     }
@@ -356,13 +380,17 @@ mod tests {
                 bloom: vec!["trace_id".into(), "absent".into()],
             },
         };
-        let written = ParquetFormat.write(&[batch(&rows)], &layout).unwrap();
+        let written = ParquetFormat::default()
+            .write(&[batch(&rows)], &layout)
+            .unwrap();
         assert_eq!(written.sort_key, vec!["severity_number", "timestamp"]);
         assert_eq!(written.row_groups, 3);
         assert_eq!(written.min_timestamp, Timestamp::from_nanos(91));
         assert_eq!(written.max_timestamp, Timestamp::from_nanos(100));
         assert_eq!(written.indexes.len(), 3, "the absent column is skipped");
-        let read = ParquetFormat.read(written.bytes.clone()).unwrap();
+        let read = ParquetFormat::default()
+            .read(written.bytes.clone())
+            .unwrap();
         let all = concat_batches(&read[0].schema(), &read).unwrap();
         let severities = all
             .column_by_name("severity_number")
@@ -386,7 +414,7 @@ mod tests {
             ..Layout::l1()
         };
         assert!(matches!(
-            ParquetFormat.write(&[batch(&[log(1, "a")])], &layout),
+            ParquetFormat::default().write(&[batch(&[log(1, "a")])], &layout),
             Err(FormatError::UnknownColumn(c)) if c == "nope"
         ));
     }

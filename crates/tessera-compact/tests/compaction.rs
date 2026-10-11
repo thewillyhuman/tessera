@@ -64,7 +64,7 @@ async fn node(segments: &[&[u8]], start: Timestamp) -> Node {
     let target = FlushTarget {
         store: store.clone(),
         pool: PoolId::new("root").unwrap(),
-        format: Arc::new(ParquetFormat),
+        format: Arc::new(ParquetFormat::default()),
     };
     let mut after = Seq::ZERO;
     for ids in segments {
@@ -119,7 +119,7 @@ async fn manifest(node: &Node) -> Manifest {
 }
 
 async fn event_ids(node: &Node) -> Vec<u8> {
-    let format: Arc<dyn tessera_format::FileFormat> = Arc::new(ParquetFormat);
+    let format: Arc<dyn tessera_format::FileFormat> = Arc::new(ParquetFormat::default());
     let read = view::read(
         &node.pools,
         &format,
@@ -175,7 +175,7 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
     assert_eq!(job.inputs.len(), 4);
     let compactor = Compactor::new(
         node.pools.clone(),
-        Arc::new(ParquetFormat),
+        Arc::new(ParquetFormat::default()),
         node.env.clone(),
     );
     let outcome = compactor.run(&manifest, &job).await.unwrap();
@@ -243,7 +243,7 @@ async fn a_superseded_job_leaves_the_manifest_alone() {
     .unwrap();
     let compactor = Compactor::new(
         node.pools.clone(),
-        Arc::new(ParquetFormat),
+        Arc::new(ParquetFormat::default()),
         node.env.clone(),
     );
     assert!(matches!(
@@ -275,7 +275,7 @@ async fn removed_files_are_deleted_after_the_retention_window() {
     .unwrap();
     Compactor::new(
         node.pools.clone(),
-        Arc::new(ParquetFormat),
+        Arc::new(ParquetFormat::default()),
         node.env.clone(),
     )
     .run(&manifest, &job)
@@ -350,7 +350,7 @@ async fn flush_tail(node: &mut Node) {
     let target = FlushTarget {
         store: node.store.clone(),
         pool: PoolId::new("root").unwrap(),
-        format: Arc::new(ParquetFormat),
+        format: Arc::new(ParquetFormat::default()),
     };
     let writer = node.log.writer_id();
     let files = write_l1_files(

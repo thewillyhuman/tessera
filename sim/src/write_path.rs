@@ -66,7 +66,7 @@ struct Node {
 ///
 /// The first invariant that does not hold.
 pub async fn write_path(sim: &Sim) -> Result<Report, Violation> {
-    let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat);
+    let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
     let faulty_pools = Pools::new(pool(), sim.store());
     let pristine_pools = Pools::new(pool(), sim.pristine());
     let target = FlushTarget {

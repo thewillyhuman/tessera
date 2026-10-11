@@ -76,6 +76,8 @@ pub struct ScanStats {
     pub bytes_read: u64,
     /// Range requests made.
     pub requests: usize,
+    /// Whether the footer came from the cache instead of a request.
+    pub footer_cached: bool,
 }
 
 /// Fetched bytes ready to decode.

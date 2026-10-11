@@ -17,6 +17,7 @@ use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use tessera_object::{Key, ObjectStore};
 
 use crate::FormatError;
+use crate::footer::FooterCache;
 use crate::prune::may_match;
 use crate::scan::{Fetched, FileReader, ScanRequest, ScanStats};
 use crate::sparse::SparseFile;
@@ -37,13 +38,26 @@ pub struct ParquetReader {
     store: Arc<dyn ObjectStore>,
     key: Key,
     size: u64,
+    footers: Option<Arc<FooterCache>>,
 }
 
 impl ParquetReader {
     /// A reader of the `size`-byte object at `key`.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>, key: Key, size: u64) -> Self {
-        ParquetReader { store, key, size }
+        ParquetReader {
+            store,
+            key,
+            size,
+            footers: None,
+        }
+    }
+
+    /// The reader taking and keeping the footer in `footers`.
+    #[must_use]
+    pub fn with_footers(mut self, footers: Arc<FooterCache>) -> Self {
+        self.footers = Some(footers);
+        self
     }
 
     async fn get(&self, range: Range<u64>, stats: &mut ScanStats) -> Result<Bytes, FormatError> {
@@ -57,7 +71,24 @@ impl ParquetReader {
         Ok(bytes)
     }
 
-    async fn metadata(&self, stats: &mut ScanStats) -> Result<ParquetMetaData, FormatError> {
+    /// The footer, from the cache when it holds it.
+    async fn metadata(&self, stats: &mut ScanStats) -> Result<Arc<ParquetMetaData>, FormatError> {
+        if let Some(found) = self
+            .footers
+            .as_ref()
+            .and_then(|c| c.get(&self.key, self.size))
+        {
+            stats.footer_cached = true;
+            return Ok(found);
+        }
+        let footer = Arc::new(self.read_metadata(stats).await?);
+        if let Some(footers) = &self.footers {
+            footers.insert(&self.key, self.size, Arc::clone(&footer));
+        }
+        Ok(footer)
+    }
+
+    async fn read_metadata(&self, stats: &mut ScanStats) -> Result<ParquetMetaData, FormatError> {
         if self.size < FOOTER_SIZE {
             return Err(FormatError::Unreadable("file shorter than a footer".into()));
         }
@@ -106,7 +137,7 @@ fn coalesce(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
 impl FileReader for ParquetReader {
     async fn fetch(&self, request: ScanRequest) -> Result<Fetched, FormatError> {
         let mut stats = ScanStats::default();
-        let metadata = Arc::new(self.metadata(&mut stats).await?);
+        let metadata = self.metadata(&mut stats).await?;
         let arrow_metadata =
             ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::default())
                 .map_err(|e| FormatError::Unreadable(e.to_string()))?;

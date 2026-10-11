@@ -126,7 +126,7 @@ mod tests {
         let target = FlushTarget {
             store: Arc::new(store.clone()),
             pool: PoolId::new("root").unwrap(),
-            format: Arc::new(ParquetFormat),
+            format: Arc::new(ParquetFormat::default()),
         };
         let mut log = WriterLog::start(Arc::new(store.clone()), env());
         registry::register(

@@ -166,7 +166,7 @@ mod tests {
         FlushTarget {
             store: Arc::new(store.clone()),
             pool: PoolId::new("root").unwrap(),
-            format: Arc::new(ParquetFormat),
+            format: Arc::new(ParquetFormat::default()),
         }
     }
 
@@ -242,7 +242,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes.len() as u64, prod_first.size_bytes);
-        let rows = ParquetFormat.read(bytes).unwrap();
+        let rows = ParquetFormat::default().read(bytes).unwrap();
         let bodies: Vec<String> = rows
             .iter()
             .flat_map(|r| {
