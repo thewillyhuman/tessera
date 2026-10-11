@@ -16,7 +16,7 @@ use crate::ast::{At, BinaryOp, Expr, Grouping, MatchOp, Matcher, VectorMatching}
 use crate::lexer::{Spanned, Token, tokenize};
 
 /// The aggregation operators.
-pub const AGGREGATIONS: [&str; 12] = [
+pub const AGGREGATIONS: [&str; 14] = [
     "sum",
     "min",
     "max",
@@ -29,10 +29,19 @@ pub const AGGREGATIONS: [&str; 12] = [
     "bottomk",
     "topk",
     "quantile",
+    "limitk",
+    "limit_ratio",
 ];
 
 /// The aggregation operators that take a parameter first.
-pub const PARAMETERIZED: [&str; 4] = ["count_values", "bottomk", "topk", "quantile"];
+pub const PARAMETERIZED: [&str; 6] = [
+    "count_values",
+    "bottomk",
+    "topk",
+    "quantile",
+    "limitk",
+    "limit_ratio",
+];
 
 /// The functions.
 pub const FUNCTIONS: [&str; 72] = [

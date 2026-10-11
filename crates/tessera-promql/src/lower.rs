@@ -334,6 +334,8 @@ impl Lowerer<'_> {
                     "bottomk" => PromAggregate::Bottomk,
                     "topk" => PromAggregate::Topk,
                     "quantile" => PromAggregate::Quantile,
+                    "limitk" => PromAggregate::Limitk,
+                    "limit_ratio" => PromAggregate::LimitRatio,
                     other => {
                         return Err(Diagnostic::at(
                             *span,

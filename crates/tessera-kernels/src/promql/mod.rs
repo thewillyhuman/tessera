@@ -758,9 +758,43 @@ fn aggregate(
                 let k = k as usize;
                 out.extend(members.into_iter().take(k));
             }
+            PromAggregate::Limitk => {
+                let k = scalar_parameter()?;
+                if k.is_nan() || k < 1.0 {
+                    continue;
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let k = k as usize;
+                out.extend(members.into_iter().take(k));
+            }
+            PromAggregate::LimitRatio => {
+                let ratio = scalar_parameter()?;
+                if ratio.is_nan() {
+                    continue;
+                }
+                let ratio = ratio.clamp(-1.0, 1.0);
+                out.extend(members.into_iter().filter(|(labels, _)| {
+                    let share = series_share(labels);
+                    if ratio >= 0.0 {
+                        share < ratio
+                    } else {
+                        share >= 1.0 + ratio
+                    }
+                }));
+            }
         }
     }
     Ok(Value::Vector(out))
+}
+
+/// Where a series falls in `[0, 1)` by a stable hash of its labels, so
+/// that `limit_ratio(r)` and `limit_ratio(r - 1)` split a vector into
+/// complementary parts, the same on every evaluation.
+fn series_share(labels: &Labels) -> f64 {
+    let text: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    #[allow(clippy::cast_precision_loss)]
+    let share = tessera_types::stable_hash(text.join(",").as_bytes()) as f64 / u64::MAX as f64;
+    share.min(1.0 - f64::EPSILON)
 }
 
 fn nan_min(acc: f64, v: f64) -> f64 {
@@ -929,6 +963,31 @@ mod tests {
             args: vec![selector(0, Some(60))],
         };
         assert!((value_of(&at(&irate, 60), "api") - 10.0 / 15.0).abs() < 1e-9);
+    }
+
+    /// `limitk` keeps the first k series of a group; `limit_ratio`
+    /// keeps a stable share, complementary for `r` and `r - 1`.
+    #[test]
+    fn limitk_and_limit_ratio_cut_a_vector() {
+        let limited = |op, parameter: f64| PromExpr::Aggregate {
+            op,
+            input: Box::new(selector(0, None)),
+            parameter: Some(Box::new(PromExpr::Number(parameter))),
+            grouping: None,
+        };
+        assert_eq!(at(&limited(PromAggregate::Limitk, 1.0), 60).len(), 1);
+        assert_eq!(at(&limited(PromAggregate::Limitk, 5.0), 60).len(), 2);
+        assert_eq!(at(&limited(PromAggregate::Limitk, 0.0), 60).len(), 0);
+        assert_eq!(at(&limited(PromAggregate::LimitRatio, 1.0), 60).len(), 2);
+        assert_eq!(at(&limited(PromAggregate::LimitRatio, 0.0), 60).len(), 0);
+        let kept = at(&limited(PromAggregate::LimitRatio, 0.5), 60);
+        let rest = at(&limited(PromAggregate::LimitRatio, -0.5), 60);
+        assert_eq!(kept.len() + rest.len(), 2, "complementary shares");
+        assert_eq!(
+            at(&limited(PromAggregate::LimitRatio, 0.5), 60).len(),
+            kept.len(),
+            "stable across evaluations"
+        );
     }
 
     #[test]

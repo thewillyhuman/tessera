@@ -144,6 +144,10 @@ pub enum PromAggregate {
     Topk,
     /// `quantile`.
     Quantile,
+    /// `limitk`: the first k series of each group.
+    Limitk,
+    /// `limit_ratio`: a deterministic share of each group's series.
+    LimitRatio,
 }
 
 impl PromAggregate {
@@ -163,6 +167,8 @@ impl PromAggregate {
             PromAggregate::Bottomk => "bottomk",
             PromAggregate::Topk => "topk",
             PromAggregate::Quantile => "quantile",
+            PromAggregate::Limitk => "limitk",
+            PromAggregate::LimitRatio => "limit_ratio",
         }
     }
 }

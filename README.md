@@ -109,7 +109,7 @@ and remote write. The PromQL differential suite agrees with
 Prometheus 3.15.0 on every case.
 
 Gaps left in M5: native histograms (OTLP histograms are stored but
-not queryable through PromQL), `limitk`, `limit_ratio` and `info`,
+not queryable through PromQL), `info`,
 the `promql(...)` table function in SQL, exemplars, rules and alerts
 (M7), metric downsampling and rollups (M9); the PromQL compliance
 suite has not been run; Grafana itself has not been run against the

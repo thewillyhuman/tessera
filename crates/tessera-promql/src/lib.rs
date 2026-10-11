@@ -9,7 +9,7 @@
 //! evaluates with Prometheus' semantics (QL-5).
 //!
 //! Not supported yet: native histograms and the `histogram_*`
-//! functions over them, `limitk`, `limit_ratio` and `info`, and the
+//! functions over them, `info`, and the
 //! `promql(...)` table function in SQL (QL-3). OTLP histograms are
 //! stored as rows with their buckets, which `PromQL` does not read.
 //!
