@@ -124,6 +124,43 @@ pub fn stored_usage(
 }
 
 /// `batch` restricted to the kind's own columns, in schema order.
+/// `rows` without the rows `tombstones` delete and without what
+/// `retain`, when a retention policy is due, drops or samples out.
+fn trimmed(
+    rows: RecordBatch,
+    tombstones: &[Tombstone],
+    retain: Option<&Retain>,
+    partition: &PartitionId,
+) -> Result<RecordBatch, CompactError> {
+    let rows = if tombstones.is_empty() {
+        rows
+    } else {
+        let (rows, removed) = tombstones::remove_deleted(&rows, tombstones)?;
+        if removed > 0 {
+            tracing::info!(partition = %partition, removed, "deleted rows removed");
+        }
+        rows
+    };
+    match retain {
+        Some(retain) => {
+            let (rows, applied) = retention::apply(&rows, partition.kind, retain)?;
+            tracing::info!(partition = %partition, ?applied, "retention applied");
+            Ok(rows)
+        }
+        None => Ok(rows),
+    }
+}
+
+/// `rows` with the shape of the traces that lie whole within the
+/// partition's window stored (QL-14), as an L3 span file carries it.
+fn completed(rows: &RecordBatch, partition: &PartitionId) -> Result<RecordBatch, CompactError> {
+    let window = &partition.window;
+    let (rows, completion) =
+        tessera_kernels::trace::complete(rows, window.start().as_nanos(), window.end().as_nanos())?;
+    tracing::info!(partition = %partition, ?completion, "traces completed");
+    Ok(rows)
+}
+
 fn kind_columns(batch: &RecordBatch, kind: Kind) -> Result<RecordBatch, CompactError> {
     let schema = tessera_types::event::schema(kind);
     let indices = schema
@@ -217,27 +254,17 @@ impl Compactor {
         let keys = Arc::clone(&self.env.keys);
         let partition = job.partition.clone();
         let retain = retain.filter(|_| job.level == Level::L3).cloned();
+        let complete_traces = job.level == Level::L3 && job.partition.kind == Kind::Span;
         let tombstones = tombstones.to_vec();
         let (written, duplicates, stored) = tokio::task::spawn_blocking(move || {
             let (rows, duplicates) = deduplicate(&batches)?;
-            let rows = if tombstones.is_empty() {
-                rows
-            } else {
-                let (rows, removed) = tombstones::remove_deleted(&rows, &tombstones)?;
-                if removed > 0 {
-                    tracing::info!(partition = %partition, removed, "deleted rows removed");
-                }
-                rows
-            };
-            let rows = match &retain {
-                Some(retain) => {
-                    let (rows, applied) = retention::apply(&rows, partition.kind, retain)?;
-                    tracing::info!(partition = %partition, ?applied, "retention applied");
-                    rows
-                }
-                None => rows,
-            };
+            let rows = trimmed(rows, &tombstones, retain.as_ref(), &partition)?;
             let (rows, _) = promote::promote(&rows, &wanted, promote::MAX_DEDICATED)?;
+            let rows = if complete_traces {
+                completed(&rows, &partition)?
+            } else {
+                rows
+            };
             let (rows, templates) = if patterns {
                 patterns::assign(&rows)?
             } else {

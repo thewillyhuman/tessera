@@ -93,10 +93,13 @@ id (JSON and protobuf), tag names and values, metrics. The TraceQL
 differential suite agrees with Tempo 2.7.1 on every case; the
 deviations found are documented in the `tessera-traceql` crate.
 
-Gaps left in M4: trace completion (QL-14): L3 files carry no
-nested-set or trace-level columns yet, so every search builds the
-trace's tree at query time; Grafana itself has not been run against
-the API yet.
+A span partition retires to L3 an hour after its window ends, with
+the nested-set numbers and the trace-level columns of every trace
+that lies whole within it stored in the file (QL-14).
+
+Gaps left in M4: a search still builds every trace's tree at query
+time rather than reading the stored columns; Grafana itself has not
+been run against the API yet.
 
 **M5, metrics: done, with gaps listed below.** Metric data points
 over OTLP (gauges, sums, histograms, exponential histograms and
