@@ -158,6 +158,37 @@ async fn an_eval_node_runs_the_rules_in_the_control_store() {
     node.stop().await;
 }
 
+/// Whether some file of the `prod` logs was written under `epoch` with
+/// `column` leading its sort key and present as a column.
+async fn rewritten_in(
+    store: &std::sync::Arc<dyn tessera_object::ObjectStore>,
+    env: &Env,
+    epoch: u64,
+    column: &str,
+) -> bool {
+    let partitions = tessera_manifest::list_partitions(
+        &**store,
+        &TenantId::DEFAULT,
+        &DatasetName::new("prod").unwrap(),
+        Kind::Log,
+    )
+    .await
+    .unwrap();
+    for partition in partitions {
+        let manifest = tessera_manifest::Manifest::open(store.clone(), partition, env.clone());
+        let snapshot = manifest.snapshot().await.unwrap();
+        let found = snapshot.state().files().any(|f| {
+            f.layout_epoch == epoch
+                && f.sort_key.first().map(String::as_str) == Some(column)
+                && f.columns.iter().any(|c| c.name == column)
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filtered_attribute_becomes_the_sort_key_without_intervention() {
     let dir = tempfile::tempdir().unwrap();
@@ -237,5 +268,25 @@ async fn a_filtered_attribute_becomes_the_sort_key_without_intervention() {
         "{:?}",
         advice.drivers
     );
+
+    // Compaction re-clusters the files into the adopted layout (AD-10).
+    let epoch = log.layout(Kind::Log).await.unwrap().epoch;
+    let store: std::sync::Arc<dyn tessera_object::ObjectStore> =
+        std::sync::Arc::new(LocalStore::open(dir.path()).await.unwrap());
+    common::eventually(
+        "a file is rewritten in the new layout",
+        Duration::from_secs(15),
+        || {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(rewritten_in(
+                    &store,
+                    node.env(),
+                    epoch,
+                    "attr.host",
+                ))
+            })
+        },
+    )
+    .await;
     node.stop().await;
 }
