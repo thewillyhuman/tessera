@@ -238,6 +238,12 @@ const SCALARS: &[ScalarFunction] = &[
         name: "regexp_match",
         return_type: text_predicate,
     },
+    // `LogQL`'s `ip()` label filter: the text is one address, a CIDR
+    // block or an inclusive range.
+    ScalarFunction {
+        name: "ip_matches",
+        return_type: text_predicate,
+    },
     // Log-line helpers (LogQL section 9.4): strip ANSI colour codes;
     // read a duration (`1.5s`, `250ms`) as seconds; read a byte
     // size (`2KB`, `1.5MiB`) as bytes.

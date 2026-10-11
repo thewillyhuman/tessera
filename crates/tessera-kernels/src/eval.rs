@@ -541,6 +541,7 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
             let matched = regexp_is_match_scalar(strings, &pattern, None)?;
             Ok(text.with_array(Arc::new(matched)))
         }
+        ("ip_matches", [text, pattern]) => ip_matches(text, pattern),
         ("coalesce", [first, rest @ ..]) => {
             let mut acc = first.clone();
             for next in rest {
@@ -570,6 +571,28 @@ fn constant_text(value: &Value, function: &str) -> Result<String, KernelError> {
         .ok_or_else(|| {
             KernelError::Unsupported(format!("{function} needs a constant text pattern"))
         })
+}
+
+/// `LogQL`'s `ip()` filter: whether each address in `text` is one that
+/// the constant `pattern` names.
+fn ip_matches(text: &Value, pattern: &Value) -> Result<Value, KernelError> {
+    let pattern = constant_text(pattern, "ip_matches")?;
+    let matcher = crate::ip::Matcher::parse(&pattern).ok_or_else(|| {
+        KernelError::Unsupported(format!(
+            "ip({pattern:?}) is not an address, a block or a range"
+        ))
+    })?;
+    let text = text.cast(&DataType::Utf8)?;
+    let strings = text
+        .array()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| KernelError::Unsupported("ip_matches needs text".into()))?;
+    let hits: BooleanArray = strings
+        .iter()
+        .map(|s| s.map(|s| matcher.matches(s)))
+        .collect();
+    Ok(text.with_array(Arc::new(hits)))
 }
 
 fn map_text_to_float(text: &Value, f: impl Fn(&str) -> Option<f64>) -> Result<Value, KernelError> {

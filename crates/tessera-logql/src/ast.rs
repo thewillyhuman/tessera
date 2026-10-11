@@ -77,6 +77,9 @@ pub enum FilterValue {
     Duration(Duration),
     /// A byte size, compared in bytes.
     Bytes(f64),
+    /// An `ip(...)` pattern: one address, a CIDR block or a range,
+    /// compared with `=` or `!=`.
+    Ip(String),
 }
 
 /// A label filter expression.

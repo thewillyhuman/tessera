@@ -298,6 +298,17 @@ fn label_filter(filter: &LabelFilter) -> Expr {
             name, op, value, ..
         } => {
             let (target, literal) = match value {
+                FilterValue::Ip(pattern) => {
+                    let matched = call(
+                        "ip_matches",
+                        vec![label(name, DataType::Utf8), Expr::literal(pattern.as_str())],
+                    );
+                    return if *op == CompareOp::NotEq {
+                        Expr::Not(Box::new(matched))
+                    } else {
+                        matched
+                    };
+                }
                 FilterValue::Text(text) => {
                     (label(name, DataType::Utf8), Literal::Text(text.clone()))
                 }
@@ -919,6 +930,16 @@ mod tests {
         );
         let out = lowered("stdvar(rate({a=\"b\"}[1m]))", 30);
         assert!(out.plan.to_string().contains("stdvar_raw(value)"));
+        let addressed = lowered(
+            r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8") | peer != ip("::1")"#,
+            0,
+        );
+        let text = addressed.plan.to_string();
+        assert!(
+            text.contains("Filter: NOT ip_matches(label(peer), '::1')\n")
+                && text.contains("Filter: ip_matches(label(addr), '10.0.0.0/8')\n"),
+            "{text}"
+        );
         let shifted = lowered(r#"rate({a="b"}[5m] offset 1h)"#, 60);
         let text = shifted.plan.to_string();
         assert!(

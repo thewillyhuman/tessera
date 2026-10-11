@@ -506,6 +506,18 @@ impl Parser {
                 token: Token::Bytes(b),
                 ..
             }) => FilterValue::Bytes(b),
+            Some(Spanned {
+                token: Token::Ident(word),
+                span,
+            }) if word == "ip" => {
+                if !matches!(op, CompareOp::Eq | CompareOp::NotEq) {
+                    return Err(Diagnostic::at(span, "ip() is compared with = or !="));
+                }
+                self.expect_symbol("(")?;
+                let (pattern, _) = self.string()?;
+                self.expect_symbol(")")?;
+                FilterValue::Ip(pattern)
+            }
             _ => return Err(self.unexpected("expected a value")),
         };
         Ok(LabelFilter::Compare {
@@ -790,6 +802,27 @@ mod tests {
         assert!(
             matches!(&q.stages[15], Stage::Unwrap { label, conversion: Conversion::Duration, .. } if label == "latency")
         );
+    }
+
+    /// QL-7: `ip()` is a label filter value for `=` and `!=`.
+    #[test]
+    fn ip_filters_take_a_pattern() {
+        let q = log(r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8") | peer != ip("::1")"#);
+        assert!(matches!(
+            &q.stages[1],
+            Stage::Filter(LabelFilter::Compare { name, op: CompareOp::Eq, value: FilterValue::Ip(p), .. })
+                if name == "addr" && p == "10.0.0.0/8"
+        ));
+        assert!(matches!(
+            &q.stages[2],
+            Stage::Filter(LabelFilter::Compare {
+                op: CompareOp::NotEq,
+                value: FilterValue::Ip(_),
+                ..
+            })
+        ));
+        let e = parse(r#"{a="b"} | addr > ip("10.0.0.1")"#).unwrap_err();
+        assert!(e.message.contains("= or !="));
     }
 
     #[test]
