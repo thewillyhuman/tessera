@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! `TraceGroup`: group spans by trace and evaluate a spanset expression
-//! on each trace (QL-13). Blocking; every input row is held until the
-//! end of input and accounted against the pool.
+//! on each trace (QL-13). Blocking; the input is kept in trace order
+//! against the pool, spilled to local disk past the grant (QE-11), and
+//! read back one trace at a time.
 //!
 //! The input is every span of the candidate traces. Each trace's spans
 //! are sorted by start time and given the trace-level columns
@@ -20,16 +21,15 @@ use arrow::array::{
     Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, StringArray,
     TimestampNanosecondArray, UInt32Array, new_null_array,
 };
-use arrow::compute::{
-    SortColumn, SortOptions, cast, concat_batches, lexsort_to_indices, take, take_record_batch,
-};
+use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use tessera_ir::trace::{
     MATCHED, NEST_LEFT, NEST_PARENT, NEST_RIGHT, ROOT_NAME, ROOT_SERVICE, SPANSET, SPANSET_LABELS,
     TRACE_DURATION_NS, TRACE_START,
 };
 use tessera_ir::{
-    BinaryOp, Expr, Literal, Relation, SpanAggregate, Spanset, Structural, trace_group_schema,
+    BinaryOp, Expr, Literal, Relation, SortKey, SpanAggregate, Spanset, Structural,
+    trace_group_schema,
 };
 use tessera_kernels::{evaluate, evaluate_predicate};
 use tessera_types::event::{DURATION_NS, NAME, PARENT_SPAN_ID, SPAN_ID, TIMESTAMP, TRACE_ID};
@@ -37,15 +37,15 @@ use tessera_types::event::{DURATION_NS, NAME, PARENT_SPAN_ID, SPAN_ID, TIMESTAMP
 use crate::ExecError;
 use crate::batch::Batch;
 use crate::memory::MemoryPool;
-use crate::operator::sort::emit;
+use crate::operator::sort::{SortedBuffer, emit};
 use crate::operator::{Flow, Operator, Sink};
 
 /// Groups spans by trace and evaluates a spanset expression.
 pub struct TraceGroup {
     spanset: Spanset,
     memory: Arc<MemoryPool>,
-    buffered: Vec<RecordBatch>,
-    reserved: usize,
+    /// The input in trace order, once its schema is known.
+    buffer: Option<SortedBuffer>,
 }
 
 impl TraceGroup {
@@ -55,9 +55,44 @@ impl TraceGroup {
         TraceGroup {
             spanset,
             memory,
-            buffered: Vec::new(),
-            reserved: 0,
+            buffer: None,
         }
+    }
+
+    /// Evaluates the traces of the buffer one at a time: the sorted
+    /// batches are cut at trace boundaries, the trace that straddles
+    /// two batches carried into the next.
+    fn emit_traces(&mut self, out: &mut dyn Sink) -> Result<(), ExecError> {
+        let Some(buffer) = self.buffer.as_mut() else {
+            return Ok(());
+        };
+        let mut carried: Option<RecordBatch> = None;
+        for batch in buffer.drain()? {
+            let batch = batch?;
+            let spans = match carried.take() {
+                Some(carry) => concat_batches(&carry.schema(), &[carry, batch])?,
+                None => batch,
+            };
+            let n = spans.num_rows();
+            if n == 0 {
+                continue;
+            }
+            let ids = fixed(&spans, TRACE_ID)?;
+            let mut last_start = n - 1;
+            while last_start > 0 && ids.value(last_start - 1) == ids.value(n - 1) {
+                last_start -= 1;
+            }
+            if last_start > 0 {
+                let rows = self.evaluate_all(&spans.slice(0, last_start))?;
+                emit(&rows, out)?;
+            }
+            carried = Some(spans.slice(last_start, n - last_start));
+        }
+        if let Some(last) = carried {
+            let rows = self.evaluate_all(&last)?;
+            emit(&rows, out)?;
+        }
+        Ok(())
     }
 
     /// The output rows for every trace of `spans`, which are sorted by
@@ -89,43 +124,29 @@ impl TraceGroup {
 impl Operator for TraceGroup {
     fn push(&mut self, input: Batch, _: &mut dyn Sink) -> Result<Flow, ExecError> {
         let rows = input.materialize()?;
-        let bytes = rows.get_array_memory_size();
-        self.memory.reserve(bytes)?;
-        self.reserved += bytes;
-        self.buffered.push(rows);
+        let buffer = self.buffer.get_or_insert_with(|| {
+            // Trace id then start time, so a trace's spans are
+            // contiguous and in order.
+            SortedBuffer::new(
+                vec![
+                    SortKey::ascending(Expr::column(TRACE_ID)),
+                    SortKey::ascending(Expr::column(TIMESTAMP)),
+                ],
+                rows.schema(),
+                Arc::clone(&self.memory),
+            )
+        });
+        buffer.push(rows)?;
         Ok(Flow::Continue)
     }
 
     fn finish(&mut self, out: &mut dyn Sink) -> Result<(), ExecError> {
-        let result = match self.buffered.first() {
-            None => Ok(()),
-            Some(first) => {
-                let all = concat_batches(&first.schema(), &self.buffered)?;
-                self.buffered.clear();
-                sorted_by_trace(&all)
-                    .and_then(|spans| self.evaluate_all(&spans))
-                    .and_then(|rows| emit(&rows, out))
-            }
-        };
-        self.memory.release(self.reserved);
-        self.reserved = 0;
+        let result = self.emit_traces(out);
+        if let Some(buffer) = self.buffer.as_mut() {
+            buffer.release();
+        }
         result
     }
-}
-
-/// `spans` ordered by trace id, then start time.
-fn sorted_by_trace(spans: &RecordBatch) -> Result<RecordBatch, ExecError> {
-    let key = |name: &str| -> Result<SortColumn, ExecError> {
-        Ok(SortColumn {
-            values: spans
-                .column_by_name(name)
-                .ok_or_else(|| ExecError::Unsupported(format!("trace group input has no {name}")))?
-                .clone(),
-            options: Some(SortOptions::default()),
-        })
-    };
-    let indices = lexsort_to_indices(&[key(TRACE_ID)?, key(TIMESTAMP)?], None)?;
-    Ok(take_record_batch(spans, &indices)?)
 }
 
 fn fixed<'a>(rows: &'a RecordBatch, name: &str) -> Result<&'a FixedSizeBinaryArray, ExecError> {
@@ -784,6 +805,62 @@ mod tests {
             }
         }
         rows
+    }
+
+    /// QE-11: past the grant the spans go to disk in trace order and
+    /// come back one trace at a time, with the same result.
+    #[test]
+    fn spills_spans_and_still_groups_whole_traces() {
+        let all = spans();
+        let one_each: Vec<RecordBatch> = (0..all.num_rows()).map(|i| all.slice(i, 1)).collect();
+        let dir = std::env::temp_dir().join(format!("tessera-trace-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = one_each[0].get_array_memory_size();
+        let pool = MemoryPool::with_spill_dir(one * 2, Some(dir.clone()));
+        let mut spilling = TraceGroup::new(name_is("db"), Arc::clone(&pool));
+        let spilled = run(&mut spilling, one_each.clone());
+        let mut plain = TraceGroup::new(name_is("db"), MemoryPool::unbounded());
+        let expected = run(&mut plain, vec![all]);
+        let rows_of = |batches: &[RecordBatch]| -> Vec<(u8, u8, i64)> {
+            let mut rows = Vec::new();
+            for batch in batches {
+                let traces = fixed(batch, TRACE_ID).unwrap();
+                let ids = fixed(batch, SPAN_ID).unwrap();
+                let sets = batch
+                    .column_by_name(SPANSET)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    rows.push((traces.value(i)[0], ids.value(i)[0], sets.value(i)));
+                }
+            }
+            rows
+        };
+        let mut spilled_rows = rows_of(&spilled);
+        let mut expected_rows = rows_of(&expected);
+        spilled_rows.sort_unstable();
+        expected_rows.sort_unstable();
+        assert_eq!(spilled_rows, expected_rows);
+        assert_eq!(spilled_rows.len(), 2, "db in both traces");
+        assert!(pool.spilled_bytes() > 0, "runs went to disk");
+        assert_eq!(pool.used(), 0);
+        assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        std::fs::remove_dir(&dir).unwrap();
+
+        let mut refused = TraceGroup::new(name_is("db"), MemoryPool::new(one));
+        let mut sink = crate::operator::CollectSink::new();
+        refused
+            .push(Batch::new(one_each[0].clone()), &mut sink)
+            .unwrap();
+        let error = refused
+            .push(Batch::new(one_each[1].clone()), &mut sink)
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecError::Memory(_)),
+            "no directory, no spill: {error}"
+        );
     }
 
     /// QL-14: the numbers of a depth-first walk, children in start

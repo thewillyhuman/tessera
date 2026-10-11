@@ -3,7 +3,8 @@
 //! `Sort`: order every input row. Blocking; accounts its buffer and,
 //! when the grant runs out, spills what it holds as a sorted run to
 //! local disk and merges the runs back on finish (QE-11), holding one
-//! batch of each run at a time.
+//! batch of each run at a time. The [`SortedBuffer`] behind it serves
+//! every blocking operator that reads its input in key order.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -28,8 +29,11 @@ use crate::spill::SpillFile;
 /// Rows per output batch of a blocking operator.
 pub(crate) const OUTPUT_ROWS: usize = 8_192;
 
-/// Buffers its input and emits it sorted on `finish`.
-pub struct Sort {
+/// Rows kept in key order across memory and disk: what the grant holds
+/// stays in memory, the rest goes to local disk as sorted runs when a
+/// reservation is refused (QE-11), and everything comes back merged in
+/// key order, one batch of each run in memory at a time.
+pub(crate) struct SortedBuffer {
     keys: Vec<SortKey>,
     schema: SchemaRef,
     memory: Arc<MemoryPool>,
@@ -39,11 +43,10 @@ pub struct Sort {
     runs: Vec<SpillFile>,
 }
 
-impl Sort {
-    /// A sort on `keys` over rows of `schema`.
-    #[must_use]
-    pub fn new(keys: Vec<SortKey>, schema: SchemaRef, memory: Arc<MemoryPool>) -> Self {
-        Sort {
+impl SortedBuffer {
+    /// A buffer ordered on `keys` over rows of `schema`.
+    pub(crate) fn new(keys: Vec<SortKey>, schema: SchemaRef, memory: Arc<MemoryPool>) -> Self {
+        SortedBuffer {
             keys,
             schema,
             memory,
@@ -51,6 +54,18 @@ impl Sort {
             reserved: 0,
             runs: Vec::new(),
         }
+    }
+
+    /// Adds `rows`, spilling first when the grant refuses them.
+    pub(crate) fn push(&mut self, rows: RecordBatch) -> Result<(), ExecError> {
+        let bytes = rows.get_array_memory_size();
+        if let Err(failure) = self.memory.reserve(bytes) {
+            self.spill(failure)?;
+            self.memory.reserve(bytes)?;
+        }
+        self.reserved += bytes;
+        self.buffered.push(rows);
+        Ok(())
     }
 
     /// Sorts what is buffered into one run on disk and frees its
@@ -75,24 +90,51 @@ impl Sort {
         Ok(())
     }
 
-    /// Emits everything sorted: the buffer alone when nothing spilled,
-    /// else the runs on disk merged with the sorted buffer.
-    fn emit_sorted(&mut self, out: &mut dyn Sink) -> Result<(), ExecError> {
+    /// Everything in key order, in batches of at most [`OUTPUT_ROWS`]:
+    /// the buffer alone when nothing spilled, else the runs on disk
+    /// merged with the sorted buffer. The memory stays reserved until
+    /// [`SortedBuffer::release`].
+    pub(crate) fn drain(&mut self) -> Result<Run, ExecError> {
         let all = concat_batches(&self.schema, &self.buffered)?;
         self.buffered.clear();
+        let last = if all.num_rows() == 0 {
+            all
+        } else {
+            sorted(&all, &self.keys, None)?
+        };
+        let in_memory: Run = Box::new(slices(&last).into_iter().map(Ok));
         if self.runs.is_empty() {
-            if all.num_rows() == 0 {
-                return Ok(());
-            }
-            return sorted(&all, &self.keys, None).and_then(|rows| emit(&rows, out));
+            return Ok(in_memory);
         }
-        let last = sorted(&all, &self.keys, None)?;
         let mut runs: Vec<Run> = Vec::new();
         for file in &self.runs {
             runs.push(Box::new(file.read()?));
         }
-        runs.push(Box::new(slices(&last).into_iter().map(Ok)));
-        merge(runs, &self.keys, &self.schema, out)
+        runs.push(in_memory);
+        Ok(Box::new(Merged::new(runs, &self.keys, &self.schema)?))
+    }
+
+    /// Frees the memory and the runs on disk.
+    pub(crate) fn release(&mut self) {
+        self.memory.release(self.reserved);
+        self.reserved = 0;
+        self.buffered.clear();
+        self.runs.clear();
+    }
+}
+
+/// Buffers its input and emits it sorted on `finish`.
+pub struct Sort {
+    buffer: SortedBuffer,
+}
+
+impl Sort {
+    /// A sort on `keys` over rows of `schema`.
+    #[must_use]
+    pub fn new(keys: Vec<SortKey>, schema: SchemaRef, memory: Arc<MemoryPool>) -> Self {
+        Sort {
+            buffer: SortedBuffer::new(keys, schema, memory),
+        }
     }
 }
 
@@ -105,7 +147,7 @@ fn slices(rows: &RecordBatch) -> Vec<RecordBatch> {
 }
 
 /// The batches of one sorted run, in order.
-type Run = Box<dyn Iterator<Item = Result<RecordBatch, ExecError>>>;
+pub(crate) type Run = Box<dyn Iterator<Item = Result<RecordBatch, ExecError>>>;
 
 /// Where a merge is in one run: its current batch, the batch's keys as
 /// comparable rows, and the next row to take.
@@ -170,69 +212,95 @@ impl Cursor {
     }
 }
 
-/// Merges `runs`, each ordered on `keys`, into one ordered output.
-fn merge(
-    runs: Vec<Run>,
-    keys: &[SortKey],
-    schema: &SchemaRef,
-    out: &mut dyn Sink,
-) -> Result<(), ExecError> {
-    let mut converter = None;
-    let mut cursors: Vec<Cursor> = runs
-        .into_iter()
-        .map(|batches| Cursor {
-            batches,
-            batch: None,
-            rows: None,
-            index: 0,
-        })
-        .collect();
-    let mut heap: BinaryHeap<Reverse<(OwnedRow, usize)>> = BinaryHeap::new();
-    for (run, cursor) in cursors.iter_mut().enumerate() {
-        if cursor.advance(keys, &mut converter)? {
-            heap.push(Reverse((cursor.key(), run)));
-        }
-    }
-    // Rows to emit, as (run, row of the run's current batch); flushed
-    // before any run moves on, so the batches referenced stay.
-    let mut pending: Vec<(usize, usize)> = Vec::new();
-    while let Some(Reverse((_, run))) = heap.pop() {
-        let cursor = &mut cursors[run];
-        pending.push((run, cursor.index));
-        cursor.index += 1;
-        let batch_done = cursor
-            .batch
-            .as_ref()
-            .is_none_or(|b| cursor.index >= b.num_rows());
-        if batch_done || pending.len() >= OUTPUT_ROWS {
-            flush(&cursors, &mut pending, schema, out)?;
-        }
-        let cursor = &mut cursors[run];
-        if !batch_done || cursor.advance(keys, &mut converter)? {
-            heap.push(Reverse((cursor.key(), run)));
-        }
-    }
-    flush(&cursors, &mut pending, schema, out)
+/// The merge of runs ordered on the same keys, one ordered batch at a
+/// time.
+struct Merged {
+    keys: Vec<SortKey>,
+    schema: SchemaRef,
+    converter: Option<RowConverter>,
+    cursors: Vec<Cursor>,
+    heap: BinaryHeap<Reverse<(OwnedRow, usize)>>,
+    /// Rows to emit, as (run, row of the run's current batch); taken
+    /// before any run moves on, so the batches referenced stay.
+    pending: Vec<(usize, usize)>,
 }
 
-/// Emits the pending rows, taken from the cursors' current batches.
-fn flush(
-    cursors: &[Cursor],
-    pending: &mut Vec<(usize, usize)>,
-    schema: &SchemaRef,
-    out: &mut dyn Sink,
-) -> Result<(), ExecError> {
-    if pending.is_empty() {
-        return Ok(());
+impl Merged {
+    fn new(runs: Vec<Run>, keys: &[SortKey], schema: &SchemaRef) -> Result<Self, ExecError> {
+        let mut merged = Merged {
+            keys: keys.to_vec(),
+            schema: Arc::clone(schema),
+            converter: None,
+            cursors: runs
+                .into_iter()
+                .map(|batches| Cursor {
+                    batches,
+                    batch: None,
+                    rows: None,
+                    index: 0,
+                })
+                .collect(),
+            heap: BinaryHeap::new(),
+            pending: Vec::new(),
+        };
+        for run in 0..merged.cursors.len() {
+            if merged.cursors[run].advance(&merged.keys, &mut merged.converter)? {
+                merged.heap.push(Reverse((merged.cursors[run].key(), run)));
+            }
+        }
+        Ok(merged)
     }
-    let empty = RecordBatch::new_empty(Arc::clone(schema));
-    let batches: Vec<&RecordBatch> = cursors
-        .iter()
-        .map(|cursor| cursor.batch.as_ref().unwrap_or(&empty))
-        .collect();
-    let rows = interleave_record_batch(&batches, pending)?;
-    pending.clear();
-    emit(&rows, out)
+
+    /// The pending rows as one batch, taken from the cursors' current
+    /// batches; none when nothing is pending.
+    fn take_pending(&mut self) -> Result<Option<RecordBatch>, ExecError> {
+        if self.pending.is_empty() {
+            return Ok(None);
+        }
+        let empty = RecordBatch::new_empty(Arc::clone(&self.schema));
+        let batches: Vec<&RecordBatch> = self
+            .cursors
+            .iter()
+            .map(|cursor| cursor.batch.as_ref().unwrap_or(&empty))
+            .collect();
+        let rows = interleave_record_batch(&batches, &self.pending)?;
+        self.pending.clear();
+        Ok(Some(rows))
+    }
+
+    /// The next ordered batch, or none at the end.
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ExecError> {
+        while let Some(Reverse((_, run))) = self.heap.pop() {
+            let cursor = &mut self.cursors[run];
+            self.pending.push((run, cursor.index));
+            cursor.index += 1;
+            let batch_done = cursor
+                .batch
+                .as_ref()
+                .is_none_or(|b| cursor.index >= b.num_rows());
+            let taken = if batch_done || self.pending.len() >= OUTPUT_ROWS {
+                self.take_pending()?
+            } else {
+                None
+            };
+            let cursor = &mut self.cursors[run];
+            if !batch_done || cursor.advance(&self.keys, &mut self.converter)? {
+                self.heap.push(Reverse((cursor.key(), run)));
+            }
+            if taken.is_some() {
+                return Ok(taken);
+            }
+        }
+        self.take_pending()
+    }
+}
+
+impl Iterator for Merged {
+    type Item = Result<RecordBatch, ExecError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch().transpose()
+    }
 }
 
 /// `rows` ordered by `keys`, at most `limit` of them.
@@ -278,23 +346,18 @@ pub(crate) fn emit_flow(rows: &RecordBatch, out: &mut dyn Sink) -> Result<Flow, 
 
 impl Operator for Sort {
     fn push(&mut self, input: Batch, _: &mut dyn Sink) -> Result<Flow, ExecError> {
-        let rows = input.materialize()?;
-        let bytes = rows.get_array_memory_size();
-        if let Err(failure) = self.memory.reserve(bytes) {
-            self.spill(failure)?;
-            self.memory.reserve(bytes)?;
-        }
-        self.reserved += bytes;
-        self.buffered.push(rows);
+        self.buffer.push(input.materialize()?)?;
         Ok(Flow::Continue)
     }
 
     fn finish(&mut self, out: &mut dyn Sink) -> Result<(), ExecError> {
-        let result = self.emit_sorted(out);
-        self.memory.release(self.reserved);
-        self.reserved = 0;
-        self.buffered.clear();
-        self.runs.clear();
+        let result = self.buffer.drain().and_then(|batches| {
+            for batch in batches {
+                emit(&batch?, out)?;
+            }
+            Ok(())
+        });
+        self.buffer.release();
         result
     }
 }
