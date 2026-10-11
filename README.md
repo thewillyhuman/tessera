@@ -26,11 +26,11 @@ ingester with linger, memtable, flush and log rotation; a simulation
 scenario that checks the view invariant (VW-1) under faults, crashes
 and duplicate owners.
 
-Gaps left in M1: OTLP over gRPC (HTTP only); no authentication, so the
-tenant is always `default`; the partition window is the default day for
-every dataset (no dataset log yet); attributes live in the `_overflow`
-JSON column until column promotion arrives (M8); dead writers are
-detected by a quiet-time heuristic (membership shortens it since M6).
+Gaps left in M1: the partition window is the default day for every
+dataset, whatever its dataset log says (MF-2); attributes live in the
+`_overflow` JSON column until column promotion arrives (M8); dead
+writers are detected by a quiet-time heuristic (membership shortens it
+since M6). OTLP over gRPC and authentication arrived with M10.
 
 **M2, engine core: done, with gaps listed below.** The plan
 representation every language lowers into; vectorized kernels with
@@ -50,8 +50,8 @@ or window functions; no query parameters over the PostgreSQL protocol;
 blocking operators fail instead of spilling when their memory grant
 runs out; pipelines run one plan node at a time rather than fused
 across stages; a bare attribute reads as text until the advisor
-promotes it (M8); `now()` is the node's clock and there is no result
-cache. A query runs under its tenant's limits on bytes scanned, memory
+promotes it (M8); `now()` is the node's clock. A query runs under its
+tenant's limits on bytes scanned, memory
 and wall time (QE-18), the settings `query_max_scan_bytes`,
 `query_max_memory_bytes` and `query_max_seconds`; the node's defaults
 apply where a tenant sets none, and a query past a limit fails with
@@ -71,8 +71,7 @@ crate.
 
 Gaps left in M3: sort keys on attribute columns and ingest-time
 grouping of compaction inputs (CP-2) wait for column promotion (M8);
-L3, retention sampling and log patterns wait for M9; Grafana itself has
-not been run against the API yet.
+Grafana itself has not been run against the API yet.
 
 **M4, traces: done, with gaps listed below.** Spans with their span
 events (as `event` rows, DM-8) and links over OTLP; the `TraceGroup`
@@ -86,8 +85,10 @@ id (JSON and protobuf), tag names and values, metrics. The TraceQL
 differential suite agrees with Tempo 2.7.1 on every case; the
 deviations found are documented in the `tessera-traceql` crate.
 
-Gaps left in M4: trace completion (QL-14) waits for L3 compaction
-(M9); Grafana itself has not been run against the API yet.
+Gaps left in M4: trace completion (QL-14): L3 files carry no
+nested-set or trace-level columns yet, so every search builds the
+trace's tree at query time; Grafana itself has not been run against
+the API yet.
 
 **M5, metrics: done, with gaps listed below.** Metric data points
 over OTLP (gauges, sums, histograms, exponential histograms and
@@ -104,10 +105,9 @@ and remote write. The PromQL differential suite agrees with
 Prometheus 3.15.0 on every case.
 
 Gaps left in M5: native histograms (OTLP histograms are stored but
-not queryable through PromQL), `info`, exemplars, rules and alerts
-(M7), metric downsampling and rollups (M9); the PromQL compliance
-suite has not been run; Grafana itself has not been run against the
-API yet.
+not queryable through PromQL), `info` and exemplars; the PromQL
+compliance suite has not been run; Grafana itself has not been run
+against the API yet.
 
 **M6, distributed execution and cluster: done, with gaps listed
 below.** Node roles (`ingest`, `query`, `compact`, `eval`), a node
@@ -131,8 +131,7 @@ steps (OP-4).
 Gaps left in M6: aggregation and the other intermediate stages run on
 the coordinator over the rows the leaf tasks return (QE-14 asks for
 stages on worker nodes); membership is seeded from the root pool only,
-there is no gossip; load signals for an autoscaler (OP-5) and the
-`_system` tenant (14.7) wait for M10; there is no object byte
+there is no gossip; there is no object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.
@@ -164,7 +163,7 @@ the `eval` role running the rule groups it owns by slot;
 `system.alert_instances`, `GET /api/v1/rules` and `GET /api/v1/alerts`
 over the state logs.
 
-Gaps left in M7: rollups and recording rules (M9); one state
+Gaps left in M7: one state
 partition per rule group, so the group count rather than the key
 space bounds a group's parallelism (CQ-6); a writer log removed whole
 after its writer ended is not detected as a gap by a rule still to
@@ -200,7 +199,7 @@ service (8.5); `EXPLAIN LAYOUT` (AD-11). The node test shows a
 dataset whose queries filter on an attribute adopt it as the leading
 sort column and rewrite its files without intervention.
 
-Gaps left in M8: automatic rollups (8.7, with M9); the cost model
+Gaps left in M8: the cost model
 estimates selectivity from the workload and guesses cardinality,
 there are no per-column sketches (AD-6); the storage term of the cost
 is ignored; the workload events of alert rules are not logged; a
@@ -246,8 +245,8 @@ aggregates and whole-window time range match, exactly, with
 workload repeats (8.7).
 
 Gaps left in M9: `system.usage` has not been reconciled against
-object-store billing (the exit criterion); unit prices and cost are
-not shown (CO-4); `EXCEPT ERRORS` sees the error spans of the files
+object-store billing (the exit criterion); `EXCEPT ERRORS` sees the
+error spans of the files
 being compacted only, and traces referenced by alert events are not
 exempt; sketches are not merged when downsampling, and classic
 histograms whose bounds differ keep the interval's last point (CO-8);
