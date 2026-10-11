@@ -541,53 +541,46 @@ latency, and the data is megabytes where some targets name terabytes.
 
 On an Apple M1 Pro (10 cores, 32 GB, local SSD), release build,
 2026-10-11, with 300,000 log rows (66.6 MB of OTLP protobuf, 75 MB as
-flat JSON lines), 144,000 metric samples and 2,000 traces:
+flat JSON lines), 144,000 metric samples and 2,000 traces, after the
+changes the first run called for (metric samples store no event id,
+promoted attributes are stored once, event times are delta-encoded,
+the default linger is 50 ms):
 
 | Area | Target (17.1) | Measured |
 |------|---------------|----------|
 | New node serving | <= 30 s from process start | 0.02 s |
-| Write acknowledgment (durable) | p50 <= 200 ms, p99 <= 500 ms | p50 199 ms, p99 231 ms (linger 50 ms, 8 clients); p50 489 ms, p99 812 ms saturated (default linger 250 ms, 32 clients) |
-| Ingest throughput | >= 20 MB/s of OTLP per ingest core | 17.1 MB/s at 8 clients, 22.5 MB/s saturated, on one ingest task; 1.7 to 2.3 MB/s per machine core |
-| Freshness (acknowledged to queryable) | p99 <= 1 s | p50 145 ms, max 196 ms over 4 probes; max 849 ms saturated |
-| Log compression | >= 10x against raw JSON | 3.3x against flat JSON lines, 8.2x against OTLP JSON |
-| Metric storage | <= 3 bytes per sample after L2 | 19.2 bytes per sample |
-| Dashboard panel, SQL, 1 h by minute | p95 <= 200 ms warm | warm p50 130 ms, p95 134 ms; cold 162 ms |
-| Error count, SQL, 1 h | p95 <= 200 ms warm | warm p50 99 ms, p95 104 ms; cold 107 ms |
-| Line-filter search, LogQL, 1 h | p95 <= 5 s cold over 1 TB | warm p50 221 ms, p95 226 ms; cold 162 ms (megabytes, not a terabyte) |
-| Dashboard panel, PromQL, 1 h | p95 <= 200 ms warm | warm p50 117 ms, p95 124 ms; cold 79 ms |
-| Trace by id, Tempo | p99 <= 500 ms cold over 30 days | warm p50 36 ms, p95 51 ms; cold 1 ms (1 h of spans) |
-| Attribute search, TraceQL, 1 h | p95 <= 3 s cold over 24 h | warm p50 45 ms, p95 54 ms; cold 5 ms (1 h of spans) |
-| Alert, eager rule: write to notification | p99 <= 3 s | p50 150 ms, p99 499 ms over 10 probes |
+| Write acknowledgment (durable) | p50 <= 200 ms, p99 <= 500 ms | p50 199 ms, p99 205 ms (8 clients); p50 489 ms, p99 812 ms saturated (32 clients, linger 250 ms) |
+| Ingest throughput | >= 20 MB/s of OTLP per ingest core | 17.6 MB/s at 8 clients, 22.5 MB/s saturated, on one ingest task; 1.8 to 2.3 MB/s per machine core |
+| Freshness (acknowledged to queryable) | p99 <= 1 s | p50 107 ms, max 157 ms over 4 probes; max 849 ms saturated |
+| Log compression | >= 10x against raw JSON | 5.3x against flat JSON lines, 13.4x against OTLP JSON (was 3.3x and 8.2x) |
+| Metric storage | <= 3 bytes per sample after L2 | 3.1 bytes per sample (was 19.2) |
+| Dashboard panel, SQL, 1 h by minute | p95 <= 200 ms warm | warm p50 121 ms, p95 126 ms; cold 161 ms |
+| Error count, SQL, 1 h | p95 <= 200 ms warm | warm p50 112 ms, p95 121 ms; cold 125 ms |
+| Line-filter search, LogQL, 1 h | p95 <= 5 s cold over 1 TB | warm p50 134 ms, p95 141 ms; cold 144 ms (megabytes, not a terabyte) |
+| Dashboard panel, PromQL, 1 h | p95 <= 200 ms warm | warm p50 179 ms, p95 188 ms; cold 142 ms |
+| Trace by id, Tempo | p99 <= 500 ms cold over 30 days | warm p50 43 ms, p95 55 ms; cold 2 ms (1 h of spans) |
+| Attribute search, TraceQL, 1 h | p95 <= 3 s cold over 24 h | warm p50 53 ms, p95 69 ms; cold 6 ms (1 h of spans) |
+| Alert, eager rule: write to notification | p99 <= 3 s | p50 156 ms, p99 348 ms over 10 probes |
 | Node restart serving | <= 30 s from process start | 0.00 s |
 
 What the numbers say:
 
-- The query, freshness, alert and start-up targets hold at this size
-  on local disk. They remain to be measured at the sizes the targets
-  name and against an object store.
-- Acknowledgment latency is the ingester's linger plus queueing. The
-  default linger of 250 ms puts p50 near 300 ms unloaded; at 50 ms it
-  meets the target until the ingest task saturates. The linger is not a
-  command-line option yet.
+- The query, freshness, alert, metric storage and start-up targets
+  hold at this size on local disk. They remain to be measured at the
+  sizes the targets name and against an object store.
+- Acknowledgment latency is the ingester's linger plus queueing. At the
+  default 50 ms linger it meets the target until the ingest task
+  saturates; `--linger-ms` trades it for larger segments.
 - A node has one ingest task, which serializes every write (ST-5), so
   the 17 to 22 MB/s it reaches is the throughput of one core: on the
   target per ingest core, but a tenth of it per machine core. Taking
   load across cores needs several writer logs per node.
-- Compression misses the target for reasons the column breakdown
-  names. Of 77 bytes per compacted log row, `_overflow` is 26: every
-  promoted attribute is stored twice, once in its column and once in
-  the JSON kept whole. The random 16-byte event id is 16 more. The
-  request id, the user id and the durations are random by construction
-  and cost 15. Timestamps cost 8.5 because rows in a file are not in
-  time order. Dropping promoted keys from `_overflow`, deriving event
-  ids after deduplication and delta-encoding sorted timestamps would
-  bring the row to about 30 bytes, near 8x; the rest is the data's
-  entropy.
-- Metric storage misses by the event id alone: 16 of 19.2 bytes per
-  sample is the random id stored per point, the value is 2.7 and
-  everything else rounds to zero. A metric's identity is its series
-  and timestamp; deriving it instead of storing one puts the figure at
-  3.2 bytes.
+- Compression is short of the target for reasons the column breakdown
+  names. Of 47 bytes per compacted log row, the random 16-byte event
+  id is 16, and the request id, user id and durations, random by
+  construction, are 15; the body is 9 and the delta-encoded time 4.
+  The data's own entropy is most of what is left; dropping the stored
+  event id after deduplication would be the next step.
 
 ## Testing
 
