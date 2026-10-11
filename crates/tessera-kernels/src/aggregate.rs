@@ -93,6 +93,13 @@ pub fn accumulator(
             weighted: false,
             sums: Vec::new(),
         })),
+        "stddev" | "stddev_raw" | "stdvar" | "stdvar_raw" if numeric(input) => {
+            Ok(Box::new(Variance {
+                weighted: !name.ends_with("_raw"),
+                root: name.starts_with("stddev"),
+                moments: Vec::new(),
+            }))
+        }
         "min" | "max" => {
             let input = input.ok_or_else(unsupported)?;
             let keep_smaller = name == "min";
@@ -251,6 +258,65 @@ impl Accumulator for Sum {
 struct Avg {
     weighted: bool,
     sums: Vec<(f64, f64)>,
+}
+
+/// The population variance, or its square root, by Welford's running
+/// moments: per group the total weight, the mean and the sum of
+/// squared deviations.
+struct Variance {
+    weighted: bool,
+    root: bool,
+    moments: Vec<(f64, f64, f64)>,
+}
+
+impl Accumulator for Variance {
+    fn update(
+        &mut self,
+        groups: &[u32],
+        values: Option<&ArrayRef>,
+        sample_rates: Option<&Float64Array>,
+    ) -> Result<(), KernelError> {
+        let values =
+            values.ok_or_else(|| KernelError::Unsupported("stddev needs an argument".into()))?;
+        grow(&mut self.moments, groups, (0.0, 0.0, 0.0));
+        let floats = as_floats(values)?;
+        for (i, group) in groups.iter().enumerate() {
+            if floats.is_null(i) {
+                continue;
+            }
+            let w = if self.weighted {
+                weight(sample_rates, i)
+            } else {
+                1.0
+            };
+            if w <= 0.0 {
+                continue;
+            }
+            let x = floats.value(i);
+            let (total, mean, m2) = &mut self.moments[*group as usize];
+            *total += w;
+            let delta = x - *mean;
+            *mean += delta * w / *total;
+            *m2 += w * delta * (x - *mean);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, groups: usize) -> Result<ArrayRef, KernelError> {
+        self.moments.resize(groups, (0.0, 0.0, 0.0));
+        let root = self.root;
+        Ok(Arc::new(
+            self.moments
+                .iter()
+                .map(|(total, _, m2)| {
+                    (*total > 0.0).then(|| {
+                        let variance = m2 / total;
+                        if root { variance.sqrt() } else { variance }
+                    })
+                })
+                .collect::<Float64Array>(),
+        ))
+    }
 }
 
 impl Accumulator for Avg {
@@ -490,6 +556,36 @@ mod tests {
             .update(&[0, 0, 1], Some(&values), Some(&rates))
             .unwrap();
         assert_eq!(floats(&avg_raw.finish(2).unwrap()), vec![Some(15.0), None]);
+    }
+
+    /// `stddev` and `stdvar` are the population moments; the weighted
+    /// forms count each row `1 / sample_rate` times.
+    #[test]
+    fn deviation_and_variance_are_population_moments() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(2.0),
+            Some(4.0),
+            Some(4.0),
+            Some(4.0),
+            Some(5.0),
+            Some(5.0),
+            Some(7.0),
+            Some(9.0),
+            None,
+        ]));
+        let groups = [0u32; 9];
+        let mut stddev = accumulator("stddev_raw", Some(&DataType::Float64)).unwrap();
+        stddev.update(&groups, Some(&values), None).unwrap();
+        assert_eq!(floats(&stddev.finish(2).unwrap()), vec![Some(2.0), None]);
+        let mut stdvar = accumulator("stdvar_raw", Some(&DataType::Float64)).unwrap();
+        stdvar.update(&groups, Some(&values), None).unwrap();
+        assert_eq!(floats(&stdvar.finish(1).unwrap()), vec![Some(4.0)]);
+        // Two rows at rate 0.5 weigh like four rows of each value.
+        let pair: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), Some(3.0)]));
+        let rates = Float64Array::from(vec![Some(0.5), Some(0.5)]);
+        let mut weighted = accumulator("stdvar", Some(&DataType::Float64)).unwrap();
+        weighted.update(&[0, 0], Some(&pair), Some(&rates)).unwrap();
+        assert_eq!(floats(&weighted.finish(1).unwrap()), vec![Some(1.0)]);
     }
 
     #[test]

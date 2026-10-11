@@ -287,6 +287,29 @@ const AGGREGATES: &[AggregateFunction] = &[
         return_type: average,
         weighted: false,
     },
+    // Population standard deviation and variance, as PromQL and LogQL
+    // define `stddev` and `stdvar`; the weighted forms scale each row
+    // by its sample rate (QE-13).
+    AggregateFunction {
+        name: "stddev",
+        return_type: average,
+        weighted: true,
+    },
+    AggregateFunction {
+        name: "stddev_raw",
+        return_type: average,
+        weighted: false,
+    },
+    AggregateFunction {
+        name: "stdvar",
+        return_type: average,
+        weighted: true,
+    },
+    AggregateFunction {
+        name: "stdvar_raw",
+        return_type: average,
+        weighted: false,
+    },
     AggregateFunction {
         name: "min",
         return_type: extremum,

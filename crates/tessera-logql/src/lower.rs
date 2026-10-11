@@ -78,7 +78,7 @@ pub fn lower(query: &Query, ctx: &BindContext, params: RangeParams) -> Result<Lo
         Query::Metric(metric) => {
             let plan = metric_plan(metric, ctx, params)?;
             let kind = match metric {
-                MetricExpr::Scalar(_) => ResultKind::Scalar,
+                _ if constant(metric).is_some() => ResultKind::Scalar,
                 _ if params.step.is_zero() => ResultKind::Vector,
                 _ => ResultKind::Matrix,
             };
@@ -503,13 +503,12 @@ fn aggregate_plan(
         AggregateOp::Min => "min",
         AggregateOp::Max => "max",
         AggregateOp::Count => "count_raw",
-        AggregateOp::Stddev
-        | AggregateOp::Stdvar
-        | AggregateOp::Topk(_)
-        | AggregateOp::Bottomk(_) => {
+        AggregateOp::Stddev => "stddev_raw",
+        AggregateOp::Stdvar => "stdvar_raw",
+        AggregateOp::Topk(_) | AggregateOp::Bottomk(_) => {
             return Err(Diagnostic::at(
                 span,
-                "stddev, stdvar, topk and bottomk are not supported yet",
+                "topk and bottomk are not supported yet",
             ));
         }
     };
@@ -528,8 +527,62 @@ fn aggregate_plan(
     })
 }
 
+/// The value of an expression made of scalars and arithmetic alone.
+fn constant(expr: &MetricExpr) -> Option<f64> {
+    match expr {
+        MetricExpr::Scalar(value) => Some(*value),
+        MetricExpr::Binary {
+            op, left, right, ..
+        } => {
+            let (l, r) = (constant(left)?, constant(right)?);
+            match op {
+                BinaryOp::Add => Some(l + r),
+                BinaryOp::Sub => Some(l - r),
+                BinaryOp::Mul => Some(l * r),
+                BinaryOp::Div => Some(l / r),
+                BinaryOp::Rem => Some(l % r),
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Gt
+                | BinaryOp::Gte
+                | BinaryOp::Lt
+                | BinaryOp::Lte => None,
+            }
+        }
+        MetricExpr::Range { .. } | MetricExpr::Aggregate { .. } => None,
+    }
+}
+
+/// Two scalars folded, where the operator is arithmetic.
+fn fold_scalars(op: BinaryOp, left: f64, right: f64, span: Span) -> Result<Plan, Diagnostic> {
+    let value = match op {
+        BinaryOp::Add => left + right,
+        BinaryOp::Sub => left - right,
+        BinaryOp::Mul => left * right,
+        BinaryOp::Div => left / right,
+        BinaryOp::Rem => left % right,
+        BinaryOp::Eq
+        | BinaryOp::NotEq
+        | BinaryOp::Gt
+        | BinaryOp::Gte
+        | BinaryOp::Lt
+        | BinaryOp::Lte => {
+            return Err(Diagnostic::at(
+                span,
+                "a comparison between two scalars is not supported",
+            ));
+        }
+    };
+    Ok(Plan::Values {
+        schema: std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(VALUE, DataType::Float64, true),
+        ])),
+        rows: vec![vec![Literal::Float(value)]],
+    })
+}
+
 /// A vector against a scalar: arithmetic projects the value, a comparison
-/// filters the rows.
+/// filters the rows; two scalars fold.
 fn binary_plan(
     op: BinaryOp,
     left: &MetricExpr,
@@ -538,15 +591,10 @@ fn binary_plan(
     ctx: &BindContext,
     params: RangeParams,
 ) -> Result<Plan, Diagnostic> {
-    let (vector, scalar, flipped) = match (left, right) {
-        (MetricExpr::Scalar(_), MetricExpr::Scalar(_)) => {
-            return Err(Diagnostic::at(
-                span,
-                "constant arithmetic is not supported yet",
-            ));
-        }
-        (vector, MetricExpr::Scalar(s)) => (vector, *s, false),
-        (MetricExpr::Scalar(s), vector) => (vector, *s, true),
+    let (vector, scalar, flipped) = match (constant(left), constant(right)) {
+        (Some(l), Some(r)) => return fold_scalars(op, l, r, span),
+        (None, Some(s)) => (left, s, false),
+        (Some(s), None) => (right, s, true),
         _ => {
             return Err(Diagnostic::at(
                 span,
@@ -731,6 +779,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.message.contains("topk"));
+        let out = lowered(r#"stddev by (app) (rate({a="b"}[1m]))"#, 30);
+        assert!(
+            out.plan
+                .to_string()
+                .contains("aggregates=[stddev_raw(value) AS value]"),
+            "{}",
+            out.plan
+        );
+        let out = lowered("stdvar(rate({a=\"b\"}[1m]))", 30);
+        assert!(out.plan.to_string().contains("stdvar_raw(value)"));
+        let folded = lowered("(2 + 3) * 4", 0);
+        assert_eq!(folded.plan.to_string(), "Values: 1 rows\n");
+        assert!(
+            matches!(&folded.plan, Plan::Values { rows, .. } if rows[0][0] == Literal::Float(20.0))
+        );
         let e = lower(
             &parse(r#"rate({a="b"}[1m]) / rate({c="d"}[1m])"#).unwrap(),
             &ctx(),
