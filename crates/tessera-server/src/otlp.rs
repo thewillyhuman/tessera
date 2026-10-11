@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! OTLP over HTTP (IN-1): `POST /v1/logs` and `POST /v1/traces` with a
-//! protobuf or JSON body.
+//! OTLP over HTTP (IN-1): `POST /v1/logs`, `POST /v1/traces` and
+//! `POST /v1/metrics` with a protobuf or JSON body.
 //!
 //! The dataset comes from the `X-Tessera-Dataset` header, `default` when
 //! absent; the tenant is `default` until authentication exists (CT-5
@@ -16,6 +16,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceResponse;
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceResponse;
 use prost::Message;
 use tessera_ingest::otlp;
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/logs", post(export_logs))
         .route("/v1/traces", post(export_traces))
+        .route("/v1/metrics", post(export_metrics))
         .with_state(state)
 }
 
@@ -131,6 +133,30 @@ async fn export_traces(
     ))
 }
 
+async fn export_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let encoding = encoding(&headers)?;
+    let request = match encoding {
+        Encoding::Protobuf => otlp::metrics::parse_protobuf(&body),
+        Encoding::Json => otlp::metrics::parse_json(&body),
+    }
+    .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let dataset = dataset(&headers)?;
+    let now = state.env.clock.now();
+    let batch = otlp::metrics::to_batch(&request, TenantId::DEFAULT, dataset, now)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if let Some(batch) = batch {
+        state.ingest.write(batch).await?;
+    }
+    Ok(export_response(
+        encoding,
+        ExportMetricsServiceResponse::default().encode_to_vec(),
+    ))
+}
+
 fn dataset(headers: &HeaderMap) -> Result<DatasetName, ApiError> {
     match headers.get(DATASET_HEADER) {
         None => Ok(
@@ -176,6 +202,65 @@ pub(crate) mod testing {
         pub duration: u64,
         /// Whether the status is error.
         pub error: bool,
+    }
+
+    /// An export of the gauge `name` of service `service`, one point per
+    /// `(label, time offset in seconds, value)` under `attr.job`, from
+    /// 2023-11-14T22:13:20Z.
+    pub fn export_gauges(
+        service: &str,
+        name: &str,
+        points: &[(&str, u64, f64)],
+    ) -> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(service.into())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: name.into(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: points
+                                .iter()
+                                .map(|(job, offset, value)| NumberDataPoint {
+                                    attributes: vec![KeyValue {
+                                        key: "job".into(),
+                                        value: Some(AnyValue {
+                                            value: Some(any_value::Value::StringValue(
+                                                (*job).into(),
+                                            )),
+                                        }),
+                                        ..Default::default()
+                                    }],
+                                    time_unix_nano: 1_700_000_000_000_000_000
+                                        + offset * 1_000_000_000,
+                                    value: Some(number_data_point::Value::AsDouble(*value)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
     }
 
     /// The export of `spans`, one resource per span, each span carrying
@@ -399,6 +484,22 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = post_to(&app, "/v1/traces", "text/plain", None, b"x".to_vec()).await;
         assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn accepts_metrics_in_both_encodings() {
+        let app = router(crate::testing::state().await);
+        let metrics = crate::otlp::testing::export_gauges("api", "up", &[("a", 0, 1.0)]);
+        let json = serde_json::to_vec(&metrics).unwrap();
+        let (status, body) = post_to(&app, "/v1/metrics", JSON, Some("prod"), json).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(body, b"{}");
+        let (status, body) =
+            post_to(&app, "/v1/metrics", PROTOBUF, None, metrics.encode_to_vec()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ExportMetricsServiceResponse::decode(body.as_slice()).is_ok());
+        let (status, _) = post_to(&app, "/v1/metrics", JSON, None, b"{".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
