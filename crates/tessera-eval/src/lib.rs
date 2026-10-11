@@ -9,6 +9,7 @@
 
 pub mod evaluate;
 pub mod group;
+pub mod incremental;
 pub mod lifecycle;
 pub mod mode;
 pub mod notify;
@@ -18,6 +19,7 @@ pub mod state;
 
 pub use evaluate::{EvalError, observe};
 pub use group::{Delivered, Delivery, Evaluated, RuleGroup};
+pub use incremental::{Firing, Shape, shape_of};
 pub use lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
 pub use mode::{Mode, mode_of};
 pub use notify::{HttpNotifier, MemoryNotifier, Notification, Notifier, payloads};

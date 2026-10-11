@@ -12,12 +12,15 @@ tessera-catalog.workspace = true
 tessera-commit.workspace = true
 tessera-exec.workspace = true
 tessera-ir.workspace = true
+tessera-kernels.workspace = true
 tessera-logql.workspace = true
+tessera-manifest.workspace = true
 tessera-object.workspace = true
 tessera-opt.workspace = true
 tessera-promql.workspace = true
 tessera-sql.workspace = true
 tessera-types.workspace = true
+tessera-wal.workspace = true
 
 arrow = { version = "60", default-features = false }
 futures = "0.3"
@@ -30,8 +33,6 @@ ureq = { version = "3", default-features = false }
 
 [dev-dependencies]
 tessera-format.workspace = true
-tessera-manifest.workspace = true
-tessera-wal.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

@@ -17,6 +17,7 @@ use tessera_commit::{Action, ApplyError, CommitLog, KvMutation, State};
 use tessera_object::{ObjectStore, layout};
 use tessera_types::{Env, Seq, TenantId, Timestamp};
 
+use crate::incremental::WindowState;
 use crate::lifecycle::{Instance, Transition};
 
 /// The folded state of a rule group partition.
@@ -31,12 +32,20 @@ pub struct EvalState {
     pub outbox: BTreeMap<String, Transition>,
     /// When each rule was last evaluated.
     pub evaluated: BTreeMap<String, Timestamp>,
+    /// The newest observed time seen per writer (section 11.5).
+    #[serde(default)]
+    pub watermarks: BTreeMap<String, Timestamp>,
+    /// The windows of the incremental rules, by `rule/start/fingerprint`.
+    #[serde(default)]
+    pub windows: BTreeMap<String, WindowState>,
 }
 
 const INSTANCE: &str = "instance/";
 const POSITION: &str = "position/";
 const OUTBOX: &str = "outbox/";
 const EVALUATED: &str = "evaluated/";
+const WATERMARK: &str = "watermark/";
+const WINDOW: &str = "window/";
 
 impl EvalState {
     /// Records an instance.
@@ -73,6 +82,24 @@ impl EvalState {
     #[must_use]
     pub fn put_evaluated(rule: &str, at: Timestamp) -> Action {
         put(format!("{EVALUATED}{rule}"), &at)
+    }
+
+    /// Records the newest observed time of a writer.
+    #[must_use]
+    pub fn put_watermark(writer: &str, at: Timestamp) -> Action {
+        put(format!("{WATERMARK}{writer}"), &at)
+    }
+
+    /// Records a window.
+    #[must_use]
+    pub fn put_window(window: &WindowState) -> Action {
+        put(format!("{WINDOW}{}", window.key()), window)
+    }
+
+    /// Forgets a window.
+    #[must_use]
+    pub fn delete_window(key: &str) -> Action {
+        delete(format!("{WINDOW}{key}"))
     }
 
     /// The outbox in transition order.
@@ -122,6 +149,10 @@ impl State for EvalState {
                     self.outbox.insert(rest.to_owned(), decode(key, value)?);
                 } else if let Some(rest) = key.strip_prefix(EVALUATED) {
                     self.evaluated.insert(rest.to_owned(), decode(key, value)?);
+                } else if let Some(rest) = key.strip_prefix(WATERMARK) {
+                    self.watermarks.insert(rest.to_owned(), decode(key, value)?);
+                } else if let Some(rest) = key.strip_prefix(WINDOW) {
+                    self.windows.insert(rest.to_owned(), decode(key, value)?);
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }
@@ -135,6 +166,10 @@ impl State for EvalState {
                     self.outbox.remove(rest);
                 } else if let Some(rest) = key.strip_prefix(EVALUATED) {
                     self.evaluated.remove(rest);
+                } else if let Some(rest) = key.strip_prefix(WATERMARK) {
+                    self.watermarks.remove(rest);
+                } else if let Some(rest) = key.strip_prefix(WINDOW) {
+                    self.windows.remove(rest);
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }

@@ -70,7 +70,7 @@ pub async fn execute(
                 .ok_or_else(|| ApiError::bad_request(format!("unknown alert {name}")))?;
             let rule: AlertRule = serde_json::from_value(document)
                 .map_err(|e| ApiError::bad_request(format!("alert {name} does not decode: {e}")))?;
-            Ok(mode_of(&rule).to_string())
+            Ok(mode_of(&rule, tenant).to_string())
         }
         ControlStatement::Insert { table, rows } => {
             insert(&control, writable(&table)?, &rows).await

@@ -16,9 +16,10 @@ use tessera_commit::{Action, ApplyError, KvMutation, UpdateError};
 use tessera_exec::Engine;
 use tessera_object::ObjectStore;
 use tessera_types::event::Scalar;
-use tessera_types::{Attributes, DatasetName, Env, EventBatch, EventRow, TenantId, Timestamp};
+use tessera_types::{Attributes, DatasetName, Env, EventBatch, EventRow, Seq, TenantId, Timestamp};
 
 use crate::evaluate::{EvalError, instance_labels, observe};
+use crate::incremental;
 use crate::lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
 use crate::notify::{Notification, Notifier};
 use crate::rule::{Acknowledgment, AlertRule, NotificationRoute, Silence};
@@ -30,6 +31,7 @@ pub struct RuleGroup {
     tenant: TenantId,
     name: String,
     rules: Vec<AlertRule>,
+    store: Arc<dyn ObjectStore>,
     log: StateLog,
 }
 
@@ -54,11 +56,12 @@ impl RuleGroup {
         env: Env,
     ) -> Self {
         let name = name.into();
-        let log = crate::state::open(store, &tenant, &name, 0, env);
+        let log = crate::state::open(Arc::clone(&store), &tenant, &name, 0, env);
         RuleGroup {
             tenant,
             name,
             rules,
+            store,
             log,
         }
     }
@@ -104,8 +107,11 @@ impl RuleGroup {
     }
 
     /// Evaluates every rule that is due at `now` and commits what
-    /// changed. A rule that fails is logged, counted as evaluated so
-    /// that its interval holds, and leaves its instances as they were.
+    /// changed. Rules in the incremental subset read their new segments
+    /// every time (CQ-1); the others run through the engine at their
+    /// interval (CQ-8). A rule that fails is logged, counted as
+    /// evaluated so that its interval holds, and leaves its instances
+    /// as they were.
     ///
     /// # Errors
     ///
@@ -116,23 +122,40 @@ impl RuleGroup {
             .snapshot()
             .await
             .map_err(|e| EvalError::State(e.to_string()))?;
-        let mut observed: Vec<(&AlertRule, Option<Vec<Observation>>)> = Vec::new();
+        let mut observed: Vec<Observed<'_>> = Vec::new();
         for rule in &self.rules {
-            let due = snapshot
-                .state()
-                .evaluated
-                .get(&rule.name)
-                .is_none_or(|at| now.duration_since(*at).is_some_and(|d| d >= rule.every()));
+            let incremental = incremental::shape_of(rule, &self.tenant).ok();
+            let due =
+                incremental.is_some()
+                    || snapshot.state().evaluated.get(&rule.name).is_none_or(|at| {
+                        now.duration_since(*at).is_some_and(|d| d >= rule.every())
+                    });
             if !due {
                 continue;
             }
-            match observe(engine, &self.tenant, rule, now).await {
-                Ok(observations) => observed.push((rule, Some(observations))),
+            let outcome = match &incremental {
+                Some(shape) => {
+                    self.observe_incrementally(rule, shape, snapshot.state(), now)
+                        .await
+                }
+                None => observe(engine, &self.tenant, rule, now)
+                    .await
+                    .map(|observations| (observations, Vec::new()))
+                    .map_err(|e| e.to_string()),
+            };
+            let (observations, extra) = match outcome {
+                Ok(found) => (Some(found.0), found.1),
                 Err(error) => {
                     tracing::warn!(tenant = %self.tenant, group = %self.name, rule = %rule.name, error = %error, "rule evaluation failed");
-                    observed.push((rule, None));
+                    (None, Vec::new())
                 }
-            }
+            };
+            observed.push(Observed {
+                rule,
+                observations,
+                extra,
+                positions_before: snapshot.state().positions.clone(),
+            });
         }
         if observed.is_empty() {
             return Ok(Evaluated::default());
@@ -147,11 +170,37 @@ impl RuleGroup {
             .await
             .map_err(|e: UpdateError<ApplyError>| EvalError::State(e.to_string()))?;
         Ok(Evaluated {
-            rules: observed.iter().map(|(r, _)| r.name.clone()).collect(),
+            rules: observed.iter().map(|o| o.rule.name.clone()).collect(),
             transitions: transitions
                 .into_inner()
                 .unwrap_or_else(PoisonError::into_inner),
         })
+    }
+
+    /// The incremental path (CQ-1): read the new segments into the
+    /// windows, then read the windows; the actions that record the
+    /// read come back with the observations.
+    async fn observe_incrementally(
+        &self,
+        rule: &AlertRule,
+        shape: &incremental::Shape,
+        state: &EvalState,
+        now: Timestamp,
+    ) -> Result<(Vec<Observation>, Vec<Action>), String> {
+        let ingested =
+            incremental::ingest(&self.store, &self.tenant, rule, shape, state, now).await?;
+        if ingested.late_rows > 0 {
+            tracing::info!(tenant = %self.tenant, rule = %rule.name, late_rows = ingested.late_rows, "late rows ignored");
+        }
+        let writers: Vec<String> = ingested.watermarks.keys().cloned().collect();
+        let mut after = state.clone();
+        after.positions.clone_from(&ingested.positions);
+        after.watermarks.clone_from(&ingested.watermarks);
+        after.windows.extend(ingested.windows.clone());
+        let horizon = incremental::watermark(&after, &writers, now);
+        let observations = incremental::observe(rule, shape, &after.windows, horizon)?;
+        let actions = incremental::actions(rule, shape, &ingested, state, horizon);
+        Ok((observations, actions))
     }
 
     /// Delivers the outbox (CQ-15). Every pending transition is written
@@ -412,18 +461,41 @@ fn applies(state: &EvalState, action: &Action) -> bool {
     }
 }
 
+/// What one rule's evaluation observed, with what recording it needs.
+struct Observed<'a> {
+    rule: &'a AlertRule,
+    observations: Option<Vec<Observation>>,
+    /// Actions of the incremental path: positions, watermarks, windows.
+    extra: Vec<Action>,
+    /// The writer positions the evaluation started from; a state that
+    /// moved past them belongs to another owner (AR-6) and the
+    /// evaluation is dropped rather than counted twice.
+    positions_before: BTreeMap<String, Seq>,
+}
+
 /// The actions that bring `state` up to date with what was observed,
 /// and the transitions they record. Pure, so that the commit log can
 /// run it again on a newer state after a lost race.
 fn decide(
     state: &EvalState,
-    observed: &[(&AlertRule, Option<Vec<Observation>>)],
+    observed: &[Observed<'_>],
     now: Timestamp,
 ) -> (Vec<Action>, Vec<Transition>) {
     let mut actions = Vec::new();
     let mut transitions = Vec::new();
-    for (rule, observations) in observed {
+    for Observed {
+        rule,
+        observations,
+        extra,
+        positions_before,
+    } in observed
+    {
+        if !extra.is_empty() && state.positions != *positions_before {
+            tracing::warn!(rule = %rule.name, "another owner moved the positions; evaluation dropped");
+            continue;
+        }
         actions.push(EvalState::put_evaluated(&rule.name, now));
+        actions.extend(extra.iter().cloned());
         let Some(observations) = observations else {
             continue;
         };

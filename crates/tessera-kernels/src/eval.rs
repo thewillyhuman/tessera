@@ -474,7 +474,7 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
         .map(|a| value(a, batch))
         .collect::<Result<Vec<_>, _>>()?;
     match (name, values.as_slice()) {
-        ("time_bucket", [interval, timestamps]) => {
+        ("time_bucket", [interval, timestamps]) | ("tumble", [timestamps, interval]) => {
             let interval = interval
                 .array()
                 .as_any()
@@ -482,14 +482,14 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
                 .filter(|a| a.len() == 1 && !a.is_null(0))
                 .map(|a| a.value(0))
                 .ok_or_else(|| {
-                    KernelError::Unsupported("time_bucket needs a constant interval".into())
+                    KernelError::Unsupported(format!("{name} needs a constant interval"))
                 })?;
             let timestamps = timestamps.cast(&DataType::Timestamp(TimeUnit::Nanosecond, None))?;
             let array = timestamps
                 .array()
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| KernelError::Unsupported("time_bucket needs timestamps".into()))?;
+                .ok_or_else(|| KernelError::Unsupported(format!("{name} needs timestamps")))?;
             Ok(timestamps.with_array(time::time_bucket(interval, array)?))
         }
         ("prometheus_name", [name, unit, metric_type, monotonic]) => {

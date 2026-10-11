@@ -2525,6 +2525,7 @@ dependencies = [
  "tessera-exec",
  "tessera-format",
  "tessera-ir",
+ "tessera-kernels",
  "tessera-logql",
  "tessera-manifest",
  "tessera-object",

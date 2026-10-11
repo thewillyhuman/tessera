@@ -109,6 +109,16 @@ fn time_bucket(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+/// `tumble(timestamp, interval)`: the start of the tumbling window a
+/// time falls in (section 9.5), `time_bucket` with its arguments in
+/// the order windows are written.
+fn tumble(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [t, DataType::Duration(_)] if *t == timestamp() => Some(timestamp()),
+        _ => None,
+    }
+}
+
 fn now(args: &[DataType]) -> Option<DataType> {
     args.is_empty().then(timestamp)
 }
@@ -163,6 +173,10 @@ const SCALARS: &[ScalarFunction] = &[
     ScalarFunction {
         name: "time_bucket",
         return_type: time_bucket,
+    },
+    ScalarFunction {
+        name: "tumble",
+        return_type: tumble,
     },
     ScalarFunction {
         name: "prometheus_name",
