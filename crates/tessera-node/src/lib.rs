@@ -219,6 +219,7 @@ impl Node {
             format: Arc::clone(&shared.format),
             engine: Arc::clone(&engine),
             env: shared.env.clone(),
+            controls: Arc::clone(&controls),
             cluster: Some(Arc::new(Cluster {
                 membership: Arc::clone(&shared.membership),
                 remote,

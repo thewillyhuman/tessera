@@ -117,10 +117,12 @@ impl PgServer {
                     stream::iter(rows),
                 )))
             }
-            tessera_exec::Response::Control(_) => Err(user_error(
-                "0A000",
-                "control statements are not carried out over this protocol yet".into(),
-            )),
+            tessera_exec::Response::Control(statement) => {
+                let message = crate::control::execute(&self.state, &ctx.tenant, statement)
+                    .await
+                    .map_err(|e| user_error("42000", e.message().to_owned()))?;
+                Ok(Response::Execution(Tag::new(&message)))
+            }
         }
     }
 

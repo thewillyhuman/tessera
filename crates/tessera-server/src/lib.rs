@@ -12,6 +12,7 @@
 //! rule about tenants or data lives here.
 
 pub mod admin;
+mod control;
 pub mod encode;
 mod error;
 pub mod internal;
@@ -26,7 +27,7 @@ pub mod tempo;
 use std::sync::Arc;
 
 use axum::Router;
-use tessera_catalog::Catalog;
+use tessera_catalog::{Catalog, ControlStores};
 use tessera_cluster::{Admission, Membership, QueryPermit, Role};
 use tessera_exec::Engine;
 use tessera_format::FileFormat;
@@ -65,6 +66,8 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     /// The node's environment.
     pub env: Env,
+    /// The tenants' control stores (section 12.3).
+    pub controls: Arc<ControlStores>,
     /// The cluster, when the node is in one; alone, nothing is forwarded
     /// and nothing is limited.
     pub cluster: Option<Arc<Cluster>>,
@@ -174,7 +177,7 @@ impl AppState {
             Arc::new(ParquetFormat::default()),
         );
         let (ingest, _task) = tessera_ingest::spawn(ingester, Duration::from_millis(1));
-        let pools = Arc::new(Pools::new(pool, Arc::new(store)));
+        let pools = Arc::new(Pools::new(pool, Arc::new(store.clone())));
         let engine = Engine::new(
             Arc::clone(&pools),
             Arc::new(ParquetFormat::default()),
@@ -188,6 +191,7 @@ impl AppState {
             pools,
             format: Arc::new(ParquetFormat::default()),
             engine: Arc::new(engine),
+            controls: Arc::new(ControlStores::new(Arc::new(store), env.clone())),
             env,
             cluster: None,
         }

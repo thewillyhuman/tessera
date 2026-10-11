@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tessera_catalog::{Row, Table};
+use tessera_ir::AlertDefinition;
 use tessera_types::Timestamp;
 
 /// The language of a rule's expression (CQ-3).
@@ -131,6 +132,25 @@ impl AlertRule {
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             notify: Vec::new(),
+        }
+    }
+
+    /// The rule `CREATE ALERT` defines (section 11.2): SQL, with the
+    /// statement's options and the defaults for the rest.
+    #[must_use]
+    pub fn from_definition(definition: &AlertDefinition) -> Self {
+        AlertRule {
+            name: definition.name.clone(),
+            group: default_group(),
+            language: Language::Sql,
+            expr: definition.query.clone(),
+            dataset: definition.dataset.to_string(),
+            every_seconds: definition.every.map_or_else(default_every, |d| d.as_secs()),
+            for_seconds: definition.hold.map_or(0, |d| d.as_secs()),
+            severity: definition.severity.clone().unwrap_or_else(default_severity),
+            labels: definition.labels.iter().cloned().collect(),
+            annotations: definition.annotations.iter().cloned().collect(),
+            notify: definition.notify.clone(),
         }
     }
 

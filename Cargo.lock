@@ -2727,6 +2727,7 @@ dependencies = [
  "snap",
  "tessera-catalog",
  "tessera-cluster",
+ "tessera-eval",
  "tessera-exec",
  "tessera-format",
  "tessera-ingest",

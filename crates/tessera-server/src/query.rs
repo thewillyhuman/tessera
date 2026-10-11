@@ -114,10 +114,15 @@ async fn run_native(
         Response::Explain { plan, analysis } => QueryResponse::Explain {
             explain: explain_text(&plan, analysis.as_ref()),
         },
-        Response::Control(_) => {
-            return Err(ApiError::bad_request(
-                "control statements are not carried out over this API yet",
-            ));
+        Response::Control(statement) => {
+            let message = crate::control::execute(state, &ctx.tenant, statement).await?;
+            QueryResponse::Rows {
+                columns: vec![ColumnJson {
+                    name: "result".into(),
+                    r#type: "text".into(),
+                }],
+                rows: vec![vec![serde_json::Value::String(message)]],
+            }
         }
     }))
 }
