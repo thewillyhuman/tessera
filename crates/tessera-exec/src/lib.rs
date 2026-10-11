@@ -16,6 +16,7 @@ pub mod engine;
 pub mod memory;
 pub mod operator;
 pub mod pipeline;
+pub mod promql;
 pub mod query;
 pub mod scan;
 pub mod scheduler;

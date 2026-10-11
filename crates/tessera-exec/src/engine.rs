@@ -23,6 +23,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
 use tessera_ir::{Expr, Literal, Plan, PlanError, Registry};
+use tessera_kernels::promql::Params;
 use tessera_manifest::ManifestError;
 use tessera_object::{PoolError, Pools};
 use tessera_types::event::TRACE_ID;
@@ -36,6 +37,7 @@ use crate::operator::{
     Sort, Steps, TopK, TraceGroup,
 };
 use crate::pipeline::Pipeline;
+use crate::promql;
 use crate::scan::{self, ScanAnalysis};
 use crate::scheduler::{CpuPool, TaskError};
 
@@ -213,6 +215,29 @@ impl Engine {
                     let batches = self.execute(&spans, memory, analysis).await?;
                     let operator = Box::new(TraceGroup::new(spanset.clone(), Arc::clone(memory)));
                     self.pipe(operator, batches).await
+                }
+                Plan::PromQL {
+                    inputs,
+                    expr,
+                    start,
+                    end,
+                    step,
+                } => {
+                    let mut series = Vec::with_capacity(inputs.len());
+                    for input in inputs {
+                        let batches = self.execute(input, memory, analysis).await?;
+                        series.push(promql::series_of(&batches)?);
+                    }
+                    let params = Params {
+                        start: start.as_nanos(),
+                        end: end.as_nanos(),
+                        step: i64::try_from(step.as_nanos()).unwrap_or(i64::MAX),
+                    };
+                    let expr = expr.clone();
+                    let task = self
+                        .cpu
+                        .spawn(move || promql::evaluate(&expr, &series, params));
+                    Ok(vec![task.await??])
                 }
                 other => {
                     let input = other.inputs()[0];
