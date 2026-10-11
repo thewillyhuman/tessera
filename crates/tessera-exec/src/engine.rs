@@ -12,9 +12,9 @@
 //! stages and exchanges are introduced.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch,
@@ -22,12 +22,12 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
-use tessera_ir::{Expr, Literal, Plan, PlanError, Registry};
+use tessera_ir::{BinaryOp, Expr, Literal, Plan, PlanError, Registry};
 use tessera_kernels::promql::Params;
-use tessera_manifest::{ManifestError, Manifests};
+use tessera_manifest::{DatasetLogs, ManifestError, Manifests};
 use tessera_object::{PoolError, Pools};
-use tessera_types::event::TRACE_ID;
-use tessera_types::{Env, Window};
+use tessera_types::event::{OBSERVED_TIMESTAMP, TRACE_ID};
+use tessera_types::{DatasetName, Env, Kind, TenantId, Window};
 
 use crate::ExecError;
 use crate::batch::Batch;
@@ -64,6 +64,9 @@ pub enum EngineError {
     /// A manifest, registry or segment could not be read.
     #[error("{0}")]
     Manifest(#[from] ManifestError),
+    /// The dataset log could not be read.
+    #[error("{0}")]
+    Dataset(#[from] tessera_manifest::DatasetLogError),
     /// A file could not be read.
     #[error("{0}")]
     Format(#[from] FormatError),
@@ -127,6 +130,14 @@ impl Default for QueryLimits {
     }
 }
 
+/// How long a table's tombstones are kept before they are read again.
+const TOMBSTONE_TTL: Duration = Duration::from_secs(1);
+
+/// A table: the tenant, the dataset and the kind.
+type TableKey = (TenantId, DatasetName, Kind);
+/// A table's tombstone filters and when they were read.
+type KeptFilters = (Instant, Arc<Vec<Expr>>);
+
 /// The engine of one node.
 pub struct Engine {
     pub(crate) pools: Arc<Pools>,
@@ -140,6 +151,10 @@ pub struct Engine {
     rollups: Option<Arc<dyn RollupSource>>,
     /// The manifests this node has opened (section 10.8).
     pub(crate) manifests: Manifests,
+    /// The dataset logs, for tombstones (SE-5).
+    datasets: DatasetLogs,
+    /// The tombstones read in the last second, per table.
+    tombstones: Mutex<HashMap<TableKey, KeptFilters>>,
     /// Results of closed-range queries (section 10.8).
     results: ResultCache,
     limits: QueryLimits,
@@ -160,9 +175,10 @@ impl Engine {
     ) -> Self {
         let manifests = Manifests::new(
             Arc::clone(pools.root().store()),
-            env,
+            env.clone(),
             tessera_manifest::manifests::DEFAULT_CAPACITY,
         );
+        let datasets = DatasetLogs::new(Arc::clone(pools.root().store()), env);
         Engine {
             pools,
             format,
@@ -172,6 +188,8 @@ impl Engine {
             system_tables: None,
             rollups: None,
             manifests,
+            datasets,
+            tombstones: Mutex::new(HashMap::new()),
             results: ResultCache::new(cache::DEFAULT_BYTES),
             limits,
             registry: Registry::builtin(),
@@ -196,6 +214,60 @@ impl Engine {
     #[must_use]
     pub fn rollups(&self) -> Option<&Arc<dyn RollupSource>> {
         self.rollups.as_ref()
+    }
+
+    /// The conjuncts that hide the deleted rows of a table (SE-5): for
+    /// each tombstone, not (its predicate and observed before it). Read
+    /// from the dataset log at most once a second per table.
+    ///
+    /// # Errors
+    ///
+    /// If the dataset log cannot be read: deleted rows are never served
+    /// for want of knowing about them.
+    pub async fn tombstone_filters(
+        &self,
+        tenant: &TenantId,
+        dataset: &DatasetName,
+        kind: Kind,
+    ) -> Result<Arc<Vec<Expr>>, EngineError> {
+        let key = (tenant.clone(), dataset.clone(), kind);
+        {
+            let cached = self
+                .tombstones
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some((at, filters)) = cached.get(&key) {
+                if at.elapsed() < TOMBSTONE_TTL {
+                    return Ok(Arc::clone(filters));
+                }
+            }
+        }
+        let log = self.datasets.open(tenant, dataset);
+        let filters: Vec<Expr> = log
+            .tombstones(kind)
+            .await?
+            .into_iter()
+            .map(|t| {
+                let predicate: Expr = serde_json::from_value(t.predicate).map_err(|source| {
+                    EngineError::Dataset(tessera_manifest::DatasetLogError::Corrupt {
+                        key: format!("tombstone {}", t.id),
+                        source,
+                    })
+                })?;
+                Ok(Expr::Not(Box::new(
+                    predicate.and(
+                        Expr::column(OBSERVED_TIMESTAMP)
+                            .binary(BinaryOp::LtEq, Expr::literal(t.created_at)),
+                    ),
+                )))
+            })
+            .collect::<Result<_, EngineError>>()?;
+        let filters = Arc::new(filters);
+        self.tombstones
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, (Instant::now(), Arc::clone(&filters)));
+        Ok(filters)
     }
 
     /// The engine keeping at most `bytes` of closed-range results.

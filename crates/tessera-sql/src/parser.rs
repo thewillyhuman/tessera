@@ -499,8 +499,22 @@ impl Parser<'_> {
     fn delete(&mut self) -> Result<Statement, Diagnostic> {
         self.expect_keyword("from")?;
         let table = self.table_ref()?;
-        let filter = self.equalities()?;
-        Ok(Statement::Delete { table, filter })
+        let (filter, filter_text) = if self.eat_keyword("where") {
+            let start = self.span_here().start;
+            let filter = self.expr()?;
+            let end = self
+                .tokens
+                .get(self.at.saturating_sub(1))
+                .map_or(start, |t| t.span.end);
+            (Some(filter), self.text[start..end].to_owned())
+        } else {
+            (None, String::new())
+        };
+        Ok(Statement::Delete {
+            table,
+            filter,
+            filter_text,
+        })
     }
 
     /// `column = value`, where the value is a literal, so `AND` ends it.
@@ -1133,7 +1147,17 @@ mod tests {
         let Statement::Delete { filter, .. } = parse("DELETE FROM system.silences").unwrap() else {
             panic!("not a delete");
         };
-        assert!(filter.is_empty());
+        assert!(filter.is_none());
+        let Statement::Delete {
+            filter,
+            filter_text,
+            ..
+        } = parse("DELETE FROM logs WHERE attr.user = 'u1' AND severity_number < 9").unwrap()
+        else {
+            panic!("not a delete");
+        };
+        assert!(filter.is_some());
+        assert_eq!(filter_text, "attr.user = 'u1' AND severity_number < 9");
     }
 
     #[test]

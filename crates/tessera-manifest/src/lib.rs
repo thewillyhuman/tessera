@@ -15,7 +15,9 @@ pub mod manifests;
 pub mod registry;
 pub mod view;
 
-pub use dataset::{Advice, Alternative, DatasetLog, DatasetLogError, DatasetLogs, LayoutRecord};
+pub use dataset::{
+    Advice, Alternative, DatasetLog, DatasetLogError, DatasetLogs, LayoutRecord, Tombstone,
+};
 pub use manifest::{Manifest, ManifestError, ManifestState, list_partitions};
 pub use manifests::Manifests;
 pub use registry::Registration;

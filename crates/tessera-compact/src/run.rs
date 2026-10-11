@@ -14,14 +14,14 @@ use arrow::array::{
 use arrow::compute::{concat_batches, filter_record_batch};
 use tessera_format::FileFormat;
 use tessera_format::layout::SERVICE;
-use tessera_manifest::{LayoutRecord, Manifest};
+use tessera_manifest::{LayoutRecord, Manifest, Tombstone};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::event::{EVENT_ID, NAME, PATTERN_ID};
 use tessera_types::{Env, FileId, FileMeta, FileSource, Kind, Level, Meter, PartitionId, Stored};
 
 use crate::plan::Job;
 use crate::retention::{self, Retain};
-use crate::{CompactError, patterns, promote};
+use crate::{CompactError, patterns, promote, tombstones};
 
 /// Runs compaction jobs against the pools.
 pub struct Compactor {
@@ -162,6 +162,7 @@ impl Compactor {
         job: &Job,
         record: &LayoutRecord,
         retain: Option<&Retain>,
+        tombstones: &[Tombstone],
     ) -> Result<Outcome, CompactError> {
         let mut batches = Vec::new();
         for input in &job.inputs {
@@ -178,8 +179,18 @@ impl Compactor {
         let format = Arc::clone(&self.format);
         let partition = job.partition.clone();
         let retain = retain.filter(|_| job.level == Level::L3).cloned();
+        let tombstones = tombstones.to_vec();
         let (written, duplicates, stored) = tokio::task::spawn_blocking(move || {
             let (rows, duplicates) = deduplicate(&batches)?;
+            let rows = if tombstones.is_empty() {
+                rows
+            } else {
+                let (rows, removed) = tombstones::remove_deleted(&rows, &tombstones)?;
+                if removed > 0 {
+                    tracing::info!(partition = %partition, removed, "deleted rows removed");
+                }
+                rows
+            };
             let rows = match &retain {
                 Some(retain) => {
                     let (rows, applied) = retention::apply(&rows, partition.kind, retain)?;

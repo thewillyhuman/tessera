@@ -184,6 +184,7 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
             &job,
             &LayoutRecord::default_for(job.partition.kind),
             None,
+            &[],
         )
         .await
         .unwrap();
@@ -271,6 +272,7 @@ async fn a_superseded_job_leaves_the_manifest_alone() {
                 &job,
                 &LayoutRecord::default_for(job.partition.kind),
                 None,
+                &[],
             )
             .await
             .unwrap(),
@@ -284,6 +286,7 @@ async fn a_superseded_job_leaves_the_manifest_alone() {
                 &job,
                 &LayoutRecord::default_for(job.partition.kind),
                 None,
+                &[],
             )
             .await
             .unwrap(),
@@ -317,6 +320,7 @@ async fn removed_files_are_deleted_after_the_retention_window() {
         &job,
         &LayoutRecord::default_for(job.partition.kind),
         None,
+        &[],
     )
     .await
     .unwrap();

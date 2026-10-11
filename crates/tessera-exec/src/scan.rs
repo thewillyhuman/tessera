@@ -101,6 +101,7 @@ pub(crate) async fn run(
     analysis: &mut ScanAnalysis,
 ) -> Result<Vec<RecordBatch>, EngineError> {
     analysis.source = format!("{}/{}", scan.dataset, scan.kind);
+    let scan = &without_deleted(engine, scan).await?;
     let schema = scan.schema()?;
     let found = view::sources(
         &engine.manifests,
@@ -174,6 +175,21 @@ pub(crate) async fn run(
     let from_files = read_files(engine, scan, local, &output, analysis).await?;
     output.extend(from_files);
     Ok(output)
+}
+
+/// `scan` with the conjuncts that hide its table's deleted rows (SE-5),
+/// so that the tail, the files read here and the files read by peers
+/// all leave them out.
+async fn without_deleted(engine: &Engine, scan: &Scan) -> Result<Scan, EngineError> {
+    let filters = engine
+        .tombstone_filters(&scan.tenant, &scan.dataset, scan.kind)
+        .await?;
+    if filters.is_empty() {
+        return Ok(scan.clone());
+    }
+    let mut hidden = scan.clone();
+    hidden.predicates.extend(filters.iter().cloned());
+    Ok(hidden)
 }
 
 /// The scan's predicates with its time range as conjuncts: rows outside

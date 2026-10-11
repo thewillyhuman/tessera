@@ -75,8 +75,10 @@ pub enum Statement {
     Delete {
         /// The table.
         table: TableRef,
-        /// The equalities of `WHERE`, joined by `AND`.
-        filter: Vec<(String, Expr)>,
+        /// The `WHERE` condition, if any.
+        filter: Option<Expr>,
+        /// The condition as written.
+        filter_text: String,
     },
 }
 

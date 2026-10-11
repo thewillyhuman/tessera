@@ -116,12 +116,87 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
                 filter: literals(filter, ctx)?,
             }))
         }
-        ast::Statement::Delete { table, filter } => {
-            Ok(Statement::Control(ControlStatement::Delete {
-                table: control_table(table)?,
-                filter: literals(filter, ctx)?,
-            }))
+        ast::Statement::Delete {
+            table,
+            filter,
+            filter_text,
+        } => lower_delete(table, filter.as_ref(), filter_text, ctx, &registry),
+    }
+}
+
+/// `DELETE`: on a system table, the equalities of `WHERE`; on a
+/// dataset's table, a tombstone over the kind's rows (SE-5), which
+/// needs a `WHERE`.
+fn lower_delete(
+    table: &ast::TableRef,
+    filter: Option<&ast::Expr>,
+    filter_text: &str,
+    ctx: &BindContext,
+    registry: &Registry,
+) -> Result<Statement, Diagnostic> {
+    if table.dataset.as_deref() == Some("system") {
+        let pairs = match filter {
+            Some(filter) => equalities_of(filter)?,
+            None => Vec::new(),
+        };
+        return Ok(Statement::Control(ControlStatement::Delete {
+            table: table.table.clone(),
+            filter: literals(&pairs, ctx)?,
+        }));
+    }
+    let Some(filter) = filter else {
+        return Err(Diagnostic::at(
+            table.span,
+            "DELETE on a dataset needs a WHERE; to remove everything, drop the dataset",
+        ));
+    };
+    let (dataset, kind) = resolve_table(table, ctx)?;
+    let lowerer = Lowerer {
+        ctx,
+        registry,
+        scope: Scope {
+            schema: event::schema(kind),
+            table: Some(table.table.clone()),
+            kind: Some(kind),
+        },
+        substitution: None,
+    };
+    let predicate = lowerer.expr(filter)?;
+    Ok(Statement::Control(ControlStatement::DeleteRows {
+        dataset,
+        kind,
+        predicate,
+        text: filter_text.to_owned(),
+    }))
+}
+
+/// `column = literal [AND ...]`, the only condition a system table takes.
+fn equalities_of(filter: &ast::Expr) -> Result<Vec<(String, ast::Expr)>, Diagnostic> {
+    match &filter.kind {
+        ast::ExprKind::Binary {
+            op: ast::BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut pairs = equalities_of(left)?;
+            pairs.extend(equalities_of(right)?);
+            Ok(pairs)
         }
+        ast::ExprKind::Binary {
+            op: ast::BinaryOp::Eq,
+            left,
+            right,
+        } => match &left.kind {
+            ast::ExprKind::Name(parts) => Ok(vec![(parts.join("."), (**right).clone())]),
+            _ => Err(Diagnostic::at(
+                left.span,
+                "a system table condition is column = literal",
+            )),
+        },
+        _ => Err(Diagnostic::at(
+            filter.span,
+            "a system table condition is column = literal [AND ...]",
+        )),
     }
 }
 
@@ -1304,10 +1379,23 @@ mod tests {
             ))
         );
         assert!(
-            error("DELETE FROM logs WHERE body = 'x'")
+            error("INSERT INTO logs (body) VALUES ('x')")
                 .message
                 .contains("system tables only")
         );
+        assert!(error("DELETE FROM logs").message.contains("needs a WHERE"));
+        let Statement::Control(ControlStatement::DeleteRows {
+            kind,
+            predicate,
+            text,
+            ..
+        }) = lower(&parse("DELETE FROM logs WHERE body = 'x'").unwrap(), &ctx()).unwrap()
+        else {
+            panic!("not a delete of rows");
+        };
+        assert_eq!(kind, Kind::Log);
+        assert_eq!(text, "body = 'x'");
+        assert_eq!(predicate.to_string(), "(body = 'x')");
         assert!(
             error("INSERT INTO system.silences (id) VALUES (lower('x'))")
                 .message

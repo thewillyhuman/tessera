@@ -9,9 +9,9 @@
 use std::fmt;
 use std::time::Duration;
 
-use tessera_types::{DatasetName, RetentionPolicy, TenantId, Timestamp};
+use tessera_types::{DatasetName, Kind, RetentionPolicy, TenantId, Timestamp};
 
-use crate::expr::Literal;
+use crate::expr::{Expr, Literal};
 use crate::plan::Plan;
 
 /// A byte range in the query text.
@@ -180,6 +180,19 @@ pub enum ControlStatement {
         set: Vec<(String, Literal)>,
         /// The equalities every changed row satisfies; empty for all.
         filter: Vec<(String, Literal)>,
+    },
+    /// `DELETE FROM <table> WHERE predicate` on a dataset's rows (SE-5):
+    /// a tombstone that hides the matching rows at once and has them
+    /// removed by compaction.
+    DeleteRows {
+        /// The dataset.
+        dataset: DatasetName,
+        /// The kind of event the table holds.
+        kind: Kind,
+        /// The predicate, lowered against the kind's schema.
+        predicate: Expr,
+        /// The predicate as written.
+        text: String,
     },
     /// `DELETE FROM system.<table> WHERE column = literal AND ...`.
     Delete {

@@ -4,8 +4,8 @@
 //! (section 9.5, CS-3): `CREATE ALERT`, `DROP ALERT`, `EXPLAIN ALERT`,
 //! `CREATE ROLLUP`, `DROP ROLLUP`, `EXPLAIN LAYOUT`,
 //! `CREATE RETENTION POLICY`, `DROP RETENTION POLICY`,
-//! `EXPLAIN RETENTION` and `INSERT`, `UPDATE` and `DELETE` on the
-//! `system` tables. Each
+//! `EXPLAIN RETENTION`, `INSERT`, `UPDATE` and `DELETE` on the
+//! `system` tables, and `DELETE` on a dataset's table (SE-5). Each
 //! statement is one transaction (CS-1); the typed tables are checked
 //! against their record before anything is stored.
 
@@ -16,8 +16,8 @@ use serde_json::{Map, Value};
 use tessera_catalog::{AccessRole, ApiKey, ControlError, ControlStore, Row, Table, Transaction};
 use tessera_eval::{Acknowledgment, AlertRule, NotificationRoute, Rollup, Silence, mode_of};
 use tessera_ir::{ControlStatement, Literal};
-use tessera_manifest::DatasetLog;
-use tessera_types::{DatasetName, Kind, RetentionPolicy, TenantId};
+use tessera_manifest::{DatasetLog, Tombstone};
+use tessera_types::{DatasetName, Kind, Random, RetentionPolicy, TenantId};
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -112,6 +112,12 @@ pub async fn execute(
         ControlStatement::Delete { table, filter } => {
             delete(&control, writable(&table)?, &filter).await
         }
+        ControlStatement::DeleteRows {
+            dataset,
+            kind,
+            predicate,
+            text,
+        } => delete_rows(state, tenant, &dataset, kind, &predicate, &text).await,
     }
 }
 
@@ -531,6 +537,40 @@ fn json_of(literal: &Literal) -> Value {
     }
 }
 
+/// `DELETE FROM <table> WHERE ...` on a dataset (SE-5): a tombstone in
+/// the dataset log, which hides the matching rows at once and opens a
+/// layout epoch so compaction rewrites the files without them.
+async fn delete_rows(
+    state: &AppState,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    kind: Kind,
+    predicate: &tessera_ir::Expr,
+    text: &str,
+) -> Result<String, ApiError> {
+    let log = DatasetLog::open(
+        Arc::clone(state.pools.root().store()),
+        tenant,
+        dataset,
+        state.env.clone(),
+    );
+    let tombstone = Tombstone {
+        id: format!("{:016x}", state.env.random.clone().next_u64()),
+        predicate: serde_json::to_value(predicate).map_err(|e| internal(&e))?,
+        text: text.to_owned(),
+        created_at: state.env.clock.now(),
+        epoch: 0,
+    };
+    let stored = log
+        .add_tombstone(kind, tombstone)
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))?;
+    Ok(format!(
+        "DELETE {dataset}/{kind} WHERE {text}: tombstone {}, hidden now, removed by compaction",
+        stored.id
+    ))
+}
+
 /// `CREATE ROLLUP`: checked as a rollup, then stored unless the name is
 /// taken.
 async fn create_rollup(
@@ -612,6 +652,56 @@ mod tests {
 
     fn result(value: &Value) -> &str {
         value["rows"][0][0].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_delete_hides_matching_rows_at_once_and_spares_later_ones() {
+        use tessera_types::{EventBatch, LogRow, Timestamp};
+
+        let state = crate::testing::state().await;
+        // Rows carry when they were observed; the delete applies to the
+        // ones observed before it was issued.
+        let logs = |users: &[&str], at: i64, observed: Timestamp| {
+            let rows: Vec<LogRow> = users
+                .iter()
+                .enumerate()
+                .map(|(i, user)| LogRow {
+                    timestamp: Timestamp::from_nanos(
+                        1_700_000_000_000_000_000 + at + i64::try_from(i).unwrap(),
+                    ),
+                    observed_timestamp: observed,
+                    event_id: [u8::try_from(i).unwrap() + u8::try_from(at % 200).unwrap(); 16],
+                    body: Some(format!("by {user}")),
+                    attributes: std::collections::BTreeMap::from([(
+                        "attr.user".to_owned(),
+                        tessera_types::event::Scalar::Text((*user).to_owned()),
+                    )]),
+                    ..LogRow::default()
+                })
+                .collect();
+            EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &rows)
+                .unwrap()
+        };
+        let before = Timestamp::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(1),
+        );
+        state
+            .write(logs(&["u1", "u2", "u1"], 0, before))
+            .await
+            .unwrap();
+        let (status, value) = sql(&state, "DELETE FROM logs WHERE attr.user = 'u1'").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert!(result(&value).contains("tombstone"), "{value}");
+        let (_, count) = sql(&state, "SELECT count(*) FROM logs").await;
+        assert_eq!(count["rows"][0][0], 1.0, "{count}");
+        // Rows of the same user ingested after the delete are not affected.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let after = Timestamp::from_system_time(std::time::SystemTime::now());
+        state.write(logs(&["u1"], 100, after)).await.unwrap();
+        let (_, count) = sql(&state, "SELECT count(*) FROM logs").await;
+        assert_eq!(count["rows"][0][0], 2.0, "{count}");
+        let (status, value) = sql(&state, "DELETE FROM logs").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
     }
 
     #[tokio::test]

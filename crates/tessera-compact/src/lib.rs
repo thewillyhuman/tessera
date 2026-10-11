@@ -21,6 +21,7 @@ pub mod plan;
 pub mod promote;
 pub mod retention;
 pub mod run;
+pub mod tombstones;
 
 use tessera_format::FormatError;
 use tessera_manifest::ManifestError;
@@ -32,6 +33,7 @@ pub use plan::{Job, Policy, input_bytes, plan};
 pub use promote::promote;
 pub use retention::{Applied, Retain};
 pub use run::{Compactor, Outcome, stored_usage};
+pub use tombstones::remove_deleted;
 
 /// Why compaction or collection failed.
 #[derive(Debug, thiserror::Error)]
@@ -60,4 +62,7 @@ pub enum CompactError {
     /// A CPU task did not complete.
     #[error("compaction task failed: {0}")]
     Task(String),
+    /// A tombstone cannot be applied.
+    #[error("tombstone: {0}")]
+    Tombstone(String),
 }

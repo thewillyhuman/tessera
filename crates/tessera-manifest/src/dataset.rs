@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tessera_commit::{Action, CommitError, CommitLog, KvMutation, KvState, UpdateError};
 use tessera_format::{IndexSpec, Layout};
 use tessera_object::{ObjectStore, layout};
-use tessera_types::{DatasetName, Env, Kind, TenantId, Window};
+use tessera_types::{DatasetName, Env, Kind, TenantId, Timestamp, Window};
 
 /// The layout of one kind of event in a dataset, as the dataset log
 /// records it.
@@ -147,6 +147,31 @@ fn advice_key(kind: Kind) -> String {
 
 const WINDOW_KEY: &str = "window_seconds";
 
+fn tombstones_key(kind: Kind) -> String {
+    format!("tombstones/{kind}")
+}
+
+/// A delete by predicate (SE-5): rows of the kind that match the
+/// predicate and were ingested before the delete are hidden from every
+/// read at once, and removed by compaction, which rewrites the files
+/// older than the layout epoch the delete opened. The predicate is the
+/// plan expression as JSON, lowered against the kind's schema.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Tombstone {
+    /// The tombstone's id.
+    pub id: String,
+    /// The predicate over the kind's rows, as the plan expression's JSON.
+    pub predicate: serde_json::Value,
+    /// The predicate as written, for people.
+    pub text: String,
+    /// When the delete was issued; rows observed after it are not
+    /// affected.
+    pub created_at: Timestamp,
+    /// The layout epoch the delete opened: a file of this epoch or a
+    /// later one was written with the tombstone applied.
+    pub epoch: u64,
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(key: &str, text: &str) -> Result<T, DatasetLogError> {
     serde_json::from_str(text).map_err(|source| DatasetLogError::Corrupt {
         key: key.to_owned(),
@@ -223,6 +248,109 @@ impl DatasetLog {
                 source: serde_json::Error::io(std::io::Error::other("layout vanished")),
             })?;
         decode(&key, text)
+    }
+
+    /// The tombstones of `kind` still to be applied everywhere.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be read or the record does not decode.
+    pub async fn tombstones(&self, kind: Kind) -> Result<Vec<Tombstone>, DatasetLogError> {
+        let snapshot = self.log.snapshot().await?;
+        let key = tombstones_key(kind);
+        match snapshot.state().get(&key) {
+            Some(text) => decode(&key, text),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Adds `tombstone` for `kind` and opens the next layout epoch, so
+    /// that every file written before it is rewritten with the tombstone
+    /// applied (AD-10). Returns the tombstone with its epoch.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be committed.
+    pub async fn add_tombstone(
+        &self,
+        kind: Kind,
+        tombstone: Tombstone,
+    ) -> Result<Tombstone, DatasetLogError> {
+        let layout_key = layout_key(kind);
+        let key = tombstones_key(kind);
+        let snapshot = self
+            .log
+            .update(|state| {
+                let layout = match state.get(&layout_key) {
+                    Some(text) => decode::<LayoutRecord>(&layout_key, text)?,
+                    None => LayoutRecord::default_for(kind),
+                };
+                let next = LayoutRecord {
+                    epoch: layout.epoch + 1,
+                    ..layout
+                };
+                let mut tombstones: Vec<Tombstone> = match state.get(&key) {
+                    Some(text) => decode(&key, text)?,
+                    None => Vec::new(),
+                };
+                tombstones.push(Tombstone {
+                    epoch: next.epoch,
+                    ..tombstone.clone()
+                });
+                Ok::<_, DatasetLogError>(vec![
+                    put(layout_key.clone(), &next),
+                    put(key.clone(), &tombstones),
+                ])
+            })
+            .await?;
+        let tombstones: Vec<Tombstone> = match snapshot.state().get(&key) {
+            Some(text) => decode(&key, text)?,
+            None => Vec::new(),
+        };
+        tombstones
+            .into_iter()
+            .find(|t| t.id == tombstone.id)
+            .ok_or_else(|| DatasetLogError::Corrupt {
+                key,
+                source: serde_json::Error::io(std::io::Error::other("tombstone vanished")),
+            })
+    }
+
+    /// Removes the tombstones of `kind` that `done` says are applied
+    /// everywhere; returns how many were removed.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be committed.
+    pub async fn remove_tombstones(
+        &self,
+        kind: Kind,
+        done: impl Fn(&Tombstone) -> bool,
+    ) -> Result<usize, DatasetLogError> {
+        let key = tombstones_key(kind);
+        let removed = std::sync::Mutex::new(0);
+        self.log
+            .update(|state| {
+                let tombstones: Vec<Tombstone> = match state.get(&key) {
+                    Some(text) => decode(&key, text)?,
+                    None => Vec::new(),
+                };
+                let kept: Vec<Tombstone> =
+                    tombstones.iter().filter(|t| !done(t)).cloned().collect();
+                *removed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    tombstones.len() - kept.len();
+                if kept.len() == tombstones.len() {
+                    return Ok::<_, DatasetLogError>(Vec::new());
+                }
+                Ok(vec![put(key.clone(), &kept)])
+            })
+            .await?;
+        let removed = *removed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(removed)
     }
 
     /// The partition window of the dataset (MF-1, AD-14): the one set,
@@ -355,6 +483,54 @@ impl DatasetLogs {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_tombstone_opens_the_next_epoch_and_is_removed_once_done() {
+        use std::sync::Arc;
+
+        use tessera_object::MemoryStore;
+
+        let log = DatasetLog::open(
+            Arc::new(MemoryStore::new()),
+            &TenantId::DEFAULT,
+            &DatasetName::new("prod").unwrap(),
+            Env::simulated(1, Timestamp::from_nanos(0)),
+        );
+        assert_eq!(log.layout(Kind::Log).await.unwrap().epoch, 0);
+        let stored = log
+            .add_tombstone(
+                Kind::Log,
+                Tombstone {
+                    id: "t1".into(),
+                    predicate: serde_json::json!({"Column": "body"}),
+                    text: "body = 'x'".into(),
+                    created_at: Timestamp::from_nanos(5),
+                    epoch: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.epoch, 1, "the delete opened epoch 1");
+        assert_eq!(log.layout(Kind::Log).await.unwrap().epoch, 1);
+        assert_eq!(
+            log.tombstones(Kind::Log).await.unwrap(),
+            vec![stored.clone()]
+        );
+        assert!(log.tombstones(Kind::Span).await.unwrap().is_empty());
+        assert_eq!(
+            log.remove_tombstones(Kind::Log, |t| t.epoch == 0)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            log.remove_tombstones(Kind::Log, |t| t.epoch <= 1)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(log.tombstones(Kind::Log).await.unwrap().is_empty());
+    }
+
     use tessera_object::MemoryStore;
     use tessera_types::Timestamp;
 

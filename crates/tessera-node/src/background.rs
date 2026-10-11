@@ -21,11 +21,13 @@ use tessera_cluster::{Load, Membership};
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan};
 use tessera_format::FileFormat;
-use tessera_manifest::{DatasetLogs, Manifest, Registration, intake, list_partitions, registry};
+use tessera_manifest::{
+    DatasetLog, DatasetLogs, Manifest, Registration, intake, list_partitions, registry,
+};
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
-    DatasetName, Env, Kind, Level, Meter, PoolId, RetentionPolicy, TenantId, Window, WorkKind,
-    WriterId,
+    DatasetName, Env, Kind, Level, Meter, PoolId, RetentionPolicy, TenantId, Timestamp, Window,
+    WorkKind, WriterId,
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
@@ -201,6 +203,7 @@ async fn compact_and_collect(
     let log = background.datasets.open(tenant, dataset);
     let record = log.layout(kind).await?;
     let value_score = log.value_score(kind).await?;
+    let tombstones = log.tombstones(kind).await?;
     let mut partitions = list_partitions(&*background.store, tenant, dataset, kind).await?;
     partitions.sort_by_key(|p| std::cmp::Reverse(p.window.start()));
     for partition in partitions {
@@ -258,7 +261,7 @@ async fn compact_and_collect(
         if let Some(job) = job {
             let inputs = job.inputs.len();
             match compactor
-                .run(&manifest, &job, &record, retain.as_ref())
+                .run(&manifest, &job, &record, retain.as_ref(), &tombstones)
                 .await?
             {
                 Outcome::Replaced {
@@ -279,7 +282,53 @@ async fn compact_and_collect(
             tracing::info!(%tenant, %dataset, %kind, window = %partition.window, collected, "files collected");
         }
     }
+    if !tombstones.is_empty() {
+        let key = format!("{tenant}/{dataset}/{kind}/tombstones");
+        if background.owned.owns(WorkKind::Partition, key.as_bytes()) {
+            let removed = collect_tombstones(background, &log, tenant, dataset, kind, now).await?;
+            if removed > 0 {
+                tracing::info!(%tenant, %dataset, %kind, removed, "tombstones applied everywhere");
+            }
+        }
+    }
     Ok(deferred)
+}
+
+/// How long a tombstone stays after its delete, so that every file
+/// flushed before it has been compacted with it applied (SE-5).
+const TOMBSTONE_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Removes the tombstones of a dataset and kind that every file beyond
+/// L1 was written under, once the retention of SE-5 has passed; the
+/// files are read across every partition, so one node does it.
+async fn collect_tombstones(
+    background: &Background,
+    log: &DatasetLog,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    kind: Kind,
+    now: Timestamp,
+) -> Result<usize, Failure> {
+    let mut oldest_epoch = u64::MAX;
+    for partition in list_partitions(&*background.store, tenant, dataset, kind).await? {
+        let manifest = Manifest::open(
+            Arc::clone(&background.store),
+            partition,
+            background.env.clone(),
+        );
+        let snapshot = manifest.snapshot().await?;
+        for file in snapshot.state().files().filter(|f| f.level != Level::L1) {
+            oldest_epoch = oldest_epoch.min(file.layout_epoch);
+        }
+    }
+    Ok(log
+        .remove_tombstones(kind, |t| {
+            t.epoch <= oldest_epoch
+                && now
+                    .duration_since(t.created_at)
+                    .is_some_and(|age| age >= TOMBSTONE_RETENTION)
+        })
+        .await?)
 }
 
 /// The enabled retention policies of `tenant`; a store or a document
