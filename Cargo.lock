@@ -2632,6 +2632,7 @@ dependencies = [
  "arrow",
  "regex",
  "serde_json",
+ "sha2",
  "tessera-format",
  "tessera-ir",
  "tessera-types",

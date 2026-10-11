@@ -8,7 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use tessera_types::{Budget, InvalidBudget, TenantId, Timestamp};
+use tessera_types::{Budget, InvalidBudget, Redaction, TenantId, Timestamp};
 
 const MAX_NAME_LEN: usize = 63;
 
@@ -148,6 +148,9 @@ pub struct TenantSettings {
     pub query_budget: Option<Budget>,
     /// Ingest budgets per team, by the value of the team attribute.
     pub team_ingest_budgets: BTreeMap<String, Budget>,
+    /// What is dropped, hashed or masked at ingest (SE-4); a patch
+    /// with any rules replaces them all.
+    pub redactions: Vec<Redaction>,
 }
 
 /// Why settings were refused.
@@ -187,6 +190,11 @@ impl TenantSettings {
                 .chain(&patch.team_ingest_budgets)
                 .map(|(team, budget)| (team.clone(), *budget))
                 .collect(),
+            redactions: if patch.redactions.is_empty() {
+                self.redactions.clone()
+            } else {
+                patch.redactions.clone()
+            },
         }
     }
 

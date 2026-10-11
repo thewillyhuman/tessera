@@ -27,6 +27,7 @@ mod params;
 pub mod pg;
 pub mod prometheus;
 pub mod query;
+mod redact;
 pub mod rollups;
 pub mod rules;
 pub mod system;
@@ -94,8 +95,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Writes `batch`: as the tenant's and its teams' budgets admit it
-    /// (section 13.4), within the tenant's bytes in flight, then here or
+    /// Writes `batch`: with the tenant's redaction rules applied (SE-4),
+    /// as the tenant's and its teams' budgets admit it (section 13.4),
+    /// within the tenant's bytes in flight, then here or
     /// through one of the dataset's preferred ingesters (IN-9), chosen by
     /// rendezvous hashing over the live ones; a preferred ingester that
     /// cannot be reached means writing here.
@@ -109,6 +111,7 @@ impl AppState {
         let batch = if batch.tenant() == &TenantId::SYSTEM {
             batch
         } else {
+            let batch = redact::apply(self, batch)?;
             let Some(admitted) = budgets::admit_ingest(self, batch)? else {
                 return Ok(());
             };
