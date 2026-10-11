@@ -16,6 +16,7 @@ pub mod audit;
 pub mod auth;
 mod bodies;
 mod budgets;
+pub use budgets::share_budgets;
 mod control;
 pub mod encode;
 mod error;
@@ -226,16 +227,24 @@ impl AppState {
     /// If the in-memory catalog cannot be opened, which cannot happen
     /// without a store failure.
     pub async fn in_memory() -> AppState {
+        Self::in_memory_on(tessera_object::MemoryStore::new()).await
+    }
+
+    /// A state over `store`, so that several share one root pool.
+    ///
+    /// # Panics
+    ///
+    /// If the catalog cannot be opened in memory, which does not happen.
+    pub async fn in_memory_on(store: tessera_object::MemoryStore) -> AppState {
         use std::time::Duration;
 
         use tessera_catalog::PoolConfig;
         use tessera_exec::{CpuPool, QueryLimits};
         use tessera_format::ParquetFormat;
         use tessera_ingest::{IngestConfig, Ingester};
-        use tessera_object::{MemoryStore, PoolState};
+        use tessera_object::PoolState;
         use tessera_types::PoolId;
 
-        let store = MemoryStore::new();
         let env = Env::system();
         let pool = PoolId::new("root").unwrap_or_else(|_| unreachable!("a valid id"));
         let root = PoolConfig {

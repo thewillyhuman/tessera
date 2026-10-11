@@ -7,20 +7,23 @@
 //! this was the first time the budget was reached today, so that the
 //! alert is recorded once.
 //!
-//! The ledger counts what this node admitted since it started. Across a
-//! cluster every ingester keeps its own, so a tenant can get up to as
-//! many budgets as there are ingesters serving it; seeding the ledger
-//! from `system.usage` is a gap.
+//! The ledger counts what this node admitted since it started, plus
+//! what the other nodes published of their own counts, which the node
+//! absorbs on the heartbeat cadence; a tenant served by several
+//! ingesters has one budget, within that cadence. Seeding the ledger
+//! from `system.usage` after every node restarted is a gap.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use tessera_types::{Budget, BudgetAction, TenantId, Timestamp};
 
 const NANOS_PER_DAY: i64 = 86_400 * 1_000_000_000;
 
 /// What a budget limits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Phase {
     /// Bytes received.
     Ingest,
@@ -29,7 +32,7 @@ pub enum Phase {
 }
 
 /// Whose usage is counted: a tenant, or one of its teams.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Account {
     /// The tenant.
     pub tenant: TenantId,
@@ -57,10 +60,23 @@ struct Entry {
     reached: bool,
 }
 
-/// The bytes counted per account in the current day.
+/// What one node counted in one UTC day, as it publishes it for the
+/// others (section 13.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Counts {
+    /// The UTC day, as days since the epoch.
+    pub day: i64,
+    /// The bytes per account.
+    pub bytes: Vec<(Account, u64)>,
+}
+
+/// The bytes counted per account in the current day, on this node
+/// and, as absorbed, on the others.
 #[derive(Default)]
 pub struct Ledger {
     entries: Mutex<HashMap<Account, Entry>>,
+    /// What the other nodes counted today, summed per account.
+    remote: Mutex<HashMap<Account, u64>>,
 }
 
 impl Ledger {
@@ -88,15 +104,60 @@ impl Ledger {
             };
         }
         let after = entry.bytes.saturating_add(bytes);
-        let beyond = after > budget.bytes_per_day;
+        let total = after.saturating_add(self.elsewhere(account));
+        let beyond = total > budget.bytes_per_day;
         let crossed = beyond && !entry.reached;
         entry.reached |= beyond;
         entry.bytes = after;
         Charge {
             action: beyond.then_some(budget.action),
             crossed,
-            total: entry.bytes,
+            total,
         }
+    }
+
+    /// What the other nodes counted today for `account`.
+    fn elsewhere(&self, account: &Account) -> u64 {
+        self.remote
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(account)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// What this node counted today, for the other nodes.
+    #[must_use]
+    pub fn counts(&self, now: Timestamp) -> Counts {
+        let day = now.as_nanos().div_euclid(NANOS_PER_DAY);
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bytes: Vec<(Account, u64)> = entries
+            .iter()
+            .filter(|(_, entry)| entry.day == day && entry.bytes > 0)
+            .map(|(account, entry)| (account.clone(), entry.bytes))
+            .collect();
+        bytes.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+        Counts { day, bytes }
+    }
+
+    /// Takes what the other nodes published as today's counts, replacing
+    /// what was absorbed before; counts of another day are dropped.
+    pub fn absorb(&self, others: &[Counts], now: Timestamp) {
+        let day = now.as_nanos().div_euclid(NANOS_PER_DAY);
+        let mut summed: HashMap<Account, u64> = HashMap::new();
+        for counts in others.iter().filter(|c| c.day == day) {
+            for (account, bytes) in &counts.bytes {
+                let slot = summed.entry(account.clone()).or_default();
+                *slot = slot.saturating_add(*bytes);
+            }
+        }
+        *self
+            .remote
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = summed;
     }
 
     /// Whether `account` has used up `budget` today, for the check before
@@ -107,9 +168,11 @@ impl Ledger {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let day = now.as_nanos().div_euclid(NANOS_PER_DAY);
-        entries
+        let here = entries
             .get(account)
-            .is_some_and(|entry| entry.day == day && entry.bytes >= budget.bytes_per_day)
+            .filter(|entry| entry.day == day)
+            .map_or(0, |entry| entry.bytes);
+        here.saturating_add(self.elsewhere(account)) >= budget.bytes_per_day
     }
 }
 
@@ -161,6 +224,33 @@ mod tests {
         let small = ledger.charge(&account(), &budget, 5, NOON);
         assert_eq!(small.action, Some(BudgetAction::Reject));
         assert!(ledger.exhausted(&account(), &budget, NOON));
+    }
+
+    /// Section 13.4: what the other nodes counted today counts here,
+    /// and what they counted yesterday does not.
+    #[test]
+    fn the_other_nodes_counts_are_absorbed_for_today_alone() {
+        let ledger = Ledger::new();
+        let budget = budget(BudgetAction::Reject);
+        ledger.charge(&account(), &budget, 30, NOON);
+        let published = ledger.counts(NOON);
+        assert_eq!(published.bytes, vec![(account(), 30)]);
+        let other = Ledger::new();
+        other.absorb(std::slice::from_ref(&published), NOON);
+        let charge = other.charge(&account(), &budget, 80, NOON);
+        assert_eq!(charge.total, 110, "its own 80 and the 30 from elsewhere");
+        assert_eq!(charge.action, Some(BudgetAction::Reject));
+        assert!(charge.crossed);
+        assert!(other.exhausted(&account(), &budget, NOON));
+        let yesterday = Counts {
+            day: published.day - 1,
+            bytes: vec![(account(), 1_000)],
+        };
+        other.absorb(&[yesterday], NOON);
+        assert!(
+            !other.exhausted(&account(), &budget, NOON),
+            "replaced, and not today's"
+        );
     }
 
     #[test]

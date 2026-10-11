@@ -8,7 +8,9 @@
 //! before it runs when the tenant's query budget is used up and says
 //! to reject, and charged with the bytes it scanned afterwards. The
 //! first time a budget is reached in a day is logged and recorded as a
-//! `budget` row of `system.usage`, with the action and the limit.
+//! `budget` row of `system.usage`, with the action and the limit. The
+//! nodes of a cluster share their counts through the root pool
+//! ([`share_budgets`]), so a tenant has one budget across them.
 
 use std::collections::BTreeMap;
 
@@ -101,6 +103,48 @@ pub fn admit_ingest(state: &AppState, batch: EventBatch) -> Result<Option<EventB
 /// # Errors
 ///
 /// As described.
+/// Publishes what this node counted today under its own key in the
+/// root pool and absorbs what every other node published, one round of
+/// the sharing the node repeats on its heartbeat (section 13.4).
+///
+/// # Errors
+///
+/// When the root pool cannot be written or listed; a node's counts that
+/// cannot be read are skipped.
+pub async fn share_budgets(state: &AppState) -> Result<(), String> {
+    use futures::TryStreamExt;
+    use tessera_cluster::Counts;
+    use tessera_object::layout;
+
+    let store = state.pools.root().store();
+    let now = state.env.clock.now();
+    let own = layout::budget_counts(state.env.node);
+    let mine = serde_json::to_vec(&state.budgets.counts(now)).map_err(|e| e.to_string())?;
+    store
+        .put(&own, mine.into())
+        .await
+        .map_err(|e| e.to_string())?;
+    let listed: Vec<tessera_object::ObjectMeta> = store
+        .list(&layout::budgets())
+        .try_collect()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut others = Vec::new();
+    for meta in listed.into_iter().filter(|m| m.key != own) {
+        match store.get(&meta.key).await {
+            Ok(bytes) => match serde_json::from_slice::<Counts>(&bytes) {
+                Ok(counts) => others.push(counts),
+                Err(error) => {
+                    tracing::debug!(key = %meta.key, error = %error, "budget counts unreadable");
+                }
+            },
+            Err(error) => tracing::debug!(key = %meta.key, error = %error, "budget counts unread"),
+        }
+    }
+    state.budgets.absorb(&others, now);
+    Ok(())
+}
+
 pub fn admit_query(state: &AppState, tenant: &TenantId) -> Result<(), ApiError> {
     let Some(budget) = settings(state, tenant).and_then(|s| s.query_budget) else {
         return Ok(());
@@ -409,6 +453,42 @@ mod tests {
             error.message()
         );
         assert_eq!(count(&state).await, 3);
+    }
+
+    /// Section 13.4: once the nodes have shared their counts, a budget
+    /// reached on one node refuses writes on another.
+    #[tokio::test]
+    async fn a_budget_reached_on_one_node_holds_on_another() {
+        let store = tessera_object::MemoryStore::new();
+        let a = AppState::in_memory_on(store.clone()).await;
+        let b = AppState::in_memory_on(store).await;
+        let first = logs(3, |_| "a");
+        let fits = u64::try_from(first.rows().get_array_memory_size()).unwrap();
+        configure(
+            &a,
+            TenantSettings {
+                ingest_budget: Some(budget(fits, BudgetAction::Reject)),
+                ..TenantSettings::default()
+            },
+        )
+        .await;
+        b.catalog.snapshot().await.unwrap();
+        a.write(first).await.unwrap();
+        assert!(
+            b.write(logs(3, |_| "a")).await.is_ok(),
+            "b has not heard yet"
+        );
+        share_budgets(&a).await.unwrap();
+        share_budgets(&b).await.unwrap();
+        let error = b.write(logs(3, |_| "a")).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::TOO_MANY_REQUESTS);
+        share_budgets(&a).await.unwrap();
+        let error = a.write(logs(3, |_| "a")).await.unwrap_err();
+        assert_eq!(
+            error.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "and a counts b's"
+        );
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 
 mod advisor;
 mod background;
+mod budgets;
 mod evaluator;
 mod health;
 mod heartbeat;
@@ -287,6 +288,7 @@ impl Node {
         );
         shared.advise_layouts(&config, leases.as_ref(), engine, &controls, &mut loops);
         loops.push(tokio::spawn(release_idle(state.clone())));
+        loops.push(tokio::spawn(budgets::run(state.clone(), config.heartbeat)));
         loops.push(tokio::spawn(observe::run_metrics(
             state.clone(),
             config.metrics,

@@ -257,8 +257,8 @@ not shown (CO-4); `EXCEPT ERRORS` sees the error spans of the files
 being compacted only, and traces referenced by alert events are not
 exempt; sketches are not merged when downsampling, and classic
 histograms whose bounds differ keep the interval's last point (CO-8);
-the budget ledger counts per node, so a tenant served by
-several ingesters gets up to that many budgets; teams have no query
+the budget ledger starts empty when every node restarts, not from
+`system.usage`; teams have no query
 budget, since queries carry no principal; Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a

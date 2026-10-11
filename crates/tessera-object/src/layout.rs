@@ -7,6 +7,7 @@
 //!   _cluster/catalog/_log/{version:020}          cluster catalog
 //!   _cluster/leases/{kind}/{slot}/{epoch}        slot leases
 //!   _cluster/nodes/{node_id}                     node registry
+//!   _cluster/budgets/{node_id}                   budget counts a node published
 //!
 //! any pool
 //!   _wal/{writer_id}/{seq:012}                   writer log entries
@@ -55,6 +56,18 @@ pub fn nodes() -> Key {
 #[must_use]
 pub fn node(node: NodeId) -> Key {
     key(&["_cluster", "nodes", &node.to_string()])
+}
+
+/// Prefix of the budget counts the nodes publish (section 13.4).
+#[must_use]
+pub fn budgets() -> Key {
+    key(&["_cluster", "budgets"])
+}
+
+/// The budget counts one node published.
+#[must_use]
+pub fn budget_counts(node: NodeId) -> Key {
+    key(&["_cluster", "budgets", &node.to_string()])
 }
 
 /// Prefix of one writer's log.
