@@ -112,11 +112,20 @@ Prometheus HTTP API: queries, series, labels, label values, metadata,
 exemplars and remote write. The PromQL differential suite agrees with
 Prometheus 3.15.0 on every case.
 
+The Prometheus compliance suite (539 cases, a Prometheus 3.1.0
+reference scraping the PromLabs demo targets and writing the same
+samples to a node over remote write) passes 537 cases; the two apart
+are a `topk` pick between two series with the same value, which
+Prometheus breaks by the order its storage returns series, and one
+`histogram_quantile` step where the rank falls on a bucket boundary
+and the last bit of the rates decides the bucket.
+
 Gaps left in M5: an OTLP histogram answers PromQL as the classic
 `_bucket`, `_count` and `_sum` series a scrape would give, but there
 is no native histogram sample type, so the `histogram_*` functions
-over one are absent; `info`; the PromQL compliance
-suite has not been run; Grafana itself has not been run against the
+over one are absent; `info`; two suite cases assume a Prometheus
+before 3.0, which accepted `label_join` into an invalid label name
+less than it does now; Grafana itself has not been run against the
 API yet.
 
 **M6, distributed execution and cluster: done, with gaps listed

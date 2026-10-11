@@ -337,11 +337,15 @@ impl Params {
             .ok_or_else(|| ApiError::bad_request(format!("invalid parameter \"{key}\": missing")))
     }
 
+    /// A time parameter, to the millisecond: Prometheus keeps no finer
+    /// a time, so `time()` and the step instants agree with it.
     fn time(&self, key: &str, default: Timestamp, now: Timestamp) -> Result<Timestamp, ApiError> {
         match self.get(key).filter(|v| !v.is_empty()) {
-            Some(text) => parse_time(text, now).map_err(|e| {
-                ApiError::bad_request(format!("invalid parameter \"{key}\": {}", e.message()))
-            }),
+            Some(text) => parse_time(text, now)
+                .map(|t| Timestamp::from_nanos(t.as_nanos().div_euclid(1_000_000) * 1_000_000))
+                .map_err(|e| {
+                    ApiError::bad_request(format!("invalid parameter \"{key}\": {}", e.message()))
+                }),
             None => Ok(default),
         }
     }
@@ -1015,5 +1019,23 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let (_, value) = call(&app, get("/api/v1/status/buildinfo")).await;
         assert_eq!(value["status"], "success");
+    }
+
+    /// Prometheus keeps query times to the millisecond; a finer `time`
+    /// is truncated so that `time()` agrees with it.
+    #[tokio::test]
+    async fn time_parameters_are_truncated_to_the_millisecond() {
+        let app = crate::router(crate::testing::state().await);
+        let (status, value) = call(
+            &app,
+            get("/api/v1/query?query=time()%20%25%201&time=1700000000.1234371"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let [_, value] = value["data"]["result"].as_array().unwrap().as_slice() else {
+            panic!("{value}")
+        };
+        let value: f64 = value.as_str().unwrap().parse().unwrap();
+        assert!((value - 0.123).abs() < 1e-6, "{value}");
     }
 }

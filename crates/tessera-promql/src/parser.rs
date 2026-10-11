@@ -119,6 +119,20 @@ pub const FUNCTIONS: [&str; 72] = [
     "atan_placeholder_unused",
 ];
 
+/// Whether `matcher` matches a label that is absent, as Prometheus
+/// asks of a selector: one of its matchers must not, or it would select
+/// every series. An invalid pattern counts as not matching; the
+/// lowering reports it.
+fn matches_empty(matcher: &Matcher) -> bool {
+    let anchored = || regex::Regex::new(&format!("^(?:{})$", matcher.value)).ok();
+    match matcher.op {
+        MatchOp::Eq => matcher.value.is_empty(),
+        MatchOp::NotEq => !matcher.value.is_empty(),
+        MatchOp::Regex => anchored().is_some_and(|re| re.is_match("")),
+        MatchOp::NotRegex => anchored().is_some_and(|re| !re.is_match("")),
+    }
+}
+
 /// Parses one expression.
 ///
 /// # Errors
@@ -537,6 +551,12 @@ impl Parser {
                 "a selector needs a metric name or at least one matcher",
             ));
         }
+        if name.is_none() && matchers.iter().all(matches_empty) {
+            return Err(Diagnostic::at(
+                Span::new(start.start, self.previous_end()),
+                "vector selector must contain at least one non-empty matcher",
+            ));
+        }
         Ok(Expr::Selector {
             name,
             matchers,
@@ -732,6 +752,20 @@ mod tests {
         ));
         assert!(parse("{}").is_err());
         assert!(parse("up offset 5m offset 1m").is_err());
+    }
+
+    #[test]
+    fn a_selector_without_a_name_needs_a_matcher_that_excludes_absence() {
+        assert!(
+            parse(r#"{__name__=~".*"}"#).is_err(),
+            "matches every series"
+        );
+        assert!(parse(r#"{job=""}"#).is_err());
+        assert!(parse(r#"{job!~".+"}"#).is_err());
+        assert!(parse(r#"{job!=""}"#).is_ok());
+        assert!(parse(r#"{job=~".+"}"#).is_ok());
+        assert!(parse(r#"{job=~".*", instance="a"}"#).is_ok());
+        assert!(parse(r#"up{job=~".*"}"#).is_ok(), "the name is a matcher");
     }
 
     #[test]

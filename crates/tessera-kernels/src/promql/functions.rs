@@ -535,26 +535,53 @@ fn label_replace(
         }
     };
     let (dst, replacement, src, pattern) = (text(1)?, text(2)?, text(3)?, text(4)?);
+    if !valid_label_name(&dst) {
+        return Err(unsupported(format!(
+            "label_replace: invalid destination label name: {dst}"
+        )));
+    }
     let regex = regex::Regex::new(&format!("^(?:{pattern})$"))
         .map_err(|e| unsupported(format!("label_replace: invalid regular expression: {e}")))?;
-    Ok(Value::Vector(
-        series
-            .into_iter()
-            .map(|(mut labels, v)| {
-                let value = labels.get(&src).cloned().unwrap_or_default();
-                if let Some(captures) = regex.captures(&value) {
-                    let mut out = String::new();
-                    captures.expand(&replacement, &mut out);
-                    if out.is_empty() {
-                        labels.remove(&dst);
-                    } else {
-                        labels.insert(dst.clone(), out);
-                    }
+    let replaced = series
+        .into_iter()
+        .map(|(mut labels, v)| {
+            let value = labels.get(&src).cloned().unwrap_or_default();
+            if let Some(captures) = regex.captures(&value) {
+                let mut out = String::new();
+                captures.expand(&replacement, &mut out);
+                if out.is_empty() {
+                    labels.remove(&dst);
+                } else {
+                    labels.insert(dst.clone(), out);
                 }
-                (labels, v)
-            })
-            .collect(),
-    ))
+            }
+            (labels, v)
+        })
+        .collect();
+    Ok(Value::Vector(unique(replaced)?))
+}
+
+/// A label name as Prometheus validates one: `[a-zA-Z_][a-zA-Z0-9_]*`.
+fn valid_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `series` as a vector: every label set once, or the error Prometheus
+/// gives when a label function makes two series alike.
+fn unique(series: Vec<(Labels, f64)>) -> Result<Vec<(Labels, f64)>, KernelError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (labels, _) in &series {
+        if !seen.insert(labels) {
+            return Err(unsupported(
+                "vector cannot contain metrics with the same labelset",
+            ));
+        }
+    }
+    Ok(series)
 }
 
 fn label_join(evaluator: &Evaluator<'_>, args: &[PromExpr], t: i64) -> Result<Value, KernelError> {
@@ -568,24 +595,23 @@ fn label_join(evaluator: &Evaluator<'_>, args: &[PromExpr], t: i64) -> Result<Va
     let dst = text(1)?;
     let separator = text(2)?;
     let sources: Vec<String> = (3..args.len()).map(text).collect::<Result<_, _>>()?;
-    Ok(Value::Vector(
-        series
-            .into_iter()
-            .map(|(mut labels, v)| {
-                let joined: Vec<&str> = sources
-                    .iter()
-                    .map(|s| labels.get(s).map_or("", String::as_str))
-                    .collect();
-                let joined = joined.join(&separator);
-                if joined.is_empty() {
-                    labels.remove(&dst);
-                } else {
-                    labels.insert(dst.clone(), joined);
-                }
-                (labels, v)
-            })
-            .collect(),
-    ))
+    let joined = series
+        .into_iter()
+        .map(|(mut labels, v)| {
+            let joined: Vec<&str> = sources
+                .iter()
+                .map(|s| labels.get(s).map_or("", String::as_str))
+                .collect();
+            let joined = joined.join(&separator);
+            if joined.is_empty() {
+                labels.remove(&dst);
+            } else {
+                labels.insert(dst.clone(), joined);
+            }
+            (labels, v)
+        })
+        .collect();
+    Ok(Value::Vector(unique(joined)?))
 }
 
 /// `histogram_quantile(q, buckets)` over classic `le` buckets, with
@@ -749,5 +775,20 @@ mod tests {
         assert!((slope - 2.0).abs() < 1e-9 && (intercept - 1.0).abs() < 1e-9);
         assert!(holt_winters(&samples, 0.5, 0.5).unwrap() > 8.0);
         assert!(extrapolated_rate(&samples[..1], 0, 10, true, true).is_none());
+    }
+
+    #[test]
+    fn label_functions_validate_names_and_keep_label_sets_apart() {
+        assert!(valid_label_name("job_1"));
+        assert!(valid_label_name("_x"));
+        assert!(!valid_label_name("~invalid"));
+        assert!(!valid_label_name("1a"));
+        assert!(!valid_label_name(""));
+        let labels = |job: &str| Labels::from([("job".to_owned(), job.to_owned())]);
+        assert!(unique(vec![(labels("a"), 1.0), (labels("b"), 2.0)]).is_ok());
+        assert!(matches!(
+            unique(vec![(labels("a"), 1.0), (labels("a"), 2.0)]),
+            Err(KernelError::Unsupported(message)) if message.contains("same labelset")
+        ));
     }
 }
