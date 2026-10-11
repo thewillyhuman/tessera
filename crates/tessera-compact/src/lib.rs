@@ -28,7 +28,7 @@ use tessera_manifest::ManifestError;
 use tessera_object::{ObjectError, PoolError};
 use tessera_wal::WalError;
 
-pub use gc::{LogCollection, collect_files, collect_log};
+pub use gc::{Checkpoints, LogCollection, collect_files, collect_log};
 pub use plan::{Job, Policy, input_bytes, plan};
 pub use promote::promote;
 pub use retention::{Applied, Retain};

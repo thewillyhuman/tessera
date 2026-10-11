@@ -7,9 +7,10 @@
 //! data file and sidecar are deleted, then the tombstone is dropped.
 //!
 //! Segments: a segment is deleted once every partition its rows touched
-//! has adopted past it and a reader grace period has elapsed since it
-//! was written (GC-2). Entries are collected in order from the oldest;
-//! the first segment that must stay stops the pass, so a log never has a
+//! has adopted past it, a reader grace period has elapsed since it was
+//! written, and every rule group has read past it or it is older than
+//! the hard cap (GC-2). Entries are collected in order from the oldest;
+//! the first entry that must stay stops the pass, so a log never has a
 //! hole a reader could fall into. A log whose every entry can go,
 //! including its end marker, is removed whole.
 
@@ -31,6 +32,54 @@ use crate::CompactError;
 pub const DEFAULT_FILE_RETENTION: Duration = Duration::from_secs(24 * 3_600);
 /// How long an adopted segment is kept for readers of older views (GC-2).
 pub const DEFAULT_SEGMENT_GRACE: Duration = Duration::from_secs(3_600);
+
+/// Where the continuous queries are in the writer logs (GC-2 c): the
+/// oldest position any rule group holds per writer. An entry past a
+/// held position stays until the group reads it, or until it is older
+/// than `cap`, the hard cap after which a group that stayed behind
+/// rebuilds its windows from the files instead (section 11.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoints {
+    /// The oldest position held per writer.
+    pub positions: BTreeMap<WriterId, Seq>,
+    /// How old an entry may be before a held position stops keeping it.
+    pub cap: Duration,
+}
+
+impl Checkpoints {
+    /// The hard cap of GC-2.
+    pub const DEFAULT_CAP: Duration = Duration::from_secs(24 * 3_600);
+
+    /// No continuous query: nothing is held.
+    #[must_use]
+    pub fn none() -> Self {
+        Checkpoints {
+            positions: BTreeMap::new(),
+            cap: Self::DEFAULT_CAP,
+        }
+    }
+
+    /// Records that a group holds `seq` of `writer`; the oldest wins.
+    pub fn hold(&mut self, writer: WriterId, seq: Seq) {
+        self.positions
+            .entry(writer)
+            .and_modify(|held| *held = (*held).min(seq))
+            .or_insert(seq);
+    }
+
+    /// Whether entry `seq` of `writer`, `age` old, is kept for a group
+    /// that has not read it yet.
+    #[must_use]
+    pub fn keeps(&self, writer: WriterId, seq: Seq, age: Duration) -> bool {
+        age < self.cap && self.positions.get(&writer).is_some_and(|held| *held < seq)
+    }
+}
+
+impl Default for Checkpoints {
+    fn default() -> Self {
+        Self::none()
+    }
+}
 
 /// Deletes the objects of tombstones older than `retention` and forgets
 /// them. Returns how many files were collected.
@@ -76,7 +125,8 @@ pub struct LogCollection {
 }
 
 /// Collects the entries of `writer`'s log that every touched partition
-/// has adopted and that are older than `grace`.
+/// has adopted, that are older than `grace`, and that `checkpoints`
+/// do not keep for a rule group still to read them.
 ///
 /// # Errors
 ///
@@ -88,6 +138,7 @@ pub async fn collect_log(
     now: Timestamp,
     grace: Duration,
     window: Duration,
+    checkpoints: &Checkpoints,
 ) -> Result<LogCollection, CompactError> {
     let mut positions = Positions::new(Arc::clone(store), env.clone(), window);
     let seqs = reader::list(&**store, writer).await?;
@@ -96,26 +147,20 @@ pub async fn collect_log(
     let mut ended = false;
     for seq in &seqs {
         let entry = reader::read(&**store, writer, *seq).await?;
-        let aged = now
-            .duration_since(entry.header().written_at)
-            .is_some_and(|age| age >= grace);
+        let age = now.duration_since(entry.header().written_at);
+        let aged = age.is_some_and(|age| age >= grace);
+        if !aged || checkpoints.keeps(writer, *seq, age.unwrap_or(Duration::ZERO)) {
+            break;
+        }
         match entry.body() {
             EntryBody::Segment { blocks } => {
-                if !aged || !positions.adopted(blocks, writer, *seq).await? {
+                if !positions.adopted(blocks, writer, *seq).await? {
                     break;
                 }
                 deletable.push(*seq);
             }
-            EntryBody::Flush { .. } | EntryBody::Seal { .. } => {
-                if !aged {
-                    break;
-                }
-                deletable.push(*seq);
-            }
+            EntryBody::Flush { .. } | EntryBody::Seal { .. } => deletable.push(*seq),
             EntryBody::End => {
-                if !aged {
-                    break;
-                }
                 ended = true;
                 deletable.push(*seq);
             }

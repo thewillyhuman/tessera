@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, FixedSizeBinaryArray};
-use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, plan};
+use tessera_compact::{Checkpoints, Compactor, Outcome, Policy, collect_files, collect_log, plan};
 use tessera_format::{ParquetFormat, Sidecar};
 use tessera_manifest::{LayoutRecord, Manifest, intake, list_partitions, registry, view};
 use tessera_object::{MemoryStore, ObjectStore, Pools, layout};
@@ -470,8 +470,19 @@ async fn removed_files_are_deleted_after_the_retention_window() {
 
 const GRACE: Duration = Duration::from_secs(3_600);
 
-/// A collection pass over the node's writer log at `now`.
+/// A collection pass over the node's writer log at `now`, with no rule
+/// group holding a position.
 async fn collect(node: &Node, now: Timestamp) -> tessera_compact::LogCollection {
+    collect_held(node, now, &Checkpoints::none()).await
+}
+
+/// A collection pass over the node's writer log at `now` with the
+/// positions rule groups hold.
+async fn collect_held(
+    node: &Node,
+    now: Timestamp,
+    held: &Checkpoints,
+) -> tessera_compact::LogCollection {
     let store: Arc<dyn ObjectStore> = node.store.clone();
     collect_log(
         &store,
@@ -480,6 +491,7 @@ async fn collect(node: &Node, now: Timestamp) -> tessera_compact::LogCollection 
         now,
         GRACE,
         Window::DEFAULT_LENGTH,
+        held,
     )
     .await
     .unwrap()
@@ -567,6 +579,37 @@ async fn adopted_segments_are_collected_after_the_grace_period() {
         .checked_add(Duration::from_secs(1))
         .unwrap();
     assert_eq!(collect(&node, soon).await.deleted, 0);
+}
+
+/// GC-2 (c): an adopted entry a rule group has not read stays until the
+/// group reads past it, or until the hard cap, after which the group
+/// rebuilds its windows from the files instead (section 11.7).
+#[tokio::test]
+async fn an_entry_a_rule_group_has_not_read_stays_until_the_cap() {
+    let mut node = node(&[&[1, 2], &[3]], Timestamp::UNIX_EPOCH).await;
+    node.log.append_segment(&[batch(&[9])]).await.unwrap();
+    let writer: WriterId = node.log.writer_id();
+    let mut held = Checkpoints::none();
+    held.hold(writer, Seq::new(1));
+
+    let later = node.env.clock.now().checked_add(2 * GRACE).unwrap();
+    let collected = collect_held(&node, later, &held).await;
+    assert_eq!(
+        collected.deleted, 1,
+        "segment 1 was read; flush record 2 is the first entry the group has not"
+    );
+    assert_eq!(
+        reader::list(&*node.store, writer).await.unwrap(),
+        vec![Seq::new(2), Seq::new(3), Seq::new(4), Seq::new(5)]
+    );
+
+    let past_cap = later.checked_add(Checkpoints::DEFAULT_CAP).unwrap();
+    let collected = collect_held(&node, past_cap, &held).await;
+    assert_eq!(collected.deleted, 3, "the cap passed: only the tail stays");
+    assert_eq!(
+        reader::list(&*node.store, writer).await.unwrap(),
+        vec![Seq::new(5)]
+    );
 }
 
 #[tokio::test]

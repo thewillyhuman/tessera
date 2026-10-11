@@ -13,13 +13,18 @@
 //! quiet for a long time. Writers of this process are never recovered;
 //! the ingester ends or rotates its own logs.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, ControlStores, Table, TenantSettingsSource};
 use tessera_cluster::{Load, Membership};
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
-use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan};
+use tessera_compact::{
+    Checkpoints, Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan,
+};
+use tessera_eval::AlertRule;
+use tessera_eval::rule::decode_rows;
 use tessera_format::FileFormat;
 use tessera_manifest::{
     DatasetLog, DatasetLogs, Manifest, Registration, intake, list_partitions, registry,
@@ -355,9 +360,49 @@ async fn policies_of(background: &Background, tenant: &TenantId) -> Vec<Retentio
     policies.into_iter().filter(|p| p.enabled).collect()
 }
 
-/// Collects adopted segments of every writer log in the store.
+/// Where every tenant's rule groups are in the writer logs (GC-2 c),
+/// from their state logs.
+async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
+    let mut checkpoints = Checkpoints::none();
+    let tenants: Vec<TenantId> = background
+        .catalog
+        .cached()
+        .state()
+        .tenants()
+        .map(|t| t.id.clone())
+        .collect();
+    for tenant in tenants {
+        let rows = background
+            .controls
+            .open(&tenant)
+            .rows(Table::AlertRules)
+            .await?;
+        let (rules, _) = decode_rows::<AlertRule>(&rows);
+        let groups: BTreeSet<String> = rules.into_iter().map(|r| r.group).collect();
+        for group in groups {
+            let log = tessera_eval::state::open(
+                Arc::clone(&background.store),
+                &tenant,
+                &group,
+                0,
+                background.env.clone(),
+            );
+            let snapshot = log.snapshot().await?;
+            for (writer, seq) in &snapshot.state().positions {
+                if let Ok(writer) = writer.parse::<WriterId>() {
+                    checkpoints.hold(writer, *seq);
+                }
+            }
+        }
+    }
+    Ok(checkpoints)
+}
+
+/// Collects adopted segments of every writer log in the store that
+/// every rule group has read past (GC-2).
 async fn collect_logs(background: &Background) -> Result<(), Failure> {
     let now = background.env.clock.now();
+    let checkpoints = checkpoints(background).await?;
     for writer in reader::writers(&*background.store).await? {
         if !background
             .owned
@@ -372,6 +417,7 @@ async fn collect_logs(background: &Background) -> Result<(), Failure> {
             now,
             DEFAULT_SEGMENT_GRACE,
             Window::DEFAULT_LENGTH,
+            &checkpoints,
         )
         .await?;
         if collected.deleted > 0 {
