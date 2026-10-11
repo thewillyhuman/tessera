@@ -20,6 +20,7 @@ pub mod expr;
 pub mod frontend;
 pub mod function;
 pub mod plan;
+pub mod promql;
 pub mod trace;
 pub mod typing;
 
@@ -30,5 +31,6 @@ pub use plan::{
     AggregateExpr, ExtractStage, NamedExpr, Plan, PlanError, RangeFunction, Scan, SeriesGrouping,
     SortKey, VALUE, range_vector_schema,
 };
+pub use promql::{Group, LOOKBACK, Matching, PromAggregate, PromExpr, PromOp};
 pub use trace::{Relation, SpanAggregate, Spanset, Structural, trace_group_schema};
 pub use typing::{TypeError, expr_type};

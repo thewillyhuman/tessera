@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 
 use tessera_ir::trace::SPAN_COLUMNS;
-use tessera_ir::{BinaryOp, Expr, Literal, Plan, Scan, SortKey, Spanset};
+use tessera_ir::{BinaryOp, Expr, Literal, Plan, Scan, SortKey, Spanset, VALUE as VALUE_COLUMN};
 use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
 use tessera_types::{TimeRange, Timestamp};
 
@@ -180,6 +180,19 @@ fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
             spans: Box::new(f(*spans)),
             spanset,
         },
+        Plan::PromQL {
+            inputs,
+            expr,
+            start,
+            end,
+            step,
+        } => Plan::PromQL {
+            inputs: inputs.into_iter().map(f).collect(),
+            expr,
+            start,
+            end,
+            step,
+        },
     }
 }
 
@@ -307,41 +320,6 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
     match plan {
         Plan::Scan(scan) => Plan::Scan(narrow_scan(scan, needed)),
         Plan::Values { schema, rows } => Plan::Values { schema, rows },
-        Plan::RangeVector {
-            input,
-            function,
-            value,
-            range,
-            step,
-            start,
-            end,
-            grouping,
-        } => {
-            // Series keys come from every label source; lines are measured
-            // by the byte functions; the unwrapped value reads what it reads.
-            let mut needed: BTreeSet<String> = [
-                TIMESTAMP,
-                BODY,
-                OVERFLOW,
-                EXTRACTED,
-                tessera_types::event::SEVERITY_TEXT,
-            ]
-            .map(str::to_owned)
-            .into();
-            if let Some(value) = &value {
-                needed = add(needed, value);
-            }
-            Plan::RangeVector {
-                input: Box::new(push_projection(*input, Some(needed))),
-                function,
-                value,
-                range,
-                step,
-                start,
-                end,
-                grouping,
-            }
-        }
         Plan::Filter { input, predicate } => {
             let needed = needed.map(|n| add(n, &predicate));
             push_projection(*input, needed).filter(predicate)
@@ -466,6 +444,76 @@ fn push_projection_text(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
                 labels,
                 drop,
                 keep,
+            }
+        }
+        other => push_projection_series(other),
+    }
+}
+
+/// The series nodes of [`push_projection`]: a range vector reads every
+/// label source and its unwrapped value; a `PromQL` node reads each
+/// input's time, value and labels.
+fn push_projection_series(plan: Plan) -> Plan {
+    let add = |mut set: BTreeSet<String>, expr: &Expr| {
+        set.extend(expr.references());
+        set
+    };
+    match plan {
+        Plan::RangeVector {
+            input,
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+            grouping,
+        } => {
+            // Series keys come from every label source; lines are measured
+            // by the byte functions; the unwrapped value reads what it reads.
+            let mut needed: BTreeSet<String> = [
+                TIMESTAMP,
+                BODY,
+                OVERFLOW,
+                EXTRACTED,
+                tessera_types::event::SEVERITY_TEXT,
+            ]
+            .map(str::to_owned)
+            .into();
+            if let Some(value) = &value {
+                needed = add(needed, value);
+            }
+            Plan::RangeVector {
+                input: Box::new(push_projection(*input, Some(needed))),
+                function,
+                value,
+                range,
+                step,
+                start,
+                end,
+                grouping,
+            }
+        }
+        Plan::PromQL {
+            inputs,
+            expr,
+            start,
+            end,
+            step,
+        } => {
+            // The evaluator reads each input's time, value and labels.
+            let needed: BTreeSet<String> = [TIMESTAMP, OVERFLOW, EXTRACTED, VALUE_COLUMN]
+                .map(str::to_owned)
+                .into();
+            Plan::PromQL {
+                inputs: inputs
+                    .into_iter()
+                    .map(|i| push_projection(i, Some(needed.clone())))
+                    .collect(),
+                expr,
+                start,
+                end,
+                step,
             }
         }
         other => other,

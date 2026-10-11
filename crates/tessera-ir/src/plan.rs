@@ -17,6 +17,7 @@ use tessera_types::{DatasetName, Kind, TenantId, TimeRange, Timestamp, event};
 
 use crate::expr::{Expr, Literal};
 use crate::function::Registry;
+use crate::promql::PromExpr;
 use crate::trace::{Spanset, trace_group_schema};
 use crate::typing::{TypeError, expr_type};
 
@@ -398,6 +399,22 @@ pub enum Plan {
         /// The rows, one literal per column.
         rows: Vec<Vec<Literal>>,
     },
+    /// Evaluate a `PromQL` expression over the samples of its inputs at
+    /// every step from `start` to `end` with Prometheus' semantics
+    /// (QL-5); one row per series and step, like `RangeVector`.
+    PromQL {
+        /// The inputs, one per selector, each producing samples with
+        /// their labels.
+        inputs: Vec<Plan>,
+        /// The expression, referring to inputs by index.
+        expr: PromExpr,
+        /// The first step.
+        start: Timestamp,
+        /// The last step, inclusive.
+        end: Timestamp,
+        /// The distance between steps; one step when zero.
+        step: Duration,
+    },
     /// Group spans by trace and evaluate a spanset expression on each
     /// trace (QL-13). The engine reads the trace ids of `candidates`,
     /// then every span of those traces from `spans`.
@@ -464,7 +481,7 @@ impl Plan {
             | Plan::Extract { input, .. }
             | Plan::Format { input, .. }
             | Plan::RangeVector { input, .. } => vec![input],
-            Plan::Union { inputs } => inputs.iter().collect(),
+            Plan::Union { inputs } | Plan::PromQL { inputs, .. } => inputs.iter().collect(),
             Plan::TraceGroup {
                 candidates, spans, ..
             } => candidates
@@ -482,7 +499,7 @@ impl Plan {
         match self {
             Plan::Scan(scan) => scan.time_range,
             Plan::Values { .. } => TimeRange::ALL,
-            Plan::Union { inputs } => inputs
+            Plan::Union { inputs } | Plan::PromQL { inputs, .. } => inputs
                 .iter()
                 .map(Plan::time_range)
                 .reduce(|a, b| TimeRange::new(a.start.min(b.start), a.end.max(b.end)))
@@ -521,6 +538,7 @@ impl Plan {
             | Plan::Union { .. }
             | Plan::Values { .. }
             | Plan::RangeVector { .. }
+            | Plan::PromQL { .. }
             | Plan::TraceGroup { .. } => Vec::new(),
         }
     }
@@ -549,7 +567,7 @@ impl Plan {
             | Plan::Limit { input, .. }
             | Plan::TopK { input, .. } => input.schema(registry),
             Plan::Extract { input, .. } => Ok(with_extracted(&input.schema(registry)?)),
-            Plan::RangeVector { .. } => Ok(range_vector_schema()),
+            Plan::RangeVector { .. } | Plan::PromQL { .. } => Ok(range_vector_schema()),
             Plan::TraceGroup { .. } => Ok(trace_group_schema()),
             Plan::Format { input, labels, .. } => {
                 let input = input.schema(registry)?;
@@ -608,92 +626,9 @@ impl Plan {
         let pad = "  ".repeat(depth);
         match self {
             Plan::Scan(scan) => fmt_scan(f, &pad, scan),
-            Plan::Filter { input, predicate } => {
-                writeln!(f, "{pad}Filter: {predicate}")?;
-                input.fmt_tree(f, depth + 1)
-            }
-            Plan::Project { input, exprs } => {
-                fmt_project(f, &pad, exprs)?;
-                input.fmt_tree(f, depth + 1)
-            }
-            Plan::Aggregate {
-                input,
-                group_by,
-                aggregates,
-            } => {
-                fmt_aggregate(f, &pad, group_by, aggregates)?;
-                input.fmt_tree(f, depth + 1)
-            }
-            Plan::Sort { input, keys } => {
-                let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
-                writeln!(f, "{pad}Sort: {}", shown.join(", "))?;
-                input.fmt_tree(f, depth + 1)
-            }
-            Plan::Limit {
-                input,
-                offset,
-                count,
-            } => {
-                match count {
-                    Some(count) => writeln!(f, "{pad}Limit: offset={offset} count={count}")?,
-                    None => writeln!(f, "{pad}Limit: offset={offset}")?,
-                }
-                input.fmt_tree(f, depth + 1)
-            }
-            Plan::TopK { input, keys, k } => {
-                let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
-                writeln!(f, "{pad}TopK: k={k} order=[{}]", shown.join(", "))?;
-                input.fmt_tree(f, depth + 1)
-            }
             Plan::Union { inputs } => {
                 writeln!(f, "{pad}Union")?;
-                for input in inputs {
-                    input.fmt_tree(f, depth + 1)?;
-                }
-                Ok(())
-            }
-            Plan::Extract {
-                input,
-                source,
-                stage,
-            } => {
-                writeln!(f, "{pad}Extract: {stage} from {source}")?;
-                input.fmt_tree(f, depth + 1)
-            }
-            Plan::Format {
-                input,
-                line,
-                labels,
-                drop,
-                keep,
-            } => {
-                fmt_format(f, &pad, line.as_deref(), labels, drop, keep.as_deref())?;
-                input.fmt_tree(f, depth + 1)
-            }
-            Plan::RangeVector {
-                input,
-                function,
-                value,
-                range,
-                step,
-                start,
-                end,
-                grouping,
-            } => {
-                fmt_range_vector(
-                    f,
-                    &pad,
-                    *function,
-                    value.as_ref(),
-                    *range,
-                    *step,
-                    *start,
-                    *end,
-                )?;
-                if let Some(grouping) = grouping {
-                    writeln!(f, "{pad}  series {grouping}")?;
-                }
-                input.fmt_tree(f, depth + 1)
+                inputs.iter().try_for_each(|i| i.fmt_tree(f, depth + 1))
             }
             Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
             Plan::TraceGroup {
@@ -701,8 +636,104 @@ impl Plan {
                 spans,
                 spanset,
             } => fmt_trace_group(f, depth, candidates.as_deref(), spans, spanset),
+            Plan::PromQL {
+                inputs,
+                expr,
+                start,
+                end,
+                step,
+            } => fmt_promql(
+                f,
+                depth,
+                inputs,
+                &format!("{expr} from {start} to {end} step {}s", step.as_secs_f64()),
+            ),
+            single => {
+                single.fmt_line(f, &pad)?;
+                single.inputs()[0].fmt_tree(f, depth + 1)
+            }
         }
     }
+
+    /// The line of a node with one input, which `fmt_tree` follows with
+    /// the input.
+    fn fmt_line(&self, f: &mut fmt::Formatter<'_>, pad: &str) -> fmt::Result {
+        match self {
+            Plan::Filter { predicate, .. } => writeln!(f, "{pad}Filter: {predicate}"),
+            Plan::Project { exprs, .. } => fmt_project(f, pad, exprs),
+            Plan::Aggregate {
+                group_by,
+                aggregates,
+                ..
+            } => fmt_aggregate(f, pad, group_by, aggregates),
+            Plan::Sort { keys, .. } => {
+                let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
+                writeln!(f, "{pad}Sort: {}", shown.join(", "))
+            }
+            Plan::Limit { offset, count, .. } => fmt_limit(f, pad, *offset, *count),
+            Plan::TopK { keys, k, .. } => {
+                let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
+                writeln!(f, "{pad}TopK: k={k} order=[{}]", shown.join(", "))
+            }
+            Plan::Extract { source, stage, .. } => {
+                writeln!(f, "{pad}Extract: {stage} from {source}")
+            }
+            Plan::Format {
+                line,
+                labels,
+                drop,
+                keep,
+                ..
+            } => fmt_format(f, pad, line.as_deref(), labels, drop, keep.as_deref()),
+            Plan::RangeVector {
+                function,
+                value,
+                range,
+                step,
+                start,
+                end,
+                grouping,
+                ..
+            } => {
+                fmt_range_vector(
+                    f,
+                    pad,
+                    *function,
+                    value.as_ref(),
+                    *range,
+                    *step,
+                    *start,
+                    *end,
+                )?;
+                match grouping {
+                    Some(grouping) => writeln!(f, "{pad}  series {grouping}"),
+                    None => Ok(()),
+                }
+            }
+            Plan::Scan(_)
+            | Plan::Union { .. }
+            | Plan::Values { .. }
+            | Plan::TraceGroup { .. }
+            | Plan::PromQL { .. } => Ok(()),
+        }
+    }
+}
+
+/// The `PromQL` lines of `EXPLAIN`: the expression, then each input
+/// under its index.
+fn fmt_promql(
+    f: &mut fmt::Formatter<'_>,
+    depth: usize,
+    inputs: &[Plan],
+    header: &str,
+) -> fmt::Result {
+    let pad = "  ".repeat(depth);
+    writeln!(f, "{pad}PromQL: {header}")?;
+    for (i, input) in inputs.iter().enumerate() {
+        writeln!(f, "{pad}  input{i}:")?;
+        input.fmt_tree(f, depth + 2)?;
+    }
+    Ok(())
 }
 
 /// The `TraceGroup` lines of `EXPLAIN`: the expression, then each scan
@@ -722,6 +753,19 @@ fn fmt_trace_group(
     }
     writeln!(f, "{pad}  spans:")?;
     spans.fmt_tree(f, depth + 2)
+}
+
+/// The `Limit` line of `EXPLAIN`.
+fn fmt_limit(
+    f: &mut fmt::Formatter<'_>,
+    pad: &str,
+    offset: usize,
+    count: Option<usize>,
+) -> fmt::Result {
+    match count {
+        Some(count) => writeln!(f, "{pad}Limit: offset={offset} count={count}"),
+        None => writeln!(f, "{pad}Limit: offset={offset}"),
+    }
 }
 
 /// The `Project` line of `EXPLAIN`.
@@ -1064,6 +1108,41 @@ mod tests {
         assert_eq!(
             formatted.to_string(),
             "Format: line=\"{{.x}}\" drop=[y]\n  Scan: prod/log [all time) default\n"
+        );
+    }
+
+    #[test]
+    fn a_promql_node_lists_its_inputs_and_keeps_the_range_vector_schema() {
+        let mut scan = scan();
+        scan.kind = Kind::Metric;
+        let plan = Plan::PromQL {
+            inputs: vec![Plan::Scan(scan.clone()), Plan::Scan(scan)],
+            expr: PromExpr::Selector {
+                input: 1,
+                range: None,
+                offset: 0,
+                at: None,
+            },
+            start: Timestamp::from_nanos(0),
+            end: Timestamp::from_nanos(60_000_000_000),
+            step: Duration::from_secs(15),
+        };
+        assert_eq!(plan.inputs().len(), 2);
+        assert_eq!(
+            plan.schema(&Registry::builtin()).unwrap(),
+            range_vector_schema()
+        );
+        assert!(plan.ordering().is_empty());
+        let text = plan.to_string();
+        assert!(
+            text.starts_with(
+                "PromQL: input1 from 1970-01-01T00:00:00Z to 1970-01-01T00:01:00Z step 15s\n  input0:\n    Scan: prod/metric"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  input1:\n    Scan: prod/metric"),
+            "{text}"
         );
     }
 

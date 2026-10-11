@@ -301,7 +301,11 @@ impl Engine {
                 grouping.clone(),
                 Arc::clone(memory),
             )),
-            Plan::Scan(_) | Plan::Values { .. } | Plan::Union { .. } | Plan::TraceGroup { .. } => {
+            Plan::Scan(_)
+            | Plan::Values { .. }
+            | Plan::Union { .. }
+            | Plan::TraceGroup { .. }
+            | Plan::PromQL { .. } => {
                 return Err(EngineError::Exec(ExecError::Unsupported(
                     "not a single-input node".into(),
                 )));

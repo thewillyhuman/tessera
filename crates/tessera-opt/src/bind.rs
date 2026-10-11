@@ -53,15 +53,7 @@ fn bind_plan(plan: Plan) -> Plan {
             input: Box::new(bind_plan(*input)),
             predicate: bind_expr(predicate),
         },
-        Plan::TraceGroup {
-            candidates,
-            spans,
-            spanset,
-        } => Plan::TraceGroup {
-            candidates: candidates.map(|c| Box::new(bind_plan(*c))),
-            spans: Box::new(bind_plan(*spans)),
-            spanset: spanset.map(&mut bind_expr),
-        },
+        grouped @ (Plan::TraceGroup { .. } | Plan::PromQL { .. }) => bind_grouped(grouped),
         Plan::Extract {
             input,
             source,
@@ -123,6 +115,36 @@ fn bind_plan(plan: Plan) -> Plan {
 
 /// Numeric aggregates read an attribute path as a number; the others
 /// leave it as its context typed it.
+/// Binds the nodes that evaluate an expression of their own over
+/// several inputs.
+fn bind_grouped(plan: Plan) -> Plan {
+    match plan {
+        Plan::TraceGroup {
+            candidates,
+            spans,
+            spanset,
+        } => Plan::TraceGroup {
+            candidates: candidates.map(|c| Box::new(bind_plan(*c))),
+            spans: Box::new(bind_plan(*spans)),
+            spanset: spanset.map(&mut bind_expr),
+        },
+        Plan::PromQL {
+            inputs,
+            expr,
+            start,
+            end,
+            step,
+        } => Plan::PromQL {
+            inputs: inputs.into_iter().map(bind_plan).collect(),
+            expr,
+            start,
+            end,
+            step,
+        },
+        other => bind_plan(other),
+    }
+}
+
 fn bind_aggregate(aggregate: AggregateExpr) -> AggregateExpr {
     let numeric = matches!(
         aggregate.function.as_str(),
