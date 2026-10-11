@@ -172,6 +172,54 @@ async fn a_windowed_count_fires_eagerly_and_counts_each_segment_once() {
     assert_eq!(group.instances().await.unwrap().len(), 2);
 }
 
+/// CQ-7: a hopping window counts a row in every window it falls in,
+/// and the newest one decides.
+#[tokio::test]
+async fn a_hopping_window_counts_rows_in_every_window_they_fall_in() {
+    let mut fx = fixture().await;
+    fx.log
+        .append_segment(&[errors(at(1_000), 3, "checkout", 17)])
+        .await
+        .unwrap();
+    let group = group(
+        &fx,
+        "errors",
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         WHERE severity_text = 'ERROR' \
+         GROUP BY attr.service, hop(timestamp, INTERVAL '2 minutes', INTERVAL '1 minute') \
+         HAVING count(*) >= 2",
+    );
+    let first = group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert_eq!(first.transitions.len(), 1, "fires once per group");
+    let seen = windows(&fx).await;
+    let mut starts: Vec<i64> = seen
+        .values()
+        .map(|w| w.start.as_nanos() / 1_000_000_000)
+        .collect();
+    starts.sort_unstable();
+    assert_eq!(
+        starts,
+        [900, 960],
+        "two windows of two minutes, a minute apart, hold 1000 s"
+    );
+    assert!(seen.values().all(|w| w.partials[0].count == 3));
+    // A row at 1030 s is in the windows starting at 960 and 1020, not 900.
+    fx.log
+        .append_segment(&[errors(at(1_030), 1, "checkout", 17)])
+        .await
+        .unwrap();
+    group.evaluate(&fx.engine, at(1_035)).await.unwrap();
+    let seen = windows(&fx).await;
+    let count_at = |start: i64| {
+        seen.values()
+            .find(|w| w.start.as_nanos() / 1_000_000_000 == start)
+            .map(|w| w.partials[0].count)
+    };
+    assert_eq!(count_at(900), Some(3));
+    assert_eq!(count_at(960), Some(4));
+    assert_eq!(count_at(1_020), Some(1));
+}
+
 #[tokio::test]
 async fn an_average_condition_waits_for_the_watermark() {
     let mut fx = fixture().await;

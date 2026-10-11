@@ -153,7 +153,7 @@ through Prometheus and Loki rule files on the ruler API (CQ-3); the
 alert lifecycle of section 11.8 with `FOR`; rule-group state logs
 that record instances, input positions and the outbox in one commit,
 so a takeover repeats no transition (CQ-12, CQ-13); the incremental
-mode for SQL rules that filter, group by keys and a tumbling window
+mode for SQL rules that filter, group by keys and a tumbling or hopping window
 and aggregate with mergeable functions, maintained from writer-log
 segments with eager firing for monotone conditions and watermark
 firing for the rest (CQ-1, CQ-2, CQ-4, CQ-5, CQ-7, CQ-9, CQ-10,
@@ -175,9 +175,10 @@ from data files when a partition falls behind the WAL retention cap
 (section 11.7); inhibition rules and Alertmanager-style grouping of
 notifications; email; the incremental subset is SQL only and counts
 rows unweighted; the alert latency target is set by the evaluation
-interval (five seconds by default) rather than measured; hopping and
-sliding windows, sketches and histograms, and absence detection run
-periodically.
+interval (five seconds by default) rather than measured; sliding
+windows, sketches and histograms, and absence detection run
+periodically, while hopping windows, `hop(timestamp, size, step)`,
+are incremental.
 
 **M8, adaptive design: done, with gaps listed below.** A workload
 log: every query appends to `_system.queries` what it asked of each
@@ -519,7 +520,7 @@ psql 'host=127.0.0.1 port=5432 dbname=prod' -c \
 Alert rules are continuous queries whose sink is the alert state
 machine. They live in the tenant's control store, which SQL exposes
 as the `system` tables, and are evaluated by the `eval` role; a rule
-that filters, groups by keys and a tumbling window and aggregates with
+that filters, groups by keys and a tumbling or hopping window and aggregates with
 `count`, `sum`, `min`, `max` or `avg` is maintained from the write-ahead
 log as rows arrive, anything else is re-executed at its interval:
 

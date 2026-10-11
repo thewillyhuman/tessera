@@ -67,6 +67,8 @@ pub struct Shape {
     pub keys: Vec<(String, Expr)>,
     /// The window length.
     pub window: Duration,
+    /// How far apart hopping windows start (CQ-7); tumbling when none.
+    pub hop: Option<Duration>,
     /// The aggregates, in output order.
     pub aggregates: Vec<AggregateExpr>,
     /// The type of each key, in the order of `keys`.
@@ -167,7 +169,7 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
     let predicate = predicates
         .into_iter()
         .reduce(|a, b| a.binary(BinaryOp::And, b));
-    let (keys, window) = keys_and_window(group_by)?;
+    let (keys, window, hop) = keys_and_window(group_by)?;
     check_aggregates(aggregates)?;
     let schema = node
         .schema(&tessera_ir::Registry::builtin())
@@ -175,7 +177,7 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
     let key_types: Vec<DataType> = group_by
         .iter()
         .enumerate()
-        .filter(|(_, key)| !matches!(&key.expr, Expr::Call { name, .. } if name == "tumble" || name == "time_bucket"))
+        .filter(|(_, key)| !matches!(&key.expr, Expr::Call { name, .. } if is_window(name)))
         .map(|(i, _)| schema.field(i).data_type().clone())
         .collect();
     let aggregate_types: Vec<DataType> = (0..aggregates.len())
@@ -192,6 +194,7 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
         predicate,
         keys,
         window,
+        hop,
         aggregates: aggregates.clone(),
         key_types,
         aggregate_types,
@@ -200,41 +203,67 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
     })
 }
 
-/// The grouping keys and the one tumbling window of a `GROUP BY`.
-fn keys_and_window(
-    group_by: &[tessera_ir::NamedExpr],
-) -> Result<(Vec<(String, Expr)>, Duration), String> {
+/// Whether a function call in `GROUP BY` is the window.
+fn is_window(name: &str) -> bool {
+    matches!(name, "tumble" | "time_bucket" | "hop")
+}
+
+/// The grouping keys of a `GROUP BY`, its window's length, and how far
+/// apart the window's starts are when it hops.
+type KeysAndWindow = (Vec<(String, Expr)>, Duration, Option<Duration>);
+
+/// The grouping keys and the one window of a `GROUP BY`: its length,
+/// and how far apart its starts are when it hops (CQ-7).
+fn keys_and_window(group_by: &[tessera_ir::NamedExpr]) -> Result<KeysAndWindow, String> {
     let mut keys = Vec::new();
     let mut window = None;
+    let constant = |expr: Option<&Expr>| match expr {
+        Some(Expr::Literal(Literal::Duration(d))) => Ok(*d),
+        _ => Err("the window needs a constant interval".to_owned()),
+    };
     for key in group_by {
         match &key.expr {
-            Expr::Call { name, args } if name == "tumble" || name == "time_bucket" => {
-                let (interval, time) = if name == "tumble" {
-                    (args.get(1), args.first())
-                } else {
-                    (args.first(), args.get(1))
+            Expr::Call { name, args } if is_window(name) => {
+                let (interval, time, step) = match name.as_str() {
+                    "tumble" => (args.get(1), args.first(), None),
+                    "hop" => (args.get(1), args.first(), Some(args.get(2))),
+                    _ => (args.first(), args.get(1), None),
                 };
-                let length = match interval {
-                    Some(Expr::Literal(Literal::Duration(d))) => *d,
-                    _ => return Err("the window needs a constant interval".into()),
-                };
+                let length = constant(interval)?;
+                let hop = step.map(constant).transpose()?;
                 if !matches!(time, Some(Expr::Column(c)) if c == TIMESTAMP) {
                     return Err("the window must be over the timestamp column".into());
                 }
-                if window.replace(length).is_some() {
+                if window.replace((length, hop)).is_some() {
                     return Err("only one window is supported".into());
                 }
             }
             expr => keys.push((key.name.clone(), expr.clone())),
         }
     }
-    let Some(window) = window else {
-        return Err("no tumbling window in GROUP BY".into());
+    let Some((window, hop)) = window else {
+        return Err("no tumbling or hopping window in GROUP BY".into());
     };
     if window.is_zero() {
         return Err("the window must be longer than zero".into());
     }
-    Ok((keys, window))
+    if let Some(hop) = hop {
+        if hop.is_zero() || hop > window || window.as_nanos() % hop.as_nanos() != 0 {
+            return Err("a hop must be longer than zero, at most the window and divide it".into());
+        }
+    }
+    Ok((keys, window, hop))
+}
+
+/// The starts of the windows a row at `at` belongs to: one for a
+/// tumbling window, `length / hop` for a hopping one, newest first.
+fn window_starts(at: i64, length: i64, hop: Option<i64>) -> Vec<Timestamp> {
+    let hop = hop.unwrap_or(length).max(1);
+    let newest = at.div_euclid(hop) * hop;
+    let count = (length / hop).max(1);
+    (0..count)
+        .map(|k| Timestamp::from_nanos(newest - k * hop))
+        .collect()
 }
 
 /// Every aggregate must be mergeable (CQ-7) with at most one argument.
@@ -513,34 +542,39 @@ fn fold_batch(
         })
         .collect::<Result<_, _>>()?;
     let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
+    let hop = shape
+        .hop
+        .map(|h| i64::try_from(h.as_nanos()).unwrap_or(i64::MAX));
     for row in 0..rows.num_rows() {
         let at = times.value(row);
         if Timestamp::from_nanos(at) < horizon {
             ingested.late_rows += 1;
             continue;
         }
-        let start = Timestamp::from_nanos(at.div_euclid(length) * length);
         let labels: BTreeMap<String, String> = shape
             .keys
             .iter()
             .zip(&keys)
             .filter_map(|((name, _), array)| cell(array, row).map(|v| (name.clone(), v)))
             .collect();
-        let key = window_key(&rule.name, start, &fingerprint(&labels));
-        let window = ingested.windows.entry(key.clone()).or_insert_with(|| {
-            state
-                .windows
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| WindowState {
-                    rule: rule.name.clone(),
-                    start,
-                    keys: labels.clone(),
-                    partials: vec![Partial::default(); shape.aggregates.len()],
-                })
-        });
-        for (partial, arg) in window.partials.iter_mut().zip(&args) {
-            partial.fold(arg.as_ref().and_then(|a| number(a, row)));
+        let group = fingerprint(&labels);
+        for start in window_starts(at, length, hop) {
+            let key = window_key(&rule.name, start, &group);
+            let window = ingested.windows.entry(key.clone()).or_insert_with(|| {
+                state
+                    .windows
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| WindowState {
+                        rule: rule.name.clone(),
+                        start,
+                        keys: labels.clone(),
+                        partials: vec![Partial::default(); shape.aggregates.len()],
+                    })
+            });
+            for (partial, arg) in window.partials.iter_mut().zip(&args) {
+                partial.fold(arg.as_ref().and_then(|a| number(a, row)));
+            }
         }
     }
     Ok(())

@@ -119,6 +119,16 @@ fn tumble(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+/// `hop(timestamp, size, step)`: a hopping window of `size` starting
+/// every `step` (CQ-7). A row belongs to several windows, so only the
+/// incremental evaluator runs it; the type is the window start.
+fn hop(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [t, DataType::Duration(_), DataType::Duration(_)] if *t == timestamp() => Some(timestamp()),
+        _ => None,
+    }
+}
+
 fn now(args: &[DataType]) -> Option<DataType> {
     args.is_empty().then(timestamp)
 }
@@ -177,6 +187,10 @@ const SCALARS: &[ScalarFunction] = &[
     ScalarFunction {
         name: "tumble",
         return_type: tumble,
+    },
+    ScalarFunction {
+        name: "hop",
+        return_type: hop,
     },
     ScalarFunction {
         name: "prometheus_name",

@@ -88,6 +88,9 @@ impl Rollup {
             enabled: true,
         };
         let shape = rollup.shape(tenant)?;
+        if shape.hop.is_some() {
+            return Err("a rollup needs a tumbling window; hop windows are for alert rules".into());
+        }
         Ok(Rollup {
             window_seconds: shape.window.as_secs(),
             every_seconds: rollup.every_seconds.max(shape.window.as_secs()).max(1),
@@ -212,7 +215,14 @@ mod tests {
     #[test]
     fn refuses_what_cannot_be_merged_again() {
         let errors = [
-            ("SELECT count(*) AS n FROM logs", "no tumbling window"),
+            (
+                "SELECT count(*) AS n FROM logs",
+                "no tumbling or hopping window",
+            ),
+            (
+                "SELECT count(*) AS n FROM logs GROUP BY hop(timestamp, INTERVAL '2m', INTERVAL '1m')",
+                "needs a tumbling window",
+            ),
             (
                 "SELECT count(*) AS n FROM logs GROUP BY tumble(timestamp, INTERVAL '1m') \
                  HAVING count(*) > 1",
