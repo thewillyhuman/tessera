@@ -176,6 +176,11 @@ impl Parser {
                 group_by.push(self.expr()?);
             }
         }
+        let having = if self.eat_keyword("having") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
         let mut order_by = Vec::new();
         if self.eat_keyword("order") {
             self.expect_keyword("by")?;
@@ -209,6 +214,7 @@ impl Parser {
             from,
             filter,
             group_by,
+            having,
             order_by,
             limit,
             offset,

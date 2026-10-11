@@ -95,6 +95,7 @@ fn lower_query(
         plan = plan.filter(lowerer.expr(filter)?);
     }
     let grouped = !query.group_by.is_empty()
+        || query.having.is_some()
         || query.items.iter().any(
             |i| matches!(i, ast::SelectItem::Expr { expr, .. } if lowerer.has_aggregate(expr)),
         );
@@ -258,12 +259,21 @@ impl Lowerer<'_> {
         for item in &query.order_by {
             self.collect_aggregates(&item.expr, None, &mut substitution, &mut aggregates)?;
         }
+        if let Some(having) = &query.having {
+            self.collect_aggregates(having, None, &mut substitution, &mut aggregates)?;
+        }
         let mut plan = Plan::Aggregate {
             input: Box::new(plan),
             group_by,
             aggregates,
         };
         self.substitution = Some(substitution);
+        if let Some(having) = &query.having {
+            plan = Plan::Filter {
+                input: Box::new(plan),
+                predicate: self.expr(having)?,
+            };
+        }
         let items = self.select_items(query)?;
         if !query.order_by.is_empty() {
             let aliases: BTreeMap<&str, &Expr> =
@@ -542,7 +552,10 @@ impl Lowerer<'_> {
     /// timestamp against a timestamp column.
     fn coerce_literal(&self, target: &Expr, literal: Literal) -> Literal {
         let target_type = match target {
-            Expr::Column(name) => self.scope.column_type(name),
+            Expr::Column(name) => self
+                .scope
+                .column_type(name)
+                .or_else(|| self.substituted_type(name)),
             Expr::Cast { to, .. } => Some(to.clone()),
             _ => None,
         };
@@ -551,6 +564,29 @@ impl Lowerer<'_> {
                 .parse::<Timestamp>()
                 .map_or(literal, Literal::Timestamp),
             _ => literal,
+        }
+    }
+
+    /// The type of an `Aggregate` output column above the node: a
+    /// grouping column's own, or the argument's for `min` and `max`,
+    /// which keep their argument's type.
+    fn substituted_type(&self, output: &str) -> Option<DataType> {
+        let substitution = self.substitution.as_ref()?;
+        let source = |expr: &ast::Expr| match &expr.kind {
+            ast::ExprKind::Name(parts) => self.scope.column_type(&parts.join(".")),
+            _ => None,
+        };
+        if let Some((expr, _)) = substitution.groups.iter().find(|(_, n)| n == output) {
+            return source(expr);
+        }
+        let (expr, _) = substitution.aggregates.iter().find(|(_, n)| n == output)?;
+        match &expr.kind {
+            ast::ExprKind::Call { name, args, .. }
+                if matches!(name.as_str(), "min" | "max") && args.len() == 1 =>
+            {
+                source(&args[0])
+            }
+            _ => None,
         }
     }
 
@@ -777,6 +813,18 @@ mod tests {
              Scan: prod/log [all time) default\n"
         );
         plan.schema(&Registry::builtin()).unwrap();
+        let having = lowered(
+            "SELECT severity_text, count(*) AS n FROM logs \
+             GROUP BY severity_text HAVING count(*) > 1 AND min(timestamp) > '2024-01-01'",
+        );
+        assert_eq!(
+            having.to_string(),
+            "Project: severity_text AS severity_text, n AS n\n  \
+             Filter: ((n > 1) AND (min > TIMESTAMP '2024-01-01T00:00:00Z'))\n    \
+             Aggregate: group_by=[severity_text AS severity_text] aggregates=[count() AS n, min(timestamp) AS min]\n      \
+             Scan: prod/log [all time) default\n"
+        );
+        having.schema(&Registry::builtin()).unwrap();
         let bucketed = lowered(
             "SELECT time_bucket(INTERVAL '5m', timestamp) AS bucket, avg(severity_number) \
              FROM logs GROUP BY time_bucket(INTERVAL '5m', timestamp)",

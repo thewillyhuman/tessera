@@ -30,6 +30,8 @@ pub struct Query {
     pub filter: Option<Expr>,
     /// `GROUP BY` expressions.
     pub group_by: Vec<Expr>,
+    /// `HAVING`, if any: a condition on the groups.
+    pub having: Option<Expr>,
     /// `ORDER BY` items.
     pub order_by: Vec<OrderItem>,
     /// `LIMIT`, if any.
