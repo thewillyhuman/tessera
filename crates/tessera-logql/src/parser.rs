@@ -592,6 +592,12 @@ impl Parser {
         if let Some((_, _)) = RANGE_FUNCTIONS.iter().find(|(f, _)| *f == name) {
             return self.range_expr(name, start);
         }
+        if name == "vector" {
+            self.expect_symbol("(")?;
+            let (value, _) = self.number()?;
+            self.expect_symbol(")")?;
+            return Ok(MetricExpr::Vector(value));
+        }
         let op = match name.as_str() {
             "sum" => AggregateOp::Sum,
             "avg" => AggregateOp::Avg,
@@ -1028,6 +1034,19 @@ mod tests {
         let e = parse(r#"frobnicate({a="b"}[5m])"#).unwrap_err();
         assert_eq!(e.message, "unknown function frobnicate");
         assert_eq!(e.span, Some(Span::new(0, 10)));
+        assert!(matches!(
+            metric("vector(1.5)"),
+            MetricExpr::Vector(v) if (v - 1.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            metric("vector(1) + vector(1)"),
+            MetricExpr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+        let e = parse("vector(x)").unwrap_err();
+        assert!(e.message.starts_with("expected a number"), "{}", e.message);
         let e = parse(r#"{a="b"} extra"#).unwrap_err();
         assert!(e.message.starts_with("unexpected \"extra\""));
         let e = parse(r#"{a="b"}[5m]"#).unwrap_err();

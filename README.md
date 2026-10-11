@@ -85,8 +85,7 @@ directions; the deviations found are documented in the `tessera-logql`
 crate.
 
 Gaps left in M3: sort keys on attribute columns and ingest-time
-grouping of compaction inputs (CP-2) wait for column promotion (M8);
-Grafana itself has not been run against the API yet.
+grouping of compaction inputs (CP-2) wait for column promotion (M8).
 
 **M4, traces: done, with gaps listed below.** Spans with their span
 events (as `event` rows, DM-8) and links over OTLP; the `TraceGroup`
@@ -112,7 +111,15 @@ and prunes them by their statistics; files that store only some
 traces let the others through to be numbered, and files below L3
 and the tail are read whole.
 
-Gaps left in M4: Grafana itself has not been run against the API yet.
+Grafana 11.6 has been run against the API in Docker with the three
+data sources provisioned at the node: the Loki, Tempo and Prometheus
+checks pass, and through Grafana's own query API a LogQL stream and
+metric query, a PromQL range query, a TraceQL search, the tag names
+and a trace by id all come back as Grafana expects. The Loki check
+runs `vector(1)+vector(1)`, which LogQL now answers.
+
+Gaps left in M4: Grafana's dashboards have not been built against
+the API by hand.
 
 **M5, metrics: done, with gaps listed below.** Metric data points
 over OTLP (gauges, sums, histograms, exponential histograms and
@@ -142,8 +149,7 @@ Gaps left in M5: an OTLP histogram answers PromQL as the classic
 is no native histogram sample type, so the `histogram_*` functions
 over one are absent; `info`; two suite cases assume a Prometheus
 before 3.0, which accepted `label_join` into an invalid label name
-less than it does now; Grafana itself has not been run against the
-API yet.
+less than it does now.
 
 **M6, distributed execution and cluster: done, with gaps listed
 below.** Node roles (`ingest`, `query`, `compact`, `eval`), a node

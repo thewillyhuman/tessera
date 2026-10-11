@@ -403,6 +403,7 @@ fn metric_plan(
             ])),
             rows: vec![vec![Literal::Float(*value)]],
         }),
+        MetricExpr::Vector(value) => Ok(constant_series(*value, params)),
         MetricExpr::Range {
             function,
             parameter,
@@ -574,6 +575,37 @@ fn aggregate_plan(
     })
 }
 
+/// Steps a constant series is cut off at, as Prometheus caps a range
+/// query's points.
+const MAX_STEPS: usize = 11_000;
+
+/// `vector(value)`: one series without labels, `value` at every step
+/// of `params`, at the end alone for an instant query.
+fn constant_series(value: f64, params: RangeParams) -> Plan {
+    let step = i64::try_from(params.step.as_nanos()).unwrap_or(i64::MAX);
+    let mut rows = Vec::new();
+    let mut t = if step == 0 {
+        params.end.as_nanos()
+    } else {
+        params.start.as_nanos()
+    };
+    while t <= params.end.as_nanos() && rows.len() < MAX_STEPS {
+        rows.push(vec![
+            Literal::Timestamp(Timestamp::from_nanos(t)),
+            Literal::Text("{}".into()),
+            Literal::Float(value),
+        ]);
+        if step == 0 {
+            break;
+        }
+        t = t.saturating_add(step);
+    }
+    Plan::Values {
+        schema: tessera_ir::range_vector_schema(),
+        rows,
+    }
+}
+
 /// The value of an expression made of scalars and arithmetic alone.
 fn constant(expr: &MetricExpr) -> Option<f64> {
     match expr {
@@ -596,7 +628,7 @@ fn constant(expr: &MetricExpr) -> Option<f64> {
                 | BinaryOp::Lte => None,
             }
         }
-        MetricExpr::Range { .. } | MetricExpr::Aggregate { .. } => None,
+        MetricExpr::Range { .. } | MetricExpr::Aggregate { .. } | MetricExpr::Vector(_) => None,
     }
 }
 
@@ -988,6 +1020,22 @@ mod tests {
     /// QL-7: `on` and `ignoring` match on a label subset, the result
     /// carrying the labels matched on; a group modifier carries the
     /// many side's labels and the included ones of the other.
+    /// `vector(n)` is a series, not a scalar: an instant query of it is
+    /// a vector, a range query a matrix with a point per step, and two
+    /// of them add on their empty labels.
+    #[test]
+    fn a_constant_vector_has_a_point_per_step() {
+        let instant = lowered("vector(1)", 0);
+        assert_eq!(instant.kind, ResultKind::Vector);
+        assert_eq!(instant.plan.to_string().trim(), "Values: 1 rows");
+        let range = lowered("vector(2) + vector(3)", 10);
+        assert_eq!(range.kind, ResultKind::Matrix);
+        let shown = range.plan.to_string();
+        assert!(shown.contains("Join inner"), "{shown}");
+        let points = shown.matches("Values: 41 rows").count();
+        assert_eq!(points, 2, "a point per step on each side: {shown}");
+    }
+
     #[test]
     fn vectors_match_on_a_label_subset() {
         let on = lowered(

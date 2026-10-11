@@ -949,6 +949,27 @@ mod tests {
         assert_eq!(value["data"]["result"][0]["value"][1], "1");
     }
 
+    /// Grafana checks a Loki data source with `vector(1)+vector(1)` as
+    /// an instant query and expects one series worth 2.
+    #[tokio::test]
+    async fn grafanas_health_check_query_answers_a_vector() {
+        let app = pushed().await;
+        let (status, value) = call(
+            &app,
+            get("/loki/api/v1/query?query=vector(1)%2Bvector(1)&time=1700000010000000000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["data"]["resultType"], "vector", "{value}");
+        assert_eq!(
+            value["data"]["result"].as_array().unwrap().len(),
+            1,
+            "{value}"
+        );
+        assert_eq!(value["data"]["result"][0]["metric"], json!({}), "{value}");
+        assert_eq!(value["data"]["result"][0]["value"][1], "2", "{value}");
+    }
+
     /// QL-7: two vectors combine step by step on their labels, and
     /// `topk` keeps the k largest series at every step.
     #[tokio::test]

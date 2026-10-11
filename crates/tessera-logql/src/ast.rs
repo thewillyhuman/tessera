@@ -277,6 +277,9 @@ pub enum MetricExpr {
     },
     /// A number.
     Scalar(f64),
+    /// `vector(n)`: a series without labels whose value is `n` at every
+    /// step, which Grafana's data source check adds to itself.
+    Vector(f64),
 }
 
 /// `on`/`ignoring` after a binary operator, with an optional
