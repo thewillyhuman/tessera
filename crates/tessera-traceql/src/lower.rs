@@ -62,6 +62,8 @@ pub struct Lowered {
     pub shown: Vec<String>,
     /// The series label columns of a metrics query, as written.
     pub labels: Vec<String>,
+    /// The metrics function, as written; empty for a search.
+    pub function: String,
 }
 
 /// Lowers `query` under `ctx` and `params`.
@@ -79,6 +81,7 @@ pub fn lower(query: &Query, ctx: &BindContext, params: RangeParams) -> Result<Lo
             kind: ResultKind::Spansets,
             shown,
             labels: Vec::new(),
+            function: String::new(),
         }),
         Some(metrics) => {
             let input = match (&query.pipeline.first, query.pipeline.stages.is_empty()) {
@@ -100,6 +103,7 @@ pub fn lower(query: &Query, ctx: &BindContext, params: RangeParams) -> Result<Lo
                 kind: ResultKind::Metrics,
                 shown,
                 labels,
+                function: metrics.function.clone(),
             })
         }
     }
@@ -458,6 +462,15 @@ fn binary(
     }
 }
 
+/// Whether `expr` is a duration intrinsic, measured in nanoseconds.
+fn is_duration(expr: &FieldExpr) -> bool {
+    match expr {
+        // `trace:duration` and `span:duration` share the name `duration`.
+        FieldExpr::Intrinsic { name, .. } => name == "duration" || name == "traceDuration",
+        _ => false,
+    }
+}
+
 /// The metrics plan over `input` rows of spans: one value per step
 /// bucket and series, with the series labels as written.
 fn metrics_plan(
@@ -529,6 +542,9 @@ fn metrics_plan(
     };
     let value = if metrics.function == "rate" {
         value.binary(BinaryOp::Div, Expr::literal(step.as_secs_f64()))
+    } else if metrics.arg.as_ref().is_some_and(is_duration) {
+        // A duration is reported in seconds, as Tempo reports it.
+        value.binary(BinaryOp::Div, Expr::literal(1e9))
     } else {
         value
     };
@@ -697,6 +713,11 @@ mod tests {
         let text = structural.plan.to_string();
         assert!(text.contains("TraceGroup"), "{text}");
         assert!(text.contains("max(duration_ns) AS value"), "{text}");
+        assert!(
+            text.contains("(CAST(value AS Float64) / 1000000000.0) AS value"),
+            "durations in seconds: {text}"
+        );
+        assert_eq!(structural.function, "max_over_time");
         assert!(
             text.contains("group_by=[TIMESTAMP '1970-01-01T00:00:00.000001000Z' AS timestamp]"),
             "one bucket over the range: {text}"
