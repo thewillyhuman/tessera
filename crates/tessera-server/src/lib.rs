@@ -491,4 +491,39 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!((count_logs(&state).await - 3.0).abs() < f64::EPSILON);
     }
+
+    /// Section 14.1: a gossip exchange folds the caller's records into
+    /// the view and answers with the whole view, own record included.
+    #[tokio::test]
+    async fn gossip_exchanges_membership_views() {
+        let state = crate::testing::state().await;
+        let other = NodeRecord {
+            node: tessera_types::NodeId::random(&mut state.env.random.fork()),
+            ..record(&state, &[Role::Query], "http://other.invalid")
+        };
+        let state = clustered(
+            state,
+            &[Role::Query, Role::Ingest],
+            vec![],
+            Limits::default(),
+        );
+        let app = router(state.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/v1/gossip")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&vec![other.clone()]).unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let view: Vec<NodeRecord> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(view.len(), 2, "own record and the gossiped one");
+        assert!(view.iter().any(|r| r.node == other.node));
+        assert!(view.iter().any(|r| r.node == state.env.node));
+        let membership = &state.cluster.as_ref().unwrap().membership;
+        assert_eq!(membership.live_ids(Role::Query).len(), 2);
+    }
 }

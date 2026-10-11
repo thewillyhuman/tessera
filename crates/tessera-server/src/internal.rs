@@ -4,8 +4,10 @@
 //! `/internal/v1`: a leaf task to run (`POST /internal/v1/scan`, a JSON
 //! `LeafTask`, answered with the rows as an Arrow IPC stream) and a
 //! batch to write (`POST /internal/v1/ingest`, an Arrow IPC stream with
-//! the tenant, dataset and kind in headers, answered once durable).
-//! [`HttpRemote`] is the client side of both.
+//! the tenant, dataset and kind in headers, answered once durable), and
+//! a membership exchange (`POST /internal/v1/gossip`, the caller's view
+//! as JSON node records, answered with this node's view, section 14.1).
+//! [`HttpRemote`] is the client side of all three.
 //!
 //! These routes carry no authentication yet; they are meant for the
 //! loopback and private networks a cluster runs on (M10 hardens them).
@@ -16,13 +18,14 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
-use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use axum::{Json, Router};
 use futures::future::BoxFuture;
+use tessera_cluster::NodeRecord;
 use tessera_exec::{LeafTask, Peer, RemoteError, RemoteScan};
 use tessera_types::{DatasetName, EventBatch, Kind, TenantId};
 
@@ -42,7 +45,22 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/internal/v1/scan", post(scan))
         .route("/internal/v1/ingest", post(ingest))
+        .route("/internal/v1/gossip", post(gossip))
         .with_state(state)
+}
+
+/// `POST /internal/v1/gossip`: folds the caller's view into this node's
+/// and answers with this node's view; a node outside any cluster
+/// answers nothing.
+async fn gossip(
+    State(state): State<AppState>,
+    Json(records): Json<Vec<NodeRecord>>,
+) -> Json<Vec<NodeRecord>> {
+    let Some(cluster) = &state.cluster else {
+        return Json(Vec::new());
+    };
+    cluster.membership.merge(records);
+    Json(cluster.membership.records())
 }
 
 /// `batches` as an Arrow IPC stream, `schema` first.
@@ -222,6 +240,29 @@ impl HttpRemote {
             )));
         }
         Ok(bytes)
+    }
+
+    /// Exchanges membership views with the node at `http` (section
+    /// 14.1): sends `records` and returns the peer's view.
+    ///
+    /// # Errors
+    ///
+    /// If the request fails or the answer does not decode.
+    pub async fn gossip(
+        &self,
+        http: &str,
+        records: &[NodeRecord],
+    ) -> Result<Vec<NodeRecord>, RemoteError> {
+        let body = serde_json::to_vec(records).map_err(|e| RemoteError(e.to_string()))?;
+        let url = format!("{}/internal/v1/gossip", http.trim_end_matches('/'));
+        let client = self.clone();
+        let target = url.clone();
+        let bytes = tokio::task::spawn_blocking(move || {
+            client.post(&target, "application/json", &[], &body)
+        })
+        .await
+        .map_err(|e| RemoteError(e.to_string()))??;
+        serde_json::from_slice(&bytes).map_err(|e| RemoteError(format!("{url}: {e}")))
     }
 
     /// Writes `batch` through the ingester at `http` (IN-9).

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! The membership view (section 14.1): the live nodes by role, refreshed
-//! from the registry, and the rendezvous hashing that picks preferred
-//! nodes for a key (IN-9, QE-15).
+//! from the registry and from what the peers gossip, and the rendezvous
+//! hashing that picks preferred nodes for a key (IN-9, QE-15).
 //!
 //! The view is a hint: it may lag the registry by a refresh interval and
 //! may name a node that just died. Every use of it falls back to doing
-//! the work locally.
+//! the work locally. The registry says who is a member; gossip says how
+//! recently each was seen, a node's newest heartbeat winning wherever
+//! it came from, and names a node that registered since the last
+//! listing until the next one confirms it.
 
 use std::collections::BTreeSet;
 use std::sync::RwLock;
@@ -32,12 +35,62 @@ impl Membership {
         }
     }
 
-    /// Replaces the view with `records`, as the registry listed them.
+    /// Replaces the view with `records`, as the registry listed them,
+    /// keeping the fresher heartbeat gossip may know of a listed node.
+    /// A node the listing lacks is gone: withdrawn, or not registered
+    /// yet, in which case gossip names it again.
     pub fn replace(&self, records: Vec<NodeRecord>) {
-        *self
+        let mut view = self
             .records
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = records;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = records;
+        for known in view.drain(..) {
+            if let Some(listed) = next.iter_mut().find(|r| r.node == known.node) {
+                if known.heartbeat_at > listed.heartbeat_at {
+                    *listed = known;
+                }
+            }
+        }
+        *view = next;
+    }
+
+    /// Folds `records`, as a peer gossiped them, into the view: a node's
+    /// newest heartbeat wins, and this node's own record stays its own.
+    pub fn merge(&self, records: Vec<NodeRecord>) {
+        let mut view = self
+            .records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for record in records {
+            if record.node == self.env.node {
+                continue;
+            }
+            match view.iter_mut().find(|r| r.node == record.node) {
+                Some(known) => {
+                    if record.heartbeat_at > known.heartbeat_at {
+                        *known = record;
+                    }
+                }
+                None => view.push(record),
+            }
+        }
+    }
+
+    /// Up to `count` live peers to gossip with on `round`, this node
+    /// left out: a different few each round, every node in turn.
+    #[must_use]
+    pub fn gossip_peers(&self, round: u64, count: usize) -> Vec<NodeRecord> {
+        let now = self.env.clock.now();
+        let mut peers: Vec<NodeRecord> = self
+            .records()
+            .into_iter()
+            .filter(|r| r.node != self.env.node && r.is_live_at(now))
+            .collect();
+        peers.sort_by_key(|r| rendezvous_score(&round.to_le_bytes(), r.node));
+        peers.dedup_by_key(|r| r.node);
+        peers.truncate(count);
+        peers
     }
 
     /// Every record the view holds, fresh or not.
@@ -209,5 +262,76 @@ mod tests {
             "at most the live nodes"
         );
         assert!(view.preferred(Role::Eval, b"k", 2).is_empty());
+    }
+
+    /// Section 14.1: gossip folds into the view by freshness, and a
+    /// listing keeps what gossip knew better.
+    #[test]
+    fn gossip_merges_by_freshness_and_listings_keep_fresher_records() {
+        let clock = Arc::new(ManualClock::new(Timestamp::from_nanos(1_000_000_000_000)));
+        let env = Env::new(
+            NodeId::from_u128(1),
+            clock.clone(),
+            SharedRandom::new(SeededRandom::new(1)),
+        );
+        let at = |node: u128, seconds: i64| NodeRecord {
+            format: 1,
+            reads_through: 1,
+            node: NodeId::from_u128(node),
+            roles: BTreeSet::from([Role::Query]),
+            http: format!("http://node-{node}"),
+            started_at: Timestamp::from_nanos(0),
+            heartbeat_at: Timestamp::from_nanos(seconds * 1_000_000_000),
+        };
+        let view = Membership::new(env, at(1, 1_000));
+        view.merge(vec![at(2, 999), at(1, 0)]);
+        assert_eq!(view.records().len(), 2);
+        assert_eq!(
+            view.records()[0].heartbeat_at,
+            Timestamp::from_nanos(1_000_000_000_000),
+            "the own record is not overwritten"
+        );
+        view.merge(vec![at(2, 998)]);
+        let two = view
+            .records()
+            .into_iter()
+            .find(|r| r.node == NodeId::from_u128(2))
+            .unwrap();
+        assert_eq!(
+            two.heartbeat_at.as_nanos(),
+            999 * 1_000_000_000,
+            "older gossip is ignored"
+        );
+        view.replace(vec![at(1, 1_000), at(2, 997), at(3, 999)]);
+        let two = view
+            .records()
+            .into_iter()
+            .find(|r| r.node == NodeId::from_u128(2))
+            .unwrap();
+        assert_eq!(
+            two.heartbeat_at.as_nanos(),
+            999 * 1_000_000_000,
+            "the fresher one stays"
+        );
+        assert_eq!(view.records().len(), 3);
+        view.merge(vec![at(4, 999)]);
+        assert_eq!(
+            view.records().len(),
+            4,
+            "gossip names a node before the listing"
+        );
+        assert_eq!(view.gossip_peers(0, 1).len(), 1);
+        assert_eq!(
+            view.gossip_peers(0, 5).len(),
+            3,
+            "the live peers, never itself"
+        );
+        view.replace(vec![at(1, 1_000)]);
+        let left: BTreeSet<NodeId> = view.records().into_iter().map(|r| r.node).collect();
+        assert_eq!(
+            left,
+            BTreeSet::from([NodeId::from_u128(1)]),
+            "the listing says who is a member"
+        );
     }
 }

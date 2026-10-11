@@ -87,6 +87,13 @@ pub struct Config {
     /// The base URL peers reach this node's HTTP API at; by default the
     /// listen address, which is right only when it is a real address.
     pub advertise: Option<String>,
+    /// Base URLs of nodes to gossip with on every heartbeat, whatever
+    /// the registry says (section 14.1): a static seed list.
+    pub seeds: Vec<String>,
+    /// A `host:port` whose addresses, looked up on every heartbeat, are
+    /// nodes to gossip with (section 14.1): a DNS seed, such as a
+    /// headless service.
+    pub seed_dns: Option<String>,
     /// How often the node announces itself and re-reads the registry.
     pub heartbeat: Duration,
     /// How long a slot lease lasts (OP-3).
@@ -137,6 +144,8 @@ impl Config {
             pg_listen: loopback(5432),
             roles: Role::ALL.into_iter().collect(),
             advertise: None,
+            seeds: Vec::new(),
+            seed_dns: None,
             heartbeat: registry::HEARTBEAT,
             lease: LeaseManager::DEFAULT_DURATION,
             renewal: LeaseManager::DEFAULT_RENEWAL,
@@ -251,6 +260,12 @@ impl Node {
             .advertise
             .clone()
             .unwrap_or_else(|| format!("{scheme}://{http}"));
+        let gossip = heartbeat::Gossip {
+            remote: peer_client(&config)?,
+            seeds: config.seeds.clone(),
+            dns: config.seed_dns.clone(),
+            scheme,
+        };
         let (registry, membership) = join(
             &store,
             &env,
@@ -258,6 +273,7 @@ impl Node {
             advertise,
             &mut loops,
             config.heartbeat,
+            gossip,
         )
         .await?;
         let shared = Shared {
@@ -692,6 +708,7 @@ async fn join(
     advertise: String,
     loops: &mut Vec<JoinHandle<()>>,
     heartbeat: Duration,
+    gossip: heartbeat::Gossip,
 ) -> Result<(Arc<Registry>, Arc<Membership>), RunError> {
     let registry = Arc::new(Registry::new(
         Arc::clone(store),
@@ -723,6 +740,7 @@ async fn join(
         Arc::clone(&registry),
         Arc::clone(&membership),
         heartbeat,
+        gossip,
     )));
     Ok((registry, membership))
 }

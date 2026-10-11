@@ -60,6 +60,15 @@ struct RunArgs {
     /// listen address is not one they can use, such as 0.0.0.0.
     #[arg(long)]
     advertise: Option<String>,
+    /// A node to gossip membership with on every heartbeat, by its base
+    /// URL; repeatable. The registry in the root pool seeds membership
+    /// without it.
+    #[arg(long = "seed")]
+    seeds: Vec<String>,
+    /// A `host:port` whose addresses are nodes to gossip membership
+    /// with, looked up on every heartbeat: a headless service.
+    #[arg(long)]
+    seed_dns: Option<String>,
     /// Refuse requests without an API key. By default a request without
     /// one acts as a cluster administrator, which suits a single node on
     /// the loopback interface and nothing anyone else can reach.
@@ -155,6 +164,8 @@ async fn main() -> ExitCode {
                 pg_listen: args.pg_listen,
                 roles: args.roles.into_iter().collect(),
                 advertise: args.advertise,
+                seeds: args.seeds,
+                seed_dns: args.seed_dns,
                 allow_anonymous: !args.no_anonymous,
                 cluster_secret: args.cluster_secret,
                 tls: args
@@ -225,6 +236,20 @@ mod tests {
         let Command::Run(args) = cli.command;
         assert_eq!(args.roles, [Role::Query, Role::Compact]);
         assert_eq!(args.advertise.as_deref(), Some("http://node-1:8080"));
+        let Command::Run(seeded) = Cli::try_parse_from([
+            "tessera",
+            "run",
+            "--seed",
+            "http://a:8080",
+            "--seed",
+            "http://b:8080",
+            "--seed-dns",
+            "tessera:8080",
+        ])
+        .unwrap()
+        .command;
+        assert_eq!(seeded.seeds, ["http://a:8080", "http://b:8080"]);
+        assert_eq!(seeded.seed_dns.as_deref(), Some("tessera:8080"));
         assert!(Cli::try_parse_from(["tessera", "run", "--roles", "boss"]).is_err());
         let Command::Run(args) = Cli::try_parse_from(["tessera", "run", "--linger-ms", "200"])
             .unwrap()

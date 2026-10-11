@@ -141,7 +141,10 @@ API yet.
 **M6, distributed execution and cluster: done, with gaps listed
 below.** Node roles (`ingest`, `query`, `compact`, `eval`), a node
 registry in the root pool with heartbeats and a membership view
-(section 14.1); slot ownership through leases shared by rendezvous
+gossiped with the seeds a node is given, `--seed` base URLs and a
+`--seed-dns` name looked up on every heartbeat, and with two live
+peers chosen anew each round, a node's newest heartbeat winning
+wherever it came from (section 14.1); slot ownership through leases shared by rendezvous
 hashing over the live compact nodes, renewed, handed over when the
 view changes and taken over when a node's leases expire (sections 5.3
 and 14.2), driving intake, recovery, compaction and collection; dead
@@ -159,8 +162,7 @@ steps (OP-4).
 
 Gaps left in M6: aggregation and the other intermediate stages run on
 the coordinator over the rows the leaf tasks return (QE-14 asks for
-stages on worker nodes); membership is seeded from the root pool only,
-there is no gossip; there is no object byte
+stages on worker nodes); there is no object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.
@@ -371,8 +373,7 @@ material never enters the object store; the catalog holds names only.
 Gaps left in M10: no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a
-cluster, and the binary is not statically linked; membership still comes from the registry alone, not
-gossip or DNS.
+cluster, and the binary is not statically linked.
 
 ## Layout
 
@@ -448,7 +449,7 @@ at (OP-11):
 
 ```
 cargo run -p tessera -- run --data-dir /shared/tessera --roles ingest,query     --listen 0.0.0.0:8080 --advertise http://node-1:8080
-cargo run -p tessera -- run --data-dir /shared/tessera --roles compact     --listen 0.0.0.0:8081 --pg-listen 0.0.0.0:5433 --advertise http://node-2:8081
+cargo run -p tessera -- run --data-dir /shared/tessera --roles compact     --listen 0.0.0.0:8081 --pg-listen 0.0.0.0:5433 --advertise http://node-2:8081 --seed http://node-1:8080
 ```
 
 Adding a node is starting it; removing one is stopping it.
