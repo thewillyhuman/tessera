@@ -30,13 +30,15 @@ pub(crate) enum Need {
     Admin,
 }
 
-/// The tenant and dataset a request addresses, once who asks was allowed
-/// what it needs.
+/// The tenant and dataset a request addresses, and who asks, once they
+/// were allowed what the request needs.
 pub(crate) struct Scope {
     /// The tenant.
     pub tenant: TenantId,
     /// The dataset.
     pub dataset: DatasetName,
+    /// Who asks.
+    pub principal: Principal,
 }
 
 /// The scope of a request with `headers`, allowed `need`.
@@ -62,7 +64,11 @@ pub(crate) async fn scope(
         Some(name) => DatasetName::new(name).map_err(|e| ApiError::bad_request(e.to_string()))?,
     };
     allow(&principal, need, dataset.as_str())?;
-    Ok(Scope { tenant, dataset })
+    Ok(Scope {
+        tenant,
+        dataset,
+        principal,
+    })
 }
 
 /// The tenant `headers` address for `principal`.

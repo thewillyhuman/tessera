@@ -150,6 +150,7 @@ async fn run_native(
         Response::Control(statement) => {
             crate::params::allow(&principal, crate::params::Need::Admin, "")?;
             let message = crate::control::execute(state, &ctx.tenant, statement).await?;
+            crate::audit::record(state, &principal, &ctx.tenant, "control", &message);
             QueryResponse::Rows {
                 columns: vec![ColumnJson {
                     name: "result".into(),

@@ -33,14 +33,14 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use tessera_catalog::{
-    AccessRole, ApiKey, CatalogError, Table, Tenant, TenantName, TenantSettings,
+    AccessRole, ApiKey, CatalogError, Principal, Table, Tenant, TenantName, TenantSettings,
 };
 use tessera_types::Timestamp;
 
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, audit};
 
 /// The administration router.
 pub fn router(state: AppState) -> Router {
@@ -79,6 +79,8 @@ async fn require_cluster_admin(
             "cluster administration needs a _system admin key",
         ));
     }
+    let mut request = request;
+    request.extensions_mut().insert(principal);
     Ok(next.run(request).await)
 }
 
@@ -139,6 +141,7 @@ fn tenant_of(state: &AppState, name: &str) -> Result<Tenant, ApiError> {
 
 async fn issue_key(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(name): Path<String>,
     Body(request): Body<IssueKey>,
 ) -> Result<(StatusCode, Json<IssuedView>), ApiError> {
@@ -163,7 +166,13 @@ async fn issue_key(
         .put(Table::ApiKeys, &issued.record.id, document)
         .await
         .map_err(|e| ApiError::unavailable(e.to_string()))?;
-    tracing::info!(tenant = %tenant.name, key = %issued.record.id, name = %issued.record.name, "api key issued");
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "key.issue",
+        &format!("{} ({})", issued.record.name, issued.record.id),
+    );
     Ok((
         StatusCode::CREATED,
         Json(IssuedView {
@@ -194,6 +203,7 @@ async fn list_keys(
 
 async fn revoke_key(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let tenant = tenant_of(&state, &name)?;
@@ -211,7 +221,7 @@ async fn revoke_key(
         .await
         .map_err(|e| ApiError::unavailable(e.to_string()))?;
     state.auth.forget(&id);
-    tracing::info!(tenant = %tenant.name, key = %id, "api key revoked");
+    audit::record(&state, &principal, &tenant.id, "key.revoke", &id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -258,13 +268,20 @@ async fn list_tenants(State(state): State<AppState>) -> Result<Json<Vec<Tenant>>
 
 async fn create_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Body(request): Body<CreateTenant>,
 ) -> Result<(StatusCode, Json<Tenant>), ApiError> {
     let tenant = state
         .catalog
         .create_tenant(request.name, request.settings)
         .await?;
-    tracing::info!(tenant = %tenant.name, id = %tenant.id, "tenant created");
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "tenant.create",
+        tenant.name.as_str(),
+    );
     Ok((StatusCode::CREATED, Json(tenant)))
 }
 
@@ -284,55 +301,103 @@ async fn get_tenant(
 
 async fn alter_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(text): Path<String>,
     Body(patch): Body<TenantSettings>,
 ) -> Result<Json<Tenant>, ApiError> {
-    Ok(Json(
-        state.catalog.alter_tenant(&name(&text)?, patch).await?,
-    ))
+    let tenant = state.catalog.alter_tenant(&name(&text)?, patch).await?;
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "tenant.alter",
+        tenant.name.as_str(),
+    );
+    Ok(Json(tenant))
 }
 
 async fn rename_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(text): Path<String>,
     Body(request): Body<RenameTenant>,
 ) -> Result<Json<Tenant>, ApiError> {
-    Ok(Json(
-        state
-            .catalog
-            .rename_tenant(&name(&text)?, request.new_name)
-            .await?,
-    ))
+    let tenant = state
+        .catalog
+        .rename_tenant(&name(&text)?, request.new_name)
+        .await?;
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "tenant.rename",
+        &format!("{text} -> {}", tenant.name),
+    );
+    Ok(Json(tenant))
 }
 
 async fn suspend_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
-    Ok(Json(state.catalog.suspend_tenant(&name(&text)?).await?))
+    let tenant = state.catalog.suspend_tenant(&name(&text)?).await?;
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "tenant.suspend",
+        tenant.name.as_str(),
+    );
+    Ok(Json(tenant))
 }
 
 async fn resume_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
-    Ok(Json(state.catalog.resume_tenant(&name(&text)?).await?))
+    let tenant = state.catalog.resume_tenant(&name(&text)?).await?;
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "tenant.resume",
+        tenant.name.as_str(),
+    );
+    Ok(Json(tenant))
 }
 
 async fn drop_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
     let tenant = state.catalog.drop_tenant(&name(&text)?).await?;
-    tracing::info!(tenant = %tenant.name, id = %tenant.id, "tenant dropped");
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "tenant.drop",
+        tenant.name.as_str(),
+    );
     Ok(Json(tenant))
 }
 
 async fn restore_tenant(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(text): Path<String>,
 ) -> Result<Json<Tenant>, ApiError> {
-    Ok(Json(state.catalog.restore_tenant(&name(&text)?).await?))
+    let tenant = state.catalog.restore_tenant(&name(&text)?).await?;
+    audit::record(
+        &state,
+        &principal,
+        &tenant.id,
+        "tenant.restore",
+        tenant.name.as_str(),
+    );
+    Ok(Json(tenant))
 }
 
 #[cfg(test)]

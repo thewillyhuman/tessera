@@ -12,6 +12,7 @@
 //! rule about tenants or data lives here.
 
 pub mod admin;
+pub mod audit;
 pub mod auth;
 mod budgets;
 mod control;

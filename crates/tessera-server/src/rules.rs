@@ -168,6 +168,7 @@ async fn load(
         })
         .await
         .map_err(|e| ApiError::unavailable(e.to_string()))?;
+    crate::audit::record(state, &scope.principal, &scope.tenant, "rules.load", &group);
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -212,6 +213,13 @@ async fn remove(
     if removed == 0 {
         return Err(ApiError::not_found(format!("no rule group {group}")));
     }
+    crate::audit::record(
+        state,
+        &scope.principal,
+        &scope.tenant,
+        "rules.remove",
+        &group,
+    );
     Ok(StatusCode::ACCEPTED.into_response())
 }
 

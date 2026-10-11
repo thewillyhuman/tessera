@@ -167,6 +167,7 @@ impl PgServer {
                 let message = crate::control::execute(&self.state, &ctx.tenant, statement)
                     .await
                     .map_err(|e| user_error("42000", e.message().to_owned()))?;
+                crate::audit::record(&self.state, &principal, &ctx.tenant, "control", &message);
                 Ok(Response::Execution(Tag::new(&message)))
             }
         }
