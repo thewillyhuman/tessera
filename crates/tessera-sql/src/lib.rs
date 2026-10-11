@@ -14,7 +14,8 @@
 //! `search('...')` embeds the search syntax of section 9.6 as a
 //! predicate, and `promql('...', start, end, step)`, `logql('...',
 //! start, end)` and `traceql('...', start, end)` embed the other
-//! languages as tables in `FROM` (QL-3).
+//! languages as tables in `FROM` (QL-3), where a parenthesised query
+//! is a derived table too.
 //!
 //! Statements of the control plane (`CREATE ALERT`, `CREATE TENANT` and
 //! the others of section 9.2) arrive with their milestones.

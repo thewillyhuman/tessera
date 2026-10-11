@@ -685,8 +685,24 @@ impl Parser<'_> {
     }
 
     /// `[[tenant.]dataset.]table [[AS] alias]`, or where `functions`
-    /// may appear, a table function `name(args) [[AS] alias]` (QL-3).
+    /// may appear, a table function `name(args) [[AS] alias]` (QL-3) or
+    /// a derived table `(SELECT ...) [[AS] alias]`.
     fn table_ref(&mut self, functions: bool) -> Result<TableRef, Diagnostic> {
+        if functions && self.is_symbol("(") {
+            let start = self.expect_symbol("(")?;
+            let query = self.query()?;
+            let end = self.expect_symbol(")")?;
+            let alias = self.alias(&table_keywords())?;
+            return Ok(TableRef {
+                tenant: None,
+                dataset: None,
+                table: "subquery".into(),
+                alias,
+                args: None,
+                subquery: Some(Box::new(query)),
+                span: Span::new(start.start, end.end),
+            });
+        }
         let (first, start) = self.identifier()?;
         let mut parts = vec![first];
         let mut end = start;
@@ -713,19 +729,14 @@ impl Parser<'_> {
         let table = parts.pop().unwrap_or_default();
         let dataset = parts.pop();
         let tenant = parts.pop();
-        let keywords: Vec<&str> = CLAUSE_KEYWORDS
-            .iter()
-            .chain(ALERT_KEYWORDS.iter())
-            .chain(TABLE_KEYWORDS.iter())
-            .copied()
-            .collect();
-        let alias = self.alias(&keywords)?;
+        let alias = self.alias(&table_keywords())?;
         Ok(TableRef {
             tenant,
             dataset,
             table,
             alias,
             args,
+            subquery: None,
             span,
         })
     }
@@ -733,7 +744,19 @@ impl Parser<'_> {
     fn expr(&mut self) -> Result<Expr, Diagnostic> {
         self.or_expr()
     }
+}
 
+/// The words that end a table reference rather than alias it.
+fn table_keywords() -> Vec<&'static str> {
+    CLAUSE_KEYWORDS
+        .iter()
+        .chain(ALERT_KEYWORDS.iter())
+        .chain(TABLE_KEYWORDS.iter())
+        .copied()
+        .collect()
+}
+
+impl Parser<'_> {
     fn or_expr(&mut self) -> Result<Expr, Diagnostic> {
         let mut left = self.and_expr()?;
         while self.eat_keyword("or") {

@@ -175,6 +175,8 @@ pub struct TableRef {
     /// The arguments when the table is a function, such as
     /// `promql('up', start, end, step)` (QL-3).
     pub args: Option<Vec<Expr>>,
+    /// The query when the table is a derived one, `(SELECT ...)`.
+    pub subquery: Option<Box<Query>>,
     /// Where it was written.
     pub span: Span,
 }

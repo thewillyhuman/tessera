@@ -253,6 +253,18 @@ mod tests {
             "{explain}"
         );
 
+        // A derived table nests a query.
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT count(*) AS n FROM (SELECT body FROM logs WHERE attr.n >= 1) t",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"][0][0], 2.0, "{value}");
+
         // QL-3: LogQL as a table, over the same rows.
         let (status, value) = post(
             &app,

@@ -619,6 +619,20 @@ fn source(
     ctx: &BindContext,
     registry: &Registry,
 ) -> Result<(TableScope, Plan), Diagnostic> {
+    if let Some(query) = &from.subquery {
+        let plan = lower_query(query, ctx, registry)?;
+        let schema = plan
+            .schema(registry)
+            .map_err(|e| Diagnostic::at(from.span, e.to_string()))?;
+        return Ok((
+            TableScope {
+                name: from.alias.clone().unwrap_or_else(|| from.table.clone()),
+                schema,
+                kinds: Vec::new(),
+            },
+            plan,
+        ));
+    }
     if let Some(args) = &from.args {
         let plan = table_function(from, args, ctx)?;
         let schema = plan
@@ -1675,6 +1689,33 @@ mod tests {
             Statement::Query(plan) => plan,
             other => panic!("not a query: {other:?}"),
         }
+    }
+
+    /// A parenthesised query in `FROM` is a derived table with the
+    /// columns it selects, named by its alias.
+    #[test]
+    fn derived_tables_nest_queries() {
+        let plan = lowered(
+            "SELECT t.service, n FROM (SELECT attr.service AS service, count(*) AS n FROM logs \
+             GROUP BY attr.service) t WHERE n > 1 ORDER BY n DESC LIMIT 5",
+        );
+        let text = plan.to_string();
+        assert!(
+            text.starts_with(
+                "Limit: offset=0 count=5\n  Project: service AS service, n AS n\n    Sort: n DESC\n      Filter: (n > 1)\n        Project: service AS service, n AS n\n          Aggregate:"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Scan: prod/log"), "{text}");
+        let joined = lowered(
+            "SELECT l.body FROM logs l JOIN (SELECT trace_id FROM spans WHERE status_code = 'error') e \
+             ON l.trace_id = e.trace_id",
+        );
+        assert!(joined.to_string().contains("Join inner:"), "{joined}");
+        assert!(
+            parse("INSERT INTO (SELECT 1) VALUES (1)").is_err(),
+            "a derived table is not a target"
+        );
     }
 
     /// QL-3: a language in `FROM` is a relation named after it, under
