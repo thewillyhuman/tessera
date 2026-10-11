@@ -2364,6 +2364,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-compat-traceql"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "serde_json",
+ "tessera-server",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "tessera-exec"
 version = "0.1.0"
 dependencies = [

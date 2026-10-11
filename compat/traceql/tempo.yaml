@@ -1,0 +1,59 @@
+# A single-binary Tempo for the TraceQL differential suite: local
+# storage, blocks cut within seconds, and the generator's local blocks
+# so that TraceQL metrics answer for recent spans.
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9096
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: "0.0.0.0:4318"
+
+ingester:
+  max_block_duration: 5s
+  complete_block_timeout: 5s
+  flush_check_period: 1s
+  trace_idle_period: 1s
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo/blocks
+    wal:
+      path: /tmp/tempo/wal
+      ingestion_time_range_slack: 2h
+    blocklist_poll: 2s
+
+querier:
+  frontend_worker:
+    frontend_address: 127.0.0.1:9096
+
+query_frontend:
+  search:
+    query_backend_after: 0s
+    query_ingesters_until: 1h
+
+metrics_generator:
+  # Spans older than this at arrival never reach the metrics; the
+  # fixture is pushed up to a minute after its spans.
+  metrics_ingestion_time_range_slack: 2h
+  storage:
+    path: /tmp/tempo/generator/wal
+  traces_storage:
+    path: /tmp/tempo/generator/traces
+  processor:
+    local_blocks:
+      flush_to_storage: true
+      max_block_duration: 5s
+      flush_check_period: 1s
+      trace_idle_period: 1s
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [local-blocks]

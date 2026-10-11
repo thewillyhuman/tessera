@@ -1,0 +1,20 @@
+[package]
+name = "tessera-compat-traceql"
+description = "Differential tests of Tessera's TraceQL and Tempo API against a Tempo instance on identical data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-server.workspace = true
+
+axum = "0.8"
+base64 = "0.22"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+ureq = { version = "3", default-features = false, features = ["json"] }
+
+[lints]
+workspace = true
