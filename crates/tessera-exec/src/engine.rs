@@ -17,25 +17,26 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch,
-    StringArray, TimestampNanosecondArray, new_null_array,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array,
+    RecordBatch, StringArray, TimestampNanosecondArray, new_null_array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
-use tessera_ir::{BinaryOp, Expr, Literal, Plan, PlanError, Registry};
+use tessera_ir::{BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, PlanError, Registry};
+use tessera_kernels::Grouper;
 use tessera_kernels::promql::Params;
 use tessera_manifest::{DatasetLogs, ManifestError, Manifests};
 use tessera_object::{PoolError, Pools};
 use tessera_types::event::{OBSERVED_TIMESTAMP, TRACE_ID};
-use tessera_types::{DatasetName, Env, Kind, TenantId, Window};
+use tessera_types::{DatasetName, Env, Kind, TenantId, Timestamp, Window};
 
 use crate::ExecError;
 use crate::batch::Batch;
 use crate::cache::{self, ResultCache, ResultKey};
 use crate::memory::MemoryPool;
 use crate::operator::{
-    CollectSink, Extract, Filter, Format, HashAggregate, Limit, Operator, Project, RangeVector,
-    Sort, Steps, TopK, TraceGroup,
+    BuildSide, CollectSink, Extract, Filter, Format, HashAggregate, HashJoin, JoinInput, Limit,
+    Operator, Project, RangeVector, Sort, Steps, TopK, TraceGroup,
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
@@ -394,6 +395,12 @@ impl Engine {
                     }
                     Ok(batches)
                 }
+                Plan::Join {
+                    left,
+                    right,
+                    on,
+                    kind,
+                } => self.join(left, right, on, *kind, memory, analysis).await,
                 Plan::TraceGroup {
                     candidates,
                     spans,
@@ -409,7 +416,11 @@ impl Engine {
                     };
                     let spans = match ids {
                         Some(ids) if ids.is_empty() => return Ok(Vec::new()),
-                        Some(ids) => Cow::Owned(with_trace_ids(spans.as_ref().clone(), ids)),
+                        Some(ids) => Cow::Owned(with_in_list(
+                            spans.as_ref().clone(),
+                            Expr::column(TRACE_ID),
+                            ids,
+                        )),
                         None => Cow::Borrowed(spans.as_ref()),
                     };
                     let batches = self.execute(&spans, memory, analysis).await?;
@@ -530,6 +541,7 @@ impl Engine {
             | Plan::Values { .. }
             | Plan::SystemTable { .. }
             | Plan::Union { .. }
+            | Plan::Join { .. }
             | Plan::TraceGroup { .. }
             | Plan::PromQL { .. } => {
                 return Err(EngineError::Exec(ExecError::Unsupported(
@@ -537,6 +549,71 @@ impl Engine {
                 )));
             }
         })
+    }
+
+    /// Runs a join (DM-2). The right side runs first: under an inner
+    /// join its key values narrow the left side's read when they are few
+    /// (the runtime filter of QE-6). The smaller side is then hashed and
+    /// the other probes it (QE-12), except that a left join always
+    /// probes with its left side, every row of which comes out.
+    async fn join(
+        &self,
+        left: &JoinSide,
+        right: &JoinSide,
+        on: &[(Expr, Expr)],
+        kind: JoinKind,
+        memory: &Arc<MemoryPool>,
+        analysis: &mut Analysis,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let left_keys: Vec<Expr> = on.iter().map(|(l, _)| l.clone()).collect();
+        let right_keys: Vec<Expr> = on.iter().map(|(_, r)| r.clone()).collect();
+        let right_rows = self.execute(&right.plan, memory, analysis).await?;
+        let left_plan = match kind {
+            JoinKind::Inner => with_runtime_filter(
+                left.plan.as_ref().clone(),
+                &left_keys,
+                &right_keys,
+                &right_rows,
+            )?,
+            JoinKind::Left => left.plan.as_ref().clone(),
+        };
+        let left_rows = self.execute(&left_plan, memory, analysis).await?;
+        let rows_of =
+            |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let build_left = kind == JoinKind::Inner && rows_of(&left_rows) < rows_of(&right_rows);
+        let left_input = JoinInput {
+            schema: left.plan.schema(&self.registry)?,
+            keys: left_keys,
+            name: left.name.clone(),
+        };
+        let right_input = JoinInput {
+            schema: right.plan.schema(&self.registry)?,
+            keys: right_keys,
+            name: right.name.clone(),
+        };
+        let (build_side, build_rows, build, probe_rows, probe) = if build_left {
+            (
+                BuildSide::Left,
+                left_rows,
+                left_input,
+                right_rows,
+                right_input,
+            )
+        } else {
+            (
+                BuildSide::Right,
+                right_rows,
+                right_input,
+                left_rows,
+                left_input,
+            )
+        };
+        let pool = Arc::clone(memory);
+        let operator = self
+            .cpu
+            .spawn(move || HashJoin::new(kind, build_side, &build_rows, &build, &probe, pool))
+            .await??;
+        self.pipe(Box::new(operator), probe_rows).await
     }
 
     /// Runs `operator` over `batches` on the CPU pool.
@@ -571,12 +648,13 @@ fn trace_ids(batches: &[RecordBatch]) -> Vec<Literal> {
     ids.into_iter().map(Literal::Bytes).collect()
 }
 
-/// `plan` restricted to the traces in `ids`: a predicate on the scan
-/// when the plan is one, so that pruning sees it; a filter otherwise.
-fn with_trace_ids(plan: Plan, ids: Vec<Literal>) -> Plan {
+/// `plan` restricted to the rows where `expr` is one of `values`: a
+/// predicate on the scan when the plan is one, so that pruning sees it;
+/// a filter otherwise.
+fn with_in_list(plan: Plan, expr: Expr, values: Vec<Literal>) -> Plan {
     let in_list = Expr::InList {
-        expr: Box::new(Expr::column(TRACE_ID)),
-        list: ids,
+        expr: Box::new(expr),
+        list: values,
         negated: false,
     };
     match plan {
@@ -586,6 +664,109 @@ fn with_trace_ids(plan: Plan, ids: Vec<Literal>) -> Plan {
         }
         other => other.filter(in_list),
     }
+}
+
+/// The most key values a runtime filter carries; past that, reading
+/// the probe side whole costs less than testing every row against them.
+const RUNTIME_FILTER_KEYS: usize = 10_000;
+
+/// `plan`, the probe side of an inner join, restricted to the key
+/// values the build side holds (QE-6): one in-list per key that is a
+/// column, which the scan's pruning then sees. A key that is an
+/// expression, or whose values are too many or of a type no literal
+/// holds, leaves the plan alone.
+fn with_runtime_filter(
+    plan: Plan,
+    probe_keys: &[Expr],
+    build_keys: &[Expr],
+    build: &[RecordBatch],
+) -> Result<Plan, EngineError> {
+    let mut plan = plan;
+    for (probe, key) in probe_keys.iter().zip(build_keys) {
+        if !matches!(probe, Expr::Column(_)) {
+            continue;
+        }
+        if let Some(values) = distinct_literals(key, build)? {
+            plan = with_in_list(plan, probe.clone(), values);
+        }
+    }
+    Ok(plan)
+}
+
+/// The distinct non-null values `key` takes over `batches`, as
+/// literals; `None` when there are more than [`RUNTIME_FILTER_KEYS`] or
+/// no literal holds their type.
+fn distinct_literals(
+    key: &Expr,
+    batches: &[RecordBatch],
+) -> Result<Option<Vec<Literal>>, EngineError> {
+    let values = batches
+        .iter()
+        .map(|batch| tessera_kernels::evaluate(key, batch))
+        .collect::<Result<Vec<ArrayRef>, _>>()?;
+    let Some(first) = values.first() else {
+        return Ok(Some(Vec::new()));
+    };
+    let mut distinct = Grouper::new(vec![first.data_type().clone()])?;
+    for array in &values {
+        distinct.group_ids(std::slice::from_ref(array))?;
+        if distinct.len() > RUNTIME_FILTER_KEYS {
+            return Ok(None);
+        }
+    }
+    let keys = distinct.keys()?;
+    Ok(keys.first().and_then(literals_of))
+}
+
+/// The non-null values of `array` as literals, for the types a literal
+/// holds.
+fn literals_of(array: &ArrayRef) -> Option<Vec<Literal>> {
+    let any = array.as_any();
+    Some(match array.data_type() {
+        DataType::Utf8 => any
+            .downcast_ref::<StringArray>()?
+            .iter()
+            .flatten()
+            .map(Literal::from)
+            .collect(),
+        DataType::Int64 => any
+            .downcast_ref::<Int64Array>()?
+            .iter()
+            .flatten()
+            .map(Literal::Int)
+            .collect(),
+        DataType::Int32 => any
+            .downcast_ref::<Int32Array>()?
+            .iter()
+            .flatten()
+            .map(|v| Literal::Int(i64::from(v)))
+            .collect(),
+        DataType::Float64 => any
+            .downcast_ref::<Float64Array>()?
+            .iter()
+            .flatten()
+            .map(Literal::Float)
+            .collect(),
+        DataType::Boolean => any
+            .downcast_ref::<BooleanArray>()?
+            .iter()
+            .flatten()
+            .map(Literal::Bool)
+            .collect(),
+        DataType::FixedSizeBinary(_) => any
+            .downcast_ref::<FixedSizeBinaryArray>()?
+            .iter()
+            .flatten()
+            .map(|v| Literal::Bytes(v.to_vec()))
+            .collect(),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => any
+            .downcast_ref::<TimestampNanosecondArray>()?
+            .iter()
+            .flatten()
+            .map(|v| Literal::Timestamp(Timestamp::from_nanos(v)))
+            .collect(),
+        _ => return None,
+    })
 }
 
 fn values(schema: &SchemaRef, rows: &[Vec<Literal>]) -> Result<RecordBatch, EngineError> {

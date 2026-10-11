@@ -9,10 +9,13 @@ use std::sync::Arc;
 use arrow::array::{
     Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field, Schema};
 use tessera_exec::{CpuPool, Engine, QueryLimits, QueryOutput};
 use tessera_format::ParquetFormat;
-use tessera_ir::{AggregateExpr, BinaryOp, Expr, NamedExpr, Plan, Registry, Scan, SortKey};
+use tessera_ir::{
+    AggregateExpr, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, Registry, Scan,
+    SortKey,
+};
 use tessera_manifest::{LayoutRecord, intake, registry};
 use tessera_object::{MemoryStore, Pools};
 use tessera_opt::optimize;
@@ -642,4 +645,99 @@ async fn compacted_logs_carry_stable_pattern_ids() {
     assert!((counts[0].value(0) - 18.0).abs() < f64::EPSILON);
     assert!(ids[0].is_null(1), "tail rows have none yet");
     assert!((counts[0].value(1) - 3.0).abs() < f64::EPSILON);
+}
+
+/// DM-2 and QE-6: rows pair by key across a scan and constant rows, a
+/// left join keeps the unmatched rows, and the values on the build side
+/// narrow the scan on the other side.
+#[tokio::test]
+async fn a_join_pairs_rows_by_key_and_narrows_the_probe_side() {
+    let (store, env) = populate().await;
+    let engine = engine(&store, &env);
+    let owners = Plan::Values {
+        schema: Arc::new(Schema::new(vec![
+            Field::new("host", DataType::Utf8, true),
+            Field::new("owner", DataType::Utf8, true),
+        ])),
+        rows: vec![vec![
+            Literal::Text("h0".into()),
+            Literal::Text("ops".into()),
+        ]],
+    };
+    let host = Expr::Path {
+        path: "attr.host".into(),
+        data_type: DataType::Utf8,
+    };
+    let join = |kind| Plan::Join {
+        left: JoinSide::new(Plan::Scan(scan()), "l"),
+        right: JoinSide::new(owners.clone(), "o"),
+        on: vec![(host.clone(), Expr::column("host"))],
+        kind,
+    };
+    let inner = run(
+        &engine,
+        join(JoinKind::Inner).project(vec![
+            NamedExpr::new(Expr::column("l.body"), BODY),
+            NamedExpr::new(Expr::column("o.owner"), "owner"),
+        ]),
+    )
+    .await;
+    let on_h0 = run(
+        &engine,
+        Plan::Scan(scan()).filter(host.clone().binary(BinaryOp::Eq, Expr::literal("h0"))),
+    )
+    .await;
+    assert!(on_h0.num_rows() > 0 && inner.num_rows() == on_h0.num_rows());
+    assert!(
+        column::<StringArray>(&inner.batches, "owner")
+            .iter()
+            .all(|c| c.iter().all(|v| v == Some("ops")))
+    );
+    let left = run(&engine, join(JoinKind::Left)).await;
+    assert_eq!(left.num_rows(), 21, "a left join keeps every row");
+    let owned: usize = column::<StringArray>(&left.batches, "o.owner")
+        .iter()
+        .map(|c| c.len() - c.null_count())
+        .sum();
+    assert_eq!(owned, on_h0.num_rows(), "the other host has no owner");
+    // A key that is a column of the scan lets the other side's values
+    // narrow the read: the scan returns what the equivalent filter would.
+    let errors = Plan::Values {
+        schema: Arc::new(Schema::new(vec![Field::new("level", DataType::Utf8, true)])),
+        rows: vec![vec![Literal::Text("ERROR".into())]],
+    };
+    let narrowed = run(
+        &engine,
+        Plan::Join {
+            left: JoinSide::new(Plan::Scan(scan()), "l"),
+            right: JoinSide::new(errors, "e"),
+            on: vec![(Expr::column(SEVERITY_TEXT), Expr::column("level"))],
+            kind: JoinKind::Inner,
+        },
+    )
+    .await;
+    let plain = run(
+        &engine,
+        Plan::Scan(scan())
+            .filter(Expr::column(SEVERITY_TEXT).binary(BinaryOp::Eq, Expr::literal("ERROR"))),
+    )
+    .await;
+    let scanned = |output: &QueryOutput| {
+        output
+            .analysis
+            .scans
+            .iter()
+            .map(|s| s.rows_from_files + s.rows_from_tail)
+            .sum::<usize>()
+    };
+    assert_eq!(narrowed.num_rows(), plain.num_rows());
+    assert_eq!(
+        scanned(&narrowed),
+        scanned(&plain),
+        "the runtime filter reached the scan"
+    );
+    assert!(
+        scanned(&narrowed) < scanned(&left),
+        "fewer rows than without it"
+    );
 }

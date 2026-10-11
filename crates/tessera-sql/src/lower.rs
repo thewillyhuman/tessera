@@ -15,7 +15,8 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use tessera_ir::{
     AggregateExpr, AlertDefinition, BinaryOp, BindContext, ControlStatement, Diagnostic, Expr,
-    Literal, NamedExpr, Plan, Registry, RollupDefinition, Scan, SortKey, Span, Statement,
+    JoinKind, JoinSide, Literal, NamedExpr, Plan, Registry, RollupDefinition, Scan, SortKey, Span,
+    Statement, qualify, unqualify,
 };
 use tessera_types::{
     DatasetName, Kind, RetentionAction, RetentionClause, RetentionPolicy, TenantId, Timestamp,
@@ -154,11 +155,11 @@ fn lower_delete(
     let lowerer = Lowerer {
         ctx,
         registry,
-        scope: Scope {
+        scope: Scope::single(TableScope {
+            name: table.table.clone(),
             schema: event::schema(kind),
-            table: Some(table.table.clone()),
             kind: Some(kind),
-        },
+        }),
         substitution: None,
     };
     let predicate = lowerer.expr(filter)?;
@@ -364,17 +365,63 @@ fn duration(option: Option<&(String, Span)>) -> Result<Option<Duration>, Diagnos
     }
 }
 
-/// The columns an expression may refer to.
-struct Scope {
+/// One table an expression may refer to.
+#[derive(Clone)]
+struct TableScope {
+    /// The alias, or the table's own name: what qualifies its columns.
+    name: String,
     schema: SchemaRef,
-    table: Option<String>,
+    /// The kind of event, for a telemetry table; a control table has
+    /// no attributes.
     kind: Option<Kind>,
 }
 
+/// The tables an expression may refer to. With one table its columns
+/// go by their own names; with several, every column is qualified by
+/// its table's name, as a join outputs it (DM-2).
+struct Scope {
+    tables: Vec<TableScope>,
+}
+
 impl Scope {
+    fn single(table: TableScope) -> Self {
+        Scope {
+            tables: vec![table],
+        }
+    }
+
+    fn empty() -> Self {
+        Scope { tables: Vec::new() }
+    }
+
+    fn qualified(&self) -> bool {
+        self.tables.len() > 1
+    }
+
+    fn table(&self, name: &str) -> Option<&TableScope> {
+        self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// The name `column` of `table` goes by in the plan.
+    fn output_name(&self, table: &TableScope, column: &str) -> String {
+        if self.qualified() {
+            qualify(&table.name, column)
+        } else {
+            column.to_owned()
+        }
+    }
+
+    /// The type of a column by its plan name.
     fn column_type(&self, name: &str) -> Option<DataType> {
-        self.schema
-            .field_with_name(name)
+        let (table, column) = if let [table] = self.tables.as_slice() {
+            (table, name)
+        } else {
+            let (table, column) = name.split_once('.')?;
+            (self.table(table)?, column)
+        };
+        table
+            .schema
+            .field_with_name(column)
             .ok()
             .map(|f| f.data_type().clone())
     }
@@ -405,43 +452,46 @@ fn lower_query(
     let Some(from) = &query.from else {
         return lower_constant_query(query, ctx, registry);
     };
-    let (scope, mut plan) = if from.dataset.as_deref() == Some("system") && from.table == "usage" {
-        usage_source(ctx)
-    } else if from.dataset.as_deref() == Some("system") && from.table == "log_patterns" {
-        log_patterns_source(ctx)
-    } else if from.dataset.as_deref() == Some("system") {
-        let schema = tessera_ir::system_table_schema(&from.table).ok_or_else(|| {
-            Diagnostic::at(
-                from.span,
+    let (table, mut plan) = source(from, ctx)?;
+    let mut scope = Scope::single(table);
+    if let [_, second, ..] = query.joins.as_slice() {
+        return Err(Diagnostic::at(
+            second.table.span,
+            "one JOIN per query is supported",
+        ));
+    }
+    if let Some(join) = query.joins.first() {
+        let (right, right_plan) = source(&join.table, ctx)?;
+        if scope.table(&right.name).is_some() {
+            return Err(Diagnostic::at(
+                join.table.span,
                 format!(
-                    "unknown system table {}: tables are {}",
-                    from.table,
-                    tessera_ir::system::TABLES.join(", ")
+                    "{} is already in the query: alias one of the two",
+                    right.name
                 ),
-            )
-        })?;
-        (
-            Scope {
-                schema,
-                table: Some(from.table.clone()),
-                kind: None,
+            ));
+        }
+        let left_name = scope.tables[0].name.clone();
+        let right_name = right.name.clone();
+        scope.tables.push(right);
+        let lowerer = Lowerer {
+            ctx,
+            registry,
+            scope,
+            substitution: None,
+        };
+        let on = lowerer.join_keys(&join.on, &left_name, &right_name)?;
+        scope = lowerer.scope;
+        plan = Plan::Join {
+            left: JoinSide::new(plan, left_name),
+            right: JoinSide::new(right_plan, right_name),
+            on,
+            kind: match join.kind {
+                ast::JoinKind::Inner => JoinKind::Inner,
+                ast::JoinKind::Left => JoinKind::Left,
             },
-            Plan::SystemTable {
-                tenant: ctx.tenant.clone(),
-                table: from.table.clone(),
-            },
-        )
-    } else {
-        let (dataset, kind) = resolve_table(from, ctx)?;
-        (
-            Scope {
-                schema: event::schema(kind),
-                table: Some(from.table.clone()),
-                kind: Some(kind),
-            },
-            Plan::Scan(Scan::all(ctx.tenant.clone(), dataset, kind)),
-        )
-    };
+        };
+    }
     let mut lowerer = Lowerer {
         ctx,
         registry,
@@ -463,9 +513,55 @@ fn lower_query(
     }
 }
 
+/// The rows of a table in `FROM` or `JOIN`, and what its columns are
+/// called: the alias when one is written.
+fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan), Diagnostic> {
+    let (mut table, plan) = if from.dataset.as_deref() == Some("system") && from.table == "usage" {
+        usage_source(ctx)
+    } else if from.dataset.as_deref() == Some("system") && from.table == "log_patterns" {
+        log_patterns_source(ctx)
+    } else if from.dataset.as_deref() == Some("system") {
+        let schema = tessera_ir::system_table_schema(&from.table).ok_or_else(|| {
+            Diagnostic::at(
+                from.span,
+                format!(
+                    "unknown system table {}: tables are {}",
+                    from.table,
+                    tessera_ir::system::TABLES.join(", ")
+                ),
+            )
+        })?;
+        (
+            TableScope {
+                name: from.table.clone(),
+                schema,
+                kind: None,
+            },
+            Plan::SystemTable {
+                tenant: ctx.tenant.clone(),
+                table: from.table.clone(),
+            },
+        )
+    } else {
+        let (dataset, kind) = resolve_table(from, ctx)?;
+        (
+            TableScope {
+                name: from.table.clone(),
+                schema: event::schema(kind),
+                kind: Some(kind),
+            },
+            Plan::Scan(Scan::all(ctx.tenant.clone(), dataset, kind)),
+        )
+    };
+    if let Some(alias) = &from.alias {
+        table.name.clone_from(alias);
+    }
+    Ok((table, plan))
+}
+
 /// `system.usage` (CO-4): the `_system.usage` events with their
 /// attributes as columns, read whatever the request's tenant.
-fn usage_source(ctx: &BindContext) -> (Scope, Plan) {
+fn usage_source(ctx: &BindContext) -> (TableScope, Plan) {
     let schema = tessera_ir::usage_schema();
     let dataset = DatasetName::new("usage").unwrap_or_else(|_| ctx.dataset.clone());
     let scan = Plan::Scan(Scan::all(TenantId::SYSTEM, dataset, Kind::Event));
@@ -487,9 +583,9 @@ fn usage_source(ctx: &BindContext) -> (Scope, Plan) {
         ));
     }
     (
-        Scope {
+        TableScope {
+            name: "usage".into(),
             schema,
-            table: Some("usage".into()),
             kind: None,
         },
         scan.project(exprs),
@@ -498,7 +594,7 @@ fn usage_source(ctx: &BindContext) -> (Scope, Plan) {
 
 /// `system.log_patterns` (section 13.2): what compaction stored per
 /// pattern, summed over the usage events.
-fn log_patterns_source(ctx: &BindContext) -> (Scope, Plan) {
+fn log_patterns_source(ctx: &BindContext) -> (TableScope, Plan) {
     let (_, usage) = usage_source(ctx);
     let column = |name: &str| Expr::column(name);
     let stored = usage.filter(
@@ -534,9 +630,9 @@ fn log_patterns_source(ctx: &BindContext) -> (Scope, Plan) {
         ],
     };
     (
-        Scope {
+        TableScope {
+            name: "log_patterns".into(),
             schema: tessera_ir::log_patterns_schema(),
-            table: Some("log_patterns".into()),
             kind: None,
         },
         plan,
@@ -552,11 +648,7 @@ fn lower_constant_query(
     let lowerer = Lowerer {
         ctx,
         registry,
-        scope: Scope {
-            schema: std::sync::Arc::new(Schema::empty()),
-            table: None,
-            kind: None,
-        },
+        scope: Scope::empty(),
         substitution: None,
     };
     let mut fields = Vec::new();
@@ -612,6 +704,25 @@ fn resolve_table(
         None => ctx.dataset.clone(),
     };
     Ok((dataset, kind))
+}
+
+/// The only table of `candidates`, none, or the ambiguity.
+fn one_of<'a>(
+    candidates: &[&'a TableScope],
+    column: &str,
+    span: Span,
+) -> Result<Option<&'a TableScope>, Diagnostic> {
+    match candidates {
+        [one] => Ok(Some(*one)),
+        [] => Ok(None),
+        [first, second, ..] => Err(Diagnostic::at(
+            span,
+            format!(
+                "{column} is ambiguous: qualify it with {} or {}",
+                first.name, second.name
+            ),
+        )),
+    }
 }
 
 fn apply_limit(plan: Plan, query: &ast::Query) -> Plan {
@@ -808,17 +919,83 @@ impl Lowerer<'_> {
         for (i, item) in query.items.iter().enumerate() {
             match item {
                 ast::SelectItem::Wildcard => {
-                    for field in self.scope.schema.fields() {
-                        items.push(NamedExpr::new(Expr::column(field.name()), field.name()));
+                    for table in &self.scope.tables {
+                        for field in table.schema.fields() {
+                            let name = self.scope.output_name(table, field.name());
+                            items.push(NamedExpr::new(Expr::column(&name), name));
+                        }
                     }
                 }
                 ast::SelectItem::Expr { expr, alias } => {
-                    let name = alias.clone().unwrap_or_else(|| default_name(expr, i));
+                    let name = alias.clone().unwrap_or_else(|| self.default_name(expr, i));
                     items.push(NamedExpr::new(self.expr(expr)?, name));
                 }
             }
         }
         Ok(items)
+    }
+
+    /// The output name of an item without an alias: a name without the
+    /// table that qualifies it, else [`default_name`].
+    fn default_name(&self, expr: &ast::Expr, index: usize) -> String {
+        match &expr.kind {
+            ast::ExprKind::Name(parts) => match parts.as_slice() {
+                [table, rest @ ..] if !rest.is_empty() && self.scope.table(table).is_some() => {
+                    rest.join(".")
+                }
+                _ => parts.join("."),
+            },
+            _ => default_name(expr, index),
+        }
+    }
+
+    /// The keys of `ON`: a conjunction of equalities, each between an
+    /// expression over `left` and one over `right`, returned in that
+    /// order and over their own tables' names.
+    fn join_keys(
+        &self,
+        on: &ast::Expr,
+        left: &str,
+        right: &str,
+    ) -> Result<Vec<(Expr, Expr)>, Diagnostic> {
+        let unsupported = || {
+            Diagnostic::at(
+                on.span,
+                format!(
+                    "join conditions must be equalities between the two tables, \
+                     such as {left}.trace_id = {right}.trace_id; other conditions go in WHERE"
+                ),
+            )
+        };
+        let mut keys = Vec::new();
+        for conjunct in self.expr(on)?.conjuncts() {
+            let Expr::Binary {
+                op: BinaryOp::Eq,
+                left: l,
+                right: r,
+            } = conjunct
+            else {
+                return Err(unsupported());
+            };
+            let side_of = |expr: &Expr| {
+                let names = expr.names();
+                if names.is_empty() {
+                    None
+                } else if names.iter().all(|n| unqualify(left, n).is_some()) {
+                    Some(true)
+                } else if names.iter().all(|n| unqualify(right, n).is_some()) {
+                    Some(false)
+                } else {
+                    None
+                }
+            };
+            keys.push(match (side_of(&l), side_of(&r)) {
+                (Some(true), Some(false)) => (l.unqualify(left), r.unqualify(right)),
+                (Some(false), Some(true)) => (r.unqualify(left), l.unqualify(right)),
+                _ => return Err(unsupported()),
+            });
+        }
+        Ok(keys)
     }
 
     /// Lowers an expression; under an aggregate, grouping expressions and
@@ -922,35 +1099,54 @@ impl Lowerer<'_> {
         }
     }
 
+    /// A name: a column of a table in scope, the pattern id of a log
+    /// table or an attribute path of a telemetry table, found in the
+    /// table a leading part names, or in the only table that has it.
     fn name(&self, parts: &[String], span: Span) -> Result<Expr, Diagnostic> {
-        let scopes = ["attr", "resource", "scope"];
-        let parts: Vec<&str> = match parts {
-            [table, rest @ ..] if Some(table) == self.scope.table.as_ref() && !rest.is_empty() => {
-                rest.iter().map(String::as_str).collect()
+        let scope = &self.scope;
+        let (tables, rest): (Vec<&TableScope>, &[String]) = match parts {
+            [first, rest @ ..] if !rest.is_empty() && scope.table(first).is_some() => {
+                (scope.table(first).into_iter().collect(), rest)
             }
-            _ => parts.iter().map(String::as_str).collect(),
+            _ => (scope.tables.iter().collect(), parts),
         };
-        if let [single] = parts.as_slice() {
-            if self.scope.column_type(single).is_some() {
-                return Ok(Expr::column(*single));
-            }
-            // The pattern of a compacted log row (section 13.2): a column
-            // of compacted files, read like a path so that files without
-            // it read as null.
-            if *single == event::PATTERN_ID && self.scope.kind == Some(Kind::Log) {
+        let column = rest.join(".");
+        let owners: Vec<&TableScope> = tables
+            .iter()
+            .filter(|t| t.schema.field_with_name(&column).is_ok())
+            .copied()
+            .collect();
+        if let Some(table) = one_of(&owners, &column, span)? {
+            return Ok(Expr::column(scope.output_name(table, &column)));
+        }
+        // The pattern of a compacted log row (section 13.2): a column of
+        // compacted files, read like a path so that files without it
+        // read as null.
+        if column == event::PATTERN_ID {
+            let logs: Vec<&TableScope> = tables
+                .iter()
+                .filter(|t| t.kind == Some(Kind::Log))
+                .copied()
+                .collect();
+            if let Some(table) = one_of(&logs, &column, span)? {
                 return Ok(Expr::Path {
-                    path: event::PATTERN_ID.to_owned(),
+                    path: scope.output_name(table, &column),
                     data_type: DataType::Int64,
                 });
             }
-            if let Some((prefix, _)) = single.split_once('.') {
-                if scopes.contains(&prefix) {
-                    return Ok(path(single));
-                }
-            }
         }
-        if parts.len() > 1 && scopes.contains(&parts[0]) {
-            return Ok(path(&parts.join(".")));
+        let scoped = column
+            .split_once('.')
+            .is_some_and(|(prefix, _)| ["attr", "resource", "scope"].contains(&prefix));
+        if scoped {
+            let telemetry: Vec<&TableScope> = tables
+                .iter()
+                .filter(|t| t.kind.is_some())
+                .copied()
+                .collect();
+            if let Some(table) = one_of(&telemetry, &column, span)? {
+                return Ok(path(&scope.output_name(table, &column)));
+            }
         }
         Err(Diagnostic::at(
             span,
@@ -1088,10 +1284,16 @@ impl Lowerer<'_> {
                 "search() takes one string of search syntax",
             ));
         };
-        let kind = self
-            .scope
-            .kind
-            .ok_or_else(|| Diagnostic::at(span, "search() needs a table"))?;
+        // Search syntax is read against one kind of event: the single
+        // telemetry table in scope.
+        let telemetry: Vec<Kind> = self.scope.tables.iter().filter_map(|t| t.kind).collect();
+        let [kind] = telemetry.as_slice() else {
+            return Err(Diagnostic::at(
+                span,
+                "search() needs a table of events, exactly one, in the query",
+            ));
+        };
+        let kind = *kind;
         tessera_search::parse(text, kind).map_err(|inner| {
             // The inner position is within the string: report the call.
             Diagnostic::at(span, format!("in search(): {}", inner.message))
@@ -1222,6 +1424,60 @@ mod tests {
             Statement::Control(statement) => statement,
             other => panic!("not a control statement: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_join_qualifies_columns_by_table_and_lowers_its_keys() {
+        let plan = lowered(
+            "SELECT a.name, k.by FROM alerts a JOIN system.acknowledgments k \
+             ON k.fingerprint = a.attr.alert.fingerprint WHERE k.by = 'ann' AND a.timestamp > 0",
+        );
+        assert_eq!(
+            plan.to_string(),
+            "Project: a.name AS name, k.by AS by\n  \
+             Filter: ((k.by = 'ann') AND (a.timestamp > 0))\n    \
+             Join inner: a.attr.alert.fingerprint = k.fingerprint\n      \
+             Scan: prod/alert [all time) default\n      \
+             SystemTable: default system.acknowledgments\n"
+        );
+        plan.schema(&Registry::builtin()).unwrap();
+        let star = lowered("SELECT * FROM logs l LEFT JOIN spans s ON l.trace_id = s.trace_id");
+        let Plan::Join { kind, .. } = &star else {
+            panic!("a wildcard over a join projects nothing: {star}")
+        };
+        assert_eq!(*kind, JoinKind::Left);
+        let schema = star.schema(&Registry::builtin()).unwrap();
+        assert!(
+            schema.field_with_name("l.body").is_ok() && schema.field_with_name("s.name").is_ok()
+        );
+    }
+
+    #[test]
+    fn join_mistakes_are_diagnosed() {
+        let contains = |sql: &str, text: &str| {
+            let message = lower(&parse(sql).unwrap(), &ctx()).unwrap_err().to_string();
+            assert!(message.contains(text), "{message}");
+        };
+        contains(
+            "SELECT timestamp FROM logs l JOIN spans s ON l.trace_id = s.trace_id",
+            "timestamp is ambiguous",
+        );
+        contains(
+            "SELECT * FROM logs JOIN logs ON logs.trace_id = logs.trace_id",
+            "already in the query",
+        );
+        contains(
+            "SELECT * FROM logs l JOIN spans s ON l.timestamp < s.timestamp",
+            "equalities between the two tables",
+        );
+        contains(
+            "SELECT * FROM logs l JOIN spans s ON l.trace_id = s.trace_id JOIN events e ON e.trace_id = s.trace_id",
+            "one JOIN per query",
+        );
+        contains(
+            "SELECT * FROM logs l JOIN spans s ON l.trace_id = s.trace_id WHERE attr.host = 'h1'",
+            "attr.host is ambiguous",
+        );
     }
 
     #[test]

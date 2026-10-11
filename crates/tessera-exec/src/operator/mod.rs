@@ -12,6 +12,7 @@
 mod aggregate;
 mod extract;
 mod filter;
+mod join;
 mod limit;
 mod project;
 mod range;
@@ -27,6 +28,7 @@ use crate::batch::Batch;
 pub use aggregate::HashAggregate;
 pub use extract::{Extract, Format};
 pub use filter::Filter;
+pub use join::{BuildSide, HashJoin, JoinInput};
 pub use limit::Limit;
 pub use project::Project;
 pub use range::{RangeVector, Steps};

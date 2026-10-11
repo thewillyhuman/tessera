@@ -10,7 +10,12 @@
 //! float, booleans a boolean, timestamps a timestamp, anything else text.
 
 use arrow::datatypes::DataType;
-use tessera_ir::{AggregateExpr, Expr, Literal, NamedExpr, Plan, PlanError, Registry, SortKey};
+use tessera_ir::{
+    AggregateExpr, BinaryOp, Expr, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
+    SortKey, expr_type,
+};
+
+use crate::rewrite::rebuild_inputs;
 
 /// Types every path in `plan` from its context and checks the plan.
 ///
@@ -18,9 +23,56 @@ use tessera_ir::{AggregateExpr, Expr, Literal, NamedExpr, Plan, PlanError, Regis
 ///
 /// If an expression does not type or a projection or union is malformed.
 pub fn bind(plan: Plan, registry: &Registry) -> Result<Plan, PlanError> {
-    let bound = bind_plan(plan);
+    let bound = type_join_keys(bind_plan(plan), registry)?;
     bound.schema(registry)?;
     Ok(bound)
+}
+
+/// Gives a join key that is a path the type of the key it must equal,
+/// read from the other side's schema: `a.attr.n = b.severity_number`
+/// reads the attribute as an integer.
+fn type_join_keys(plan: Plan, registry: &Registry) -> Result<Plan, PlanError> {
+    let mut failed = None;
+    let plan = rebuild_inputs(plan, |input| match type_join_keys(input, registry) {
+        Ok(typed) => typed,
+        Err(error) => {
+            failed = Some(error);
+            Plan::Union { inputs: Vec::new() }
+        }
+    });
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    let Plan::Join {
+        left,
+        right,
+        on,
+        kind,
+    } = plan
+    else {
+        return Ok(plan);
+    };
+    let left_schema = left.plan.schema(registry)?;
+    let right_schema = right.plan.schema(registry)?;
+    let on = on
+        .into_iter()
+        .map(|(l, r)| {
+            let left_type = expr_type(&l, &left_schema, registry).ok();
+            let right_type = expr_type(&r, &right_schema, registry).ok();
+            match (&l, &r) {
+                (Expr::Path { .. }, Expr::Path { .. }) => (l, r),
+                (Expr::Path { .. }, _) => (retype(l, right_type), r),
+                (_, Expr::Path { .. }) => (l, retype(r, left_type)),
+                _ => (l, r),
+            }
+        })
+        .collect();
+    Ok(Plan::Join {
+        left,
+        right,
+        on,
+        kind,
+    })
 }
 
 fn bind_plan(plan: Plan) -> Plan {
@@ -111,6 +163,26 @@ fn bind_plan(plan: Plan) -> Plan {
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs.into_iter().map(bind_plan).collect(),
         },
+        Plan::Join {
+            left,
+            right,
+            on,
+            kind,
+        } => Plan::Join {
+            left: JoinSide::new(bind_plan(*left.plan), left.name),
+            right: JoinSide::new(bind_plan(*right.plan), right.name),
+            on: on.into_iter().map(bind_join_key).collect(),
+            kind,
+        },
+    }
+}
+
+/// Binds a join key pair as the comparison it is, so that a path on
+/// one side takes the type of the column on the other.
+fn bind_join_key((left, right): (Expr, Expr)) -> (Expr, Expr) {
+    match bind_expr(left.binary(BinaryOp::Eq, right)) {
+        Expr::Binary { left, right, .. } => (*left, *right),
+        other => unreachable!("a comparison binds to a comparison: {other}"),
     }
 }
 
@@ -278,10 +350,42 @@ pub fn bind_expr(expr: Expr) -> Expr {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::TimeUnit;
-    use tessera_ir::{BinaryOp, Scan};
+    use tessera_ir::{JoinKind, Scan};
     use tessera_types::{DatasetName, Kind, TenantId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn a_join_key_path_takes_the_other_sides_type() {
+        let scan = || {
+            Plan::Scan(Scan::all(
+                TenantId::DEFAULT,
+                DatasetName::new("prod").unwrap(),
+                Kind::Log,
+            ))
+        };
+        let bound = bind(
+            Plan::Join {
+                left: JoinSide::new(scan(), "a"),
+                right: JoinSide::new(scan(), "b"),
+                on: vec![
+                    (path("attr.n"), Expr::column("severity_number")),
+                    (Expr::column("timestamp"), path("attr.at")),
+                ],
+                kind: JoinKind::Inner,
+            },
+            &Registry::builtin(),
+        )
+        .unwrap();
+        let Plan::Join { on, .. } = bound else {
+            panic!("join")
+        };
+        assert_eq!(typed(&on[0].0), &DataType::Int32);
+        assert_eq!(
+            typed(&on[1].1),
+            &DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
+    }
 
     fn path(p: &str) -> Expr {
         Expr::Path {

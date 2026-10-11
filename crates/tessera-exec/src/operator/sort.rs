@@ -67,15 +67,21 @@ pub(crate) fn sorted(
 
 /// Pushes `rows` to `out` in batches of [`OUTPUT_ROWS`].
 pub(crate) fn emit(rows: &RecordBatch, out: &mut dyn Sink) -> Result<(), ExecError> {
+    emit_flow(rows, out).map(|_| ())
+}
+
+/// [`emit`] telling whether the sink wants more, for a streaming
+/// operator that may stop its input.
+pub(crate) fn emit_flow(rows: &RecordBatch, out: &mut dyn Sink) -> Result<Flow, ExecError> {
     let mut offset = 0;
     while offset < rows.num_rows() {
         let length = OUTPUT_ROWS.min(rows.num_rows() - offset);
         if out.push(Batch::new(rows.slice(offset, length)))? == Flow::Done {
-            break;
+            return Ok(Flow::Done);
         }
         offset += length;
     }
-    Ok(())
+    Ok(Flow::Continue)
 }
 
 impl Operator for Sort {

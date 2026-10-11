@@ -9,8 +9,8 @@
 use tessera_ir::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CreateAlert, CreateRetentionPolicy, CreateRollup, Expr, ExprKind, OrderItem, Query,
-    RetentionActionAst, RetentionClauseAst, SelectItem, Statement, TableRef,
+    BinaryOp, CreateAlert, CreateRetentionPolicy, CreateRollup, Expr, ExprKind, Join, JoinKind,
+    OrderItem, Query, RetentionActionAst, RetentionClauseAst, SelectItem, Statement, TableRef,
 };
 use crate::lexer::{Spanned, Token, tokenize};
 
@@ -547,6 +547,13 @@ impl Parser<'_> {
         } else {
             None
         };
+        let mut joins = Vec::new();
+        while let Some(kind) = self.join_kind()? {
+            let table = self.table_ref()?;
+            self.expect_keyword("on")?;
+            let on = self.expr()?;
+            joins.push(Join { kind, table, on });
+        }
         let filter = if self.eat_keyword("where") {
             Some(self.expr()?)
         } else {
@@ -596,6 +603,7 @@ impl Parser<'_> {
         Ok(Query {
             items,
             from,
+            joins,
             filter,
             group_by,
             having,
@@ -626,38 +634,64 @@ impl Parser<'_> {
             return Ok(SelectItem::Wildcard);
         }
         let expr = self.expr()?;
-        let alias = if self.eat_keyword("as") {
-            Some(self.identifier()?.0)
-        } else {
-            match self.peek() {
-                // A bare name after an expression is an alias, unless it is
-                // a clause keyword.
-                Some(Spanned {
-                    token: Token::Ident { name, quoted },
-                    ..
-                }) if *quoted || !CLAUSE_KEYWORDS.contains(&name.as_str()) => {
-                    Some(self.identifier()?.0)
-                }
-                _ => None,
-            }
-        };
+        let alias = self.alias(&CLAUSE_KEYWORDS)?;
         Ok(SelectItem::Expr { expr, alias })
     }
 
+    /// `AS name`, or a bare name that is not one of `keywords`, which
+    /// end the item an alias would follow.
+    fn alias(&mut self, keywords: &[&str]) -> Result<Option<String>, Diagnostic> {
+        if self.eat_keyword("as") {
+            return Ok(Some(self.identifier()?.0));
+        }
+        match self.peek() {
+            Some(Spanned {
+                token: Token::Ident { name, quoted },
+                ..
+            }) if *quoted || !keywords.contains(&name.as_str()) => Ok(Some(self.identifier()?.0)),
+            _ => Ok(None),
+        }
+    }
+
+    /// `JOIN`, `INNER JOIN`, `LEFT JOIN` or `LEFT OUTER JOIN`, if one
+    /// starts here.
+    fn join_kind(&mut self) -> Result<Option<JoinKind>, Diagnostic> {
+        if self.eat_keyword("join") {
+            return Ok(Some(JoinKind::Inner));
+        }
+        if self.eat_keyword("inner") {
+            self.expect_keyword("join")?;
+            return Ok(Some(JoinKind::Inner));
+        }
+        if self.eat_keyword("left") {
+            let _ = self.eat_keyword("outer");
+            self.expect_keyword("join")?;
+            return Ok(Some(JoinKind::Left));
+        }
+        Ok(None)
+    }
+
+    /// `[dataset.]table [[AS] alias]`.
     fn table_ref(&mut self) -> Result<TableRef, Diagnostic> {
         let (first, start) = self.identifier()?;
-        if self.eat_symbol(".") {
+        let (dataset, table, span) = if self.eat_symbol(".") {
             let (table, end) = self.identifier()?;
-            return Ok(TableRef {
-                dataset: Some(first),
-                table,
-                span: Span::new(start.start, end.end),
-            });
-        }
+            (Some(first), table, Span::new(start.start, end.end))
+        } else {
+            (None, first, start)
+        };
+        let keywords: Vec<&str> = CLAUSE_KEYWORDS
+            .iter()
+            .chain(ALERT_KEYWORDS.iter())
+            .chain(TABLE_KEYWORDS.iter())
+            .copied()
+            .collect();
+        let alias = self.alias(&keywords)?;
         Ok(TableRef {
-            dataset: None,
-            table: first,
-            span: start,
+            dataset,
+            table,
+            alias,
+            span,
         })
     }
 
@@ -1016,9 +1050,14 @@ const ALERT_KEYWORDS: [&str; 11] = [
 
 /// Keywords that end a select item, so a bare name before them is not an
 /// alias.
-const CLAUSE_KEYWORDS: [&str; 10] = [
-    "from", "where", "group", "order", "limit", "offset", "and", "or", "as", "having",
+const CLAUSE_KEYWORDS: [&str; 15] = [
+    "from", "where", "group", "order", "limit", "offset", "and", "or", "as", "having", "join",
+    "inner", "left", "outer", "on",
 ];
+
+/// Keywords that may follow a table in the statements that name one,
+/// so a bare name before them is not an alias.
+const TABLE_KEYWORDS: [&str; 2] = ["set", "values"];
 
 fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
     let span = Span::new(left.span.start, right.span.end);
@@ -1158,6 +1197,38 @@ mod tests {
         };
         assert!(filter.is_some());
         assert_eq!(filter_text, "attr.user = 'u1' AND severity_number < 9");
+    }
+
+    #[test]
+    fn parses_joins_with_aliases() {
+        let q = query(
+            "SELECT a.name, k.by FROM alerts AS a LEFT OUTER JOIN system.acknowledgments k \
+             ON a.attr.alert.fingerprint = k.fingerprint AND a.name = k.comment WHERE k.by = 'ann'",
+        );
+        let from = q.from.unwrap();
+        assert_eq!(from.table, "alerts");
+        assert_eq!(from.alias.as_deref(), Some("a"));
+        assert_eq!(q.joins.len(), 1);
+        assert_eq!(q.joins[0].kind, JoinKind::Left);
+        assert_eq!(q.joins[0].table.dataset.as_deref(), Some("system"));
+        assert_eq!(q.joins[0].table.alias.as_deref(), Some("k"));
+        assert!(matches!(
+            &q.joins[0].on.kind,
+            ExprKind::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+        assert!(q.filter.is_some());
+        let inner = query("SELECT * FROM logs l INNER JOIN spans ON l.trace_id = spans.trace_id");
+        assert_eq!(inner.joins[0].kind, JoinKind::Inner);
+        assert_eq!(inner.joins[0].table.alias, None);
+        let plain = query("SELECT * FROM logs WHERE true");
+        assert_eq!(
+            plain.from.unwrap().alias,
+            None,
+            "a clause keyword is not an alias"
+        );
     }
 
     #[test]
@@ -1329,7 +1400,7 @@ mod tests {
         assert_eq!(error.message, "expected an expression, found end of input");
         let error = parse("SELECT * FROM logs LIMIT x").unwrap_err();
         assert!(error.message.starts_with("expected a number"));
-        let error = parse("SELECT * FROM logs extra").unwrap_err();
+        let error = parse("SELECT * FROM logs l extra").unwrap_err();
         assert_eq!(error.message, "unexpected \"extra\" after the statement");
         let error = parse("SELECT (1 FROM logs").unwrap_err();
         assert!(error.message.starts_with("expected \")\""));

@@ -195,7 +195,7 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
             negated,
         } => {
             let tested = value(expr, batch)?;
-            let found = match in_byte_set(&tested, list) {
+            let found = match in_hashed_set(&tested, list) {
                 Some(found) => tested.with_array(Arc::new(found)),
                 None => in_list(&tested, list)?,
             };
@@ -233,9 +233,10 @@ fn in_list(tested: &Value, list: &[Literal]) -> Result<Value, KernelError> {
     }))
 }
 
-/// `tested IN list` through a hash set, for a long list of bytes over a
-/// binary column; `None` when the fast path does not apply.
-fn in_byte_set(tested: &Value, list: &[Literal]) -> Option<BooleanArray> {
+/// `tested IN list` through a hash set, for a long list of bytes over
+/// a binary column or of text over a text column; `None` when the fast
+/// path does not apply.
+fn in_hashed_set(tested: &Value, list: &[Literal]) -> Option<BooleanArray> {
     if list.len() < HASHED_LIST_MIN {
         return None;
     }
@@ -243,6 +244,7 @@ fn in_byte_set(tested: &Value, list: &[Literal]) -> Option<BooleanArray> {
         .iter()
         .map(|item| match item {
             Literal::Bytes(bytes) => Some(bytes.as_slice()),
+            Literal::Text(text) => Some(text.as_bytes()),
             _ => None,
         })
         .collect::<Option<_>>()?;
@@ -260,6 +262,12 @@ fn in_byte_set(tested: &Value, list: &[Literal]) -> Option<BooleanArray> {
             .downcast_ref::<BinaryArray>()?
             .iter()
             .map(probe)
+            .collect(),
+        DataType::Utf8 => array
+            .as_any()
+            .downcast_ref::<StringArray>()?
+            .iter()
+            .map(|value| probe(value.map(str::as_bytes)))
             .collect(),
         _ => return None,
     })
@@ -921,8 +929,21 @@ mod tests {
         let mut mixed = list.clone();
         mixed.push(Literal::Int(1));
         assert!(
-            in_byte_set(&Value::Column(batch.column(0).clone()), &mixed).is_none(),
+            in_hashed_set(&Value::Column(batch.column(0).clone()), &mixed).is_none(),
             "a mixed list takes the comparison path"
+        );
+        let texts: Vec<Literal> = (0..HASHED_LIST_MIN + 2)
+            .map(|i| Literal::Text(format!("t{i}")))
+            .collect();
+        let column = Value::Column(Arc::new(StringArray::from(vec![
+            Some("t3"),
+            Some("x"),
+            None,
+        ])));
+        let found = in_hashed_set(&column, &texts).expect("text takes the hashed path");
+        assert_eq!(
+            found.iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(false), None]
         );
     }
 

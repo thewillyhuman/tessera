@@ -43,12 +43,15 @@ filtered rows late; an engine that scans files and the tail alike with
 lexer, parser and lowering; SQL over HTTP and over the PostgreSQL wire
 protocol; a differential suite against SQLite.
 
-Gaps left in M2: no joins, `HAVING`, subqueries or window functions;
-no query parameters over the PostgreSQL protocol; blocking operators
-fail instead of spilling when their memory grant runs out; pipelines
-run one plan node at a time rather than fused across stages; a bare
-attribute reads as text until the advisor promotes it (M8); `now()` is
-the node's clock and there is no result cache.
+Gaps left in M2: joins are hash joins on equality keys, inner or left,
+one `JOIN` per query, with the build side's keys as a runtime filter on
+the other side but no `ASOF`, merge or lookup variants; no subqueries
+or window functions; no query parameters over the PostgreSQL protocol;
+blocking operators fail instead of spilling when their memory grant
+runs out; pipelines run one plan node at a time rather than fused
+across stages; a bare attribute reads as text until the advisor
+promotes it (M8); `now()` is the node's clock and there is no result
+cache.
 
 **M3, logs complete: done, with gaps listed below.** Compaction of L1
 files into L2 files with deduplication, the default layouts of section

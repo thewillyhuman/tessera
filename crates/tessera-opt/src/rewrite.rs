@@ -11,11 +11,17 @@
 //! 4. A limit over a sort becomes a top-K, and a top-K or limit by time
 //!    descending over a scan lets the scan read newest first and stop
 //!    (limit and order pushdown with early termination).
+//! 5. Through a join, a predicate or a needed column that names one
+//!    side only moves to that side with its qualifier removed; a left
+//!    join keeps the predicates on its right side above itself.
 
 use std::collections::BTreeSet;
 
 use tessera_ir::trace::SPAN_COLUMNS;
-use tessera_ir::{BinaryOp, Expr, Literal, Plan, Scan, SortKey, Spanset, VALUE as VALUE_COLUMN};
+use tessera_ir::{
+    BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, Scan, SortKey, Spanset,
+    VALUE as VALUE_COLUMN, unqualify,
+};
 use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
 use tessera_types::{TimeRange, Timestamp};
 
@@ -85,6 +91,34 @@ fn push_predicates(plan: Plan, mut pending: Vec<Expr>) -> Plan {
                 .map(|i| push_predicates(i, pending.clone()))
                 .collect(),
         },
+        Plan::Join {
+            left,
+            right,
+            on,
+            kind,
+        } => {
+            let (to_left, rest): (Vec<Expr>, Vec<Expr>) = pending
+                .into_iter()
+                .partition(|p| names_one_side(p, &left.name));
+            // A predicate on the right of a left join decides which rows
+            // are null, not which right rows exist.
+            let (to_right, above): (Vec<Expr>, Vec<Expr>) = rest
+                .into_iter()
+                .partition(|p| kind == JoinKind::Inner && names_one_side(p, &right.name));
+            let joined = Plan::Join {
+                left: JoinSide::new(
+                    push_predicates(*left.plan, unqualified(to_left, &left.name)),
+                    left.name,
+                ),
+                right: JoinSide::new(
+                    push_predicates(*right.plan, unqualified(to_right, &right.name)),
+                    right.name,
+                ),
+                on,
+                kind,
+            };
+            wrap_filter(joined, above)
+        }
         other => {
             // Aggregates, limits, top-K and values stop predicates: the
             // rows above them are not the rows below.
@@ -99,6 +133,20 @@ fn wrap_filter(plan: Plan, predicates: Vec<Expr>) -> Plan {
         Some(predicate) => plan.filter(predicate),
         None => plan,
     }
+}
+
+/// Whether every name `expr` reads is qualified by `side`, and it reads
+/// at least one: what may move below a join to that side.
+fn names_one_side(expr: &Expr, side: &str) -> bool {
+    let names = expr.names();
+    !names.is_empty()
+        && !matches!(expr, Expr::Label { .. })
+        && names.iter().all(|n| unqualify(side, n).is_some())
+}
+
+/// `exprs` with the qualifier `side` removed from every name.
+fn unqualified(exprs: Vec<Expr>, side: &str) -> Vec<Expr> {
+    exprs.into_iter().map(|e| e.unqualify(side)).collect()
 }
 
 /// Applies `f` to each input of `plan`, keeping the node itself.
@@ -171,6 +219,12 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs.into_iter().map(f).collect(),
         },
+        Plan::Join {
+            left,
+            right,
+            on,
+            kind,
+        } => rebuild_join(left, right, on, kind, f),
         Plan::TraceGroup {
             candidates,
             spans,
@@ -193,6 +247,22 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
             end,
             step,
         },
+    }
+}
+
+/// The join of [`rebuild_inputs`], both sides rebuilt in order.
+fn rebuild_join(
+    left: JoinSide,
+    right: JoinSide,
+    on: Vec<(Expr, Expr)>,
+    kind: JoinKind,
+    mut f: impl FnMut(Plan) -> Plan,
+) -> Plan {
+    Plan::Join {
+        left: JoinSide::new(f(*left.plan), left.name),
+        right: JoinSide::new(f(*right.plan), right.name),
+        on,
+        kind,
     }
 }
 
@@ -387,6 +457,23 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
                 .map(|i| push_projection(i, needed.clone(), whole))
                 .collect(),
         },
+        Plan::Join {
+            left,
+            right,
+            on,
+            kind,
+        } => {
+            let side = |side: JoinSide, keys: &mut dyn Iterator<Item = &Expr>| {
+                let (needed, whole) = needed_by_side(&side.name, keys, needed.as_ref(), whole);
+                JoinSide::new(push_projection(*side.plan, needed, whole), side.name)
+            };
+            Plan::Join {
+                left: side(left, &mut on.iter().map(|(l, _)| l)),
+                right: side(right, &mut on.iter().map(|(_, r)| r)),
+                on,
+                kind,
+            }
+        }
         Plan::TraceGroup {
             candidates,
             spans,
@@ -394,6 +481,30 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
         } => push_projection_trace(candidates, *spans, spanset),
         other => push_projection_text(other, needed),
     }
+}
+
+/// What one join side must output: the columns above the join that
+/// its name qualifies, unqualified, and what its keys read.
+fn needed_by_side(
+    name: &str,
+    keys: &mut dyn Iterator<Item = &Expr>,
+    needed: Option<&BTreeSet<String>>,
+    whole: bool,
+) -> (Option<BTreeSet<String>>, bool) {
+    let mut needed = needed.map(|n| {
+        n.iter()
+            .filter_map(|c| unqualify(name, c).map(str::to_owned))
+            .collect::<BTreeSet<String>>()
+    });
+    let mut whole = whole;
+    for key in keys {
+        needed = needed.map(|mut n| {
+            n.extend(key.references());
+            n
+        });
+        whole = whole || key.needs_overflow_whole();
+    }
+    (needed, whole)
 }
 
 /// The trace group of [`push_projection`]: candidates contribute only
@@ -548,6 +659,92 @@ mod tests {
             Plan::Scan(scan) => scan,
             other => other.inputs().into_iter().map(scan_of).next().unwrap(),
         }
+    }
+
+    /// `logs a JOIN spans b ON a.trace_id = b.trace_id`, filtered on both
+    /// sides and projecting one column of each.
+    fn joined(kind: JoinKind) -> Plan {
+        let dataset = DatasetName::new("prod").unwrap();
+        let scan = |k| Plan::Scan(Scan::all(TenantId::DEFAULT, dataset.clone(), k));
+        Plan::Join {
+            left: JoinSide::new(scan(Kind::Log), "a"),
+            right: JoinSide::new(scan(Kind::Span), "b"),
+            on: vec![(Expr::column("trace_id"), Expr::column("trace_id"))],
+            kind,
+        }
+        .filter(
+            Expr::column("a.severity_number")
+                .binary(BinaryOp::GtEq, Expr::literal(17))
+                .and(Expr::column("b.name").binary(BinaryOp::Eq, Expr::literal("db")))
+                .and(Expr::column("a.timestamp").binary(BinaryOp::Lt, Expr::column("b.timestamp"))),
+        )
+        .project(vec![
+            NamedExpr::new(Expr::column("a.body"), "body"),
+            NamedExpr::new(
+                Expr::Path {
+                    path: "b.attr.db.statement".into(),
+                    data_type: DataType::Utf8,
+                },
+                "statement",
+            ),
+        ])
+    }
+
+    #[test]
+    fn predicates_and_columns_move_to_their_join_side_unqualified() {
+        let Plan::Project { input, .. } = rewrite(joined(JoinKind::Inner)) else {
+            panic!("project")
+        };
+        let Plan::Filter { input, predicate } = *input else {
+            panic!("the predicate over both sides stays above the join")
+        };
+        assert_eq!(predicate.to_string(), "(a.timestamp < b.timestamp)");
+        let Plan::Join { left, right, .. } = *input else {
+            panic!("join")
+        };
+        let left = scan_of(&left.plan);
+        assert_eq!(left.predicates[0].to_string(), "(severity_number >= 17)");
+        assert_eq!(
+            left.projection.as_deref(),
+            Some(
+                &[
+                    "timestamp".to_owned(),
+                    "trace_id".into(),
+                    "severity_number".into(),
+                    "body".into()
+                ][..]
+            )
+        );
+        let right = scan_of(&right.plan);
+        assert_eq!(right.predicates[0].to_string(), "(name = 'db')");
+        assert!(
+            right
+                .projection
+                .as_deref()
+                .unwrap()
+                .contains(&OVERFLOW.to_owned()),
+            "the path read above the join needs the right side's overflow"
+        );
+        assert!(!right.overflow_whole, "a path reads one attribute");
+    }
+
+    #[test]
+    fn a_left_join_keeps_its_right_predicates_above() {
+        let Plan::Project { input, .. } = rewrite(joined(JoinKind::Left)) else {
+            panic!("project")
+        };
+        let Plan::Filter { input, predicate } = *input else {
+            panic!("filter")
+        };
+        assert_eq!(
+            predicate.to_string(),
+            "((b.name = 'db') AND (a.timestamp < b.timestamp))"
+        );
+        let Plan::Join { left, right, .. } = *input else {
+            panic!("join")
+        };
+        assert_eq!(scan_of(&left.plan).predicates.len(), 1);
+        assert!(scan_of(&right.plan).predicates.is_empty());
     }
 
     #[test]

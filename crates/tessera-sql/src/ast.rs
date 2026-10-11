@@ -128,6 +128,8 @@ pub struct Query {
     pub items: Vec<SelectItem>,
     /// `FROM`, if any.
     pub from: Option<TableRef>,
+    /// The `JOIN` clauses after `FROM`, in order.
+    pub joins: Vec<Join>,
     /// `WHERE`, if any.
     pub filter: Option<Expr>,
     /// `GROUP BY` expressions.
@@ -163,8 +165,31 @@ pub struct TableRef {
     pub dataset: Option<String>,
     /// The table name: `logs`, `spans`, ...
     pub table: String,
+    /// `AS name`, or a bare name after the table.
+    pub alias: Option<String>,
     /// Where it was written.
     pub span: Span,
+}
+
+/// A `JOIN` clause: another table and the condition pairing its rows
+/// with the rows so far.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Join {
+    /// Which rows are kept.
+    pub kind: JoinKind,
+    /// The joined table.
+    pub table: TableRef,
+    /// `ON`.
+    pub on: Expr,
+}
+
+/// Which rows a join keeps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinKind {
+    /// `JOIN` or `INNER JOIN`: the rows matched on both sides.
+    Inner,
+    /// `LEFT JOIN`: every row so far, matched or not.
+    Left,
 }
 
 /// One `ORDER BY` item.

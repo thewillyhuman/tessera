@@ -26,15 +26,15 @@ pub mod system;
 pub mod trace;
 pub mod typing;
 
-pub use expr::{BinaryOp, Expr, Literal};
+pub use expr::{BinaryOp, Expr, Literal, qualify, split_qualifier, unqualify};
 pub use frontend::{
     AlertDefinition, BindContext, ControlStatement, Diagnostic, Frontend, RollupDefinition, Span,
     Statement,
 };
 pub use function::{AggregateFunction, Registry, ScalarFunction};
 pub use plan::{
-    AggregateExpr, ExtractStage, NamedExpr, PathColumn, Plan, PlanError, RangeFunction, Scan,
-    SeriesGrouping, SortKey, VALUE, range_vector_schema,
+    AggregateExpr, ExtractStage, JoinKind, JoinSide, NamedExpr, PathColumn, Plan, PlanError,
+    RangeFunction, Scan, SeriesGrouping, SortKey, VALUE, range_vector_schema,
 };
 pub use promql::{Group, LOOKBACK, Matching, PromAggregate, PromExpr, PromOp};
 pub use system::{log_patterns_schema, system_table_schema, usage_schema};

@@ -16,7 +16,35 @@ use serde::{Deserialize, Serialize};
 
 use arrow::datatypes::{DataType, TimeUnit};
 use tessera_types::Timestamp;
-use tessera_types::event::{EXTRACTED, OVERFLOW, SEVERITY_TEXT};
+use tessera_types::event::{EXTRACTED, OVERFLOW, PATTERN_ID, SCOPES, SEVERITY_TEXT};
+
+/// `column` as a side of a join outputs it: `name.column` (DM-2).
+#[must_use]
+pub fn qualify(name: &str, column: &str) -> String {
+    format!("{name}.{column}")
+}
+
+/// The column behind `qualified` if it is `name.column`, else `None`.
+#[must_use]
+pub fn unqualify<'a>(name: &str, qualified: &'a str) -> Option<&'a str> {
+    qualified
+        .strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('.'))
+}
+
+/// The join side and attribute path of a path written `name.attr.x`:
+/// the part before the scope prefix, or before the pattern id, names
+/// the side. A path with no side, or whose first part is itself a
+/// scope, is not qualified.
+#[must_use]
+pub fn split_qualifier(path: &str) -> Option<(&str, &str)> {
+    let (name, rest) = path.split_once('.')?;
+    let scoped = rest == PATTERN_ID || SCOPES.iter().any(|scope| rest.starts_with(scope));
+    let name_is_scope = SCOPES
+        .iter()
+        .any(|scope| scope.trim_end_matches('.') == name);
+    (scoped && !name_is_scope).then_some((name, rest))
+}
 
 /// A constant.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -311,13 +339,87 @@ impl Expr {
         columns
     }
 
+    /// The names the expression reads as written: columns by name and
+    /// attributes by path, with no mapping to the columns that serve
+    /// them. A label names nothing: it may come from any attribute.
+    #[must_use]
+    pub fn names(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        self.collect_names(&mut names);
+        names
+    }
+
+    /// The expression with every column name and attribute path
+    /// renamed by `f`: how a join side's names gain and lose their
+    /// qualifier.
+    #[must_use]
+    pub fn rename(self, f: &impl Fn(String) -> String) -> Expr {
+        match self {
+            Expr::Column(name) => Expr::Column(f(name)),
+            Expr::Path { path, data_type } => Expr::Path {
+                path: f(path),
+                data_type,
+            },
+            Expr::Label { .. } | Expr::Literal(_) => self,
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op,
+                left: Box::new(left.rename(f)),
+                right: Box::new(right.rename(f)),
+            },
+            Expr::Not(expr) => Expr::Not(Box::new(expr.rename(f))),
+            Expr::Negate(expr) => Expr::Negate(Box::new(expr.rename(f))),
+            Expr::IsNull { expr, negated } => Expr::IsNull {
+                expr: Box::new(expr.rename(f)),
+                negated,
+            },
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                case_insensitive,
+            } => Expr::Like {
+                expr: Box::new(expr.rename(f)),
+                pattern,
+                negated,
+                case_insensitive,
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(expr.rename(f)),
+                list,
+                negated,
+            },
+            Expr::Call { name, args } => Expr::Call {
+                name,
+                args: args.into_iter().map(|a| a.rename(f)).collect(),
+            },
+            Expr::Cast { expr, to } => Expr::Cast {
+                expr: Box::new(expr.rename(f)),
+                to,
+            },
+        }
+    }
+
+    /// The expression with the qualifier `side` removed from every
+    /// name: what a join side evaluates over its own rows.
+    #[must_use]
+    pub fn unqualify(self, side: &str) -> Expr {
+        self.rename(&|name| unqualify(side, &name).map_or(name.clone(), str::to_owned))
+    }
+
     /// Whether the expression reads `_overflow` as a whole: the column
-    /// itself, or a label, which may come from any attribute. A path
-    /// reads one attribute, which a dedicated column serves as well.
+    /// itself, on any join side, or a label, which may come from any
+    /// attribute. A path reads one attribute, which a dedicated column
+    /// serves as well.
     #[must_use]
     pub fn needs_overflow_whole(&self) -> bool {
         match self {
-            Expr::Column(name) => name == OVERFLOW,
+            Expr::Column(name) => name
+                .strip_suffix(OVERFLOW)
+                .is_some_and(|side| side.is_empty() || side.ends_with('.')),
             Expr::Label { .. } => true,
             Expr::Path { .. } | Expr::Literal(_) => false,
             Expr::Binary { left, right, .. } => {
@@ -333,13 +435,41 @@ impl Expr {
         }
     }
 
+    fn collect_names(&self, into: &mut BTreeSet<String>) {
+        match self {
+            Expr::Column(name) | Expr::Path { path: name, .. } => {
+                into.insert(name.clone());
+            }
+            Expr::Label { .. } | Expr::Literal(_) => {}
+            Expr::Binary { left, right, .. } => {
+                left.collect_names(into);
+                right.collect_names(into);
+            }
+            Expr::Not(expr)
+            | Expr::Negate(expr)
+            | Expr::IsNull { expr, .. }
+            | Expr::Like { expr, .. }
+            | Expr::InList { expr, .. }
+            | Expr::Cast { expr, .. } => expr.collect_names(into),
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    arg.collect_names(into);
+                }
+            }
+        }
+    }
+
     fn collect_references(&self, into: &mut BTreeSet<String>) {
         match self {
             Expr::Column(name) => {
                 into.insert(name.clone());
             }
-            Expr::Path { .. } => {
-                into.insert(OVERFLOW.to_owned());
+            Expr::Path { path, .. } => {
+                // A qualified path reads its own side's overflow.
+                into.insert(match split_qualifier(path) {
+                    Some((side, _)) => qualify(side, OVERFLOW),
+                    None => OVERFLOW.to_owned(),
+                });
             }
             Expr::Label { .. } => {
                 into.insert(EXTRACTED.to_owned());
@@ -465,6 +595,40 @@ impl fmt::Display for Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualified_names_read_their_own_sides_overflow() {
+        let path = Expr::Path {
+            path: "a.attr.n".into(),
+            data_type: DataType::Int64,
+        };
+        let expr = path.clone().binary(BinaryOp::Eq, Expr::column("s.id"));
+        assert_eq!(
+            expr.references(),
+            BTreeSet::from(["a._overflow".to_owned(), "s.id".to_owned()])
+        );
+        assert_eq!(
+            expr.names(),
+            BTreeSet::from(["a.attr.n".to_owned(), "s.id".to_owned()])
+        );
+        assert_eq!(split_qualifier("a.attr.n"), Some(("a", "attr.n")));
+        assert_eq!(
+            split_qualifier("attr.attr.n"),
+            None,
+            "a scope is not a side"
+        );
+        assert_eq!(split_qualifier("attr.n"), None);
+        assert_eq!(unqualify("a", "a.attr.n"), Some("attr.n"));
+        assert_eq!(unqualify("a", "ab.x"), None);
+        let stripped = expr.unqualify("a");
+        assert_eq!(
+            stripped.names(),
+            BTreeSet::from(["attr.n".to_owned(), "s.id".to_owned()])
+        );
+        assert!(Expr::column("a._overflow").needs_overflow_whole());
+        assert!(!Expr::column("a.body").needs_overflow_whole());
+        assert!(!path.needs_overflow_whole());
+    }
 
     #[test]
     fn conjuncts_flatten_nested_ands() {

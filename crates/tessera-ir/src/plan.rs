@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tessera_types::event::{EXTRACTED, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{DatasetName, Kind, TenantId, TimeRange, Timestamp, event};
 
-use crate::expr::{Expr, Literal};
+use crate::expr::{Expr, Literal, qualify};
 use crate::function::Registry;
 use crate::promql::PromExpr;
 use crate::trace::{Spanset, trace_group_schema};
@@ -40,6 +40,55 @@ pub enum PlanError {
     /// A union has no inputs.
     #[error("union has no inputs")]
     EmptyUnion,
+    /// The sides of a join have one name, so their columns would clash.
+    #[error("both sides of the join are named {0}")]
+    JoinNames(String),
+    /// A join has no key.
+    #[error("join has no condition")]
+    EmptyJoin,
+    /// A join key has different types on the two sides.
+    #[error("join keys have different types: {0} and {1}")]
+    JoinKeyTypes(String, String),
+}
+
+/// Which rows a join keeps (DM-2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinKind {
+    /// The rows with a match on both sides.
+    Inner,
+    /// Every left row, with nulls in the right columns where no right
+    /// row matches.
+    Left,
+}
+
+impl fmt::Display for JoinKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinKind::Inner => write!(f, "inner"),
+            JoinKind::Left => write!(f, "left"),
+        }
+    }
+}
+
+/// One side of a join: the rows and the name that qualifies their
+/// columns in the output, so that both sides may have a `timestamp`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct JoinSide {
+    /// The rows.
+    pub plan: Box<Plan>,
+    /// The qualifier: `name.column` is this side's `column`.
+    pub name: String,
+}
+
+impl JoinSide {
+    /// `plan` qualified by `name`.
+    #[must_use]
+    pub fn new(plan: Plan, name: impl Into<String>) -> Self {
+        JoinSide {
+            plan: Box::new(plan),
+            name: name.into(),
+        }
+    }
 }
 
 /// An expression with the name it is output under.
@@ -375,6 +424,19 @@ pub enum Plan {
         /// The inputs.
         inputs: Vec<Plan>,
     },
+    /// The pairs of rows of two inputs whose keys are equal (DM-2),
+    /// each side's columns qualified by the side's name. A key is an
+    /// expression over its own side; null keys match nothing.
+    Join {
+        /// The side whose rows a left join keeps.
+        left: JoinSide,
+        /// The other side.
+        right: JoinSide,
+        /// The keys, a left expression and the right one it must equal.
+        on: Vec<(Expr, Expr)>,
+        /// Which rows are kept.
+        kind: JoinKind,
+    },
     /// Derive labels from text: parse `source` by `stage` and add the
     /// results to the `_extracted` column, later stages overriding
     /// earlier labels of the same name.
@@ -521,6 +583,7 @@ impl Plan {
             | Plan::Format { input, .. }
             | Plan::RangeVector { input, .. } => vec![input],
             Plan::Union { inputs } | Plan::PromQL { inputs, .. } => inputs.iter().collect(),
+            Plan::Join { left, right, .. } => vec![&left.plan, &right.plan],
             Plan::TraceGroup {
                 candidates, spans, ..
             } => candidates
@@ -575,6 +638,7 @@ impl Plan {
             }
             Plan::Aggregate { .. }
             | Plan::Union { .. }
+            | Plan::Join { .. }
             | Plan::Values { .. }
             | Plan::SystemTable { .. }
             | Plan::RangeVector { .. }
@@ -661,6 +725,12 @@ impl Plan {
                 }
                 Ok(schema)
             }
+            Plan::Join {
+                left,
+                right,
+                on,
+                kind,
+            } => join_schema(left, right, on, *kind, registry),
         }
     }
 
@@ -671,6 +741,26 @@ impl Plan {
             Plan::Union { inputs } => {
                 writeln!(f, "{pad}Union")?;
                 inputs.iter().try_for_each(|i| i.fmt_tree(f, depth + 1))
+            }
+            Plan::Join {
+                left,
+                right,
+                on,
+                kind,
+            } => {
+                let keys: Vec<String> = on
+                    .iter()
+                    .map(|(l, r)| {
+                        format!(
+                            "{} = {}",
+                            qualified_key(&left.name, l),
+                            qualified_key(&right.name, r)
+                        )
+                    })
+                    .collect();
+                writeln!(f, "{pad}Join {kind}: {}", keys.join(" AND "))?;
+                left.plan.fmt_tree(f, depth + 1)?;
+                right.plan.fmt_tree(f, depth + 1)
             }
             Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
             Plan::SystemTable { tenant, table } => {
@@ -757,11 +847,72 @@ impl Plan {
             }
             Plan::Scan(_)
             | Plan::Union { .. }
+            | Plan::Join { .. }
             | Plan::Values { .. }
             | Plan::SystemTable { .. }
             | Plan::TraceGroup { .. }
             | Plan::PromQL { .. } => Ok(()),
         }
+    }
+}
+
+/// The schema of a join: the left columns then the right ones, each
+/// qualified by its side's name; the right ones nullable under a left
+/// join. The keys must type on their sides, pairwise alike.
+fn join_schema(
+    left: &JoinSide,
+    right: &JoinSide,
+    on: &[(Expr, Expr)],
+    kind: JoinKind,
+    registry: &Registry,
+) -> Result<SchemaRef, PlanError> {
+    if left.name == right.name {
+        return Err(PlanError::JoinNames(left.name.clone()));
+    }
+    if on.is_empty() {
+        return Err(PlanError::EmptyJoin);
+    }
+    let left_schema = left.plan.schema(registry)?;
+    let right_schema = right.plan.schema(registry)?;
+    for (l, r) in on {
+        let left_type = expr_type(l, &left_schema, registry)?;
+        let right_type = expr_type(r, &right_schema, registry)?;
+        if left_type != right_type {
+            return Err(PlanError::JoinKeyTypes(
+                left_type.to_string(),
+                right_type.to_string(),
+            ));
+        }
+    }
+    let qualified = |schema: &Schema, name: &str, nullable: bool| {
+        schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let field = f.as_ref().clone().with_name(qualify(name, f.name()));
+                if nullable {
+                    field.with_nullable(true)
+                } else {
+                    field
+                }
+            })
+            .collect::<Vec<Field>>()
+    };
+    let mut fields = qualified(&left_schema, &left.name, false);
+    fields.extend(qualified(
+        &right_schema,
+        &right.name,
+        kind == JoinKind::Left,
+    ));
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// A join key as `EXPLAIN` shows it: the side's name on a column or
+/// path, around anything else.
+fn qualified_key(name: &str, key: &Expr) -> String {
+    match key {
+        Expr::Column(column) | Expr::Path { path: column, .. } => qualify(name, column),
+        other => format!("{name}.({other})"),
     }
 }
 
@@ -986,6 +1137,72 @@ mod tests {
 
     fn registry() -> Registry {
         Registry::builtin()
+    }
+
+    #[test]
+    fn a_join_qualifies_both_sides_and_types_its_keys() {
+        let alerts = Plan::Scan(Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Alert,
+        ));
+        let silences = Plan::SystemTable {
+            tenant: TenantId::DEFAULT,
+            table: "silences".into(),
+        };
+        let on = vec![(Expr::column(event::NAME), Expr::column("id"))];
+        let join = Plan::Join {
+            left: JoinSide::new(alerts.clone(), "a"),
+            right: JoinSide::new(silences.clone(), "s"),
+            on: on.clone(),
+            kind: JoinKind::Left,
+        };
+        let schema = join.schema(&registry()).unwrap();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(names.contains(&"a.timestamp") && names.contains(&"s.id"));
+        assert!(
+            schema.field_with_name("s.id").unwrap().is_nullable(),
+            "a left join may leave the right side null"
+        );
+        assert!(join.ordering().is_empty());
+        assert_eq!(join.inputs().len(), 2);
+        assert!(
+            join.to_string().starts_with(
+                "Join left: a.name = s.id
+  Scan: default/prod logs"
+            ) || join.to_string().starts_with(
+                "Join left: a.name = s.id
+  Scan:"
+            ),
+            "{join}"
+        );
+        let same_names = Plan::Join {
+            left: JoinSide::new(alerts.clone(), "t"),
+            right: JoinSide::new(silences.clone(), "t"),
+            on: on.clone(),
+            kind: JoinKind::Inner,
+        };
+        assert_eq!(
+            same_names.schema(&registry()),
+            Err(PlanError::JoinNames("t".into()))
+        );
+        let no_keys = Plan::Join {
+            left: JoinSide::new(alerts.clone(), "a"),
+            right: JoinSide::new(silences.clone(), "s"),
+            on: Vec::new(),
+            kind: JoinKind::Inner,
+        };
+        assert_eq!(no_keys.schema(&registry()), Err(PlanError::EmptyJoin));
+        let mismatched = Plan::Join {
+            left: JoinSide::new(alerts, "a"),
+            right: JoinSide::new(silences, "s"),
+            on: vec![(Expr::column(TIMESTAMP), Expr::column("id"))],
+            kind: JoinKind::Inner,
+        };
+        assert!(matches!(
+            mismatched.schema(&registry()),
+            Err(PlanError::JoinKeyTypes(..))
+        ));
     }
 
     #[test]

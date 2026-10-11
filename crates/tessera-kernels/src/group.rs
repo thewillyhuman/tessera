@@ -61,6 +61,28 @@ impl Grouper {
         Ok(ids)
     }
 
+    /// The group id of each row of `keys` among the groups seen so far,
+    /// `None` where the row's key is new or has a null in it: a probe,
+    /// which creates nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the keys cannot be encoded.
+    pub fn lookup(&self, keys: &[ArrayRef]) -> Result<Vec<Option<u32>>, KernelError> {
+        let rows = self.converter.convert_columns(keys)?;
+        Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                if keys.iter().any(|k| k.is_null(i)) {
+                    None
+                } else {
+                    self.groups.get(&row.owned()).copied()
+                }
+            })
+            .collect())
+    }
+
     /// How many groups have been seen.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -91,6 +113,28 @@ mod tests {
     use arrow::array::{Array, Int64Array, StringArray};
 
     use super::*;
+
+    #[test]
+    fn a_lookup_finds_seen_keys_and_never_a_null_one() {
+        let mut grouper = Grouper::new(vec![DataType::Utf8]).unwrap();
+        grouper
+            .group_ids(&[Arc::new(StringArray::from(vec![
+                Some("a"),
+                None,
+                Some("b"),
+            ]))])
+            .unwrap();
+        let found = grouper
+            .lookup(&[Arc::new(StringArray::from(vec![
+                Some("b"),
+                Some("c"),
+                None,
+                Some("a"),
+            ]))])
+            .unwrap();
+        assert_eq!(found, vec![Some(2), None, None, Some(0)]);
+        assert_eq!(grouper.len(), 3, "a lookup creates no group");
+    }
 
     #[test]
     fn equal_keys_share_a_group_across_batches() {

@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
-use tessera_ir::{Expr, PathColumn, Plan};
+use tessera_ir::{Expr, JoinSide, PathColumn, Plan, split_qualifier};
 
 use crate::rewrite::rebuild_inputs;
 
@@ -33,6 +33,35 @@ fn assign(plan: Plan, columns: &[PathColumn]) -> Plan {
         Plan::Scan(mut scan) => {
             scan.paths = columns.to_vec();
             Plan::Scan(scan)
+        }
+        Plan::Join {
+            left,
+            right,
+            on,
+            kind,
+        } => {
+            // A side reads the paths qualified by its name, unqualified,
+            // and the ones below the join.
+            let side = |side: JoinSide| {
+                let own: Vec<PathColumn> = columns
+                    .iter()
+                    .filter_map(|c| match split_qualifier(&c.path) {
+                        Some((name, path)) if name == side.name => Some(PathColumn {
+                            path: path.to_owned(),
+                            data_type: c.data_type.clone(),
+                        }),
+                        Some(_) => None,
+                        None => Some(c.clone()),
+                    })
+                    .collect();
+                JoinSide::new(assign(*side.plan, &own), side.name)
+            };
+            Plan::Join {
+                left: side(left),
+                right: side(right),
+                on,
+                kind,
+            }
         }
         other => rebuild_inputs(other, |input| assign(input, columns)),
     }
@@ -76,6 +105,16 @@ fn collect_plan(plan: &Plan, into: &mut BTreeMap<String, DataType>) {
             }
             collect_plan(input, into);
         }
+        Plan::Join {
+            left, right, on, ..
+        } => {
+            for (l, r) in on {
+                collect_expr(l, into);
+                collect_expr(r, into);
+            }
+            collect_plan(&left.plan, into);
+            collect_plan(&right.plan, into);
+        }
         other => {
             for input in other.inputs() {
                 collect_plan(input, into);
@@ -110,10 +149,51 @@ fn collect_expr(expr: &Expr, into: &mut BTreeMap<String, DataType>) {
 
 #[cfg(test)]
 mod tests {
-    use tessera_ir::{BinaryOp, NamedExpr, Scan};
+    use tessera_ir::{BinaryOp, JoinKind, NamedExpr, Scan};
     use tessera_types::{DatasetName, Kind, TenantId};
 
     use super::*;
+
+    #[test]
+    fn a_qualified_path_becomes_a_column_of_its_own_side() {
+        let scan = |k| {
+            Plan::Scan(Scan::all(
+                TenantId::DEFAULT,
+                DatasetName::new("prod").unwrap(),
+                k,
+            ))
+        };
+        let path = |p: &str| Expr::Path {
+            path: p.into(),
+            data_type: DataType::Utf8,
+        };
+        let plan = Plan::Join {
+            left: JoinSide::new(scan(Kind::Log), "a"),
+            right: JoinSide::new(scan(Kind::Span), "b"),
+            on: vec![(path("attr.request"), path("attr.request"))],
+            kind: JoinKind::Inner,
+        }
+        .project(vec![NamedExpr::new(
+            path("b.attr.db.statement"),
+            "statement",
+        )]);
+        let Plan::Project { input, .. } = promote_paths(plan) else {
+            panic!("project")
+        };
+        let Plan::Join { left, right, .. } = *input else {
+            panic!("join")
+        };
+        let paths = |side: &JoinSide| match side.plan.as_ref() {
+            Plan::Scan(scan) => scan
+                .paths
+                .iter()
+                .map(|p| p.path.clone())
+                .collect::<Vec<_>>(),
+            other => panic!("scan: {other}"),
+        };
+        assert_eq!(paths(&left), ["attr.request"]);
+        assert_eq!(paths(&right), ["attr.request", "attr.db.statement"]);
+    }
 
     #[test]
     fn paths_read_above_a_scan_become_its_columns() {

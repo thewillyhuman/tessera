@@ -162,10 +162,14 @@ pub fn batch_of(schema: &SchemaRef, documents: &[Value]) -> Result<RecordBatch, 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use serde_json::json;
+    use tessera_types::event::Scalar;
+    use tessera_types::{DatasetName, EventBatch, EventRow, Timestamp};
     use tower::ServiceExt;
 
     use crate::AppState;
@@ -185,6 +189,56 @@ mod tests {
     }
 
     use super::*;
+
+    /// CS-5: a control table joins with telemetry, here acknowledgments
+    /// with the alert events they acknowledge.
+    #[tokio::test]
+    async fn control_tables_join_with_telemetry() {
+        let state = crate::testing::state().await;
+        let alert = |name: &str, fingerprint: &str, i: u8| EventRow {
+            timestamp: Timestamp::from_nanos(1_700_000_000_000_000_000 + i64::from(i)),
+            observed_timestamp: Timestamp::from_nanos(1_700_000_000_000_000_000),
+            event_id: [i; 16],
+            trace_id: None,
+            span_id: None,
+            name: name.into(),
+            attributes: BTreeMap::from([(
+                "attr.alert.fingerprint".to_owned(),
+                Scalar::Text(fingerprint.into()),
+            )]),
+        };
+        let alerts = EventBatch::from_alerts(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            &[alert("errors", "fp1", 1), alert("latency", "fp2", 2)],
+        )
+        .unwrap();
+        state.write(alerts).await.unwrap();
+        let (status, value) = sql(
+            &state,
+            "INSERT INTO system.acknowledgments (fingerprint, until, by) \
+             VALUES ('fp1', TIMESTAMP '2024-01-02T00:00:00Z', 'ann')",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, value) = sql(
+            &state,
+            "SELECT a.name, k.by FROM alerts a JOIN system.acknowledgments k \
+             ON a.attr.alert.fingerprint = k.fingerprint",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["columns"][0]["name"], "name");
+        assert_eq!(value["rows"], json!([["errors", "ann"]]));
+        let (status, value) = sql(
+            &state,
+            "SELECT a.name, k.by FROM alerts a LEFT JOIN system.acknowledgments k \
+             ON a.attr.alert.fingerprint = k.fingerprint ORDER BY a.name",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"], json!([["errors", "ann"], ["latency", null]]));
+    }
 
     #[tokio::test]
     async fn system_tables_are_queried_like_any_other() {
