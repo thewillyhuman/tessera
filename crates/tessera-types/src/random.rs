@@ -62,6 +62,54 @@ impl SeededRandom {
     }
 }
 
+/// `seed` with a few random edits, as a fuzzer makes them (RS-5): bytes
+/// flipped, inserted or removed, a slice repeated, the end cut, and
+/// now and then plain random bytes instead. The tests of every parser
+/// and decoder feed these to prove that no input panics.
+#[must_use]
+pub fn mutated(seed: &[u8], random: &mut impl Random) -> Vec<u8> {
+    let mut out = seed.to_vec();
+    let below = |random: &mut dyn Random, n: usize| {
+        usize::try_from(random.next_u64() % u64::try_from(n.max(1)).unwrap_or(1)).unwrap_or(0)
+    };
+    if random.next_u64() % 8 == 0 {
+        let len = below(random, 64);
+        return (0..len)
+            .map(|_| u8::try_from(random.next_u64() % 256).unwrap_or(0))
+            .collect();
+    }
+    let edits = 1 + below(random, 4);
+    for _ in 0..edits {
+        let byte = u8::try_from(random.next_u64() % 256).unwrap_or(0);
+        match random.next_u64() % 5 {
+            0 if !out.is_empty() => {
+                let at = below(random, out.len());
+                out[at] ^= byte | 1;
+            }
+            1 => {
+                let at = below(random, out.len() + 1);
+                out.insert(at, byte);
+            }
+            2 if !out.is_empty() => {
+                let at = below(random, out.len());
+                out.remove(at);
+            }
+            3 if !out.is_empty() => {
+                let start = below(random, out.len());
+                let end = start + below(random, out.len() - start + 1);
+                let slice = out[start..end].to_vec();
+                let at = below(random, out.len() + 1);
+                out.splice(at..at, slice);
+            }
+            _ => {
+                let keep = below(random, out.len() + 1);
+                out.truncate(keep);
+            }
+        }
+    }
+    out
+}
+
 impl Random for SeededRandom {
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -124,6 +172,20 @@ impl Random for SharedRandom {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutations_change_the_seed_and_stay_deterministic() {
+        let seed = b"SELECT count(*) FROM logs WHERE x = 1";
+        let mut random = SeededRandom::new(9);
+        let outputs: Vec<Vec<u8>> = (0..200).map(|_| mutated(seed, &mut random)).collect();
+        assert!(outputs.iter().any(|o| o != seed), "something changes");
+        assert!(outputs.iter().any(|o| o.len() < seed.len()));
+        assert!(outputs.iter().any(|o| o.len() > seed.len()));
+        let mut again = SeededRandom::new(9);
+        let replay: Vec<Vec<u8>> = (0..200).map(|_| mutated(seed, &mut again)).collect();
+        assert_eq!(outputs, replay, "a seed replays");
+        assert!(mutated(b"", &mut random).len() <= 64, "an empty seed works");
+    }
 
     #[test]
     fn seeded_random_is_reproducible() {

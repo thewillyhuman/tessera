@@ -244,6 +244,23 @@ mod tests {
         assert_eq!(value["rows"][0][0], 1.0);
     }
 
+    /// RS-5: no line, however mangled, makes the event conversion panic.
+    #[test]
+    fn mangled_lines_never_panic() {
+        let seeds = [
+            "{\"timestamp\":\"2024-01-01T00:00:00Z\",\"name\":\"deploy\",\"trace_id\":\"0123456789abcdef0123456789abcdef\",\"span_id\":\"0123456789abcdef\",\"resource\":{\"service\":{\"name\":\"api\"}},\"attributes\":{\"version\":\"1.2\"},\"http\":{\"status\":500},\"tags\":[\"a\"],\"ok\":false}",
+            "{\"timestamp\":1704067201000000000}",
+        ];
+        let mut random = tessera_types::SeededRandom::new(5);
+        let now = Timestamp::from_nanos(1);
+        for round in 0..1_500 {
+            let input = tessera_types::mutated(seeds[round % seeds.len()].as_bytes(), &mut random);
+            if let Ok(value) = serde_json::from_slice::<Value>(&input) {
+                let _ = event_of(&value, now, &mut random);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_bad_line_is_refused_by_number() {
         let app = crate::router(crate::testing::state().await);

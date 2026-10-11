@@ -1,0 +1,79 @@
+[package]
+name = "tessera-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "LicenseRef-Tessera-Pending"
+description = "cargo-fuzz targets for every decoder and parser (RS-5)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = "0.4"
+tessera-commit = { path = "../crates/tessera-commit" }
+tessera-ingest = { path = "../crates/tessera-ingest" }
+tessera-logql = { path = "../crates/tessera-logql" }
+tessera-promql = { path = "../crates/tessera-promql" }
+tessera-search = { path = "../crates/tessera-search" }
+tessera-sql = { path = "../crates/tessera-sql" }
+tessera-traceql = { path = "../crates/tessera-traceql" }
+tessera-types = { path = "../crates/tessera-types" }
+tessera-wal = { path = "../crates/tessera-wal" }
+
+[[bin]]
+name = "sql"
+path = "fuzz_targets/sql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "logql"
+path = "fuzz_targets/logql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "promql"
+path = "fuzz_targets/promql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "traceql"
+path = "fuzz_targets/traceql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "search"
+path = "fuzz_targets/search.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "otlp"
+path = "fuzz_targets/otlp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_entry"
+path = "fuzz_targets/wal_entry.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commit_record"
+path = "fuzz_targets/commit_record.rs"
+test = false
+doc = false
+bench = false

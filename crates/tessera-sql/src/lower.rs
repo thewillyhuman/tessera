@@ -1502,7 +1502,7 @@ fn interval(text: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use tessera_types::TenantId;
+    use tessera_types::{SeededRandom, TenantId};
 
     use super::*;
     use crate::parser::parse;
@@ -1526,6 +1526,28 @@ mod tests {
         match lower(&parse(sql).unwrap(), &ctx()).unwrap() {
             Statement::Control(statement) => statement,
             other => panic!("not a control statement: {other:?}"),
+        }
+    }
+
+    /// RS-5: no statement, however mangled, makes parsing or lowering
+    /// panic.
+    #[test]
+    fn mangled_statements_never_panic() {
+        let seeds = [
+            "SELECT a.body, k.by FROM alerts a JOIN system.acknowledgments k ON a.attr.x = k.fingerprint WHERE k.by = 'ann' ORDER BY a.timestamp DESC LIMIT 10 OFFSET 2",
+            "SELECT time_bucket(INTERVAL '5m', timestamp) AS t, count(*), max(severity_number) FROM prod.logs WHERE attr.n >= 1 AND body LIKE '%x%' GROUP BY 1 HAVING count(*) > 2",
+            "CREATE ALERT errors SEVERITY critical EVERY 30s FOR 5m LABELS (team = 'pay') AS SELECT count(*) AS n FROM logs HAVING count(*) > 10",
+            "INSERT INTO system.silences (id, matchers, starts_at, ends_at) VALUES ('s1', '{}', TIMESTAMP '2024-01-01T00:00:00Z', TIMESTAMP '2024-01-02T00:00:00Z')",
+            "DELETE FROM logs WHERE severity_number < 9 AND timestamp < now() - INTERVAL '7d'",
+            "EXPLAIN ANALYZE SELECT * FROM events WHERE kind = 'span' AND search('timeout service:api')",
+        ];
+        let mut random = SeededRandom::new(5);
+        for round in 0..2_000 {
+            let input = tessera_types::mutated(seeds[round % seeds.len()].as_bytes(), &mut random);
+            let text = String::from_utf8_lossy(&input);
+            if let Ok(statement) = parse(&text) {
+                let _ = lower(&statement, &ctx());
+            }
         }
     }
 

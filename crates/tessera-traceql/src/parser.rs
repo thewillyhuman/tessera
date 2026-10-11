@@ -512,6 +512,21 @@ mod tests {
         }
     }
 
+    /// RS-5: no query, however mangled, makes the parser panic.
+    #[test]
+    fn mangled_queries_never_panic() {
+        let seeds = [
+            r#"{ resource.service.name = "api" && span.http.status_code >= 500 } >> { name = "db" } | count() > 2"#,
+            r#"{ duration > 100ms && status = error } ~ { span.db.system = "postgres" }"#,
+            r#"{ .foo = "bar" } | by(resource.service.name) | avg(duration) > 1s"#,
+        ];
+        let mut random = tessera_types::SeededRandom::new(5);
+        for round in 0..2_000 {
+            let input = tessera_types::mutated(seeds[round % seeds.len()].as_bytes(), &mut random);
+            let _ = parse(&String::from_utf8_lossy(&input));
+        }
+    }
+
     #[test]
     fn parses_conditions_with_precedence() {
         assert_eq!(

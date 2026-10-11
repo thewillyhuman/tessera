@@ -139,6 +139,16 @@ mod tests {
         }
     }
 
+    /// RS-5: no bytes, however mangled, make the decoder panic.
+    #[test]
+    fn mangled_records_never_panic() {
+        let seed = commit().encode();
+        let mut random = SeededRandom::new(5);
+        for _ in 0..1_500 {
+            let _ = Commit::decode(&tessera_types::mutated(&seed, &mut random));
+        }
+    }
+
     #[test]
     fn a_commit_round_trips_through_its_encoding() {
         let original = commit();

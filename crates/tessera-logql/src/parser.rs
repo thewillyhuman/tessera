@@ -703,6 +703,21 @@ mod tests {
         }
     }
 
+    /// RS-5: no query, however mangled, makes the parser panic.
+    #[test]
+    fn mangled_queries_never_panic() {
+        let seeds = [
+            r#"{app="checkout"} |= "timeout" | json | status >= 500 | line_format "{{.msg}}""#,
+            r#"sum by (app) (rate({app=~"a.*"} | logfmt | unwrap duration [5m]))"#,
+            r#"topk(3, count_over_time({job="x"} != "noise" | pattern "<ip> - <_>" [1h] offset 5m))"#,
+        ];
+        let mut random = tessera_types::SeededRandom::new(5);
+        for round in 0..2_000 {
+            let input = tessera_types::mutated(seeds[round % seeds.len()].as_bytes(), &mut random);
+            let _ = parse(&String::from_utf8_lossy(&input));
+        }
+    }
+
     #[test]
     fn parses_selectors_and_every_stage() {
         let q = log(

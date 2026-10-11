@@ -34,7 +34,7 @@ pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, Wr
 pub use kind::Kind;
 pub use partition::{InvalidWindow, PartitionId, Window};
 pub use position::{Epoch, Seq, Version};
-pub use random::{OsRandom, Random, SeededRandom, SharedRandom};
+pub use random::{OsRandom, Random, SeededRandom, SharedRandom, mutated};
 pub use redaction::{Redaction, RedactionAction};
 pub use retention::{RetentionAction, RetentionClause, RetentionPolicy};
 pub use time::{Clock, InvalidTimestamp, ManualClock, SystemClock, TimeRange, Timestamp};

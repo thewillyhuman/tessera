@@ -624,6 +624,12 @@ cargo run --release -p tessera-sim -- --seeds 2000 --nodes 5 --steps 40 \
     --fail-before 0.15 --fail-after 0.15
 ```
 
+Every parser and decoder has a test feeding it thousands of mangled
+inputs, so that no input panics (RS-5), and `fuzz/` holds cargo-fuzz
+targets for the same entry points: `cargo install cargo-fuzz` and
+`cargo +nightly fuzz run sql` (or `logql`, `promql`, `traceql`,
+`search`, `otlp`, `wal_entry`, `commit_record`).
+
 A simulation is reproducible from its seed; a violation is reported with
 the command line that replays it. The scenarios cover the commit log,
 leases, the catalog and the write path (ingest, recovery, intake and

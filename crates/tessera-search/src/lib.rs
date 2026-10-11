@@ -129,8 +129,10 @@ fn value(text: &str, i: usize, start: usize) -> Result<(String, bool, usize), Di
             match bytes[j] {
                 b'"' => return Ok((value, true, j + 1)),
                 b'\\' if j + 1 < bytes.len() => {
-                    value.push(char::from(bytes[j + 1]));
-                    j += 2;
+                    // The escaped character may be more than one byte.
+                    let c = text[j + 1..].chars().next().unwrap_or('?');
+                    value.push(c);
+                    j += 1 + c.len_utf8();
                 }
                 _ => {
                     let c = text[j..].chars().next().unwrap_or('?');
@@ -332,6 +334,22 @@ mod tests {
 
     fn lowered(text: &str) -> String {
         parse(text, Kind::Log).unwrap().to_string()
+    }
+
+    /// RS-5: no search text, however mangled, makes the parser panic.
+    #[test]
+    fn mangled_searches_never_panic() {
+        let seeds = [
+            "timeout -healthcheck service:checkout severity:error \"exact phrase\"",
+            "(a OR b) AND NOT c attr.http.status:500 trace:0123456789abcdef0123456789abcdef",
+        ];
+        let mut random = tessera_types::SeededRandom::new(5);
+        for round in 0..2_000 {
+            let input = tessera_types::mutated(seeds[round % seeds.len()].as_bytes(), &mut random);
+            for kind in Kind::ALL {
+                let _ = parse(&String::from_utf8_lossy(&input), kind);
+            }
+        }
     }
 
     #[test]

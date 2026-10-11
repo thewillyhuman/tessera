@@ -316,6 +316,62 @@ mod tests {
         decode_with(request, &mut SeededRandom::new(1))
     }
 
+    /// RS-5: no request body, however mangled, makes a decoder or the
+    /// conversion panic, in either encoding, for any signal.
+    #[test]
+    fn mangled_requests_never_panic() {
+        use prost::Message;
+        let logs = request(vec![LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: Some(AnyValue {
+                value: Some(any_value::Value::StringValue("hi".into())),
+            }),
+            attributes: vec![kv("n", any_value::Value::IntValue(1))],
+            ..Default::default()
+        }]);
+        let traces = br#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"0123456789abcdef0123456789abcdef","spanId":"0123456789abcdef","name":"db","startTimeUnixNano":"1700000000000000000","endTimeUnixNano":"1700000000001000000","status":{"code":2}}]}]}]}"#;
+        let metrics = br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"up","gauge":{"dataPoints":[{"timeUnixNano":"1700000000000000000","asDouble":1}]}}]}]}]}"#;
+        let seeds: Vec<Vec<u8>> = vec![
+            serde_json::to_vec(&logs).unwrap(),
+            logs.encode_to_vec(),
+            traces.to_vec(),
+            metrics.to_vec(),
+        ];
+        let dataset = DatasetName::new("prod").unwrap();
+        let now = Timestamp::from_nanos(1);
+        let mut random = SeededRandom::new(5);
+        for round in 0..1_500 {
+            let input = tessera_types::mutated(&seeds[round % seeds.len()], &mut random);
+            if let Ok(request) = parse_json(&input) {
+                let _ = to_batch(
+                    &request,
+                    TenantId::DEFAULT,
+                    dataset.clone(),
+                    now,
+                    &mut random,
+                );
+            }
+            if let Ok(request) = parse_protobuf(&input) {
+                let _ = to_batch(
+                    &request,
+                    TenantId::DEFAULT,
+                    dataset.clone(),
+                    now,
+                    &mut random,
+                );
+            }
+            if let Ok(request) = super::traces::parse_json(&input) {
+                let _ =
+                    super::traces::to_batches(&request, TenantId::DEFAULT, dataset.clone(), now);
+            }
+            let _ = super::traces::parse_protobuf(&input);
+            if let Ok(request) = super::metrics::parse_json(&input) {
+                let _ = super::metrics::to_batch(&request, TenantId::DEFAULT, dataset.clone(), now);
+            }
+            let _ = super::metrics::parse_protobuf(&input);
+        }
+    }
+
     #[test]
     fn normalizes_records_with_flattened_attributes() {
         let batch = decode(&request(vec![record("boom")])).unwrap();

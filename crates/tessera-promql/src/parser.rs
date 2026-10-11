@@ -675,6 +675,21 @@ fn set_at(expr: &mut Expr, at: At, span: Span) -> Result<(), Diagnostic> {
 mod tests {
     use super::*;
 
+    /// RS-5: no query, however mangled, makes the parser panic.
+    #[test]
+    fn mangled_queries_never_panic() {
+        let seeds = [
+            r#"sum by (job) (rate(http_requests_total{code!="200"}[5m])) / ignoring(code) group_left sum(rate(x[5m]))"#,
+            "histogram_quantile(0.9, sum by (le) (rate(req_duration_bucket[10m]))) > bool 0.5",
+            r#"label_replace(up{job="a"} offset 1h, "x", "$1", "job", "(.*)") and on() absent(y)"#,
+        ];
+        let mut random = tessera_types::SeededRandom::new(5);
+        for round in 0..2_000 {
+            let input = tessera_types::mutated(seeds[round % seeds.len()].as_bytes(), &mut random);
+            let _ = parse(&String::from_utf8_lossy(&input));
+        }
+    }
+
     #[test]
     fn parses_selectors_with_modifiers() {
         let expr =

@@ -2,3 +2,4 @@
 /data
 *.rs.bk
 .DS_Store
+/fuzz/target

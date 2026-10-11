@@ -409,6 +409,32 @@ mod tests {
         EntryId::random(&mut SeededRandom::new(1))
     }
 
+    /// RS-5: no bytes, however mangled, make the decoder panic.
+    #[test]
+    fn mangled_entries_never_panic() {
+        let end = Entry::new(
+            WriterId::from_u128(1),
+            Seq::new(1),
+            id(),
+            Timestamp::UNIX_EPOCH,
+            EntryBody::End,
+        );
+        let segment = Entry::segment(
+            WriterId::from_u128(1),
+            Seq::new(2),
+            id(),
+            Timestamp::UNIX_EPOCH,
+            &[logs("a", "prod", 0, 20)],
+        )
+        .unwrap();
+        let seeds = [end.encode(), segment.encode()];
+        let mut random = tessera_types::SeededRandom::new(5);
+        for round in 0..1_500 {
+            let input = tessera_types::mutated(&seeds[round % seeds.len()], &mut random);
+            let _ = Entry::decode(&Bytes::from(input));
+        }
+    }
+
     #[test]
     fn a_segment_round_trips_with_one_block_per_tenant_dataset_and_kind() {
         let batches = [
