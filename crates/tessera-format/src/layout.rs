@@ -13,6 +13,10 @@ use crate::sidecar::IndexSpec;
 /// pruning to matter, large enough for the encoders to work well.
 pub const DEFAULT_ROW_GROUP_ROWS: usize = 32_768;
 
+/// The attribute path the default sort keys call `service` (section
+/// 8.5).
+pub const SERVICE: &str = "resource.service.name";
+
 /// The physical layout of one file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Layout {
@@ -39,8 +43,8 @@ impl Layout {
     }
 
     /// The default layout of a kind before any workload exists (section
-    /// 8.5), restricted to the columns files have today: attribute sort
-    /// keys (`service`, `name`) wait for column promotion (M8).
+    /// 8.5). The service is the attribute `resource.service.name`,
+    /// which compaction promotes to a column of its own (section 8.2).
     #[must_use]
     pub fn default_for(kind: Kind) -> Self {
         let bloom_on_trace = IndexSpec {
@@ -49,7 +53,11 @@ impl Layout {
         };
         match kind {
             Kind::Log => Layout {
-                sort_key: vec![SEVERITY_NUMBER.to_owned(), TIMESTAMP.to_owned()],
+                sort_key: vec![
+                    SERVICE.to_owned(),
+                    SEVERITY_NUMBER.to_owned(),
+                    TIMESTAMP.to_owned(),
+                ],
                 row_group_rows: DEFAULT_ROW_GROUP_ROWS,
                 indexes: IndexSpec {
                     term: vec![BODY.to_owned()],
@@ -57,10 +65,9 @@ impl Layout {
                     bloom: vec![TRACE_ID.to_owned()],
                 },
             },
-            // Spans and events sort by name, then time (section 8.5);
-            // the service comes first once attribute columns exist (M8).
+            // Spans and events sort by service, name, then time.
             Kind::Span | Kind::Event => Layout {
-                sort_key: vec![NAME.to_owned(), TIMESTAMP.to_owned()],
+                sort_key: vec![SERVICE.to_owned(), NAME.to_owned(), TIMESTAMP.to_owned()],
                 row_group_rows: DEFAULT_ROW_GROUP_ROWS,
                 indexes: bloom_on_trace,
             },
@@ -125,12 +132,16 @@ mod tests {
             vec!["trace_id"]
         );
         assert_eq!(
+            Layout::default_for(Kind::Log).sort_key,
+            vec!["resource.service.name", "severity_number", "timestamp"]
+        );
+        assert_eq!(
             Layout::default_for(Kind::Span).sort_key,
-            vec!["name", "timestamp"]
+            vec!["resource.service.name", "name", "timestamp"]
         );
         assert_eq!(
             Layout::default_for(Kind::Event).sort_key,
-            vec!["name", "timestamp"]
+            vec!["resource.service.name", "name", "timestamp"]
         );
         assert_eq!(
             Layout::default_for(Kind::Metric).sort_key,

@@ -456,7 +456,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("log: epoch 0 sort key [severity_number, timestamp]"),
+            text.contains(
+                "log: epoch 0 sort key [resource.service.name, severity_number, timestamp]"
+            ),
             "{text}"
         );
         assert!(text.contains("term [body]"));

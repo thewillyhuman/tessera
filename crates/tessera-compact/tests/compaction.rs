@@ -201,7 +201,17 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].file_id, output);
     assert_eq!(files[0].level, Level::L2);
-    assert_eq!(files[0].sort_key, vec!["severity_number", "timestamp"]);
+    assert_eq!(
+        files[0].sort_key,
+        vec!["resource.service.name", "severity_number", "timestamp"]
+    );
+    assert!(
+        files[0]
+            .columns
+            .iter()
+            .any(|c| c.name == "resource.service.name"),
+        "the service is a column of its own even where no row has it"
+    );
     assert!(files[0].has_index(IndexKind::Term, "body"));
     assert!(files[0].has_index(IndexKind::Trigram, "body"));
     assert!(files[0].has_index(IndexKind::Bloom, "trace_id"));
