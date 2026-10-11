@@ -29,11 +29,14 @@ use crate::{Key, ObjectError, ObjectMeta, ObjectStore};
 
 const TEMP_DIR: &str = ".tmp";
 
+/// Numbers the staging files of every store in this process, so that two
+/// stores on one directory never stage under the same name.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// An object store rooted at a local directory.
 #[derive(Debug)]
 pub struct LocalStore {
     root: PathBuf,
-    temp_counter: AtomicU64,
 }
 
 impl LocalStore {
@@ -45,10 +48,7 @@ impl LocalStore {
     pub async fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(root.join(TEMP_DIR)).await?;
-        Ok(LocalStore {
-            root,
-            temp_counter: AtomicU64::new(0),
-        })
+        Ok(LocalStore { root })
     }
 
     fn path_for(&self, key: &Key) -> PathBuf {
@@ -56,9 +56,9 @@ impl LocalStore {
     }
 
     /// A fresh path in the temporary directory, unique across the processes
-    /// that may share this directory.
+    /// and the stores in this process that may share the directory.
     fn temp_path(&self) -> PathBuf {
-        let counter = self.temp_counter.fetch_add(1, Ordering::Relaxed);
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         self.root
             .join(TEMP_DIR)
             .join(format!("{}-{counter}", std::process::id()))
@@ -275,6 +275,17 @@ mod tests {
 
     fn key(text: &str) -> Key {
         Key::new(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_stores_on_one_directory_never_stage_under_one_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = LocalStore::open(dir.path()).await.unwrap();
+        let b = LocalStore::open(dir.path()).await.unwrap();
+        let paths: std::collections::BTreeSet<PathBuf> = (0..100)
+            .flat_map(|_| [a.temp_path(), b.temp_path()])
+            .collect();
+        assert_eq!(paths.len(), 200);
     }
 
     #[tokio::test]
