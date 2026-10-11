@@ -8,7 +8,9 @@
 
 use tessera_ir::{Diagnostic, Span};
 
-use crate::ast::{BinaryOp, Expr, ExprKind, OrderItem, Query, SelectItem, Statement, TableRef};
+use crate::ast::{
+    BinaryOp, CreateAlert, Expr, ExprKind, OrderItem, Query, SelectItem, Statement, TableRef,
+};
 use crate::lexer::{Spanned, Token, tokenize};
 
 /// Parses one statement.
@@ -19,6 +21,7 @@ use crate::lexer::{Spanned, Token, tokenize};
 pub fn parse(text: &str) -> Result<Statement, Diagnostic> {
     let tokens = tokenize(text)?;
     let mut parser = Parser {
+        text,
         tokens,
         at: 0,
         end: text.len(),
@@ -34,7 +37,8 @@ pub fn parse(text: &str) -> Result<Statement, Diagnostic> {
     Ok(statement)
 }
 
-struct Parser {
+struct Parser<'a> {
+    text: &'a str,
     tokens: Vec<Spanned>,
     at: usize,
     end: usize,
@@ -49,7 +53,7 @@ fn describe(token: &Token) -> String {
     }
 }
 
-impl Parser {
+impl Parser<'_> {
     fn peek(&self) -> Option<&Spanned> {
         self.tokens.get(self.at)
     }
@@ -145,11 +149,224 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Statement, Diagnostic> {
         if self.eat_keyword("explain") {
+            if self.eat_keyword("alert") {
+                let (name, _) = self.identifier()?;
+                return Ok(Statement::ExplainAlert { name });
+            }
             let analyze = self.eat_keyword("analyze");
             let query = self.query()?;
             return Ok(Statement::Explain { analyze, query });
         }
+        if self.eat_keyword("create") {
+            self.expect_keyword("alert")?;
+            return self
+                .create_alert()
+                .map(|alert| Statement::CreateAlert(Box::new(alert)));
+        }
+        if self.eat_keyword("drop") {
+            self.expect_keyword("alert")?;
+            let (name, _) = self.identifier()?;
+            return Ok(Statement::DropAlert { name });
+        }
+        if self.eat_keyword("insert") {
+            return self.insert();
+        }
+        if self.eat_keyword("update") {
+            return self.update();
+        }
+        if self.eat_keyword("delete") {
+            return self.delete();
+        }
         Ok(Statement::Select(self.query()?))
+    }
+
+    /// After `CREATE ALERT`: the name, the options in any order, then
+    /// `AS` and the query.
+    fn create_alert(&mut self) -> Result<CreateAlert, Diagnostic> {
+        let (name, _) = self.identifier()?;
+        let (mut severity, mut hold, mut every) = (None, None, None);
+        let (mut notify, mut labels, mut annotations) = (Vec::new(), Vec::new(), Vec::new());
+        loop {
+            if self.eat_keyword("severity") {
+                severity = Some(self.name_or_string()?);
+            } else if self.eat_keyword("for") {
+                hold = Some(self.duration_text()?);
+            } else if self.eat_keyword("every") {
+                every = Some(self.duration_text()?);
+            } else if self.eat_keyword("notify") {
+                notify.push(self.name_or_string()?);
+                while self.eat_symbol(",") {
+                    notify.push(self.name_or_string()?);
+                }
+            } else if self.eat_keyword("labels") {
+                labels = self.pairs()?;
+            } else if self.eat_keyword("annotations") {
+                annotations = self.pairs()?;
+            } else {
+                break;
+            }
+        }
+        self.expect_keyword("as")?;
+        let start = self.span_here().start;
+        let query = self.query()?;
+        let end = self
+            .tokens
+            .get(self.at.saturating_sub(1))
+            .map_or(start, |t| t.span.end);
+        Ok(CreateAlert {
+            name,
+            severity,
+            hold,
+            every,
+            notify,
+            labels,
+            annotations,
+            query,
+            query_text: self.text[start..end].to_owned(),
+        })
+    }
+
+    /// A bare name or a string.
+    fn name_or_string(&mut self) -> Result<String, Diagnostic> {
+        match self.peek() {
+            Some(Spanned {
+                token: Token::String(_),
+                ..
+            }) => Ok(self.string()?.0),
+            _ => Ok(self.identifier()?.0),
+        }
+    }
+
+    /// A duration as written: a string such as `'2m'`, or a number with
+    /// an optional unit such as `2m` or `90 seconds`.
+    fn duration_text(&mut self) -> Result<(String, Span), Diagnostic> {
+        match self.peek().cloned() {
+            Some(Spanned {
+                token: Token::String(_),
+                ..
+            }) => self.string(),
+            Some(Spanned {
+                token: Token::Number(number),
+                span,
+            }) => {
+                self.at += 1;
+                let mut text = number;
+                let mut end = span.end;
+                if let Some(Spanned {
+                    token:
+                        Token::Ident {
+                            name,
+                            quoted: false,
+                        },
+                    span: unit,
+                }) = self.peek().cloned()
+                {
+                    if !RESERVED.contains(&name.as_str())
+                        && !ALERT_KEYWORDS.contains(&name.as_str())
+                    {
+                        self.at += 1;
+                        text.push(' ');
+                        text.push_str(&name);
+                        end = unit.end;
+                    }
+                }
+                Ok((text, Span::new(span.start, end)))
+            }
+            _ => Err(self.unexpected("expected a duration")),
+        }
+    }
+
+    /// `(name = 'value', ...)`.
+    fn pairs(&mut self) -> Result<Vec<(String, String)>, Diagnostic> {
+        self.expect_symbol("(")?;
+        let mut pairs = Vec::new();
+        loop {
+            let (name, _) = self.identifier()?;
+            self.expect_symbol("=")?;
+            let (value, _) = self.string()?;
+            pairs.push((name, value));
+            if !self.eat_symbol(",") {
+                break;
+            }
+        }
+        self.expect_symbol(")")?;
+        Ok(pairs)
+    }
+
+    /// After `INSERT`: `INTO table (columns) VALUES (...), ...`.
+    fn insert(&mut self) -> Result<Statement, Diagnostic> {
+        self.expect_keyword("into")?;
+        let table = self.table_ref()?;
+        self.expect_symbol("(")?;
+        let mut columns = vec![self.identifier()?.0];
+        while self.eat_symbol(",") {
+            columns.push(self.identifier()?.0);
+        }
+        self.expect_symbol(")")?;
+        self.expect_keyword("values")?;
+        let mut rows = Vec::new();
+        loop {
+            let open = self.expect_symbol("(")?;
+            let mut row = vec![self.expr()?];
+            while self.eat_symbol(",") {
+                row.push(self.expr()?);
+            }
+            self.expect_symbol(")")?;
+            if row.len() != columns.len() {
+                return Err(Diagnostic::at(
+                    open,
+                    format!("{} values for {} columns", row.len(), columns.len()),
+                ));
+            }
+            rows.push(row);
+            if !self.eat_symbol(",") {
+                break;
+            }
+        }
+        Ok(Statement::Insert {
+            table,
+            columns,
+            rows,
+        })
+    }
+
+    /// After `UPDATE`: `table SET column = literal, ... [WHERE ...]`.
+    fn update(&mut self) -> Result<Statement, Diagnostic> {
+        let table = self.table_ref()?;
+        self.expect_keyword("set")?;
+        let mut set = vec![self.assignment()?];
+        while self.eat_symbol(",") {
+            set.push(self.assignment()?);
+        }
+        let filter = self.equalities()?;
+        Ok(Statement::Update { table, set, filter })
+    }
+
+    /// After `DELETE`: `FROM table [WHERE ...]`.
+    fn delete(&mut self) -> Result<Statement, Diagnostic> {
+        self.expect_keyword("from")?;
+        let table = self.table_ref()?;
+        let filter = self.equalities()?;
+        Ok(Statement::Delete { table, filter })
+    }
+
+    /// `column = value`, where the value is a literal, so `AND` ends it.
+    fn assignment(&mut self) -> Result<(String, Expr), Diagnostic> {
+        let (column, _) = self.identifier()?;
+        self.expect_symbol("=")?;
+        Ok((column, self.additive()?))
+    }
+
+    /// An optional `WHERE column = literal [AND ...]`.
+    fn equalities(&mut self) -> Result<Vec<(String, Expr)>, Diagnostic> {
+        let mut filter = Vec::new();
+        if self.eat_keyword("where") {
+            filter.push(self.assignment()?);
+            while self.eat_keyword("and") {
+                filter.push(self.assignment()?);
+            }
+        }
+        Ok(filter)
     }
 
     fn query(&mut self) -> Result<Query, Diagnostic> {
@@ -614,6 +831,16 @@ const RESERVED: [&str; 22] = [
     "in", "is", "like", "ilike", "between", "asc", "desc", "having", "explain", "analyze",
 ];
 
+/// Keywords of `CREATE ALERT` options, which end a duration's unit.
+const ALERT_KEYWORDS: [&str; 6] = [
+    "severity",
+    "for",
+    "every",
+    "notify",
+    "labels",
+    "annotations",
+];
+
 /// Keywords that end a select item, so a bare name before them is not an
 /// alias.
 const CLAUSE_KEYWORDS: [&str; 10] = [
@@ -639,8 +866,82 @@ mod tests {
     fn query(text: &str) -> Query {
         match parse(text).unwrap() {
             Statement::Select(q) => q,
-            Statement::Explain { .. } => panic!("explain"),
+            other => panic!("not a select: {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_alert_takes_its_options_in_any_order_and_keeps_the_query_text() {
+        let Statement::CreateAlert(alert) = parse(
+            "CREATE ALERT checkout_errors FOR 2m SEVERITY critical EVERY '30 seconds' \
+             NOTIFY 'oncall-payments', ops LABELS (team = 'payments') \
+             ANNOTATIONS (summary = 'too many errors') \
+             AS SELECT service, count(*) AS errors FROM logs GROUP BY service HAVING count(*) > 100;",
+        )
+        .unwrap() else {
+            panic!("not a create alert");
+        };
+        assert_eq!(alert.name, "checkout_errors");
+        assert_eq!(alert.severity.as_deref(), Some("critical"));
+        assert_eq!(alert.hold.as_ref().map(|h| h.0.as_str()), Some("2m"));
+        assert_eq!(
+            alert.every.as_ref().map(|e| e.0.as_str()),
+            Some("30 seconds")
+        );
+        assert_eq!(alert.notify, ["oncall-payments", "ops"]);
+        assert_eq!(alert.labels, [("team".to_owned(), "payments".to_owned())]);
+        assert_eq!(alert.annotations[0].1, "too many errors");
+        assert_eq!(
+            alert.query_text,
+            "SELECT service, count(*) AS errors FROM logs GROUP BY service HAVING count(*) > 100"
+        );
+        assert!(alert.query.having.is_some());
+        assert!(parse("CREATE ALERT x AS SELECT 1").is_ok());
+        assert!(parse("CREATE ALERT x FOR soon AS SELECT 1").is_err());
+        assert!(parse("CREATE ALERT x").is_err(), "AS is required");
+    }
+
+    #[test]
+    fn drop_explain_insert_update_and_delete_parse() {
+        assert_eq!(
+            parse("DROP ALERT x").unwrap(),
+            Statement::DropAlert { name: "x".into() }
+        );
+        assert_eq!(
+            parse("EXPLAIN ALERT x").unwrap(),
+            Statement::ExplainAlert { name: "x".into() }
+        );
+        let Statement::Insert {
+            table,
+            columns,
+            rows,
+        } = parse("INSERT INTO system.silences (id, comment) VALUES ('s1', 'x'), ('s2', 'y')")
+            .unwrap()
+        else {
+            panic!("not an insert");
+        };
+        assert_eq!(
+            (table.dataset.as_deref(), table.table.as_str()),
+            (Some("system"), "silences")
+        );
+        assert_eq!(columns, ["id", "comment"]);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            parse("INSERT INTO system.silences (id, comment) VALUES ('s1')").is_err(),
+            "arity"
+        );
+        let Statement::Update { set, filter, .. } =
+            parse("UPDATE system.alert_rules SET severity = 'warning', every_seconds = 30 WHERE name = 'x' AND dataset = 'prod'")
+                .unwrap()
+        else {
+            panic!("not an update");
+        };
+        assert_eq!(set.len(), 2);
+        assert_eq!(filter.len(), 2);
+        let Statement::Delete { filter, .. } = parse("DELETE FROM system.silences").unwrap() else {
+            panic!("not a delete");
+        };
+        assert!(filter.is_empty());
     }
 
     #[test]

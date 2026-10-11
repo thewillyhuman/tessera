@@ -7,9 +7,11 @@
 //! the terms of its language.
 
 use std::fmt;
+use std::time::Duration;
 
 use tessera_types::{DatasetName, TenantId, Timestamp};
 
+use crate::expr::Literal;
 use crate::plan::Plan;
 
 /// A byte range in the query text.
@@ -114,6 +116,74 @@ pub enum Statement {
         /// Whether to run the plan and report what it did.
         analyze: bool,
     },
+    /// A statement that changes or describes the tenant's control store
+    /// rather than reading data (section 9.5, CS-3).
+    Control(ControlStatement),
+}
+
+/// A control-plane statement. The front end checks its shape; the node
+/// that holds the control store carries it out.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ControlStatement {
+    /// `CREATE ALERT ... AS <query>` (section 11.2).
+    CreateAlert(AlertDefinition),
+    /// `DROP ALERT name`.
+    DropAlert {
+        /// The rule.
+        name: String,
+    },
+    /// `EXPLAIN ALERT name`: which evaluation mode applies and why
+    /// (CQ-8).
+    ExplainAlert {
+        /// The rule.
+        name: String,
+    },
+    /// `INSERT INTO system.<table> (columns) VALUES (...), ...`.
+    Insert {
+        /// The control table.
+        table: String,
+        /// The rows, each a column name to a literal.
+        rows: Vec<Vec<(String, Literal)>>,
+    },
+    /// `UPDATE system.<table> SET ... WHERE column = literal AND ...`.
+    Update {
+        /// The control table.
+        table: String,
+        /// The columns to set.
+        set: Vec<(String, Literal)>,
+        /// The equalities every changed row satisfies; empty for all.
+        filter: Vec<(String, Literal)>,
+    },
+    /// `DELETE FROM system.<table> WHERE column = literal AND ...`.
+    Delete {
+        /// The control table.
+        table: String,
+        /// The equalities every removed row satisfies; empty for all.
+        filter: Vec<(String, Literal)>,
+    },
+}
+
+/// What `CREATE ALERT` said.
+#[derive(Clone, PartialEq, Debug)]
+pub struct AlertDefinition {
+    /// The rule's name.
+    pub name: String,
+    /// `SEVERITY`, if given.
+    pub severity: Option<String>,
+    /// `FOR`, if given.
+    pub hold: Option<Duration>,
+    /// `EVERY`, if given.
+    pub every: Option<Duration>,
+    /// `NOTIFY` routes.
+    pub notify: Vec<String>,
+    /// `LABELS`.
+    pub labels: Vec<(String, String)>,
+    /// `ANNOTATIONS`.
+    pub annotations: Vec<(String, String)>,
+    /// The query, as written, in the statement's language.
+    pub query: String,
+    /// The dataset an unqualified table in the query means.
+    pub dataset: DatasetName,
 }
 
 /// A front end: text in one language to the shared plan (section 18.2).

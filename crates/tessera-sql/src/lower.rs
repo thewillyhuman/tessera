@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use tessera_ir::{
-    AggregateExpr, BinaryOp, BindContext, Diagnostic, Expr, Literal, NamedExpr, Plan, Registry,
-    Scan, SortKey, Span, Statement,
+    AggregateExpr, AlertDefinition, BinaryOp, BindContext, ControlStatement, Diagnostic, Expr,
+    Literal, NamedExpr, Plan, Registry, Scan, SortKey, Span, Statement,
 };
 use tessera_types::{DatasetName, Kind, Timestamp, event};
 
@@ -35,6 +35,121 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
             plan: lower_query(query, ctx, &registry)?,
             analyze: *analyze,
         }),
+        ast::Statement::CreateAlert(alert) => {
+            // The query must be one the engine can run before the rule
+            // is stored.
+            lower_query(&alert.query, ctx, &registry)?;
+            Ok(Statement::Control(ControlStatement::CreateAlert(
+                AlertDefinition {
+                    name: alert.name.clone(),
+                    severity: alert.severity.clone(),
+                    hold: duration(alert.hold.as_ref())?,
+                    every: duration(alert.every.as_ref())?,
+                    notify: alert.notify.clone(),
+                    labels: alert.labels.clone(),
+                    annotations: alert.annotations.clone(),
+                    query: alert.query_text.clone(),
+                    dataset: ctx.dataset.clone(),
+                },
+            )))
+        }
+        ast::Statement::DropAlert { name } => Ok(Statement::Control(ControlStatement::DropAlert {
+            name: name.clone(),
+        })),
+        ast::Statement::ExplainAlert { name } => {
+            Ok(Statement::Control(ControlStatement::ExplainAlert {
+                name: name.clone(),
+            }))
+        }
+        ast::Statement::Insert {
+            table,
+            columns,
+            rows,
+        } => Ok(Statement::Control(ControlStatement::Insert {
+            table: control_table(table)?,
+            rows: rows
+                .iter()
+                .map(|row| {
+                    columns
+                        .iter()
+                        .cloned()
+                        .zip(row)
+                        .map(|(c, e)| Ok((c, literal(e)?)))
+                        .collect()
+                })
+                .collect::<Result<_, Diagnostic>>()?,
+        })),
+        ast::Statement::Update { table, set, filter } => {
+            Ok(Statement::Control(ControlStatement::Update {
+                table: control_table(table)?,
+                set: literals(set)?,
+                filter: literals(filter)?,
+            }))
+        }
+        ast::Statement::Delete { table, filter } => {
+            Ok(Statement::Control(ControlStatement::Delete {
+                table: control_table(table)?,
+                filter: literals(filter)?,
+            }))
+        }
+    }
+}
+
+/// The control table a statement writes: only `system.<table>` can be
+/// written through SQL (CS-3).
+fn control_table(table: &ast::TableRef) -> Result<String, Diagnostic> {
+    if table.dataset.as_deref() != Some("system") {
+        return Err(Diagnostic::at(
+            table.span,
+            "INSERT, UPDATE and DELETE apply to system tables only; data arrives through ingestion",
+        ));
+    }
+    Ok(table.table.clone())
+}
+
+fn literals(pairs: &[(String, ast::Expr)]) -> Result<Vec<(String, Literal)>, Diagnostic> {
+    pairs
+        .iter()
+        .map(|(column, expr)| Ok((column.clone(), literal(expr)?)))
+        .collect()
+}
+
+/// A literal as written in a control statement.
+fn literal(expr: &ast::Expr) -> Result<Literal, Diagnostic> {
+    match &expr.kind {
+        ast::ExprKind::Number(text) => match number(text, expr.span)? {
+            Expr::Literal(literal) => Ok(literal),
+            _ => Err(Diagnostic::at(expr.span, "expected a literal")),
+        },
+        ast::ExprKind::Negate(inner) => match literal(inner)? {
+            Literal::Int(i) => Ok(Literal::Int(-i)),
+            Literal::Float(f) => Ok(Literal::Float(-f)),
+            _ => Err(Diagnostic::at(expr.span, "expected a number")),
+        },
+        ast::ExprKind::String(text) => Ok(Literal::Text(text.clone())),
+        ast::ExprKind::Bool(b) => Ok(Literal::Bool(*b)),
+        ast::ExprKind::Null => Ok(Literal::Null),
+        ast::ExprKind::Timestamp(text) => text
+            .parse::<Timestamp>()
+            .map(Literal::Timestamp)
+            .map_err(|e| Diagnostic::at(expr.span, format!("invalid timestamp: {e}"))),
+        ast::ExprKind::Interval(text) => interval(text)
+            .map(Literal::Duration)
+            .ok_or_else(|| Diagnostic::at(expr.span, format!("invalid interval {text}"))),
+        _ => Err(Diagnostic::at(
+            expr.span,
+            "control statements take literals only",
+        )),
+    }
+}
+
+/// A duration option of `CREATE ALERT`, as written.
+fn duration(option: Option<&(String, Span)>) -> Result<Option<Duration>, Diagnostic> {
+    match option {
+        None => Ok(None),
+        Some((text, span)) => interval(text)
+            .map(Some)
+            .ok_or_else(|| Diagnostic::at(*span, format!("invalid duration {text}"))),
     }
 }
 
@@ -767,8 +882,67 @@ mod tests {
     fn lowered(sql: &str) -> Plan {
         match lower(&parse(sql).unwrap(), &ctx()).unwrap() {
             Statement::Query(plan) => plan,
-            Statement::Explain { .. } => panic!("explain"),
+            other => panic!("not a query: {other:?}"),
         }
+    }
+
+    fn control(sql: &str) -> ControlStatement {
+        match lower(&parse(sql).unwrap(), &ctx()).unwrap() {
+            Statement::Control(statement) => statement,
+            other => panic!("not a control statement: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_statements_lower_to_literals_and_durations() {
+        let ControlStatement::CreateAlert(alert) = control(
+            "CREATE ALERT errors FOR 2m EVERY '30 seconds' NOTIFY ops \
+             AS SELECT count(*) AS n FROM logs HAVING count(*) > 1",
+        ) else {
+            panic!("not a create alert");
+        };
+        assert_eq!(alert.hold, Some(Duration::from_secs(120)));
+        assert_eq!(alert.every, Some(Duration::from_secs(30)));
+        assert_eq!(alert.dataset.as_str(), "prod");
+        assert_eq!(
+            alert.query,
+            "SELECT count(*) AS n FROM logs HAVING count(*) > 1"
+        );
+        let bad = error("CREATE ALERT errors AS SELECT nothing FROM logs");
+        assert!(
+            bad.message.contains("nothing"),
+            "the query is checked: {bad:?}"
+        );
+
+        let ControlStatement::Insert { table, rows } = control(
+            "INSERT INTO system.acknowledgments (fingerprint, until, by, weight) \
+             VALUES ('abcd', TIMESTAMP '2024-01-01T00:00:00Z', 'me', -1.5)",
+        ) else {
+            panic!("not an insert");
+        };
+        assert_eq!(table, "acknowledgments");
+        assert_eq!(
+            rows[0][0],
+            ("fingerprint".to_owned(), Literal::Text("abcd".into()))
+        );
+        assert!(matches!(rows[0][1].1, Literal::Timestamp(_)));
+        assert_eq!(rows[0][3].1, Literal::Float(-1.5));
+        let ControlStatement::Delete { filter, .. } =
+            control("DELETE FROM system.silences WHERE id = 's1'")
+        else {
+            panic!("not a delete");
+        };
+        assert_eq!(filter, [("id".to_owned(), Literal::Text("s1".into()))]);
+        assert!(
+            error("DELETE FROM logs WHERE body = 'x'")
+                .message
+                .contains("system tables only")
+        );
+        assert!(
+            error("INSERT INTO system.silences (id) VALUES (lower('x'))")
+                .message
+                .contains("literals only")
+        );
     }
 
     fn error(sql: &str) -> Diagnostic {

@@ -25,7 +25,9 @@ pub mod trace;
 pub mod typing;
 
 pub use expr::{BinaryOp, Expr, Literal};
-pub use frontend::{BindContext, Diagnostic, Frontend, Span, Statement};
+pub use frontend::{
+    AlertDefinition, BindContext, ControlStatement, Diagnostic, Frontend, Span, Statement,
+};
 pub use function::{AggregateFunction, Registry, ScalarFunction};
 pub use plan::{
     AggregateExpr, ExtractStage, NamedExpr, Plan, PlanError, RangeFunction, Scan, SeriesGrouping,

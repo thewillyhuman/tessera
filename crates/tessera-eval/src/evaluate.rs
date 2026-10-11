@@ -108,8 +108,10 @@ pub async fn observe(
             .map_err(|d| expression(d.describe(&rule.expr)))?
         {
             Statement::Query(plan) => plan,
-            Statement::Explain { .. } => {
-                return Err(expression("an alert rule is a query, not EXPLAIN".into()));
+            Statement::Explain { .. } | Statement::Control(_) => {
+                return Err(expression(
+                    "an alert rule is a query, not EXPLAIN or a control statement".into(),
+                ));
             }
         },
         Language::Promql => {

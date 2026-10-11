@@ -6,7 +6,7 @@
 
 use std::fmt::Write;
 
-use tessera_ir::{BindContext, Diagnostic, Frontend, Plan, Statement};
+use tessera_ir::{BindContext, ControlStatement, Diagnostic, Frontend, Plan, Statement};
 use tessera_opt::{OptError, optimize};
 
 use crate::engine::{Analysis, Engine, EngineError, QueryOutput};
@@ -38,6 +38,9 @@ pub enum Response {
         /// Present for `EXPLAIN ANALYZE`.
         analysis: Option<Analysis>,
     },
+    /// A control statement, which the engine does not carry out: the
+    /// caller that holds the control store does.
+    Control(ControlStatement),
 }
 
 /// Runs `text` under `ctx`.
@@ -58,6 +61,7 @@ pub async fn run(
             let plan = optimize(plan, engine.registry())?;
             Ok(Response::Rows(engine.run(&plan).await?))
         }
+        Statement::Control(statement) => Ok(Response::Control(statement)),
         Statement::Explain { plan, analyze } => {
             let plan = optimize(plan, engine.registry())?;
             let analysis = if analyze {

@@ -17,6 +17,67 @@ pub enum Statement {
         /// The explained query.
         query: Query,
     },
+    /// `CREATE ALERT ...`.
+    CreateAlert(Box<CreateAlert>),
+    /// `DROP ALERT name`.
+    DropAlert {
+        /// The rule.
+        name: String,
+    },
+    /// `EXPLAIN ALERT name`.
+    ExplainAlert {
+        /// The rule.
+        name: String,
+    },
+    /// `INSERT INTO table (columns) VALUES (...), ...`.
+    Insert {
+        /// The table.
+        table: TableRef,
+        /// The columns, in the order of the values.
+        columns: Vec<String>,
+        /// The rows of literals.
+        rows: Vec<Vec<Expr>>,
+    },
+    /// `UPDATE table SET column = literal, ... [WHERE ...]`.
+    Update {
+        /// The table.
+        table: TableRef,
+        /// The assignments.
+        set: Vec<(String, Expr)>,
+        /// The equalities of `WHERE`, joined by `AND`.
+        filter: Vec<(String, Expr)>,
+    },
+    /// `DELETE FROM table [WHERE ...]`.
+    Delete {
+        /// The table.
+        table: TableRef,
+        /// The equalities of `WHERE`, joined by `AND`.
+        filter: Vec<(String, Expr)>,
+    },
+}
+
+/// `CREATE ALERT name [SEVERITY s] [FOR d] [EVERY d] [NOTIFY 'r', ...]
+/// [LABELS (k = 'v', ...)] [ANNOTATIONS (k = 'v', ...)] AS query`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CreateAlert {
+    /// The rule's name.
+    pub name: String,
+    /// `SEVERITY`.
+    pub severity: Option<String>,
+    /// `FOR`, as written.
+    pub hold: Option<(String, Span)>,
+    /// `EVERY`, as written.
+    pub every: Option<(String, Span)>,
+    /// `NOTIFY` routes.
+    pub notify: Vec<String>,
+    /// `LABELS`.
+    pub labels: Vec<(String, String)>,
+    /// `ANNOTATIONS`.
+    pub annotations: Vec<(String, String)>,
+    /// The query.
+    pub query: Query,
+    /// The query's text, as written.
+    pub query_text: String,
 }
 
 /// A `SELECT` query.

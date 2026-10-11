@@ -114,6 +114,11 @@ async fn run_native(
         Response::Explain { plan, analysis } => QueryResponse::Explain {
             explain: explain_text(&plan, analysis.as_ref()),
         },
+        Response::Control(_) => {
+            return Err(ApiError::bad_request(
+                "control statements are not carried out over this API yet",
+            ));
+        }
     }))
 }
 

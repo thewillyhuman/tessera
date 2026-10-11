@@ -117,6 +117,10 @@ impl PgServer {
                     stream::iter(rows),
                 )))
             }
+            tessera_exec::Response::Control(_) => Err(user_error(
+                "0A000",
+                "control statements are not carried out over this protocol yet".into(),
+            )),
         }
     }
 
@@ -136,6 +140,7 @@ impl PgServer {
             .map_err(|e| query_error(&QueryError::Syntax(e), text))?;
         let plan: Plan = match statement {
             Statement::Query(plan) => plan,
+            Statement::Control(_) => return Ok(Vec::new()),
             Statement::Explain { .. } => {
                 return Ok(vec![FieldInfo::new(
                     "QUERY PLAN".into(),
