@@ -28,6 +28,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tessera_exec::QueryError;
+use tessera_ingest::loki_push::{self, Entry, Stream};
 use tessera_ir::{BindContext, Expr, Plan, Scan, SortKey};
 use tessera_kernels::{attributes_column, row_labels};
 use tessera_logql::{LogqlFrontend, Lowered, RangeParams, ResultKind};
@@ -566,7 +567,8 @@ async fn detected_labels(
     Ok(Json(json!({ "detectedLabels": labels })).into_response())
 }
 
-/// The push body: `{"streams": [{"stream": {labels}, "values": [[ts, line, meta?]]}]}`.
+/// The JSON push body: `{"streams": [{"stream": {labels}, "values":
+/// [[ts, line, meta?]]}]}`.
 #[derive(Deserialize)]
 struct PushBody {
     streams: Vec<PushStream>,
@@ -580,28 +582,13 @@ struct PushStream {
     values: Vec<Vec<Value>>,
 }
 
-async fn push(
-    State(state): State<AppState>,
-    parts: Parts,
-    body: axum::body::Bytes,
-) -> Result<Response, ApiError> {
-    let scope = scope(&state, &parts, Need::Write).await?;
-    let content_type = parts
-        .headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if !content_type.starts_with("application/json") {
-        return Err(ApiError::unsupported_media_type(format!(
-            "push accepts application/json, got {content_type:?}"
-        )));
-    }
-    let body: PushBody = serde_json::from_slice(&body)
+/// The streams of a JSON push body.
+fn streams_from_json(body: &[u8]) -> Result<Vec<Stream>, ApiError> {
+    let body: PushBody = serde_json::from_slice(body)
         .map_err(|e| ApiError::bad_request(format!("malformed push body: {e}")))?;
-    let now = state.env.clock.now();
-    let mut random = state.env.random.clone();
-    let mut rows = Vec::new();
+    let mut streams = Vec::new();
     for stream in body.streams {
+        let mut entries = Vec::new();
         for entry in stream.values {
             let (Some(ts), Some(line)) = (
                 entry.first().and_then(Value::as_str),
@@ -615,32 +602,76 @@ async fn push(
                 ts.parse::<i64>()
                     .map_err(|_| ApiError::bad_request(format!("invalid timestamp {ts:?}")))?,
             );
+            let mut metadata = BTreeMap::new();
+            if let Some(Value::Object(object)) = entry.get(2) {
+                for (name, value) in object {
+                    let text = value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned);
+                    metadata.insert(name.clone(), text);
+                }
+            }
+            entries.push(Entry {
+                timestamp: Some(timestamp),
+                line: line.to_owned(),
+                metadata,
+            });
+        }
+        streams.push(Stream {
+            labels: stream.stream,
+            entries,
+        });
+    }
+    Ok(streams)
+}
+
+/// Stores pushed streams: JSON as Loki's API documents it, or the
+/// snappy-compressed protobuf promtail and Alloy send. A stream's
+/// labels and an entry's structured metadata become attributes; the
+/// `level` label is the severity.
+async fn push(
+    State(state): State<AppState>,
+    parts: Parts,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let scope = scope(&state, &parts, Need::Write).await?;
+    let content_type = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let streams = if content_type.starts_with("application/json") {
+        streams_from_json(&body)?
+    } else if content_type.starts_with("application/x-protobuf") {
+        loki_push::decode(&body).map_err(|e| ApiError::bad_request(e.to_string()))?
+    } else {
+        return Err(ApiError::unsupported_media_type(format!(
+            "push accepts application/json or application/x-protobuf, got {content_type:?}"
+        )));
+    };
+    let now = state.env.clock.now();
+    let mut random = state.env.random.clone();
+    let mut rows = Vec::new();
+    for stream in streams {
+        let severity_text = stream
+            .labels
+            .get("level")
+            .or_else(|| stream.labels.get("detected_level"))
+            .cloned();
+        for entry in stream.entries {
             let mut attributes = BTreeMap::new();
-            for (name, value) in &stream.stream {
+            for (name, value) in stream.labels.iter().chain(&entry.metadata) {
                 attributes.insert(
                     format!("attr.{name}"),
                     tessera_types::Scalar::Text(value.clone()),
                 );
             }
-            if let Some(Value::Object(metadata)) = entry.get(2) {
-                for (name, value) in metadata {
-                    let text = value
-                        .as_str()
-                        .map_or_else(|| value.to_string(), str::to_owned);
-                    attributes.insert(format!("attr.{name}"), tessera_types::Scalar::Text(text));
-                }
-            }
-            let severity_text = stream
-                .stream
-                .get("level")
-                .or_else(|| stream.stream.get("detected_level"))
-                .cloned();
             rows.push(LogRow {
-                timestamp,
+                timestamp: entry.timestamp.unwrap_or(now),
                 observed_timestamp: now,
                 event_id: Id128::random(&mut random).as_u128().to_le_bytes(),
-                severity_text,
-                body: Some(line.to_owned()),
+                severity_text: severity_text.clone(),
+                body: Some(entry.line),
                 attributes,
                 ..LogRow::default()
             });
@@ -772,6 +803,62 @@ mod tests {
 
     fn get(uri: &str) -> Request<Body> {
         Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    /// The protobuf form promtail and Alloy send lands like the JSON
+    /// one: labels and structured metadata as attributes, the time to
+    /// the nanosecond.
+    #[tokio::test]
+    async fn protobuf_pushes_land_like_json_ones() {
+        use prost::Message;
+        use tessera_ingest::loki_push::{
+            EntryAdapter, LabelPairAdapter, ProtoTimestamp, PushRequest, StreamAdapter,
+        };
+        let app = crate::router(crate::testing::state().await);
+        let request = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{app="checkout", level="error"}"#.into(),
+                entries: vec![EntryAdapter {
+                    timestamp: Some(ProtoTimestamp {
+                        seconds: 1_700_000_000,
+                        nanos: 5,
+                    }),
+                    line: "payment timeout".into(),
+                    structured_metadata: vec![LabelPairAdapter {
+                        name: "trace_id".into(),
+                        value: "abc".into(),
+                    }],
+                }],
+                hash: 0,
+            }],
+        };
+        let body = snap::raw::Encoder::new()
+            .compress_vec(&request.encode_to_vec())
+            .unwrap();
+        let push = |body: Body| {
+            Request::builder()
+                .method("POST")
+                .uri("/loki/api/v1/push")
+                .header(header::CONTENT_TYPE, "application/x-protobuf")
+                .body(body)
+                .unwrap()
+        };
+        let (status, value) = call(&app, push(Body::from(body))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{value}");
+        let (status, value) = call(
+            &app,
+            get("/loki/api/v1/query_range?query=%7Bapp%3D%22checkout%22%7D&start=1699999999000000000&end=1700000010000000000&limit=10"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let result = value["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 1, "{value}");
+        assert_eq!(result[0]["stream"]["level"], "error");
+        assert_eq!(result[0]["stream"]["trace_id"], "abc");
+        assert_eq!(result[0]["values"][0][0], "1700000000000000005");
+        assert_eq!(result[0]["values"][0][1], "payment timeout");
+        let (status, _) = call(&app, push(Body::from("not snappy"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

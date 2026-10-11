@@ -69,8 +69,8 @@ differential suite agrees with Loki 3.3.2 on every case in both
 directions; the deviations found are documented in the `tessera-logql`
 crate.
 
-Gaps left in M3: push over protobuf (JSON only); the `bool` modifier
-in LogQL; sort keys on attribute columns and ingest-time
+Gaps left in M3: the `bool` modifier in LogQL; sort keys on attribute
+columns and ingest-time
 grouping of compaction inputs (CP-2) wait for column promotion (M8);
 L3, retention sampling and log patterns wait for M9; Grafana itself has
 not been run against the API yet.
@@ -491,7 +491,8 @@ psql 'host=127.0.0.1 port=5432 dbname=prod' \
 The database a PostgreSQL client connects to is the dataset. `EXPLAIN`
 shows the plan and `EXPLAIN ANALYZE` what each scan read and pruned.
 
-The Loki API lives under `/loki/api/v1`: push JSON streams, query with
+The Loki API lives under `/loki/api/v1`: push streams as JSON or as
+the snappy-compressed protobuf promtail and Alloy send, query with
 LogQL, list labels and values, and tail. Point Grafana's Loki data
 source at `http://localhost:8080`. The tenant comes from
 `X-Scope-OrgID` and the dataset from `x-tessera-dataset`, both

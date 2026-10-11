@@ -10,6 +10,7 @@
 //! ```
 
 pub mod ingester;
+pub mod loki_push;
 pub mod otlp;
 pub mod remote_write;
 pub mod service;
