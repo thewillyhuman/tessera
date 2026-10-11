@@ -93,6 +93,9 @@ pub struct Config {
     /// administrator (CT-5); on for a single node, off for a cluster
     /// that anyone can reach.
     pub allow_anonymous: bool,
+    /// The secret the nodes of a cluster present to each other on the
+    /// `/internal` routes (SE-3); none leaves them open.
+    pub cluster_secret: Option<String>,
     /// How often the node writes its load signals to `_system.metrics`
     /// (section 14.7).
     pub metrics: Duration,
@@ -118,6 +121,7 @@ impl Config {
             advise: advisor::DEFAULT_INTERVAL,
             ingest: IngestConfig::default(),
             allow_anonymous: true,
+            cluster_secret: None,
             metrics: observe::DEFAULT_INTERVAL,
         }
     }
@@ -237,7 +241,7 @@ impl Node {
         };
         let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
-        let (state, engine, controls) = shared.app_state(ingest.clone(), config.allow_anonymous);
+        let (state, engine, controls) = shared.app_state(ingest.clone(), &config);
         shared.evaluate_rules(
             &config,
             leases.as_ref(),
@@ -478,9 +482,9 @@ impl Shared {
     fn app_state(
         &self,
         ingest: IngestHandle,
-        allow_anonymous: bool,
+        config: &Config,
     ) -> (AppState, Arc<Engine>, Arc<ControlStores>) {
-        let remote = HttpRemote::new();
+        let remote = HttpRemote::new().with_secret(config.cluster_secret.clone());
         let controls = Arc::new(ControlStores::new(
             Arc::clone(&self.store),
             self.env.clone(),
@@ -519,7 +523,10 @@ impl Shared {
                 preferred_ingesters: PREFERRED_INGESTERS,
             })),
             budgets: Arc::new(Ledger::new()),
-            auth: Arc::new(Auth::new(allow_anonymous)),
+            auth: Arc::new(
+                Auth::new(config.allow_anonymous)
+                    .with_cluster_secret(config.cluster_secret.clone()),
+            ),
             load: Arc::clone(&self.load),
         };
         (state, engine, controls)

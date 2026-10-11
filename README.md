@@ -288,7 +288,8 @@ cannot read what it writes (OP-7).
 
 Gaps left in M10: no OIDC or mutual TLS, and traffic is not encrypted
 in transit, so a cluster must run on a private network; node-to-node
-routes under `/internal` carry no credentials (SE-1, SE-3); no
+routes under `/internal` are guarded by a shared cluster secret
+(`--cluster-secret`, SE-3) rather than mutual TLS (SE-1); no
 row-filter roles; no per-tenant encryption keys (SE-2); no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a

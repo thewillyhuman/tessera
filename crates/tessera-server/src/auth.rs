@@ -27,6 +27,10 @@ pub const TTL: Duration = Duration::from_secs(5);
 /// A node's authentication settings and its kept principals.
 pub struct Auth {
     allow_anonymous: bool,
+    /// The secret the nodes of a cluster present to each other on the
+    /// `/internal` routes (SE-3); none means those routes are open, as
+    /// on a single node or a private network.
+    cluster_secret: Option<String>,
     kept: Mutex<HashMap<String, Kept>>,
 }
 
@@ -42,14 +46,40 @@ impl Auth {
     pub fn new(allow_anonymous: bool) -> Self {
         Auth {
             allow_anonymous,
+            cluster_secret: None,
             kept: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// These settings with the `/internal` routes guarded by `secret`.
+    #[must_use]
+    pub fn with_cluster_secret(mut self, secret: Option<String>) -> Self {
+        self.cluster_secret = secret.filter(|s| !s.is_empty());
+        self
     }
 
     /// Whether requests without credentials are served.
     #[must_use]
     pub fn allows_anonymous(&self) -> bool {
         self.allow_anonymous
+    }
+
+    /// Checks that a request to an `/internal` route carries the
+    /// cluster secret, where one is configured.
+    ///
+    /// # Errors
+    ///
+    /// 401 when the secret is missing or wrong.
+    pub fn check_cluster(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let Some(expected) = &self.cluster_secret else {
+            return Ok(());
+        };
+        match bearer(headers) {
+            Some(presented) if presented == expected => Ok(()),
+            _ => Err(ApiError::unauthorized(
+                "the cluster secret is required on internal routes",
+            )),
+        }
     }
 
     /// Forgets the principals of key `id`, after it was revoked.

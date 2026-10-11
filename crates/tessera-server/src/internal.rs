@@ -75,7 +75,12 @@ pub fn decode(bytes: &[u8]) -> Result<(SchemaRef, Vec<RecordBatch>), arrow::erro
     Ok((schema, batches))
 }
 
-async fn scan(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
+async fn scan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    state.auth.check_cluster(&headers)?;
     let task: LeafTask = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("invalid leaf task: {e}")))?;
     let schema = task
@@ -107,6 +112,7 @@ async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
+    state.auth.check_cluster(&headers)?;
     let tenant = TenantId::new(header_text(&headers, TENANT_HEADER)?)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let dataset = DatasetName::new(header_text(&headers, DATASET_HEADER)?)
@@ -130,6 +136,8 @@ async fn ingest(
 #[derive(Clone, Debug)]
 pub struct HttpRemote {
     agent: ureq::Agent,
+    /// The cluster secret sent as a bearer token (SE-3), if any.
+    secret: Option<String>,
 }
 
 impl Default for HttpRemote {
@@ -148,7 +156,15 @@ impl HttpRemote {
                 .timeout_global(Some(std::time::Duration::from_secs(60)))
                 .build()
                 .into(),
+            secret: None,
         }
+    }
+
+    /// This client presenting `secret` to its peers.
+    #[must_use]
+    pub fn with_secret(mut self, secret: Option<String>) -> Self {
+        self.secret = secret.filter(|s| !s.is_empty());
+        self
     }
 
     /// Sends `body` to `url` and returns the response body, or the
@@ -161,6 +177,9 @@ impl HttpRemote {
         body: &[u8],
     ) -> Result<Vec<u8>, RemoteError> {
         let mut request = self.agent.post(url).header("content-type", content_type);
+        if let Some(secret) = &self.secret {
+            request = request.header("authorization", &format!("Bearer {secret}"));
+        }
         for (name, value) in headers {
             request = request.header(*name, value);
         }
@@ -271,6 +290,50 @@ mod tests {
         assert_eq!(schema_of(&batches, schema.clone()), schema);
         assert!(batches.is_empty());
         assert!(decode(b"not arrow").is_err());
+    }
+
+    /// SE-3: with a cluster secret configured, the internal routes take
+    /// it as a bearer token and refuse requests without it.
+    #[tokio::test]
+    async fn internal_routes_need_the_cluster_secret_once_one_is_set() {
+        let mut state = crate::testing::state().await;
+        state.auth = std::sync::Arc::new(
+            crate::auth::Auth::new(true).with_cluster_secret(Some("s3cret".into())),
+        );
+        let app = crate::router(state);
+        let batch = logs();
+        let body = encode(&batch.rows().schema(), std::slice::from_ref(batch.rows())).unwrap();
+        let request = |token: Option<&str>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/internal/v1/ingest")
+                .header(header::CONTENT_TYPE, ARROW_STREAM)
+                .header(TENANT_HEADER, "default")
+                .header(DATASET_HEADER, "prod")
+                .header(KIND_HEADER, "log");
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            request.body(Body::from(body.clone())).unwrap()
+        };
+        let response = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app.clone().oneshot(request(Some("wrong"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app.clone().oneshot(request(Some("s3cret"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let scan = Request::builder()
+            .method("POST")
+            .uri("/internal/v1/scan")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.oneshot(scan).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "checked before the body"
+        );
     }
 
     #[tokio::test]

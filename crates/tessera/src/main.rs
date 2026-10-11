@@ -61,6 +61,11 @@ struct RunArgs {
     /// the loopback interface and nothing anyone else can reach.
     #[arg(long)]
     no_anonymous: bool,
+    /// The secret the nodes of a cluster present to each other on the
+    /// `/internal` routes (SE-3); the same on every node. Without it
+    /// those routes are open, which suits a private network only.
+    #[arg(long, env = "TESSERA_CLUSTER_SECRET")]
+    cluster_secret: Option<String>,
     /// How long the ingester waits for more rows before writing a
     /// segment, in milliseconds (ST-6). Acknowledgment latency is this
     /// plus the store's write; a longer wait makes larger segments.
@@ -87,6 +92,7 @@ async fn main() -> ExitCode {
                 roles: args.roles.into_iter().collect(),
                 advertise: args.advertise,
                 allow_anonymous: !args.no_anonymous,
+                cluster_secret: args.cluster_secret,
                 ingest: tessera_ingest::IngestConfig {
                     linger: std::time::Duration::from_millis(args.linger_ms),
                     ..tessera_ingest::IngestConfig::default()
