@@ -39,6 +39,7 @@ use tessera_commit::LeaseManager;
 use tessera_eval::HttpNotifier;
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
+use tessera_iceberg::Exporter;
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::DatasetLogs;
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
@@ -129,6 +130,13 @@ pub struct Config {
     /// How often the node writes its load signals to `_system.metrics`
     /// (section 14.7).
     pub metrics: Duration,
+    /// The URI external engines read the data directory at, such as
+    /// `s3://bucket/prefix` or `file:///var/lib/tessera`. Given, the
+    /// `compact` role publishes Apache Iceberg metadata for every
+    /// dataset under it (OP-9); none, and nothing is exported.
+    pub export_location: Option<String>,
+    /// How often the Iceberg metadata is brought up to date.
+    pub export_interval: Duration,
 }
 
 impl Config {
@@ -159,6 +167,8 @@ impl Config {
             oidc: None,
             keyring: Keyring::default(),
             metrics: observe::DEFAULT_INTERVAL,
+            export_location: None,
+            export_interval: background::EXPORT_EVERY,
         }
     }
 }
@@ -550,6 +560,10 @@ impl Shared {
                     self.env.clone(),
                 )),
                 load: Arc::clone(&self.load),
+                export: config.export_location.as_deref().map(|location| {
+                    Exporter::new(Arc::clone(&self.store), location, self.env.clone())
+                }),
+                export_interval: config.export_interval,
             })));
         }
         (Some(leases), Some((stop, task)))

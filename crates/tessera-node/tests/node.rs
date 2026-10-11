@@ -627,3 +627,61 @@ async fn a_filtered_attribute_becomes_the_sort_key_without_intervention() {
     .await;
     node.stop().await;
 }
+
+/// OP-9: a node given an export location publishes Iceberg metadata
+/// for what it ingested, naming data files that exist where it says.
+#[tokio::test(flavor = "multi_thread")]
+async fn iceberg_metadata_is_published_for_an_ingested_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut config = config(dir.path());
+    config.background = Duration::from_millis(100);
+    config.export_interval = Duration::from_millis(100);
+    config.export_location = Some(format!("file://{}", root.display()));
+    let node = Node::start(config, Env::system()).await.unwrap();
+    let now = node.env().clock.now().as_nanos();
+    let body = serde_json::json!({
+        "streams": [{
+            "stream": { "app": "export" },
+            "values": [[now.to_string(), "one"], [(now + 1).to_string(), "two"]]
+        }]
+    });
+    let (status, text) = common::post(
+        format!("http://{}/loki/api/v1/push", node.http_address()),
+        vec![("x-tessera-dataset".into(), "prod".into())],
+        body,
+    )
+    .await;
+    assert_eq!(status, 204, "{text}");
+    let metadata_dir = root.join("default/prod/iceberg/log/metadata");
+    let hint = metadata_dir.join("version-hint.text");
+    common::eventually("the export", Duration::from_secs(20), || hint.exists()).await;
+    let version = std::fs::read_to_string(&hint).unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(metadata_dir.join(format!("v{}.metadata.json", version.trim()))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["format-version"], 3);
+    assert_eq!(
+        metadata["location"],
+        format!("file://{}/default/prod/iceberg/log", root.display())
+    );
+    let list = metadata["snapshots"][0]["manifest-list"].as_str().unwrap();
+    assert!(
+        std::path::Path::new(list.strip_prefix("file://").unwrap()).exists(),
+        "{list}"
+    );
+    let manifest =
+        std::fs::read(metadata_dir.join(format!("manifest-{}.avro", version.trim()))).unwrap();
+    let text = String::from_utf8_lossy(&manifest);
+    let prefix = format!("file://{}/default/prod/p/log/", root.display());
+    let mut files = 0;
+    for (start, _) in text.match_indices(&prefix) {
+        let end = start + text[start..].find(".parquet").unwrap() + ".parquet".len();
+        let path = &text[start + "file://".len()..end];
+        assert!(std::path::Path::new(path).exists(), "{path}");
+        files += 1;
+    }
+    assert!(files >= 1, "{text}");
+    node.stop().await;
+}

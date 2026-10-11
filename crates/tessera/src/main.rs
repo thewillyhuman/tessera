@@ -69,6 +69,12 @@ struct RunArgs {
     /// with, looked up on every heartbeat: a headless service.
     #[arg(long)]
     seed_dns: Option<String>,
+    /// The URI external engines read the data directory at, such as
+    /// `s3://bucket/prefix` or `file:///var/lib/tessera`. Given, the node
+    /// publishes Apache Iceberg metadata for every dataset under
+    /// `<tenant>/<dataset>/iceberg/<kind>`; without it nothing is exported.
+    #[arg(long)]
+    export_location: Option<String>,
     /// Refuse requests without an API key. By default a request without
     /// one acts as a cluster administrator, which suits a single node on
     /// the loopback interface and nothing anyone else can reach.
@@ -166,6 +172,7 @@ async fn main() -> ExitCode {
                 advertise: args.advertise,
                 seeds: args.seeds,
                 seed_dns: args.seed_dns,
+                export_location: args.export_location,
                 allow_anonymous: !args.no_anonymous,
                 cluster_secret: args.cluster_secret,
                 tls: args

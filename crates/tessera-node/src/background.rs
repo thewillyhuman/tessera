@@ -26,6 +26,7 @@ use tessera_compact::{
 use tessera_eval::AlertRule;
 use tessera_eval::rule::decode_rows;
 use tessera_format::FileFormat;
+use tessera_iceberg::{Exporter, Outcome as Export};
 use tessera_manifest::{
     DatasetLog, DatasetLogs, Manifest, ManifestState, Registration, intake, list_partitions,
     registry,
@@ -53,6 +54,11 @@ const RECLUSTER_BUDGET: u64 = 256 << 20;
 /// How often what the partitions hold is recorded in `system.usage`
 /// (section 13.1): the grain a storage bill is reconciled at.
 const HELD_EVERY: Duration = Duration::from_secs(3_600);
+
+/// How often the Iceberg metadata of the tables this node owns the
+/// export of is brought up to date (OP-9): a table whose files did not
+/// change costs its hint and metadata reads, nothing more.
+pub const EXPORT_EVERY: Duration = Duration::from_secs(600);
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
@@ -84,6 +90,11 @@ pub struct Background {
     pub controls: Arc<ControlStores>,
     /// Where the backlogs are reported (OP-5).
     pub load: Arc<Load>,
+    /// The Iceberg exporter, when the node has a location to publish
+    /// under (OP-9).
+    pub export: Option<Exporter>,
+    /// How often the exporter runs.
+    pub export_interval: Duration,
 }
 
 /// What a round left undone or had to repair.
@@ -109,6 +120,7 @@ pub async fn run(background: Background) {
     let mut ticks = tokio::time::interval(background.interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_held: Option<Timestamp> = None;
+    let mut last_export: Option<Timestamp> = None;
     loop {
         ticks.tick().await;
         let tenants: Vec<TenantId> = background
@@ -120,8 +132,8 @@ pub async fn run(background: Background) {
             .collect();
         let mut backlog = Backlog::default();
         let mut held = Vec::new();
-        for tenant in tenants {
-            match round(&background, &compactor, &tenant, &mut held).await {
+        for tenant in &tenants {
+            match round(&background, &compactor, tenant, &mut held).await {
                 Ok(left) => {
                     backlog.deferred += left.deferred;
                     backlog.recoveries += left.recoveries;
@@ -148,7 +160,56 @@ pub async fn run(background: Background) {
         if let Err(error) = collect_logs(&background).await {
             tracing::warn!(error = %error, "segment collection failed");
         }
+        if let Some(exporter) = &background.export {
+            let due = last_export.is_none_or(|at: Timestamp| {
+                now.duration_since(at)
+                    .is_some_and(|since| since >= background.export_interval)
+            });
+            // A node with no table yet looks again every round, so that a
+            // dataset's first files are published the round they are
+            // adopted; the interval counts from a round that found one.
+            if due && export_round(&background, exporter, &tenants).await > 0 {
+                last_export = Some(now);
+            }
+        }
     }
+}
+
+/// Publishes the Iceberg metadata of every table this node owns the
+/// export of (OP-9): one table per dataset and kind, its export the
+/// partition slot of the table's key. Returns how many tables there
+/// are, published now or before.
+async fn export_round(background: &Background, exporter: &Exporter, tenants: &[TenantId]) -> usize {
+    let mut tables = 0;
+    for tenant in tenants {
+        let datasets = match registry::datasets(&*background.store, tenant).await {
+            Ok(datasets) => datasets,
+            Err(error) => {
+                tracing::warn!(%tenant, error = %error, "listing datasets for export failed");
+                continue;
+            }
+        };
+        for dataset in datasets {
+            for kind in Kind::ALL {
+                let item = Exporter::item(tenant, &dataset, kind);
+                if !background.owned.owns(WorkKind::Partition, item.as_bytes()) {
+                    continue;
+                }
+                match exporter.export(tenant, &dataset, kind).await {
+                    Ok(Export::Published { version, files }) => {
+                        tables += 1;
+                        tracing::info!(%tenant, %dataset, %kind, version, files, "iceberg metadata published");
+                    }
+                    Ok(Export::Unchanged | Export::Lost { .. }) => tables += 1,
+                    Ok(Export::Empty) => {}
+                    Err(error) => {
+                        tracing::warn!(%tenant, %dataset, %kind, error = %error, "iceberg export failed");
+                    }
+                }
+            }
+        }
+    }
+    tables
 }
 
 async fn round(

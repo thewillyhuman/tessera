@@ -20,6 +20,7 @@ tessera-cluster = { path = "crates/tessera-cluster" }
 tessera-format = { path = "crates/tessera-format" }
 tessera-wal = { path = "crates/tessera-wal" }
 tessera-manifest = { path = "crates/tessera-manifest" }
+tessera-iceberg = { path = "crates/tessera-iceberg" }
 tessera-ingest = { path = "crates/tessera-ingest" }
 tessera-compact = { path = "crates/tessera-compact" }
 tessera-ir = { path = "crates/tessera-ir" }

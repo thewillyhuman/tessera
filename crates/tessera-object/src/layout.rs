@@ -134,6 +134,13 @@ pub fn partitions(tenant: &TenantId, dataset: &DatasetName, kind: tessera_types:
     key(&[tenant.as_str(), dataset.as_str(), "p", kind.as_str()])
 }
 
+/// Prefix of a dataset's Apache Iceberg export of one kind (OP-9): the
+/// table's location, its metadata under `metadata/`.
+#[must_use]
+pub fn iceberg_table(tenant: &TenantId, dataset: &DatasetName, kind: tessera_types::Kind) -> Key {
+    key(&[tenant.as_str(), dataset.as_str(), "iceberg", kind.as_str()])
+}
+
 /// Prefix of a partition: its manifest log, data files and sidecars.
 #[must_use]
 pub fn partition(partition: &PartitionId) -> Key {

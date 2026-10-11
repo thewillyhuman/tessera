@@ -16,6 +16,7 @@ tessera-compact.workspace = true
 tessera-eval.workspace = true
 tessera-exec.workspace = true
 tessera-format.workspace = true
+tessera-iceberg.workspace = true
 tessera-ingest.workspace = true
 tessera-manifest.workspace = true
 tessera-object.workspace = true

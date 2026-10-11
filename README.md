@@ -374,8 +374,21 @@ sealed while that key stays in the keyring, and a tenant naming a key
 the node lacks is refused rather than stored plain (SE-2, SE-3). Key
 material never enters the object store; the catalog holds names only.
 
-Gaps left in M10: no Iceberg
-export (OP-9); the scale envelope of 17.2 has not been run, and the
+A node given `--export-location`, the URI external engines read the
+data directory at, publishes Apache Iceberg metadata for every dataset
+(OP-9, G2): one table per dataset and kind at
+`<tenant>/<dataset>/iceberg/<kind>`, format version 3 so that event
+time is a nanosecond timestamp, every dedicated column a typed column
+and `_overflow` the JSON string the files store, over the adopted
+files only. Each export is a full snapshot, written when the file set
+changed since the last one, with a name mapping for the files, which
+carry no field ids, and the files' bounds for pruning; the snapshot
+before stays for a reader on it and older ones are removed. The
+metadata files are written by the project's own Avro container writer,
+checked against an Avro library in tests and read back with
+`pyiceberg` once by hand.
+
+Gaps left in M10: the scale envelope of 17.2 has not been run, and the
 rolling restart under load is a three-node test in `tessera-node`
 rather than a run of a real upgrade; neither the image nor the chart
 has run on a cluster.
@@ -391,6 +404,7 @@ crates/
   tessera-format    FileFormat trait and the Parquet implementation
   tessera-wal       writer logs: entries, segments, L1 flush, recovery
   tessera-manifest  partition manifests, writer registry, intake, consistent view
+  tessera-iceberg   Apache Iceberg export: table metadata, manifests and the Avro container they are written in
   tessera-ingest    ingester, ingest service, OTLP decoder
   tessera-compact   compaction jobs, deduplication, garbage collection of files and segments
   tessera-cluster   node roles, the node registry, membership and admission control
@@ -649,6 +663,21 @@ rule's dataset, queryable like any other event.
 Compaction, index building and garbage collection run in the
 background: a partition's L1 files become one indexed L2 file once
 there are four of them or a lone one is an hour old.
+
+Another engine reads the data files through the Iceberg metadata a
+node publishes when started with `--export-location`, the URI it
+reads the data directory at: `file:///var/lib/tessera` for a local
+directory, `s3://bucket/prefix` for a bucket. Each dataset and kind is
+a table at `<location>/<tenant>/<dataset>/iceberg/<kind>`, brought up
+to date every ten minutes:
+
+```sh
+tessera run --data-dir /var/lib/tessera --export-location file:///var/lib/tessera
+python3 -c "
+from pyiceberg.table import StaticTable
+table = StaticTable.from_metadata('file:///var/lib/tessera/default/prod/iceberg/log')
+print(table.scan().to_arrow().num_rows)"
+```
 
 The routes are listed in the modules of `crates/tessera-server/src`.
 Logging is controlled by `TESSERA_LOG` (for example `TESSERA_LOG=debug`).
