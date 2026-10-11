@@ -12,10 +12,11 @@ use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use tessera_types::Timestamp;
-use tessera_types::event::TIMESTAMP;
+use tessera_types::event::{OBSERVED_TIMESTAMP, TIMESTAMP};
 
 use std::sync::Arc;
 
@@ -52,10 +53,20 @@ impl ParquetFormat {
         self.footers.as_ref()
     }
 
+    /// zstd pages, and the two time columns delta-encoded rather than
+    /// dictionary-encoded: timestamps rarely repeat, but within a sort
+    /// run they grow by little, which the delta encoding stores in a
+    /// few bits where a dictionary stores every distinct value whole.
     fn properties() -> WriterProperties {
-        WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build()
+        let mut builder =
+            WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::default()));
+        for column in [TIMESTAMP, OBSERVED_TIMESTAMP] {
+            let path = ColumnPath::from(column);
+            builder = builder
+                .set_column_dictionary_enabled(path.clone(), false)
+                .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
+        }
+        builder.build()
     }
 }
 
@@ -255,6 +266,41 @@ mod tests {
             .unwrap()
             .rows()
             .clone()
+    }
+
+    #[test]
+    fn time_columns_are_delta_encoded() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let rows: Vec<LogRow> = (0..200).map(|i| log(1_000 + i * 7, "x")).collect();
+        let written = ParquetFormat::default()
+            .write(&[batch(&rows)], &Layout::l1())
+            .unwrap();
+        let reader = SerializedFileReader::new(written.bytes.clone()).unwrap();
+        let group = &reader.metadata().row_groups()[0];
+        let encodings = |name: &str| {
+            group
+                .columns()
+                .iter()
+                .find(|c| c.column_path().string() == name)
+                .map(|c| c.encodings().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert!(
+            encodings(TIMESTAMP).contains(&Encoding::DELTA_BINARY_PACKED),
+            "{:?}",
+            encodings(TIMESTAMP)
+        );
+        assert!(
+            encodings(OBSERVED_TIMESTAMP).contains(&Encoding::DELTA_BINARY_PACKED),
+            "{:?}",
+            encodings(OBSERVED_TIMESTAMP)
+        );
+        assert!(
+            !encodings(TIMESTAMP).contains(&Encoding::RLE_DICTIONARY),
+            "{:?}",
+            encodings(TIMESTAMP)
+        );
     }
 
     #[test]

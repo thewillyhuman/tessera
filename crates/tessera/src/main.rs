@@ -61,6 +61,11 @@ struct RunArgs {
     /// the loopback interface and nothing anyone else can reach.
     #[arg(long)]
     no_anonymous: bool,
+    /// How long the ingester waits for more rows before writing a
+    /// segment, in milliseconds (ST-6). Acknowledgment latency is this
+    /// plus the store's write; a longer wait makes larger segments.
+    #[arg(long, default_value_t = 50)]
+    linger_ms: u64,
 }
 
 #[tokio::main]
@@ -82,6 +87,10 @@ async fn main() -> ExitCode {
                 roles: args.roles.into_iter().collect(),
                 advertise: args.advertise,
                 allow_anonymous: !args.no_anonymous,
+                ingest: tessera_ingest::IngestConfig {
+                    linger: std::time::Duration::from_millis(args.linger_ms),
+                    ..tessera_ingest::IngestConfig::default()
+                },
                 ..tessera_node::Config::single_node(args.data_dir)
             })
             .await
@@ -126,6 +135,10 @@ mod tests {
         assert_eq!(args.roles, [Role::Query, Role::Compact]);
         assert_eq!(args.advertise.as_deref(), Some("http://node-1:8080"));
         assert!(Cli::try_parse_from(["tessera", "run", "--roles", "boss"]).is_err());
+        let Command::Run(args) = Cli::try_parse_from(["tessera", "run", "--linger-ms", "200"])
+            .unwrap()
+            .command;
+        assert_eq!(args.linger_ms, 200);
     }
 
     #[test]

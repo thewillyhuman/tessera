@@ -2396,6 +2396,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "tessera-cluster",
+ "tessera-ingest",
  "tessera-node",
  "tokio",
  "tracing",

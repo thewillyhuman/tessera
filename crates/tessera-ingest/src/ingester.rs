@@ -54,7 +54,7 @@ pub struct IngestConfig {
 impl Default for IngestConfig {
     fn default() -> Self {
         IngestConfig {
-            linger: Duration::from_millis(250),
+            linger: Duration::from_millis(50),
             segment_bytes: 8 << 20,
             flush_bytes: 64 << 20,
             flush_age: Duration::from_secs(120),
