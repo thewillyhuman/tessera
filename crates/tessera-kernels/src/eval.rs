@@ -476,10 +476,9 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
         .map(|a| value(a, batch))
         .collect::<Result<Vec<_>, _>>()?;
     match (name, values.as_slice()) {
-        ("hop", _) => Err(KernelError::Unsupported(
-            "hop windows are evaluated incrementally by alert rules; a query groups by time_bucket"
-                .into(),
-        )),
+        ("hop" | "slide", _) => Err(KernelError::Unsupported(format!(
+            "{name} windows are evaluated incrementally by alert rules; a query groups by time_bucket"
+        ))),
         ("time_bucket", [interval, timestamps]) | ("tumble", [timestamps, interval]) => {
             let interval = interval
                 .array()

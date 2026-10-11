@@ -119,6 +119,10 @@ fn tumble(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+/// `slide(timestamp, size)` types like `tumble`: a sliding window of
+/// `size` that an alert rule advances by its evaluation interval
+/// (CQ-7); the incremental evaluator alone runs it.
+///
 /// `hop(timestamp, size, step)`: a hopping window of `size` starting
 /// every `step` (CQ-7). A row belongs to several windows, so only the
 /// incremental evaluator runs it; the type is the window start.
@@ -191,6 +195,10 @@ const SCALARS: &[ScalarFunction] = &[
     ScalarFunction {
         name: "hop",
         return_type: hop,
+    },
+    ScalarFunction {
+        name: "slide",
+        return_type: tumble,
     },
     ScalarFunction {
         name: "prometheus_name",

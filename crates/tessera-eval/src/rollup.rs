@@ -89,7 +89,10 @@ impl Rollup {
         };
         let shape = rollup.shape(tenant)?;
         if shape.hop.is_some() {
-            return Err("a rollup needs a tumbling window; hop windows are for alert rules".into());
+            return Err(
+                "a rollup needs a tumbling window; hopping and sliding windows are for alert rules"
+                    .into(),
+            );
         }
         Ok(Rollup {
             window_seconds: shape.window.as_secs(),
@@ -105,7 +108,7 @@ impl Rollup {
     ///
     /// Why the query cannot be a rollup.
     pub fn shape(&self, tenant: &TenantId) -> Result<Shape, String> {
-        let shape = shape_of_sql(&self.expr, &self.dataset, tenant)?;
+        let shape = shape_of_sql(&self.expr, &self.dataset, tenant, None)?;
         if shape.having.is_some() {
             return Err("a rollup keeps every group; drop the HAVING".into());
         }

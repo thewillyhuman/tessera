@@ -101,7 +101,12 @@ pub fn shape_of(rule: &AlertRule, tenant: &TenantId) -> Result<Shape, String> {
             rule.language
         ));
     }
-    shape_of_sql(&rule.expr, &rule.dataset, tenant)
+    shape_of_sql(
+        &rule.expr,
+        &rule.dataset,
+        tenant,
+        Some(Duration::from_secs(rule.every_seconds.max(1))),
+    )
 }
 
 /// The shape of the SQL query `expr` over `dataset`, or why it has none.
@@ -110,7 +115,12 @@ pub fn shape_of(rule: &AlertRule, tenant: &TenantId) -> Result<Shape, String> {
 ///
 /// Why the query is not a grouped aggregation over one tumbling window
 /// of mergeable aggregates.
-pub fn shape_of_sql(expr: &str, dataset: &str, tenant: &TenantId) -> Result<Shape, String> {
+pub fn shape_of_sql(
+    expr: &str,
+    dataset: &str,
+    tenant: &TenantId,
+    every: Option<Duration>,
+) -> Result<Shape, String> {
     let dataset = DatasetName::new(dataset).map_err(|e| e.to_string())?;
     let ctx = BindContext::new(tenant.clone(), dataset, Timestamp::from_nanos(0));
     let plan = match SqlFrontend
@@ -123,10 +133,10 @@ pub fn shape_of_sql(expr: &str, dataset: &str, tenant: &TenantId) -> Result<Shap
         }
     };
     let plan = optimize(plan, &tessera_ir::Registry::builtin()).map_err(|e| e.to_string())?;
-    shape_of_plan(&plan)
+    shape_of_plan(&plan, every)
 }
 
-fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
+fn shape_of_plan(plan: &Plan, every: Option<Duration>) -> Result<Shape, String> {
     let mut node = plan;
     let mut having = None;
     loop {
@@ -169,7 +179,7 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
     let predicate = predicates
         .into_iter()
         .reduce(|a, b| a.binary(BinaryOp::And, b));
-    let (keys, window, hop) = keys_and_window(group_by)?;
+    let (keys, window, hop) = keys_and_window(group_by, every)?;
     check_aggregates(aggregates)?;
     let schema = node
         .schema(&tessera_ir::Registry::builtin())
@@ -205,7 +215,7 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
 
 /// Whether a function call in `GROUP BY` is the window.
 fn is_window(name: &str) -> bool {
-    matches!(name, "tumble" | "time_bucket" | "hop")
+    matches!(name, "tumble" | "time_bucket" | "hop" | "slide")
 }
 
 /// The grouping keys of a `GROUP BY`, its window's length, and how far
@@ -213,8 +223,12 @@ fn is_window(name: &str) -> bool {
 type KeysAndWindow = (Vec<(String, Expr)>, Duration, Option<Duration>);
 
 /// The grouping keys and the one window of a `GROUP BY`: its length,
-/// and how far apart its starts are when it hops (CQ-7).
-fn keys_and_window(group_by: &[tessera_ir::NamedExpr]) -> Result<KeysAndWindow, String> {
+/// and how far apart its starts are when it hops (CQ-7). A sliding
+/// window advances by `every`, the rule's evaluation interval.
+fn keys_and_window(
+    group_by: &[tessera_ir::NamedExpr],
+    every: Option<Duration>,
+) -> Result<KeysAndWindow, String> {
     let mut keys = Vec::new();
     let mut window = None;
     let constant = |expr: Option<&Expr>| match expr {
@@ -225,12 +239,17 @@ fn keys_and_window(group_by: &[tessera_ir::NamedExpr]) -> Result<KeysAndWindow, 
         match &key.expr {
             Expr::Call { name, args } if is_window(name) => {
                 let (interval, time, step) = match name.as_str() {
-                    "tumble" => (args.get(1), args.first(), None),
+                    "tumble" | "slide" => (args.get(1), args.first(), None),
                     "hop" => (args.get(1), args.first(), Some(args.get(2))),
                     _ => (args.first(), args.get(1), None),
                 };
                 let length = constant(interval)?;
-                let hop = step.map(constant).transpose()?;
+                let mut hop = step.map(constant).transpose()?;
+                if name == "slide" {
+                    hop = Some(every.ok_or_else(|| {
+                        "a sliding window advances by a rule's evaluation interval; only a rule can slide".to_owned()
+                    })?);
+                }
                 if !matches!(time, Some(Expr::Column(c)) if c == TIMESTAMP) {
                     return Err("the window must be over the timestamp column".into());
                 }
@@ -249,7 +268,11 @@ fn keys_and_window(group_by: &[tessera_ir::NamedExpr]) -> Result<KeysAndWindow, 
     }
     if let Some(hop) = hop {
         if hop.is_zero() || hop > window || window.as_nanos() % hop.as_nanos() != 0 {
-            return Err("a hop must be longer than zero, at most the window and divide it".into());
+            return Err(
+                "a window's step must be longer than zero, at most the window and divide it; \
+                 a sliding window's step is the rule's EVERY"
+                    .into(),
+            );
         }
     }
     Ok((keys, window, hop))

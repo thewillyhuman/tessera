@@ -175,9 +175,10 @@ from data files when a partition falls behind the WAL retention cap
 (section 11.7); inhibition rules and Alertmanager-style grouping of
 notifications; email; the incremental subset is SQL only and counts
 rows unweighted; the alert latency target is set by the evaluation
-interval (five seconds by default) rather than measured; sliding
-windows, sketches and histograms run periodically, while hopping
-windows, `hop(timestamp, size, step)`, and absence, a condition such
+interval (five seconds by default) rather than measured; sketches
+and histograms run periodically, while hopping windows,
+`hop(timestamp, size, step)`, sliding windows, `slide(timestamp,
+size)` stepping by the rule's `EVERY`, and absence, a condition such
 as `count(*) < 1` on a group that goes quiet, are incremental.
 
 **M8, adaptive design: done, with gaps listed below.** A workload

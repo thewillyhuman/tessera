@@ -262,6 +262,35 @@ async fn absence_fires_once_a_closed_window_has_no_rows() {
     assert!(quiet.transitions[0].value.abs() < f64::EPSILON);
 }
 
+/// CQ-7: a sliding window advances by the rule's evaluation interval.
+#[tokio::test]
+async fn a_sliding_window_advances_by_the_rules_interval() {
+    let mut fx = fixture().await;
+    fx.log
+        .append_segment(&[errors(at(1_000), 3, "checkout", 17)])
+        .await
+        .unwrap();
+    let group = group(
+        &fx,
+        "sliding",
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         GROUP BY attr.service, slide(timestamp, INTERVAL '3 minutes') \
+         HAVING count(*) >= 2",
+    );
+    group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    let seen = windows(&fx).await;
+    let mut starts: Vec<i64> = seen
+        .values()
+        .map(|w| w.start.as_nanos() / 1_000_000_000)
+        .collect();
+    starts.sort_unstable();
+    assert_eq!(
+        starts,
+        [840, 900, 960],
+        "a minute's step, the rule's EVERY, over three minutes"
+    );
+}
+
 #[tokio::test]
 async fn an_average_condition_waits_for_the_watermark() {
     let mut fx = fixture().await;
