@@ -138,6 +138,12 @@ pub enum ControlStatement {
         /// The rule.
         name: String,
     },
+    /// `EXPLAIN LAYOUT [dataset]`: the dataset's layout, the alternatives
+    /// the advisor considered and the queries that drove it (AD-11).
+    ExplainLayout {
+        /// The dataset.
+        dataset: DatasetName,
+    },
     /// `INSERT INTO system.<table> (columns) VALUES (...), ...`.
     Insert {
         /// The control table.

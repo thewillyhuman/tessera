@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! Control statements carried out against the tenant's control store
-//! (section 9.5, CS-3): `CREATE ALERT`, `DROP ALERT`, `EXPLAIN ALERT`
-//! and `INSERT`, `UPDATE` and `DELETE` on the `system` tables. Each
+//! (section 9.5, CS-3): `CREATE ALERT`, `DROP ALERT`, `EXPLAIN ALERT`,
+//! `EXPLAIN LAYOUT` and `INSERT`, `UPDATE` and `DELETE` on the `system`
+//! tables. Each
 //! statement is one transaction (CS-1); the typed tables are checked
 //! against their record before anything is stored.
+
+use std::fmt::Write;
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tessera_catalog::{ControlError, ControlStore, Row, Table, Transaction};
 use tessera_eval::{Acknowledgment, AlertRule, NotificationRoute, Silence, mode_of};
 use tessera_ir::{ControlStatement, Literal};
-use tessera_types::TenantId;
+use tessera_manifest::DatasetLog;
+use tessera_types::{DatasetName, Kind, TenantId};
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -71,6 +76,9 @@ pub async fn execute(
             let rule: AlertRule = serde_json::from_value(document)
                 .map_err(|e| ApiError::bad_request(format!("alert {name} does not decode: {e}")))?;
             Ok(mode_of(&rule, tenant).to_string())
+        }
+        ControlStatement::ExplainLayout { dataset } => {
+            explain_layout(state, tenant, &dataset).await
         }
         ControlStatement::Insert { table, rows } => {
             insert(&control, writable(&table)?, &rows).await
@@ -166,6 +174,72 @@ async fn delete(
         .await
         .map_err(control_error)?;
     Ok(format!("DELETE {count}"))
+}
+
+/// `EXPLAIN LAYOUT` (AD-11): per kind, the layout in force, the
+/// partition window, and the advisor's last report with the
+/// alternatives it costed and the queries that drove it.
+async fn explain_layout(
+    state: &AppState,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+) -> Result<String, ApiError> {
+    let log = DatasetLog::open(
+        Arc::clone(state.pools.root().store()),
+        tenant,
+        dataset,
+        state.env.clone(),
+    );
+    let mut out = String::new();
+    let window = log.window().await.map_err(unavailable)?;
+    let _ = writeln!(
+        out,
+        "dataset {dataset}: partition window {}s",
+        window.as_secs()
+    );
+    for kind in Kind::ALL {
+        let layout = log.layout(kind).await.map_err(unavailable)?;
+        let _ = writeln!(
+            out,
+            "{kind}: epoch {} sort key [{}] dedicated [{}] bloom [{}] term [{}] trigram [{}]",
+            layout.epoch,
+            layout.sort_key.join(", "),
+            layout.dedicated.join(", "),
+            layout.bloom.join(", "),
+            layout.term.join(", "),
+            layout.trigram.join(", "),
+        );
+        if let Some(advice) = log.advice(kind).await.map_err(unavailable)? {
+            let _ = writeln!(
+                out,
+                "  advisor at {}: proposes [{}], agreed {} run(s)",
+                advice.at,
+                advice.proposed.sort_key.join(", "),
+                advice.streak
+            );
+            for alternative in &advice.alternatives {
+                let _ = writeln!(
+                    out,
+                    "    [{}] cost {:.0}{}",
+                    alternative.sort_key.join(", "),
+                    alternative.cost,
+                    if alternative.current {
+                        " (current)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            for driver in &advice.drivers {
+                let _ = writeln!(out, "    driven by {driver}");
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn unavailable(error: impl std::fmt::Display) -> ApiError {
+    ApiError::unavailable(error.to_string())
 }
 
 /// The table a statement may write.
@@ -373,6 +447,19 @@ mod tests {
 
         let (_, value) = sql(&state, "EXPLAIN ALERT errors").await;
         assert!(result(&value).starts_with("periodic:"), "{value}");
+
+        let (status, value) = sql(&state, "EXPLAIN LAYOUT prod").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let text = result(&value);
+        assert!(
+            text.starts_with("dataset prod: partition window 86400s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("log: epoch 0 sort key [severity_number, timestamp]"),
+            "{text}"
+        );
+        assert!(text.contains("term [body]"));
 
         let (status, value) = sql(&state, "DROP ALERT errors").await;
         assert_eq!(status, StatusCode::OK);

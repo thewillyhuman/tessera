@@ -14,6 +14,7 @@ tessera-eval.workspace = true
 tessera-exec.workspace = true
 tessera-format.workspace = true
 tessera-ingest.workspace = true
+tessera-manifest.workspace = true
 tessera-ir.workspace = true
 tessera-kernels.workspace = true
 tessera-logql.workspace = true

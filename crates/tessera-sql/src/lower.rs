@@ -61,6 +61,16 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
                 name: name.clone(),
             }))
         }
+        ast::Statement::ExplainLayout { dataset } => {
+            let dataset = match dataset {
+                Some(name) => DatasetName::new(name.clone())
+                    .map_err(|e| Diagnostic::unlocated(format!("invalid dataset: {e}")))?,
+                None => ctx.dataset.clone(),
+            };
+            Ok(Statement::Control(ControlStatement::ExplainLayout {
+                dataset,
+            }))
+        }
         ast::Statement::Insert {
             table,
             columns,

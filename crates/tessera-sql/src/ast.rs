@@ -29,6 +29,11 @@ pub enum Statement {
         /// The rule.
         name: String,
     },
+    /// `EXPLAIN LAYOUT [dataset]`.
+    ExplainLayout {
+        /// The dataset, if named.
+        dataset: Option<String>,
+    },
     /// `INSERT INTO table (columns) VALUES (...), ...`.
     Insert {
         /// The table.

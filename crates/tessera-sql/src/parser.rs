@@ -153,6 +153,16 @@ impl Parser<'_> {
                 let (name, _) = self.identifier()?;
                 return Ok(Statement::ExplainAlert { name });
             }
+            if self.eat_keyword("layout") {
+                let dataset = match self.peek() {
+                    Some(Spanned {
+                        token: Token::Ident { .. },
+                        ..
+                    }) => Some(self.identifier()?.0),
+                    _ => None,
+                };
+                return Ok(Statement::ExplainLayout { dataset });
+            }
             let analyze = self.eat_keyword("analyze");
             let query = self.query()?;
             return Ok(Statement::Explain { analyze, query });
@@ -910,6 +920,16 @@ mod tests {
         assert_eq!(
             parse("EXPLAIN ALERT x").unwrap(),
             Statement::ExplainAlert { name: "x".into() }
+        );
+        assert_eq!(
+            parse("EXPLAIN LAYOUT prod").unwrap(),
+            Statement::ExplainLayout {
+                dataset: Some("prod".into())
+            }
+        );
+        assert_eq!(
+            parse("EXPLAIN LAYOUT").unwrap(),
+            Statement::ExplainLayout { dataset: None }
         );
         let Statement::Insert {
             table,

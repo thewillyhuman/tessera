@@ -2763,6 +2763,7 @@ dependencies = [
  "tessera-ir",
  "tessera-kernels",
  "tessera-logql",
+ "tessera-manifest",
  "tessera-object",
  "tessera-opt",
  "tessera-promql",
