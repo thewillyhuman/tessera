@@ -67,6 +67,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/settings/{name}",
             put(put_setting).delete(delete_setting),
         )
+        .route("/api/v1/usage/reconcile", get(crate::reconcile::reconcile))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_cluster_admin,

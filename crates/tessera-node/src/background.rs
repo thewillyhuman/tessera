@@ -27,12 +27,13 @@ use tessera_eval::AlertRule;
 use tessera_eval::rule::decode_rows;
 use tessera_format::FileFormat;
 use tessera_manifest::{
-    DatasetLog, DatasetLogs, Manifest, Registration, intake, list_partitions, registry,
+    DatasetLog, DatasetLogs, Manifest, ManifestState, Registration, intake, list_partitions,
+    registry,
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
-    DatasetName, Env, Kind, Level, Meter, PoolId, RetentionPolicy, TenantId, Timestamp, Window,
-    WorkKind, WriterId,
+    DatasetName, Env, Held, Kind, Level, Meter, PartitionId, PoolId, RetentionPolicy, TenantId,
+    Timestamp, Window, WorkKind, WriterId,
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
@@ -49,6 +50,9 @@ const DEAD_QUIET: Duration = Duration::from_secs(15);
 const RECOVER_AFTER: Duration = Duration::from_secs(300);
 /// Bytes of files of an older layout epoch rewritten per round (AD-10).
 const RECLUSTER_BUDGET: u64 = 256 << 20;
+/// How often what the partitions hold is recorded in `system.usage`
+/// (section 13.1): the grain a storage bill is reconciled at.
+const HELD_EVERY: Duration = Duration::from_secs(3_600);
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
@@ -104,6 +108,7 @@ pub async fn run(background: Background) {
     .with_tenants(tenants);
     let mut ticks = tokio::time::interval(background.interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_held: Option<Timestamp> = None;
     loop {
         ticks.tick().await;
         let tenants: Vec<TenantId> = background
@@ -114,8 +119,9 @@ pub async fn run(background: Background) {
             .map(|t| t.id.clone())
             .collect();
         let mut backlog = Backlog::default();
+        let mut held = Vec::new();
         for tenant in tenants {
-            match round(&background, &compactor, &tenant).await {
+            match round(&background, &compactor, &tenant, &mut held).await {
                 Ok(left) => {
                     backlog.deferred += left.deferred;
                     backlog.recoveries += left.recoveries;
@@ -127,6 +133,18 @@ pub async fn run(background: Background) {
         }
         background.load.set_compaction_backlog(backlog.deferred);
         background.load.set_intake_backlog(backlog.recoveries);
+        // What the owned partitions hold, once an hour, the first round
+        // included: each partition has one owner, so the cluster
+        // records each once.
+        let now = background.env.clock.now();
+        let due = last_held.is_none_or(|at: Timestamp| {
+            now.duration_since(at)
+                .is_some_and(|since| since >= HELD_EVERY)
+        });
+        if due && !held.is_empty() {
+            background.meter.held(held);
+            last_held = Some(now);
+        }
         if let Err(error) = collect_logs(&background).await {
             tracing::warn!(error = %error, "segment collection failed");
         }
@@ -137,6 +155,7 @@ async fn round(
     background: &Background,
     compactor: &Compactor,
     tenant: &TenantId,
+    held: &mut Vec<Held>,
 ) -> Result<Backlog, Failure> {
     let mut backlog = Backlog::default();
     for dataset in registry::datasets(&*background.store, tenant).await? {
@@ -184,6 +203,7 @@ async fn round(
                 kind,
                 &mut budget,
                 &policies,
+                held,
             )
             .await?;
         }
@@ -204,6 +224,7 @@ async fn compact_and_collect(
     kind: Kind,
     budget: &mut u64,
     policies: &[RetentionPolicy],
+    held: &mut Vec<Held>,
 ) -> Result<u64, Failure> {
     let mut deferred = 0;
     let now = background.env.clock.now();
@@ -226,6 +247,7 @@ async fn compact_and_collect(
             background.env.clone(),
         );
         let snapshot = manifest.snapshot().await?;
+        held.push(held_of(&partition, snapshot.state()));
         let age = now
             .duration_since(partition.window.end())
             .unwrap_or(Duration::ZERO);
@@ -401,6 +423,17 @@ async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
         }
     }
     Ok(checkpoints)
+}
+
+/// What `partition` holds: the bytes and rows of its adopted files.
+fn held_of(partition: &PartitionId, state: &ManifestState) -> Held {
+    Held {
+        tenant: partition.tenant.clone(),
+        dataset: partition.dataset.clone(),
+        kind: partition.kind,
+        bytes: state.files().map(|f| f.size_bytes).sum(),
+        rows: state.files().map(|f| f.row_count).sum(),
+    }
 }
 
 /// Collects adopted segments of every writer log in the store that

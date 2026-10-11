@@ -33,6 +33,7 @@ mod params;
 pub mod pg;
 pub mod prometheus;
 pub mod query;
+pub mod reconcile;
 mod redact;
 pub mod rollups;
 pub mod rules;

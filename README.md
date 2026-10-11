@@ -285,8 +285,17 @@ aggregates and whole-window time range match, exactly, with
 (AD-13); the advisor proposes rollups for the aggregation shapes the
 workload repeats (8.7).
 
-Gaps left in M9: `system.usage` has not been reconciled against
-object-store billing (the exit criterion); `EXCEPT ERRORS` sees the
+The background work records, once an hour, what each dataset's
+partitions hold in the object store as `held` rows of `system.usage`,
+the grain a storage bill is reconciled at, and `GET
+/api/v1/usage/reconcile` sets the latest `held` bytes of every tenant
+beside what the pools list under its keys, data files apart from
+indexes and logs, within a stated tolerance of a tenth: compaction
+outputs awaiting adoption, replaced files awaiting collection and the
+hour between two records.
+
+Gaps left in M9: the reconciliation has been run against the local
+store only, not against a provider's bill; `EXCEPT ERRORS` sees the
 error spans of the files
 being compacted only, and traces referenced by alert events are not
 exempt; sketches are not merged when downsampling, and classic

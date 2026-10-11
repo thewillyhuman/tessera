@@ -19,8 +19,8 @@ use tessera_ingest::IngestHandle;
 use tessera_kernels::variant;
 use tessera_types::event::{OVERFLOW, Scalar};
 use tessera_types::{
-    Attributes, DatasetName, Env, EventBatch, EventRow, Kind, Meter, Random, Stored, TenantId,
-    Timestamp,
+    Attributes, DatasetName, Env, EventBatch, EventRow, Held, Kind, Meter, Random, Stored,
+    TenantId, Timestamp,
 };
 
 use crate::AppState;
@@ -250,6 +250,38 @@ pub fn stored_usage(stored: &[Stored]) -> Vec<Usage> {
         .collect()
 }
 
+/// The `held` usage of `held`: one record per tenant, dataset and
+/// kind summing the partitions' bytes and rows, the snapshot of what
+/// the object store holds that a bill reconciles with.
+#[must_use]
+pub fn held_usage(held: &[Held]) -> Vec<Usage> {
+    let mut by_key: BTreeMap<(TenantId, String, Kind), (u64, u64)> = BTreeMap::new();
+    for h in held {
+        let entry = by_key
+            .entry((h.tenant.clone(), h.dataset.to_string(), h.kind))
+            .or_default();
+        entry.0 += h.bytes;
+        entry.1 += h.rows;
+    }
+    by_key
+        .into_iter()
+        .map(|((tenant, dataset, kind), (bytes, rows))| Usage {
+            phase: HELD,
+            tenant,
+            dataset,
+            kind: Some(kind),
+            service: None,
+            team: None,
+            bytes,
+            events: rows,
+            extra: BTreeMap::new(),
+        })
+        .collect()
+}
+
+/// The phase of the usage records that say what is held.
+pub const HELD: &str = "held";
+
 /// A meter for compaction that writes through the local ingester, which
 /// exists before the node's write path does.
 pub struct IngestMeter {
@@ -265,19 +297,29 @@ impl IngestMeter {
     }
 }
 
-impl Meter for IngestMeter {
-    fn stored(&self, stored: Vec<Stored>) {
-        let usages = stored_usage(&stored);
+impl IngestMeter {
+    /// Writes `usages` through the ingester without waiting.
+    fn write(&self, usages: &[Usage], what: &'static str) {
         let mut random = self.env.random.fork();
-        let Some(batch) = batch_of(&usages, self.env.clock.now(), &mut random) else {
+        let Some(batch) = batch_of(usages, self.env.clock.now(), &mut random) else {
             return;
         };
         let ingest = self.ingest.clone();
         tokio::spawn(async move {
             if let Err(error) = ingest.write(batch).await {
-                tracing::debug!(error = %error, "stored usage not written");
+                tracing::debug!(error = %error, "{what} usage not written");
             }
         });
+    }
+}
+
+impl Meter for IngestMeter {
+    fn stored(&self, stored: Vec<Stored>) {
+        self.write(&stored_usage(&stored), "stored");
+    }
+
+    fn held(&self, held: Vec<Held>) {
+        self.write(&held_usage(&held), "held");
     }
 }
 
@@ -403,5 +445,25 @@ mod tests {
         .await;
         assert_eq!(detail["rows"][0][0], "sql", "{detail}");
         assert_eq!(detail["rows"][0][1].as_str().unwrap().len(), 16);
+    }
+
+    #[test]
+    fn held_usage_sums_the_partitions_of_a_dataset() {
+        let held = |dataset: &str, bytes, rows| Held {
+            tenant: TenantId::DEFAULT,
+            dataset: DatasetName::new(dataset).unwrap(),
+            kind: Kind::Log,
+            bytes,
+            rows,
+        };
+        let usages = held_usage(&[
+            held("prod", 100, 10),
+            held("prod", 50, 5),
+            held("dev", 7, 1),
+        ]);
+        assert_eq!(usages.len(), 2);
+        let prod = usages.iter().find(|u| u.dataset == "prod").unwrap();
+        assert_eq!((prod.phase, prod.bytes, prod.events), (HELD, 150, 15));
+        assert_eq!(prod.kind, Some(Kind::Log));
     }
 }

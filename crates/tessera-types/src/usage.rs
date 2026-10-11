@@ -30,8 +30,31 @@ pub struct Stored {
     pub bytes: u64,
 }
 
-/// Where compaction reports what it stored.
+/// Bytes a partition's files hold in the object store at one instant:
+/// what the store bills for, recorded so that `system.usage` reconciles
+/// with the bill (section 13.1, M9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The tenant.
+    pub tenant: TenantId,
+    /// The dataset.
+    pub dataset: DatasetName,
+    /// The kind of event.
+    pub kind: Kind,
+    /// The bytes of the adopted files.
+    pub bytes: u64,
+    /// The rows of the adopted files.
+    pub rows: u64,
+}
+
+/// Where compaction reports what it stored and what is held.
 pub trait Meter: Send + Sync {
     /// Records `stored`; must not block.
     fn stored(&self, stored: Vec<Stored>);
+
+    /// Records what is held now; must not block. A meter that records
+    /// what was stored only may leave it unimplemented.
+    fn held(&self, held: Vec<Held>) {
+        drop(held);
+    }
 }

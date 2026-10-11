@@ -40,5 +40,5 @@ pub use random::{ForkedRandom, OsRandom, Random, SeededRandom, SharedRandom, mut
 pub use redaction::{Redaction, RedactionAction};
 pub use retention::{RetentionAction, RetentionClause, RetentionPolicy};
 pub use time::{Clock, InvalidTimestamp, ManualClock, SystemClock, TimeRange, Timestamp};
-pub use usage::{Meter, Stored};
+pub use usage::{Held, Meter, Stored};
 pub use work::WorkKind;
