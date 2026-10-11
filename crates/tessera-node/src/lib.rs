@@ -67,6 +67,8 @@ pub struct Config {
     pub lease: Duration,
     /// How often held leases are renewed and free ones tried (OP-3).
     pub renewal: Duration,
+    /// How often the background work of the `compact` role runs.
+    pub background: Duration,
     /// The ingester's tunables.
     pub ingest: IngestConfig,
 }
@@ -86,6 +88,7 @@ impl Config {
             heartbeat: registry::HEARTBEAT,
             lease: LeaseManager::DEFAULT_DURATION,
             renewal: LeaseManager::DEFAULT_RENEWAL,
+            background: background::DEFAULT_INTERVAL,
             ingest: IngestConfig::default(),
         }
     }
@@ -202,6 +205,7 @@ impl Node {
                 pools: Arc::clone(&pools),
                 owned: leases.owned.clone(),
                 membership: Arc::clone(&membership),
+                interval: config.background,
             })));
         }
 

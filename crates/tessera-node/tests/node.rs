@@ -2,6 +2,8 @@
 
 //! A node as a value: starts on free ports, serves, and stops.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -27,14 +29,8 @@ fn config(dir: &std::path::Path) -> Config {
 }
 
 /// Polls `condition` for up to five seconds.
-async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
-    for _ in 0..100 {
-        if condition() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("{what} did not happen in time");
+async fn eventually(what: &str, condition: impl FnMut() -> bool) {
+    common::eventually(what, Duration::from_secs(5), condition).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -47,16 +43,9 @@ async fn a_node_starts_serves_and_stops() {
     assert_ne!(node.pg_address().port(), 0);
     let url = format!("http://{}/api/v1/query", node.http_address());
     let body = serde_json::json!({ "dataset": "prod", "query": "SELECT 42" });
-    let answer: serde_json::Value = tokio::task::spawn_blocking(move || {
-        ureq::post(&url)
-            .send_json(body)
-            .unwrap()
-            .body_mut()
-            .read_json()
-            .unwrap()
-    })
-    .await
-    .unwrap();
+    let (status, text) = common::post(url, vec![], body).await;
+    assert_eq!(status, 200, "{text}");
+    let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(answer["rows"][0][0], 42, "{answer}");
     assert_eq!(
         node.membership().live_ids(Role::Query).len(),

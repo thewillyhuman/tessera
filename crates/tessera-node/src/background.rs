@@ -28,8 +28,8 @@ use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
 use crate::leases::Owned;
 
-/// How often the background work runs.
-const INTERVAL: Duration = Duration::from_secs(5);
+/// How often the background work runs by default.
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the writer of a node that left the membership view may be
 /// quiet before it is recovered: enough for a registration to reach the
 /// view before its node does.
@@ -57,6 +57,8 @@ pub struct Background {
     pub owned: Owned,
     /// The cluster, for which writers' nodes are gone.
     pub membership: Arc<Membership>,
+    /// How often a round runs.
+    pub interval: Duration,
 }
 
 /// Runs the background work forever. Failures are logged and retried on
@@ -67,7 +69,7 @@ pub async fn run(background: Background) {
         Arc::clone(&background.format),
         background.env.clone(),
     );
-    let mut ticks = tokio::time::interval(INTERVAL);
+    let mut ticks = tokio::time::interval(background.interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;
