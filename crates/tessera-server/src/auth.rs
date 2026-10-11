@@ -12,13 +12,14 @@
 //! time elsewhere.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
 use tessera_catalog::auth::{self as keys, ApiKey};
-use tessera_catalog::{AccessRole, Principal, Table, TenantStatus};
+use tessera_catalog::{AccessRole, Principal, Table, TenantName, TenantStatus};
 
+use crate::oidc::{Oidc, Verifier};
 use crate::{ApiError, AppState};
 
 /// How long a resolved principal is kept.
@@ -31,6 +32,9 @@ pub struct Auth {
     /// `/internal` routes (SE-3); none means those routes are open, as
     /// on a single node or a private network.
     cluster_secret: Option<String>,
+    /// The identity provider tokens are checked against (SE-1), if
+    /// one is configured.
+    oidc: Option<Arc<Verifier>>,
     kept: Mutex<HashMap<String, Kept>>,
 }
 
@@ -47,8 +51,16 @@ impl Auth {
         Auth {
             allow_anonymous,
             cluster_secret: None,
+            oidc: None,
             kept: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// These settings with tokens checked against `oidc`'s issuer.
+    #[must_use]
+    pub fn with_oidc(mut self, oidc: Option<Oidc>) -> Self {
+        self.oidc = oidc.map(|config| Arc::new(Verifier::new(config)));
+        self
     }
 
     /// These settings with the `/internal` routes guarded by `secret`.
@@ -129,9 +141,60 @@ impl Auth {
 /// tenant that is not active.
 pub async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
     match bearer(headers) {
-        Some(text) => with_key(state, text).await,
+        Some(text) if keys::parse(text).is_some() => with_key(state, text).await,
+        Some(text) => with_token(state, text).await,
         None => anonymous(state),
     }
+}
+
+/// The principal of the `OpenID` Connect token `text` (SE-1): the
+/// tenant its tenant claim names, acting with the roles its roles
+/// claim lists, kept like a key's principal.
+///
+/// # Errors
+///
+/// 401 without an identity provider configured, or for a token that
+/// does not verify; 403 for a tenant that is not active.
+pub async fn with_token(state: &AppState, text: &str) -> Result<Principal, ApiError> {
+    let Some(verifier) = state.auth.oidc.clone() else {
+        return Err(ApiError::unauthorized(
+            "not an API key, and no identity provider is configured",
+        ));
+    };
+    let hashed = keys::hash(text);
+    if let Some(principal) = state.auth.lookup(&hashed) {
+        return Ok(principal);
+    }
+    let token = text.to_owned();
+    let identity = tokio::task::spawn_blocking(move || verifier.verify(&token))
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))??;
+    let name = TenantName::new(&identity.tenant)
+        .map_err(|e| ApiError::unauthorized(format!("the token's tenant: {e}")))?;
+    let tenant = state
+        .catalog
+        .cached()
+        .state()
+        .tenant_by_name(&name)
+        .cloned()
+        .ok_or_else(|| ApiError::unauthorized(format!("unknown tenant {name}")))?;
+    if tenant.status != TenantStatus::Active {
+        return Err(ApiError::forbidden(format!(
+            "tenant {} is not active",
+            tenant.name
+        )));
+    }
+    let control = state.controls.open(&tenant.id);
+    let roles: Vec<AccessRole> = control
+        .rows(Table::Roles)
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))?
+        .into_iter()
+        .filter_map(|row| serde_json::from_value(row.value).ok())
+        .collect();
+    let principal = Principal::with_roles(tenant.id, identity.subject, &identity.roles, &roles);
+    state.auth.keep(hashed, String::new(), &principal);
+    Ok(principal)
 }
 
 /// The principal of a request without credentials.
@@ -335,6 +398,94 @@ mod tests {
                 .contains("tenant acme is not known or not readable"),
             "{body}"
         );
+    }
+
+    /// SE-1: a token from the configured issuer acts for the tenant and
+    /// with the roles its claims name; another audience is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oidc_tokens_act_for_the_tenant_and_roles_their_claims_name() {
+        use base64::Engine;
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        use rsa::traits::PublicKeyParts;
+
+        let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let public = key.to_public_key();
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let jwks = json!({ "keys": [{
+            "kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
+            "n": b64(&public.n().to_bytes_be()), "e": b64(&public.e().to_bytes_be()),
+        }] });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let discovery = json!({ "issuer": issuer, "jwks_uri": format!("{issuer}/jwks") });
+        let provider = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                axum::routing::get(move || {
+                    let discovery = discovery.clone();
+                    async move { axum::Json(discovery) }
+                }),
+            )
+            .route(
+                "/jwks",
+                axum::routing::get(move || {
+                    let jwks = jwks.clone();
+                    async move { axum::Json(jwks) }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+        let mut state = locked(async |_| {}).await;
+        state.auth = Arc::new(Auth::new(false).with_oidc(Some(Oidc {
+            issuer: issuer.clone(),
+            audience: "tessera".into(),
+            tenant_claim: "tenant".into(),
+            roles_claim: "roles".into(),
+        })));
+        let pem = key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let encoding = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("k1".into());
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let token = |audience: &str| {
+            encode(
+                &header,
+                &json!({ "iss": issuer, "aud": audience, "sub": "ann", "exp": exp,
+                         "tenant": "default", "roles": ["reader"] }),
+                &encoding,
+            )
+            .unwrap()
+        };
+        let reader = token("tessera");
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/api/v1/query",
+            Some(&reader),
+            &[],
+            Some(query("prod")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _) = call(&state, "POST", "/v1/logs", Some(&reader), &[], Some(logs())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a reader may not write");
+        let other = token("other");
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/api/v1/query",
+            Some(&other),
+            &[],
+            Some(query("prod")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     }
 
     #[tokio::test]

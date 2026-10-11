@@ -211,8 +211,21 @@ impl Principal {
     /// nothing.
     #[must_use]
     pub fn of(tenant: TenantId, key: &ApiKey, defined: &[Role]) -> Principal {
-        let roles: Vec<Role> = key
-            .roles
+        Self::with_roles(tenant, key.name.clone(), &key.roles, defined)
+    }
+
+    /// The principal `name` in `tenant` acting with the roles named,
+    /// resolved among `defined` and the built-in ones; a role no one
+    /// defines grants nothing. How a token's roles claim becomes a
+    /// principal (SE-1).
+    #[must_use]
+    pub fn with_roles(
+        tenant: TenantId,
+        name: String,
+        role_names: &[String],
+        defined: &[Role],
+    ) -> Principal {
+        let roles: Vec<Role> = role_names
             .iter()
             .filter_map(|name| {
                 defined
@@ -225,7 +238,7 @@ impl Principal {
         let cluster_admin = tenant == TenantId::SYSTEM && roles.iter().any(|r| r.admin);
         Principal {
             tenant,
-            name: key.name.clone(),
+            name,
             roles,
             cluster_admin,
         }

@@ -31,6 +31,7 @@ axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 form_urlencoded = "1"
 futures = "0.3"
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
 pgwire = { version = "0.41", default-features = false, features = ["server-api-ring", "pg-type-chrono"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 prost = "0.14"
@@ -45,7 +46,10 @@ tracing = "0.1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+base64 = "0.22"
 http-body-util = "0.1"
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
 snap = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"

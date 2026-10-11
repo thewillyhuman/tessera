@@ -25,6 +25,7 @@ pub mod internal;
 pub mod loki;
 pub mod metering;
 pub mod metrics;
+pub mod oidc;
 pub mod otlp;
 mod params;
 pub mod pg;

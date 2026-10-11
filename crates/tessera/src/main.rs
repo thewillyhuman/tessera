@@ -79,6 +79,20 @@ struct RunArgs {
     /// otherwise.
     #[arg(long)]
     tls_ca: Option<std::path::PathBuf>,
+    /// The `OpenID` Connect issuer bearer tokens are checked against
+    /// (SE-1), as its tokens name it; its discovery document is read
+    /// under it. Without it, only API keys are accepted.
+    #[arg(long, requires = "oidc_audience")]
+    oidc_issuer: Option<String>,
+    /// The audience a token must carry.
+    #[arg(long, requires = "oidc_issuer")]
+    oidc_audience: Option<String>,
+    /// The claim naming the tenant a token acts for.
+    #[arg(long, default_value = "tenant")]
+    oidc_tenant_claim: String,
+    /// The claim listing the roles a token acts with.
+    #[arg(long, default_value = "roles")]
+    oidc_roles_claim: String,
     /// How long the ingester waits for more rows before writing a
     /// segment, in milliseconds (ST-6). Acknowledgment latency is this
     /// plus the store's write; a longer wait makes larger segments.
@@ -113,6 +127,15 @@ async fn main() -> ExitCode {
                         cert,
                         key,
                         ca: args.tls_ca,
+                    }),
+                oidc: args
+                    .oidc_issuer
+                    .zip(args.oidc_audience)
+                    .map(|(issuer, audience)| tessera_node::Oidc {
+                        issuer,
+                        audience,
+                        tenant_claim: args.oidc_tenant_claim,
+                        roles_claim: args.oidc_roles_claim,
                     }),
                 ingest: tessera_ingest::IngestConfig {
                     linger: std::time::Duration::from_millis(args.linger_ms),

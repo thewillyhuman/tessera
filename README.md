@@ -301,7 +301,14 @@ Both listeners serve TLS from `--tls-cert` and `--tls-key`, and the
 nodes of a cluster check each other against `--tls-ca`; node-to-node
 routes under `/internal` take the shared `--cluster-secret` (SE-3).
 
-Gaps left in M10: no OIDC or mutual TLS (SE-1); no
+A node given `--oidc-issuer` and `--oidc-audience` also accepts
+bearer tokens from that OpenID Connect issuer: a token's signature,
+issuer, audience and expiry are checked against the issuer's published
+keys, and the claims named by `--oidc-tenant-claim` (`tenant`) and
+`--oidc-roles-claim` (`roles`) say which tenant it acts for and with
+which of the tenant's roles (SE-1).
+
+Gaps left in M10: no mutual TLS (SE-1); no
 row-filter roles; no per-tenant encryption keys (SE-2); no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a

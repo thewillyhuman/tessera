@@ -20,6 +20,7 @@ mod peers;
 mod retention;
 pub mod tls;
 
+pub use tessera_server::oidc::Oidc;
 pub use tls::Tls;
 
 use std::collections::BTreeSet;
@@ -106,6 +107,9 @@ pub struct Config {
     /// The certificate both listeners serve TLS with and the CA peers
     /// are checked against (SE-3); none serves plain connections.
     pub tls: Option<Tls>,
+    /// The identity provider bearer tokens that are not API keys are
+    /// checked against (SE-1); none refuses such tokens.
+    pub oidc: Option<Oidc>,
     /// How often the node writes its load signals to `_system.metrics`
     /// (section 14.7).
     pub metrics: Duration,
@@ -133,6 +137,7 @@ impl Config {
             allow_anonymous: true,
             cluster_secret: None,
             tls: None,
+            oidc: None,
             metrics: observe::DEFAULT_INTERVAL,
         }
     }
@@ -544,7 +549,8 @@ impl Shared {
             budgets: Arc::new(Ledger::new()),
             auth: Arc::new(
                 Auth::new(config.allow_anonymous)
-                    .with_cluster_secret(config.cluster_secret.clone()),
+                    .with_cluster_secret(config.cluster_secret.clone())
+                    .with_oidc(config.oidc.clone()),
             ),
             load: Arc::clone(&self.load),
         };
