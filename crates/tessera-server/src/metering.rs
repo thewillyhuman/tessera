@@ -109,7 +109,7 @@ pub fn record(state: &AppState, usages: &[Usage]) {
         return;
     }
     let now = state.env.clock.now();
-    let mut random = state.env.random.clone();
+    let mut random = state.env.random.fork();
     let Some(batch) = batch_of(usages, now, &mut random) else {
         return;
     };
@@ -268,7 +268,7 @@ impl IngestMeter {
 impl Meter for IngestMeter {
     fn stored(&self, stored: Vec<Stored>) {
         let usages = stored_usage(&stored);
-        let mut random = self.env.random.clone();
+        let mut random = self.env.random.fork();
         let Some(batch) = batch_of(&usages, self.env.clock.now(), &mut random) else {
             return;
         };

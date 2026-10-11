@@ -72,7 +72,7 @@ pub fn record_uses(
     for (tenant, bytes) in scanned {
         crate::budgets::charge_query(state, tenant, team, bytes);
     }
-    let mut random = state.env.random.clone();
+    let mut random = state.env.random.fork();
     let rows: Vec<EventRow> = uses
         .into_iter()
         .filter(|u| u.tenant != TenantId::SYSTEM)
@@ -114,7 +114,7 @@ fn event(
     source: &str,
     latency: Duration,
     now: Timestamp,
-    random: &mut tessera_types::SharedRandom,
+    random: &mut impl Random,
 ) -> EventRow {
     let mut attributes: Attributes = BTreeMap::new();
     attributes.insert("attr.tenant".into(), text(scan.tenant.as_str()));

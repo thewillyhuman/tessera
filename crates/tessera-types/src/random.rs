@@ -150,6 +150,24 @@ impl SharedRandom {
             inner: Arc::new(Mutex::new(Box::new(random))),
         }
     }
+
+    /// A generator seeded from this stream that then draws on its own.
+    ///
+    /// Every draw through a `SharedRandom` takes its lock, and the
+    /// production source behind it asks the operating system for each
+    /// word; a caller that draws once per row, such as ingest making
+    /// record ids, forks once per batch instead and the lock is taken
+    /// once. The fork takes [`ForkedRandom::SEED_WORDS`] words from the
+    /// stream, so a seeded stream stays reproducible.
+    #[must_use]
+    pub fn fork(&self) -> ForkedRandom {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = [0u64; ForkedRandom::SEED_WORDS];
+        for word in &mut state {
+            *word = inner.next_u64();
+        }
+        ForkedRandom::from_state(state)
+    }
 }
 
 impl std::fmt::Debug for SharedRandom {
@@ -166,6 +184,53 @@ impl Random for SharedRandom {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .next_u64()
+    }
+}
+
+/// A generator forked from a [`SharedRandom`] for a batch of draws.
+///
+/// `xoshiro256++` [1]: 256 bits of state, so two forks of the operating
+/// system's source never repeat each other's stream in practice, and a
+/// permutation of its state, so the 128-bit ids one fork makes do not
+/// repeat within it. Not suitable for anything that needs
+/// unpredictability.
+///
+/// [1] <https://prng.di.unimi.it/xoshiro256plusplus.c>
+#[derive(Clone, Debug)]
+pub struct ForkedRandom {
+    state: [u64; ForkedRandom::SEED_WORDS],
+}
+
+impl ForkedRandom {
+    /// How many words of its source a fork consumes.
+    pub const SEED_WORDS: usize = 4;
+
+    /// A generator over `state`; an all-zero state, which would never
+    /// leave zero, is replaced by the first words of [`SeededRandom`]'s
+    /// stream, as the algorithm's authors seed it.
+    fn from_state(mut state: [u64; ForkedRandom::SEED_WORDS]) -> Self {
+        if state == [0; ForkedRandom::SEED_WORDS] {
+            let mut seed = SeededRandom::new(0);
+            for word in &mut state {
+                *word = seed.next_u64();
+            }
+        }
+        ForkedRandom { state }
+    }
+}
+
+impl Random for ForkedRandom {
+    fn next_u64(&mut self) -> u64 {
+        let s = &mut self.state;
+        let result = s[0].wrapping_add(s[3]).rotate_left(23).wrapping_add(s[0]);
+        let t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = s[3].rotate_left(45);
+        result
     }
 }
 
@@ -223,6 +288,45 @@ mod tests {
     fn os_random_does_not_repeat_itself() {
         let mut random = OsRandom;
         assert_ne!(random.next_u64(), random.next_u64());
+    }
+
+    #[test]
+    fn forks_of_equal_seeds_replay_each_other() {
+        let mut a = SharedRandom::new(SeededRandom::new(9)).fork();
+        let mut b = SharedRandom::new(SeededRandom::new(9)).fork();
+        let draws_a: Vec<u64> = (0..8).map(|_| a.next_u64()).collect();
+        let draws_b: Vec<u64> = (0..8).map(|_| b.next_u64()).collect();
+        assert_eq!(draws_a, draws_b);
+        assert_ne!(draws_a[0], draws_a[1], "a fork moves on");
+    }
+
+    #[test]
+    fn a_fork_takes_its_seed_and_nothing_more_from_its_source() {
+        let mut reference = SeededRandom::new(9);
+        for _ in 0..ForkedRandom::SEED_WORDS {
+            reference.next_u64();
+        }
+        let mut source = SharedRandom::new(SeededRandom::new(9));
+        let mut fork = source.fork();
+        fork.next_u64();
+        fork.next_u64();
+        assert_eq!(source.next_u64(), reference.next_u64());
+    }
+
+    #[test]
+    fn successive_forks_differ() {
+        let source = SharedRandom::new(SeededRandom::new(9));
+        assert_ne!(source.fork().next_u64(), source.fork().next_u64());
+        assert_ne!(
+            SharedRandom::new(OsRandom).fork().next_u64(),
+            SharedRandom::new(OsRandom).fork().next_u64()
+        );
+    }
+
+    #[test]
+    fn an_all_zero_seed_still_produces_bits() {
+        let mut fork = ForkedRandom::from_state([0; ForkedRandom::SEED_WORDS]);
+        assert_ne!(fork.next_u64(), fork.next_u64());
     }
 
     #[test]

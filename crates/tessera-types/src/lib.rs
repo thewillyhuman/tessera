@@ -36,7 +36,7 @@ pub use keys::{KeyError, KeyPolicy, Keyring, Keys, NamedKey, TenantKey};
 pub use kind::Kind;
 pub use partition::{InvalidWindow, PartitionId, Window};
 pub use position::{Epoch, Seq, Version};
-pub use random::{OsRandom, Random, SeededRandom, SharedRandom, mutated};
+pub use random::{ForkedRandom, OsRandom, Random, SeededRandom, SharedRandom, mutated};
 pub use redaction::{Redaction, RedactionAction};
 pub use retention::{RetentionAction, RetentionClause, RetentionPolicy};
 pub use time::{Clock, InvalidTimestamp, ManualClock, SystemClock, TimeRange, Timestamp};

@@ -97,7 +97,7 @@ async fn export_logs(
         scope.tenant,
         scope.dataset,
         now,
-        &mut state.env.random.clone(),
+        &mut state.env.random.fork(),
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if let Some(batch) = batch {

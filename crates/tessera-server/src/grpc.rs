@@ -90,7 +90,7 @@ impl LogsService for Exporter {
             scope.tenant,
             scope.dataset,
             now,
-            &mut self.state.env.random.clone(),
+            &mut self.state.env.random.fork(),
         )
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
         if let Some(batch) = batch {

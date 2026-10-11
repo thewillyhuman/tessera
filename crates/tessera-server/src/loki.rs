@@ -655,7 +655,7 @@ async fn push(
         )));
     };
     let now = state.env.clock.now();
-    let mut random = state.env.random.clone();
+    let mut random = state.env.random.fork();
     let mut rows = Vec::new();
     for stream in streams {
         let severity_text = stream

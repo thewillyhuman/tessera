@@ -46,7 +46,7 @@ async fn ingest_events(
     let text = std::str::from_utf8(&body)
         .map_err(|_| ApiError::bad_request("the body must be UTF-8 JSON lines"))?;
     let now = state.env.clock.now();
-    let mut random = state.env.random.clone();
+    let mut random = state.env.random.fork();
     let mut rows = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
