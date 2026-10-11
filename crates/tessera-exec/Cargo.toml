@@ -17,6 +17,7 @@ tessera-opt.workspace = true
 tessera-types.workspace = true
 
 arrow = { version = "60", default-features = false }
+arrow-ipc = "60"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -13,6 +13,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -92,6 +93,8 @@ pub struct Analysis {
     pub scans: Vec<ScanAnalysis>,
     /// Whether the rows came from the result cache, with no scan run.
     pub result_cached: bool,
+    /// Bytes blocking operators spilled to local disk (QE-11).
+    pub spilled_bytes: u64,
 }
 
 /// The rows of a query and what producing them took.
@@ -170,6 +173,9 @@ pub struct Engine {
     pub(crate) manifests: Manifests,
     /// The dataset logs, for tombstones (SE-5).
     datasets: DatasetLogs,
+    /// Where blocking operators spill (QE-11); none means they fail
+    /// past their grant.
+    spill_dir: Option<PathBuf>,
     /// The tombstones read in the last second, per table.
     tombstones: Mutex<HashMap<TableKey, KeptFilters>>,
     /// Results of closed-range queries (section 10.8).
@@ -206,6 +212,7 @@ impl Engine {
             rollups: None,
             manifests,
             datasets,
+            spill_dir: None,
             tombstones: Mutex::new(HashMap::new()),
             results: ResultCache::new(cache::DEFAULT_BYTES),
             limits,
@@ -321,6 +328,20 @@ impl Engine {
         .await
     }
 
+    /// Lets blocking operators spill under `dir` when a query's memory
+    /// grant runs out (QE-11); the directory is created, and a
+    /// directory that cannot be is logged and left unused.
+    #[must_use]
+    pub fn with_spill_dir(mut self, dir: PathBuf) -> Self {
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => self.spill_dir = Some(dir),
+            Err(error) => {
+                tracing::warn!(dir = %dir.display(), error = %error, "spill directory unusable; queries past their memory grant fail");
+            }
+        }
+        self
+    }
+
     /// The function registry the engine runs.
     #[must_use]
     pub fn registry(&self) -> &Registry {
@@ -408,13 +429,14 @@ impl Engine {
                 analysis: Analysis {
                     scans: Vec::new(),
                     result_cached: true,
+                    spilled_bytes: 0,
                 },
                 uses: Vec::new(),
                 fingerprint: 0,
             });
         }
         let grant = Grant {
-            memory: MemoryPool::new(limits.memory_bytes),
+            memory: MemoryPool::with_spill_dir(limits.memory_bytes, self.spill_dir.clone()),
             scan_bytes: limits.scan_bytes,
         };
         let mut analysis = Analysis::default();
@@ -430,6 +452,7 @@ impl Engine {
                 })??,
             None => execution.await?,
         };
+        analysis.spilled_bytes = grant.memory.spilled_bytes();
         if let Some(key) = key {
             self.results
                 .insert(key, Arc::clone(&schema), batches.clone());

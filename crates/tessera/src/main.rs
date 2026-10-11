@@ -40,6 +40,10 @@ struct RunArgs {
     /// The directory that acts as the root pool.
     #[arg(long, default_value = "./tessera-data")]
     data_dir: PathBuf,
+    /// Where queries spill when a memory grant runs out; the system's
+    /// temporary directory by default.
+    #[arg(long, default_value_os_t = std::env::temp_dir().join("tessera-spill"))]
+    spill_dir: PathBuf,
     /// Where the HTTP API listens. Loopback by default, since requests
     /// without an API key are served unless --no-anonymous is given.
     #[arg(long, default_value = "127.0.0.1:8080")]
@@ -172,6 +176,7 @@ async fn main() -> ExitCode {
                     ..tessera_ingest::IngestConfig::default()
                 },
                 keyring,
+                spill_dir: args.spill_dir,
                 ..tessera_node::Config::single_node(args.data_dir)
             })
             .await

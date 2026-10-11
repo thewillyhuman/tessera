@@ -3168,6 +3168,7 @@ name = "tessera-exec"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-ipc",
  "futures",
  "serde",
  "serde_json",

@@ -23,6 +23,7 @@ pub mod remote;
 pub mod rollups;
 pub mod scan;
 pub mod scheduler;
+pub mod spill;
 pub mod system;
 pub mod workload;
 
@@ -52,6 +53,9 @@ pub enum ExecError {
     /// A blocking operator exhausted its memory grant.
     #[error("{0}")]
     Memory(#[from] OutOfMemory),
+    /// A spill to local disk could not be written or read back (QE-11).
+    #[error("spill to local disk failed: {0}")]
+    Spill(std::io::Error),
     /// The plan asks for something the engine cannot run.
     #[error("{0}")]
     Unsupported(String),

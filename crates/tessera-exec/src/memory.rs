@@ -4,12 +4,14 @@
 //!
 //! A pool has a limit; operators reserve what they buffer and release it
 //! when done. A reservation that would exceed the limit fails with
-//! [`OutOfMemory`], which the query reports as its own failure (QE-18).
-//! Spilling to local disk is the follow-up that turns the failure into
-//! slower progress.
+//! [`OutOfMemory`]. An operator that can spill writes what it holds to
+//! the pool's spill directory instead and goes on (QE-11); one that
+//! cannot, or a pool without a directory, reports the failure as the
+//! query's own (QE-18).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// A reservation would exceed the pool's limit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
@@ -29,16 +31,46 @@ pub struct OutOfMemory {
 pub struct MemoryPool {
     limit: usize,
     used: AtomicUsize,
+    /// Where operators spill; none means they fail instead.
+    spill_dir: Option<PathBuf>,
+    /// Bytes written to spill files so far.
+    spilled: AtomicU64,
 }
 
 impl MemoryPool {
-    /// A pool of `limit` bytes.
+    /// A pool of `limit` bytes whose operators fail rather than spill.
     #[must_use]
     pub fn new(limit: usize) -> Arc<Self> {
+        Self::with_spill_dir(limit, None)
+    }
+
+    /// A pool of `limit` bytes whose operators spill under `spill_dir`
+    /// when they can.
+    #[must_use]
+    pub fn with_spill_dir(limit: usize, spill_dir: Option<PathBuf>) -> Arc<Self> {
         Arc::new(MemoryPool {
             limit,
             used: AtomicUsize::new(0),
+            spill_dir,
+            spilled: AtomicU64::new(0),
         })
+    }
+
+    /// Where operators spill, if anywhere.
+    #[must_use]
+    pub fn spill_dir(&self) -> Option<&Path> {
+        self.spill_dir.as_deref()
+    }
+
+    /// Counts `bytes` written to a spill file.
+    pub fn note_spilled(&self, bytes: u64) {
+        self.spilled.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes written to spill files so far.
+    #[must_use]
+    pub fn spilled_bytes(&self) -> u64 {
+        self.spilled.load(Ordering::Relaxed)
     }
 
     /// A pool that never refuses, for tests and trusted callers.

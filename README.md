@@ -47,8 +47,10 @@ Gaps left in M2: joins are hash joins on equality keys, inner or left,
 one `JOIN` per query, with the build side's keys as a runtime filter on
 the other side but no `ASOF`, merge or lookup variants; no subqueries
 or window functions; no query parameters over the PostgreSQL protocol;
-blocking operators fail instead of spilling when their memory grant
-runs out; pipelines run one plan node at a time rather than fused
+sorts spill sorted runs to local disk when their memory grant runs
+out and merge them back, while aggregates, joins, top-k and trace
+groups still fail past the grant; pipelines run one plan node at a
+time rather than fused
 across stages; a bare attribute reads as text until the advisor
 promotes it (M8); `now()` is the node's clock. A query runs under its
 tenant's limits on bytes scanned, memory

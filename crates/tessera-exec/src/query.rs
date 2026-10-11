@@ -211,6 +211,13 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
     if analysis.result_cached {
         let _ = writeln!(out, "Result: from the cache, no scan run");
     }
+    if analysis.spilled_bytes > 0 {
+        let _ = writeln!(
+            out,
+            "Spilled: {} bytes to local disk",
+            analysis.spilled_bytes
+        );
+    }
     for scan in &analysis.scans {
         let _ = writeln!(out, "Scan {}:", scan.source);
         let _ = writeln!(

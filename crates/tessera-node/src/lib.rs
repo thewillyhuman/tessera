@@ -75,6 +75,8 @@ const PREFERRED_INGESTERS: usize = 8;
 pub struct Config {
     /// The directory that acts as the root pool.
     pub data_dir: PathBuf,
+    /// Where queries spill when a memory grant runs out (QE-11).
+    pub spill_dir: PathBuf,
     /// Where the HTTP API listens; port zero picks a free one.
     pub listen: SocketAddr,
     /// Where the `PostgreSQL` wire protocol listens; port zero picks a
@@ -130,6 +132,7 @@ impl Config {
         let loopback = |port| SocketAddr::from(([127, 0, 0, 1], port));
         Config {
             data_dir,
+            spill_dir: std::env::temp_dir().join("tessera-spill"),
             listen: loopback(8080),
             pg_listen: loopback(5432),
             roles: Role::ALL.into_iter().collect(),
@@ -534,6 +537,7 @@ impl Shared {
                 &self.env,
                 &self.membership,
                 &remote,
+                config.spill_dir.clone(),
             )
             .with_system_tables(Arc::new(SystemTableRows::new(
                 Arc::clone(&controls),
@@ -640,6 +644,7 @@ fn engine(
     env: &Env,
     membership: &Arc<Membership>,
     remote: &HttpRemote,
+    spill_dir: PathBuf,
 ) -> Engine {
     Engine::new(
         Arc::clone(pools),
@@ -648,6 +653,7 @@ fn engine(
         CpuPool::for_host(),
         QueryLimits::default(),
     )
+    .with_spill_dir(spill_dir)
     .with_peers(
         Arc::new(MembershipPeers::new(Arc::clone(membership))),
         Arc::new(remote.clone()),
