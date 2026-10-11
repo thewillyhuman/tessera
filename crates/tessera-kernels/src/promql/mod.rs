@@ -111,9 +111,18 @@ pub fn evaluate(
                 labels: Some(labels),
                 value,
             })),
-            // A top-level string or matrix has nothing to show per step;
-            // the API renders those from the expression.
-            Value::Text(_) | Value::Matrix(_) => {}
+            // A range vector at an instant lists its samples at their own
+            // times; a string has no rows, the API renders it.
+            Value::Matrix(series) => {
+                for s in series {
+                    rows.extend(s.samples.into_iter().map(|(time, value)| Row {
+                        time,
+                        labels: Some(s.labels.clone()),
+                        value,
+                    }));
+                }
+            }
+            Value::Text(_) => {}
         }
         if params.step <= 0 || t >= params.end {
             break;
@@ -765,7 +774,8 @@ fn nan_max(acc: f64, v: f64) -> f64 {
 /// A value as Prometheus formats it in labels: the shortest decimal
 /// that reads back exactly.
 #[allow(clippy::float_cmp)]
-pub(crate) fn format_value(value: f64) -> String {
+#[must_use]
+pub fn format_value(value: f64) -> String {
     if value.is_nan() {
         "NaN".into()
     } else if value.is_infinite() {
@@ -1080,6 +1090,23 @@ mod tests {
         assert_eq!(
             rows.iter().map(|r| r.time / S).collect::<Vec<_>>(),
             vec![0, 30, 60]
+        );
+    }
+
+    #[test]
+    fn a_range_vector_at_an_instant_lists_its_samples() {
+        let rows = at(&selector(1, Some(60)), 60);
+        assert_eq!(
+            rows.len(),
+            1,
+            "(0s, 60s] holds the sample at 30s, not the one at 0s"
+        );
+        assert_eq!(rows[0].time / S, 30);
+        assert_eq!(rows[0].labels.as_ref().unwrap()["__name__"], "up");
+        assert_eq!(
+            at(&selector(1, Some(60)), 0).len(),
+            1,
+            "right-closed: the sample at 0s is in (-60s, 0s]"
         );
     }
 
