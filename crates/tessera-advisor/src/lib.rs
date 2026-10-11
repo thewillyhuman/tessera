@@ -6,10 +6,13 @@
 //! (AD-5), the indexes the predicates call for (8.4), the attribute
 //! paths worth a dedicated column (8.2) and the partition window
 //! (AD-14). The cost of a layout is the decayed bytes the workload
-//! would scan under it plus the cost of rewriting into it:
+//! would scan under it, plus the cost of rewriting into it, plus the
+//! change in stored bytes it has shown on the files already in it:
 //!
 //! ```text
-//! cost(L) = Σ_q w_q · est_bytes_scanned(q, L) + λ · rewrite_bytes(current → L)
+//! cost(L) = Σ_q w_q · est_bytes_scanned(q, L)
+//!         + λ · rewrite_bytes(current → L)
+//!         + μ · (storage_bytes(L) − storage_bytes(now))
 //! ```
 //!
 //! A new layout is adopted only when it beats the current one by a
@@ -40,6 +43,9 @@ pub const MAX_SORT_COLUMNS: usize = 4;
 pub const ADD_THRESHOLD: f64 = 0.05;
 /// The weight of rewriting a byte against scanning one, λ.
 pub const REWRITE_WEIGHT: f64 = 0.05;
+/// The weight of a byte a layout stores against scanning one, μ: what
+/// a layout saves or costs in storage counts like rewriting it.
+pub const STORAGE_WEIGHT: f64 = 0.05;
 /// The share of workload weight a path needs to earn a dedicated
 /// column (the hot set of section 8.2).
 pub const HOT_SHARE: f64 = 0.01;
@@ -367,7 +373,30 @@ fn cost(
             .sum();
         REWRITE_WEIGHT * bytes
     };
-    scan + rewrite
+    scan + rewrite + STORAGE_WEIGHT * storage_delta(files, candidate)
+}
+
+/// The change in stored bytes the files would see under `candidate`:
+/// every row at the bytes per row measured on the files already in
+/// that layout, against the bytes as they are. A layout no file is in
+/// yet has shown nothing and changes nothing, so only compression that
+/// was measured counts.
+#[allow(clippy::cast_precision_loss)]
+fn storage_delta(files: &[FileSummary], candidate: &[String]) -> f64 {
+    let sums = |take: &dyn Fn(&&FileSummary) -> bool| {
+        files
+            .iter()
+            .filter(take)
+            .fold((0.0, 0.0), |(rows, bytes), f| {
+                (rows + f.rows as f64, bytes + f.size_bytes as f64)
+            })
+    };
+    let (all_rows, all_bytes) = sums(&|_| true);
+    let (rows, bytes) = sums(&|f| full_key(&f.sort_key) == candidate);
+    if rows == 0.0 || all_rows == 0.0 {
+        return 0.0;
+    }
+    all_rows * (bytes / rows) - all_bytes
 }
 
 /// Greedy selection (AD-5): add the column that most reduces cost,
@@ -569,6 +598,39 @@ mod tests {
             previous,
             now: at(10.0),
         }
+    }
+
+    /// The storage term: a layout whose files hold the same rows in
+    /// fewer bytes costs less by what it has shown, and one no file is
+    /// in yet is neither credited nor charged.
+    #[test]
+    fn a_layout_shown_to_compress_better_costs_less() {
+        let current = vec!["severity_number".to_owned(), TIMESTAMP.to_owned()];
+        let hosted = vec!["attr.host".to_owned(), TIMESTAMP.to_owned()];
+        let mut mixed = files(&["severity_number", "timestamp"], 5);
+        let mut compact = files(&["attr.host", "timestamp"], 5);
+        for file in &mut compact {
+            file.size_bytes = 500_000;
+        }
+        mixed.extend(compact);
+        let same_size: Vec<FileSummary> = files(&["attr.host", "timestamp"], 5)
+            .into_iter()
+            .chain(files(&["severity_number", "timestamp"], 5))
+            .collect();
+        assert!(
+            storage_delta(&mixed, &hosted) < 0.0,
+            "half the bytes per row on every row"
+        );
+        assert!(storage_delta(&same_size, &hosted).abs() < f64::EPSILON);
+        let unseen = vec!["attr.other".to_owned(), TIMESTAMP.to_owned()];
+        assert!(
+            storage_delta(&mixed, &unseen).abs() < f64::EPSILON,
+            "unseen layouts change nothing"
+        );
+        assert!(
+            cost(&[], &mixed, &current, &hosted) < cost(&[], &same_size, &current, &hosted),
+            "the saving counts against the rewrite"
+        );
     }
 
     #[test]

@@ -206,7 +206,8 @@ sort column and rewrite its files without intervention.
 Gaps left in M8: the cost model
 estimates selectivity from the workload and guesses cardinality,
 there are no per-column sketches (AD-6); the storage term of the cost
-is ignored; a
+counts only the compression a layout has shown on files already in
+it; a
 promoted column is read from `_overflow` by the tail and by files
 older than its promotion, which is correct but not faster; space-
 filling curves are not planned.
