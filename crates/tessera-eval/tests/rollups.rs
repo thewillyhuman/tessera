@@ -191,6 +191,18 @@ async fn closed_windows_are_written_once_as_events_of_the_target() {
     .unwrap();
     assert_eq!(later.windows, 60, "[1080, 4680) in one-minute steps");
     assert_eq!(later.rows, 0);
+    let progress = tessera_eval::progress_log(
+        fx.store.clone(),
+        &TenantId::DEFAULT,
+        "errors",
+        fx.env.clone(),
+    );
+    let snapshot = progress.snapshot().await.unwrap();
+    assert_eq!(
+        tessera_eval::coverage(snapshot.state()),
+        Some(tessera_types::TimeRange::new(at(1_020), at(4_680))),
+        "from the first window evaluated to the mark"
+    );
 }
 
 #[tokio::test]

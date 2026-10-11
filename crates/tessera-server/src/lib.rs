@@ -24,6 +24,7 @@ mod params;
 pub mod pg;
 pub mod prometheus;
 pub mod query;
+pub mod rollups;
 pub mod rules;
 pub mod system;
 pub mod tempo;
@@ -43,6 +44,7 @@ use tessera_types::{Env, EventBatch, TenantId};
 pub use error::ApiError;
 pub use internal::HttpRemote;
 pub use metering::IngestMeter;
+pub use rollups::RollupEntries;
 pub use system::SystemTableRows;
 
 /// What a node in a cluster adds: who else is there, how to reach
@@ -211,6 +213,11 @@ impl AppState {
             QueryLimits::default(),
         )
         .with_system_tables(Arc::new(SystemTableRows::new(
+            Arc::clone(&controls),
+            Arc::new(store.clone()),
+            env.clone(),
+        )))
+        .with_rollups(Arc::new(rollups::RollupEntries::new(
             Arc::clone(&controls),
             Arc::new(store),
             env.clone(),

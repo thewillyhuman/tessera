@@ -21,6 +21,7 @@ pub mod frontend;
 pub mod function;
 pub mod plan;
 pub mod promql;
+pub mod rollup;
 pub mod system;
 pub mod trace;
 pub mod typing;

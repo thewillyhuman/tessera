@@ -32,7 +32,7 @@ use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::DatasetLogs;
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
-use tessera_server::{AppState, Cluster, HttpRemote, IngestMeter, SystemTableRows};
+use tessera_server::{AppState, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows};
 use tessera_types::{Env, Meter, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -446,6 +446,11 @@ impl Shared {
                 &remote,
             )
             .with_system_tables(Arc::new(SystemTableRows::new(
+                Arc::clone(&controls),
+                Arc::clone(&self.store),
+                self.env.clone(),
+            )))
+            .with_rollups(Arc::new(RollupEntries::new(
                 Arc::clone(&controls),
                 Arc::clone(&self.store),
                 self.env.clone(),

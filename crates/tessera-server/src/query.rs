@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use serde::{Deserialize, Serialize};
-use tessera_exec::{Response, explain_text, query};
+use tessera_exec::{Response, RunOptions, explain_text, query};
 use tessera_ir::BindContext;
 use tessera_sql::SqlFrontend;
 use tessera_types::{DatasetName, TenantId};
@@ -42,6 +42,14 @@ struct QueryRequest {
     language: String,
     #[serde(default)]
     dataset: Option<String>,
+    /// Whether a matching aggregation may read a rollup (AD-13); on by
+    /// default.
+    #[serde(default = "yes")]
+    rollups: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn default_language() -> String {
@@ -104,9 +112,17 @@ async fn run_native(
     };
     let _turn = state.admit_query(&ctx.tenant).await?;
     let started = std::time::Instant::now();
-    let response = query::run(&state.engine, &SqlFrontend, &request.query, &ctx)
-        .await
-        .map_err(|e| ApiError::query(e, &request.query))?;
+    let response = query::run_with(
+        &state.engine,
+        &SqlFrontend,
+        &request.query,
+        &ctx,
+        RunOptions {
+            rollups: request.rollups,
+        },
+    )
+    .await
+    .map_err(|e| ApiError::query(e, &request.query))?;
     Ok(Json(match response {
         Response::Rows(output) => {
             crate::workload::record_uses(

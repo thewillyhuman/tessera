@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tessera_ir::RollupDefinition;
-use tessera_types::{DatasetName, TenantId};
+use tessera_ir::rollup::{RollupAggregate, RollupEntry, RollupKey, stored_type};
+use tessera_types::{DatasetName, TenantId, TimeRange};
 
 use crate::incremental::{Shape, shape_of_sql};
 
@@ -121,6 +122,45 @@ impl Rollup {
         Ok(shape)
     }
 
+    /// The rollup as the planner reads it (AD-13), covering `covered`.
+    ///
+    /// # Errors
+    ///
+    /// Why the query cannot be a rollup, or the target is not a dataset
+    /// name.
+    pub fn entry(&self, tenant: &TenantId, covered: TimeRange) -> Result<RollupEntry, String> {
+        let shape = self.shape(tenant)?;
+        let target = DatasetName::new(&self.target).map_err(|e| e.to_string())?;
+        Ok(RollupEntry {
+            name: self.name.clone(),
+            target,
+            dataset: shape.dataset,
+            kind: shape.kind,
+            predicate: shape.predicate,
+            keys: shape
+                .keys
+                .into_iter()
+                .zip(&shape.key_types)
+                .map(|((name, expr), data_type)| RollupKey {
+                    name,
+                    expr,
+                    data_type: stored_type(data_type),
+                })
+                .collect(),
+            window: shape.window,
+            aggregates: shape
+                .aggregates
+                .into_iter()
+                .zip(&shape.aggregate_types)
+                .map(|(aggregate, data_type)| RollupAggregate {
+                    aggregate,
+                    data_type: stored_type(data_type),
+                })
+                .collect(),
+            covered,
+        })
+    }
+
     /// The window length.
     #[must_use]
     pub fn window(&self) -> Duration {
@@ -188,6 +228,34 @@ mod tests {
                 Rollup::from_definition(&definition(query), &TenantId::DEFAULT).unwrap_err();
             assert!(error.contains(expected), "{query}: {error}");
         }
+    }
+
+    #[test]
+    fn the_planner_entry_carries_stored_types_and_coverage() {
+        let rollup = Rollup::from_definition(
+            &definition(
+                "SELECT attr.service AS service, count(*) AS n, max(severity_number) AS worst \
+                 FROM logs GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
+            ),
+            &TenantId::DEFAULT,
+        )
+        .unwrap();
+        let covered = TimeRange::new(
+            tessera_types::Timestamp::from_nanos(0),
+            tessera_types::Timestamp::from_nanos(120_000_000_000),
+        );
+        let entry = rollup.entry(&TenantId::DEFAULT, covered).unwrap();
+        assert_eq!(entry.target.as_str(), "rollup_errors_by_service");
+        assert_eq!(entry.keys.len(), 1);
+        assert_eq!(entry.keys[0].name, "service");
+        assert_eq!(entry.keys[0].data_type, arrow::datatypes::DataType::Utf8);
+        assert_eq!(entry.aggregates.len(), 2);
+        assert_eq!(
+            entry.aggregates[1].data_type,
+            arrow::datatypes::DataType::Int64,
+            "widened from the 32-bit severity"
+        );
+        assert_eq!(entry.covered, covered);
     }
 
     #[test]

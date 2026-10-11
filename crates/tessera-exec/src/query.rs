@@ -44,7 +44,21 @@ pub enum Response {
     Control(ControlStatement),
 }
 
-/// Runs `text` under `ctx`.
+/// What a caller may change about how a query runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Whether a matching aggregation may read a rollup instead of the
+    /// raw rows (AD-13); on unless the caller turns it off.
+    pub rollups: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        RunOptions { rollups: true }
+    }
+}
+
+/// Runs `text` under `ctx` with the default options.
 ///
 /// # Errors
 ///
@@ -56,10 +70,26 @@ pub async fn run(
     text: &str,
     ctx: &BindContext,
 ) -> Result<Response, QueryError> {
+    run_with(engine, frontend, text, ctx, RunOptions::default()).await
+}
+
+/// Runs `text` under `ctx` with `options`.
+///
+/// # Errors
+///
+/// A syntax error with its position, a planning error, or an execution
+/// failure.
+pub async fn run_with(
+    engine: &Engine,
+    frontend: &dyn Frontend,
+    text: &str,
+    ctx: &BindContext,
+    options: RunOptions,
+) -> Result<Response, QueryError> {
     let statement = frontend.lower(text, ctx).map_err(QueryError::Syntax)?;
     match statement {
         Statement::Query(plan) => {
-            let plan = optimize(plan, engine.registry())?;
+            let plan = plan_of(engine, plan, ctx, options).await?;
             let mut output = engine.run(&plan).await?;
             output.uses = workload::uses(&plan, &output.analysis);
             output.fingerprint = crate::cache::fingerprint(&plan);
@@ -67,7 +97,7 @@ pub async fn run(
         }
         Statement::Control(statement) => Ok(Response::Control(statement)),
         Statement::Explain { plan, analyze } => {
-            let plan = optimize(plan, engine.registry())?;
+            let plan = plan_of(engine, plan, ctx, options).await?;
             let analysis = if analyze {
                 Some(engine.run(&plan).await?.analysis)
             } else {
@@ -76,6 +106,30 @@ pub async fn run(
             Ok(Response::Explain { plan, analysis })
         }
     }
+}
+
+/// `plan` optimized, and reading the tenant's rollups where it may
+/// (AD-13): substitution runs on the optimized plan, whose scans carry
+/// their time range, and its result is optimized again.
+async fn plan_of(
+    engine: &Engine,
+    plan: Plan,
+    ctx: &BindContext,
+    options: RunOptions,
+) -> Result<Plan, QueryError> {
+    let plan = optimize(plan, engine.registry())?;
+    let Some(source) = engine.rollups().filter(|_| options.rollups) else {
+        return Ok(plan);
+    };
+    let entries = source.entries(&ctx.tenant).await;
+    if entries.is_empty() {
+        return Ok(plan);
+    }
+    let substituted = tessera_opt::substitute(plan.clone(), &entries);
+    if substituted == plan {
+        return Ok(plan);
+    }
+    Ok(optimize(substituted, engine.registry())?)
 }
 
 /// The text of an `EXPLAIN`: the plan, then one block per scan when

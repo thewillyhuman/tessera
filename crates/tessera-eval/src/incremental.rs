@@ -69,6 +69,10 @@ pub struct Shape {
     pub window: Duration,
     /// The aggregates, in output order.
     pub aggregates: Vec<AggregateExpr>,
+    /// The type of each key, in the order of `keys`.
+    pub key_types: Vec<DataType>,
+    /// The type of each aggregate, in the order of `aggregates`.
+    pub aggregate_types: Vec<DataType>,
     /// The condition over the keys and the aggregates.
     pub having: Option<Expr>,
     /// How the condition fires.
@@ -169,6 +173,18 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
         .reduce(|a, b| a.binary(BinaryOp::And, b));
     let (keys, window) = keys_and_window(group_by)?;
     check_aggregates(aggregates)?;
+    let schema = node
+        .schema(&tessera_ir::Registry::builtin())
+        .map_err(|e| e.to_string())?;
+    let key_types: Vec<DataType> = group_by
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| !matches!(&key.expr, Expr::Call { name, .. } if name == "tumble" || name == "time_bucket"))
+        .map(|(i, _)| schema.field(i).data_type().clone())
+        .collect();
+    let aggregate_types: Vec<DataType> = (0..aggregates.len())
+        .map(|i| schema.field(group_by.len() + i).data_type().clone())
+        .collect();
     let firing = if having.as_ref().is_none_or(|h| monotone(h, aggregates)) {
         Firing::Eager
     } else {
@@ -181,6 +197,8 @@ fn shape_of_plan(plan: &Plan) -> Result<Shape, String> {
         keys,
         window,
         aggregates: aggregates.clone(),
+        key_types,
+        aggregate_types,
         having,
         firing,
     })

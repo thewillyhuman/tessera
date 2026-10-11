@@ -23,7 +23,7 @@ pub use evaluate::{EvalError, observe};
 pub use group::{Delivered, Delivery, Evaluated, RuleGroup};
 pub use incremental::{Firing, Shape, shape_of, shape_of_sql};
 pub use lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
-pub use materialize::{Maintained, due_windows, maintain, materialize};
+pub use materialize::{Maintained, coverage, due_windows, maintain, materialize, progress_log};
 pub use mode::{Mode, mode_of};
 pub use notify::{HttpNotifier, MemoryNotifier, Notification, Notifier, payloads};
 pub use rollup::{Origin, Rollup};

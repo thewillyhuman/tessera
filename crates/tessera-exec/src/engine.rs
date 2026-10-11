@@ -40,6 +40,7 @@ use crate::operator::{
 use crate::pipeline::Pipeline;
 use crate::promql;
 use crate::remote::{LeafTask, Peers, RemoteScan};
+use crate::rollups::RollupSource;
 use crate::scan::{self, ScanAnalysis};
 use crate::scheduler::{CpuPool, TaskError};
 use crate::system::SystemTables;
@@ -135,6 +136,8 @@ pub struct Engine {
     pub(crate) peers: Option<(Arc<dyn Peers>, Arc<dyn RemoteScan>)>,
     /// Where the `system` tables' rows come from.
     system_tables: Option<Arc<dyn SystemTables>>,
+    /// Where the rollups the planner may read come from (AD-13).
+    rollups: Option<Arc<dyn RollupSource>>,
     /// The manifests this node has opened (section 10.8).
     pub(crate) manifests: Manifests,
     /// Results of closed-range queries (section 10.8).
@@ -167,6 +170,7 @@ impl Engine {
             partition_window: Window::DEFAULT_LENGTH,
             peers: None,
             system_tables: None,
+            rollups: None,
             manifests,
             results: ResultCache::new(cache::DEFAULT_BYTES),
             limits,
@@ -179,6 +183,19 @@ impl Engine {
     pub fn with_system_tables(mut self, provider: Arc<dyn SystemTables>) -> Self {
         self.system_tables = Some(provider);
         self
+    }
+
+    /// The engine with a provider of the rollups queries may read (AD-13).
+    #[must_use]
+    pub fn with_rollups(mut self, provider: Arc<dyn RollupSource>) -> Self {
+        self.rollups = Some(provider);
+        self
+    }
+
+    /// The provider of rollups, if any.
+    #[must_use]
+    pub fn rollups(&self) -> Option<&Arc<dyn RollupSource>> {
+        self.rollups.as_ref()
     }
 
     /// The engine keeping at most `bytes` of closed-range results.

@@ -15,6 +15,7 @@ pub mod index;
 pub mod paths;
 pub mod prune;
 pub mod rewrite;
+pub mod rollup;
 
 use tessera_ir::{Plan, PlanError, Registry};
 
@@ -22,6 +23,7 @@ pub use bind::bind;
 pub use index::{Decision, decide};
 pub use prune::{PruneReport, bounds, prune_files};
 pub use rewrite::rewrite;
+pub use rollup::substitute;
 
 /// Why a plan could not be optimized.
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]

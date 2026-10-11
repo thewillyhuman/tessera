@@ -7,7 +7,9 @@
 //! window's start with the keys and aggregates as attributes. Event
 //! ids are deterministic, so a window evaluated twice after a takeover
 //! is removed by deduplication. The progress mark lives in the rollup's
-//! own state log, as the watermark named `done`.
+//! own state log, as the watermark named `done`, beside `since`, the
+//! start of the first window evaluated: together they are what the
+//! output covers.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -41,6 +43,18 @@ pub const MAX_WINDOWS_PER_ROUND: usize = 60;
 
 /// The watermark that holds the progress mark.
 const DONE: &str = "done";
+/// The watermark that holds the start of the first window evaluated.
+const SINCE: &str = "since";
+
+/// The time a rollup's output covers in whole windows, from its state:
+/// the start of the first window evaluated to the progress mark, or
+/// nothing before the first round.
+#[must_use]
+pub fn coverage(state: &EvalState) -> Option<TimeRange> {
+    let since = state.watermarks.get(SINCE)?;
+    let done = state.watermarks.get(DONE)?;
+    Some(TimeRange::new(*since, *done))
+}
 
 /// What one round did for a rollup.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -290,8 +304,12 @@ pub async fn maintain(
             maintained.rows += u64::try_from(batch.rows().num_rows()).unwrap_or(u64::MAX);
             sink.write(batch).await.map_err(failed)?;
         }
-        log.update(|_: &EvalState| {
-            Ok::<_, String>(vec![EvalState::put_watermark(DONE, window.end)])
+        log.update(|state: &EvalState| {
+            let mut actions = vec![EvalState::put_watermark(DONE, window.end)];
+            if !state.watermarks.contains_key(SINCE) {
+                actions.push(EvalState::put_watermark(SINCE, window.start));
+            }
+            Ok::<_, String>(actions)
         })
         .await
         .map_err(|e| failed(e.to_string()))?;
