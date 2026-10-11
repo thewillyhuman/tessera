@@ -18,6 +18,7 @@ pub mod aggregate;
 pub mod eval;
 pub mod extract;
 pub mod group;
+pub mod naming;
 pub mod template;
 pub mod time;
 pub mod units;

@@ -141,116 +141,140 @@ fn text_to_float(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+fn prometheus_name(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [
+            DataType::Utf8,
+            DataType::Utf8,
+            DataType::Utf8,
+            DataType::Boolean,
+        ] => Some(DataType::Utf8),
+        _ => None,
+    }
+}
+
 fn coalesce(args: &[DataType]) -> Option<DataType> {
     let first = args.first()?;
     args.iter().all(|t| t == first).then(|| first.clone())
 }
+
+/// The scalar functions of the core engine.
+const SCALARS: &[ScalarFunction] = &[
+    ScalarFunction {
+        name: "time_bucket",
+        return_type: time_bucket,
+    },
+    ScalarFunction {
+        name: "prometheus_name",
+        return_type: prometheus_name,
+    },
+    ScalarFunction {
+        name: "now",
+        return_type: now,
+    },
+    ScalarFunction {
+        name: "lower",
+        return_type: text_to_text,
+    },
+    ScalarFunction {
+        name: "upper",
+        return_type: text_to_text,
+    },
+    ScalarFunction {
+        name: "length",
+        return_type: text_to_int,
+    },
+    ScalarFunction {
+        name: "coalesce",
+        return_type: coalesce,
+    },
+    // Text predicates (section 9.7): a substring, a token by the
+    // rules of QL-18, and a regular expression.
+    ScalarFunction {
+        name: "contains",
+        return_type: text_predicate,
+    },
+    ScalarFunction {
+        name: "has_token",
+        return_type: text_predicate,
+    },
+    ScalarFunction {
+        name: "regexp_match",
+        return_type: text_predicate,
+    },
+    // Log-line helpers (LogQL section 9.4): strip ANSI colour codes;
+    // read a duration (`1.5s`, `250ms`) as seconds; read a byte
+    // size (`2KB`, `1.5MiB`) as bytes.
+    ScalarFunction {
+        name: "decolorize",
+        return_type: text_to_text,
+    },
+    ScalarFunction {
+        name: "parse_duration",
+        return_type: text_to_float,
+    },
+    ScalarFunction {
+        name: "parse_bytes",
+        return_type: text_to_float,
+    },
+];
+
+/// The aggregate functions of the core engine.
+const AGGREGATES: &[AggregateFunction] = &[
+    AggregateFunction {
+        name: "count",
+        return_type: weighted_count,
+        weighted: true,
+    },
+    AggregateFunction {
+        name: "count_raw",
+        return_type: count,
+        weighted: false,
+    },
+    AggregateFunction {
+        name: "sum",
+        return_type: weighted_sum,
+        weighted: true,
+    },
+    AggregateFunction {
+        name: "sum_raw",
+        return_type: numeric_widened,
+        weighted: false,
+    },
+    AggregateFunction {
+        name: "avg",
+        return_type: average,
+        weighted: true,
+    },
+    AggregateFunction {
+        name: "avg_raw",
+        return_type: average,
+        weighted: false,
+    },
+    AggregateFunction {
+        name: "min",
+        return_type: extremum,
+        weighted: false,
+    },
+    AggregateFunction {
+        name: "max",
+        return_type: extremum,
+        weighted: false,
+    },
+];
 
 impl Registry {
     /// The functions of the core engine (M2).
     #[must_use]
     pub fn builtin() -> Self {
         let mut registry = Registry::default();
-        for scalar in [
-            ScalarFunction {
-                name: "time_bucket",
-                return_type: time_bucket,
-            },
-            ScalarFunction {
-                name: "now",
-                return_type: now,
-            },
-            ScalarFunction {
-                name: "lower",
-                return_type: text_to_text,
-            },
-            ScalarFunction {
-                name: "upper",
-                return_type: text_to_text,
-            },
-            ScalarFunction {
-                name: "length",
-                return_type: text_to_int,
-            },
-            ScalarFunction {
-                name: "coalesce",
-                return_type: coalesce,
-            },
-            // Text predicates (section 9.7): a substring, a token by the
-            // rules of QL-18, and a regular expression.
-            ScalarFunction {
-                name: "contains",
-                return_type: text_predicate,
-            },
-            ScalarFunction {
-                name: "has_token",
-                return_type: text_predicate,
-            },
-            ScalarFunction {
-                name: "regexp_match",
-                return_type: text_predicate,
-            },
-            // Log-line helpers (LogQL section 9.4): strip ANSI colour codes;
-            // read a duration (`1.5s`, `250ms`) as seconds; read a byte
-            // size (`2KB`, `1.5MiB`) as bytes.
-            ScalarFunction {
-                name: "decolorize",
-                return_type: text_to_text,
-            },
-            ScalarFunction {
-                name: "parse_duration",
-                return_type: text_to_float,
-            },
-            ScalarFunction {
-                name: "parse_bytes",
-                return_type: text_to_float,
-            },
-        ] {
-            registry.scalars.insert(scalar.name, scalar);
+        for scalar in SCALARS {
+            registry.scalars.insert(scalar.name, scalar.clone());
         }
-        for aggregate in [
-            AggregateFunction {
-                name: "count",
-                return_type: weighted_count,
-                weighted: true,
-            },
-            AggregateFunction {
-                name: "count_raw",
-                return_type: count,
-                weighted: false,
-            },
-            AggregateFunction {
-                name: "sum",
-                return_type: weighted_sum,
-                weighted: true,
-            },
-            AggregateFunction {
-                name: "sum_raw",
-                return_type: numeric_widened,
-                weighted: false,
-            },
-            AggregateFunction {
-                name: "avg",
-                return_type: average,
-                weighted: true,
-            },
-            AggregateFunction {
-                name: "avg_raw",
-                return_type: average,
-                weighted: false,
-            },
-            AggregateFunction {
-                name: "min",
-                return_type: extremum,
-                weighted: false,
-            },
-            AggregateFunction {
-                name: "max",
-                return_type: extremum,
-                weighted: false,
-            },
-        ] {
-            registry.aggregates.insert(aggregate.name, aggregate);
+        for aggregate in AGGREGATES {
+            registry
+                .aggregates
+                .insert(aggregate.name, aggregate.clone());
         }
         registry
     }
@@ -316,6 +340,17 @@ mod tests {
             Some(DataType::Timestamp(TimeUnit::Nanosecond, None))
         );
         assert_eq!((bucket.return_type)(&[DataType::Int64]), None);
+        let naming = registry.scalar("prometheus_name").unwrap();
+        assert_eq!(
+            (naming.return_type)(&[
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Boolean
+            ]),
+            Some(DataType::Utf8)
+        );
+        assert_eq!((naming.return_type)(&[DataType::Utf8]), None);
         assert!(registry.scalar("nope").is_none());
         let contains = registry.scalar("contains").unwrap();
         assert_eq!(

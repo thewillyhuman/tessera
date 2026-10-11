@@ -271,6 +271,51 @@ fn in_byte_set(tested: &Value, list: &[Literal]) -> Option<BooleanArray> {
     })
 }
 
+/// `prometheus_name(name, unit, metric_type, is_monotonic)` over columns
+/// (QL-19).
+fn prometheus_names(
+    name: &Value,
+    unit: &Value,
+    metric_type: &Value,
+    monotonic: &Value,
+    rows: usize,
+) -> Result<Value, KernelError> {
+    let text =
+        |v: &Value| -> Result<ArrayRef, KernelError> { v.cast(&DataType::Utf8)?.into_column(rows) };
+    let (name, unit, metric_type) = (text(name)?, text(unit)?, text(metric_type)?);
+    let monotonic = monotonic.cast(&DataType::Boolean)?.into_column(rows)?;
+    let strings = |a: &ArrayRef| -> Result<StringArray, KernelError> {
+        a.as_any()
+            .downcast_ref::<StringArray>()
+            .cloned()
+            .ok_or_else(|| KernelError::Unsupported("prometheus_name needs text".into()))
+    };
+    let (name, unit, metric_type) = (strings(&name)?, strings(&unit)?, strings(&metric_type)?);
+    let monotonic = monotonic
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| KernelError::Unsupported("prometheus_name needs a boolean".into()))?;
+    let out: StringArray = (0..rows)
+        .map(|i| {
+            if name.is_null(i) {
+                return None;
+            }
+            Some(crate::naming::prometheus_name(
+                name.value(i),
+                text_or_empty(&unit, i),
+                text_or_empty(&metric_type, i),
+                monotonic.is_valid(i) && monotonic.value(i),
+            ))
+        })
+        .collect();
+    Ok(Value::Column(Arc::new(out)))
+}
+
+/// Row `i` of `array`, empty when null.
+fn text_or_empty(array: &StringArray, i: usize) -> &str {
+    if array.is_null(i) { "" } else { array.value(i) }
+}
+
 /// SQL `LIKE` and its negated and case-insensitive forms.
 fn like(
     text: &Value,
@@ -446,6 +491,9 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
                 .downcast_ref::<TimestampNanosecondArray>()
                 .ok_or_else(|| KernelError::Unsupported("time_bucket needs timestamps".into()))?;
             Ok(timestamps.with_array(time::time_bucket(interval, array)?))
+        }
+        ("prometheus_name", [name, unit, metric_type, monotonic]) => {
+            prometheus_names(name, unit, metric_type, monotonic, batch.num_rows())
         }
         ("lower", [text]) => map_text(text, str::to_lowercase),
         ("decolorize", [text]) => map_text(text, units::decolorize),
@@ -805,6 +853,44 @@ mod tests {
         }
         .binary(BinaryOp::GtEq, Expr::literal(2));
         assert_eq!(booleans(&number), vec![false, true, false]);
+    }
+
+    #[test]
+    fn prometheus_names_derive_from_name_unit_and_type() {
+        let schema = Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("unit", DataType::Utf8, true),
+            Field::new("metric_type", DataType::Utf8, true),
+            Field::new("is_monotonic", DataType::Boolean, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("http.server.duration"),
+                    Some("up"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![Some("ms"), Some(""), None])),
+                Arc::new(StringArray::from(vec![Some("sum"), Some("gauge"), None])),
+                Arc::new(BooleanArray::from(vec![Some(true), None, None])),
+            ],
+        )
+        .unwrap();
+        let expr = Expr::Call {
+            name: "prometheus_name".into(),
+            args: vec![
+                Expr::column("name"),
+                Expr::column("unit"),
+                Expr::column("metric_type"),
+                Expr::column("is_monotonic"),
+            ],
+        };
+        let out = evaluate(&expr, &batch).unwrap();
+        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(out.value(0), "http_server_duration_milliseconds_total");
+        assert_eq!(out.value(1), "up");
+        assert!(out.is_null(2));
     }
 
     #[test]
