@@ -8,10 +8,12 @@
 //! matchers admit, and the expression to a `PromQL` node the engine
 //! evaluates with Prometheus' semantics (QL-5).
 //!
-//! Not supported yet: native histograms and the `histogram_*`
-//! functions over them, `info`, and the
-//! `promql(...)` table function in SQL (QL-3). OTLP histograms are
-//! stored as rows with their buckets, which `PromQL` does not read.
+//! A histogram stored from OTLP answers `name_bucket`, `name_count`
+//! and `name_sum` as the classic series a scrape would give, so
+//! `histogram_quantile` and the rate family read it unchanged; a
+//! summary answers its `quantile` series under its own name. Not
+//! supported yet: Prometheus' native histogram sample type and the
+//! `histogram_*` functions over it, and `info`.
 //!
 //! The differential suite (QL-4) found no deviation from Prometheus
 //! 3.15 on its cases, which cover selectors, the rate family,

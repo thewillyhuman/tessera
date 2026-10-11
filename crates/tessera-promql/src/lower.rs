@@ -23,7 +23,7 @@ use tessera_ir::{
     BinaryOp as IrOp, BindContext, Diagnostic, Expr as IrExpr, LOOKBACK, NamedExpr, Plan, Scan,
     SeriesGrouping, Span, VALUE,
 };
-use tessera_types::event::{IS_MONOTONIC, METRIC_TYPE, NAME, OVERFLOW, TIMESTAMP, UNIT};
+use tessera_types::event::{HISTOGRAM, IS_MONOTONIC, METRIC_TYPE, NAME, OVERFLOW, TIMESTAMP, UNIT};
 use tessera_types::{Kind, TimeRange, Timestamp};
 
 use crate::ast::{At, BinaryOp, Expr, MatchOp, Matcher};
@@ -410,9 +410,26 @@ pub fn selector_plan(
 ) -> Result<Plan, Diagnostic> {
     let mut scan = Scan::all(ctx.tenant.clone(), ctx.dataset.clone(), Kind::Metric);
     scan.time_range = range;
+    // A stored histogram answers `name_bucket`, `name_count` and
+    // `name_sum` under its own name (QL-5); its rows are read beside any
+    // series scraped under the suffixed name.
+    let (form, stored) = match name.and_then(|name| classic_form(name)) {
+        Some((form, base)) => (
+            form,
+            Some(
+                prometheus_name()
+                    .binary(IrOp::Eq, IrExpr::literal(base))
+                    .and(stores_buckets()),
+            ),
+        ),
+        None => ("plain", None),
+    };
     if let Some(name) = name {
-        scan.predicates
-            .push(prometheus_name().binary(IrOp::Eq, IrExpr::literal(name)));
+        let scraped = prometheus_name().binary(IrOp::Eq, IrExpr::literal(name));
+        scan.predicates.push(match stored {
+            Some(stored) => scraped.or(stored),
+            None => scraped,
+        });
     }
     for matcher in matchers {
         if matcher.name == "__name__" {
@@ -433,12 +450,38 @@ pub fn selector_plan(
                 .push(matcher_predicate(&label, matcher, true));
         }
     }
+    let shown_name = match name {
+        Some(name) => IrExpr::literal(name),
+        None => prometheus_name(),
+    };
     Ok(Plan::Scan(scan).project(vec![
         NamedExpr::new(IrExpr::column(TIMESTAMP), TIMESTAMP),
         NamedExpr::new(IrExpr::column(VALUE), VALUE),
         NamedExpr::new(IrExpr::column(OVERFLOW), OVERFLOW),
-        NamedExpr::new(prometheus_name(), "__name__"),
+        NamedExpr::new(shown_name, "__name__"),
+        NamedExpr::new(IrExpr::column(HISTOGRAM), HISTOGRAM),
+        NamedExpr::new(IrExpr::literal(form), EXPAND),
     ]))
+}
+
+/// The column that tells the engine which classic series a histogram
+/// row stands for.
+pub const EXPAND: &str = "__expand__";
+
+/// The classic form `name` asks for and the stored name it refers to:
+/// `name_bucket` the `le` buckets of `name`, `name_count` and
+/// `name_sum` its totals.
+fn classic_form(name: &str) -> Option<(&'static str, &str)> {
+    [("bucket", "_bucket"), ("count", "_count"), ("sum", "_sum")]
+        .into_iter()
+        .find_map(|(form, suffix)| name.strip_suffix(suffix).map(|base| (form, base)))
+        .filter(|(_, base)| !base.is_empty())
+}
+
+/// Whether a row stores buckets or quantiles.
+fn stores_buckets() -> IrExpr {
+    let is = |kind: &str| IrExpr::column(METRIC_TYPE).binary(IrOp::Eq, IrExpr::literal(kind));
+    is("histogram").or(is("exp_histogram")).or(is("summary"))
 }
 
 /// The Prometheus name of each row's metric.
@@ -530,7 +573,7 @@ mod tests {
         assert_eq!(lowered.kind, ResultKind::Vector);
         let text = lowered.plan.to_string();
         assert!(
-            text.starts_with("PromQL: sum by (job)(rate(input0[300000000000ns] offset 60000000000ns)) from 1970-01-01T00:10:00Z to 1970-01-01T00:15:00Z step 30s\n  input0:\n    Project: timestamp AS timestamp, value AS value, _overflow AS _overflow, prometheus_name(name, unit, metric_type, is_monotonic) AS __name__\n      Scan: prod/metric [1970-01-01T00:04:00Z, 1970-01-01T00:14:00.000000001Z)"),
+            text.starts_with("PromQL: sum by (job)(rate(input0[300000000000ns] offset 60000000000ns)) from 1970-01-01T00:10:00Z to 1970-01-01T00:15:00Z step 30s\n  input0:\n    Project: timestamp AS timestamp, value AS value, _overflow AS _overflow, 'http_requests_total' AS __name__, histogram AS histogram, 'plain' AS __expand__\n      Scan: prod/metric [1970-01-01T00:04:00Z, 1970-01-01T00:14:00.000000001Z)"),
             "{text}"
         );
         assert!(
@@ -547,6 +590,41 @@ mod tests {
             text.contains("(label(env) IS NULL OR (label(env) <> 'test'))"),
             "{text}"
         );
+    }
+
+    /// QL-5: a suffixed name reads the stored histogram under the
+    /// base name beside any scraped series, and says which form it
+    /// wants; a plain name reads its rows as they are.
+    #[test]
+    fn suffixed_names_read_stored_histograms_as_classic_series() {
+        let lowered = lower(
+            &parse("histogram_quantile(0.9, rate(latency_bucket[5m]))").unwrap(),
+            &ctx(),
+            params(0),
+        )
+        .unwrap();
+        let text = lowered.plan.to_string();
+        assert!(
+            text.contains(
+                "((prometheus_name(name, unit, metric_type, is_monotonic) = 'latency_bucket') OR ((prometheus_name(name, unit, metric_type, is_monotonic) = 'latency') AND (((metric_type = 'histogram') OR (metric_type = 'exp_histogram')) OR (metric_type = 'summary'))))"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "'latency_bucket' AS __name__, histogram AS histogram, 'bucket' AS __expand__"
+            ),
+            "{text}"
+        );
+        let plain = lower(&parse("up").unwrap(), &ctx(), params(0))
+            .unwrap()
+            .plan
+            .to_string();
+        assert!(plain.contains("'plain' AS __expand__"), "{plain}");
+        assert!(!plain.contains(" OR "), "{plain}");
+        assert_eq!(classic_form("x_sum"), Some(("sum", "x")));
+        assert_eq!(classic_form("_sum"), None);
+        assert_eq!(classic_form("up"), None);
     }
 
     #[test]

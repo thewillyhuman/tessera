@@ -587,6 +587,77 @@ mod tests {
         app
     }
 
+    /// QL-5: a histogram stored from OTLP answers `_bucket` as the
+    /// classic series, so `histogram_quantile` reads it unchanged.
+    #[tokio::test]
+    async fn stored_histograms_answer_as_classic_series() {
+        let app = crate::router(crate::testing::state().await);
+        let metrics = crate::otlp::testing::export_histogram(
+            "api",
+            "latency",
+            "a",
+            0,
+            &[10.0, 20.0],
+            &[1, 2, 0],
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/metrics")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&metrics).unwrap()))
+            .unwrap();
+        let (status, _) = call(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, value) = call(
+            &app,
+            get("/api/v1/query?query=latency_bucket&time=1700000030"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let result = value["data"]["result"].as_array().unwrap();
+        let mut buckets: Vec<(String, String)> = result
+            .iter()
+            .map(|s| {
+                (
+                    s["metric"]["le"].as_str().unwrap().to_owned(),
+                    s["value"][1].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        buckets.sort();
+        assert_eq!(
+            buckets,
+            vec![
+                ("+Inf".to_owned(), "3".to_owned()),
+                ("10".to_owned(), "1".to_owned()),
+                ("20".to_owned(), "3".to_owned())
+            ],
+            "{value}"
+        );
+        assert_eq!(result[0]["metric"]["__name__"], "latency_bucket");
+        assert_eq!(result[0]["metric"]["job"], "a");
+
+        let (status, value) = call(
+            &app,
+            get("/api/v1/query?query=histogram_quantile(0.5,%20latency_bucket)&time=1700000030"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value["data"]["result"][0]["value"][1], "12.5",
+            "the median interpolates within (10, 20]: {value}"
+        );
+        let (_, value) = call(&app, get("/api/v1/query?query=latency_sum&time=1700000030")).await;
+        assert_eq!(value["data"]["result"][0]["value"][1], "30", "{value}");
+        let (_, value) = call(&app, get("/api/v1/query?query=latency&time=1700000030")).await;
+        assert_eq!(
+            value["data"]["result"].as_array().unwrap().len(),
+            0,
+            "the plain name has no sample type yet: {value}"
+        );
+    }
+
     #[tokio::test]
     async fn instant_and_range_queries_answer_like_prometheus() {
         let app = pushed().await;

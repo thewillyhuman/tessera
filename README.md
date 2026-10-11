@@ -106,10 +106,12 @@ Prometheus HTTP API: queries, series, labels, label values, metadata
 and remote write. The PromQL differential suite agrees with
 Prometheus 3.15.0 on every case.
 
-Gaps left in M5: native histograms (OTLP histograms are stored but
-not queryable through PromQL), `info` and exemplars; the PromQL
-compliance suite has not been run; Grafana itself has not been run
-against the API yet.
+Gaps left in M5: an OTLP histogram answers PromQL as the classic
+`_bucket`, `_count` and `_sum` series a scrape would give, but there
+is no native histogram sample type, so the `histogram_*` functions
+over one are absent; `info` and exemplars; the PromQL compliance
+suite has not been run; Grafana itself has not been run against the
+API yet.
 
 **M6, distributed execution and cluster: done, with gaps listed
 below.** Node roles (`ingest`, `query`, `compact`, `eval`), a node

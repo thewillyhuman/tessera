@@ -8,6 +8,11 @@
 //! section 9.8 plus `__name__` when the input projected one. Samples
 //! of one series are sorted by time and a later row at the same time
 //! replaces an earlier one, as deduplication would (section 7.5).
+//!
+//! A row holding a histogram point becomes the classic series the
+//! selector asked for through its [`EXPAND`] column: `bucket` gives one
+//! series per `le`, `count` and `sum` the point's totals, and a plain
+//! selector a summary's series per `quantile`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,11 +22,45 @@ use arrow::array::{
 };
 use tessera_ir::promql::PromExpr;
 use tessera_ir::{VALUE, range_vector_schema};
-use tessera_kernels::promql::{self, NAME_LABEL, Params, Series};
-use tessera_kernels::{attributes_column, row_labels};
-use tessera_types::event::TIMESTAMP;
+use tessera_kernels::promql::{self, NAME_LABEL, Params, Series, format_value};
+use tessera_kernels::{attributes_column, histogram, row_labels};
+use tessera_types::event::{HISTOGRAM, TIMESTAMP};
 
 use crate::ExecError;
+
+/// The column a selector projects to say which classic series a
+/// histogram row stands for: `bucket`, `count`, `sum` or `plain`.
+pub const EXPAND: &str = "__expand__";
+
+/// The samples one histogram row yields under `form`: the labels it
+/// adds and the value of each.
+fn expanded(point: &str, form: &str) -> Vec<(Option<(&'static str, String)>, f64)> {
+    match form {
+        "bucket" => histogram::classic_buckets(point)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(le, count)| (Some(("le", format_value(le))), count))
+            .collect(),
+        "count" => histogram::count_and_sum(point)
+            .map(|(count, _)| (None, count))
+            .into_iter()
+            .collect(),
+        "sum" => histogram::count_and_sum(point)
+            .and_then(|(_, sum)| sum.map(|sum| (None, sum)))
+            .into_iter()
+            .collect(),
+        _ => histogram::quantiles(point)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(quantile, value)| (Some(("quantile", format_value(quantile))), value))
+            .collect(),
+    }
+}
+
+/// The text in `column` at `i`, if any.
+fn cell(column: Option<&StringArray>, i: usize) -> Option<&str> {
+    column.filter(|c| !c.is_null(i)).map(|c| c.value(i))
+}
 
 /// The rows of `batches` as series, one per label set.
 ///
@@ -41,22 +80,34 @@ pub fn series_of(batches: &[RecordBatch]) -> Result<Vec<Series>, ExecError> {
             .ok_or_else(|| ExecError::Unsupported("promql input has no value".into()))?;
         let merged = attributes_column(batch);
         let overflow = merged.as_ref();
-        let names = batch
-            .column_by_name(NAME_LABEL)
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let text = |name: &str| {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        };
+        let (names, points, forms) = (text(NAME_LABEL), text(HISTOGRAM), text(EXPAND));
         for i in 0..batch.num_rows() {
-            if values.is_null(i) {
-                continue;
-            }
+            let samples: Vec<(Option<(&str, String)>, f64)> =
+                match (cell(points, i), cell(forms, i), values.is_null(i)) {
+                    (Some(point), Some(form), _) => expanded(point, form),
+                    (_, _, true) => continue,
+                    (_, _, false) => vec![(None, values.value(i))],
+                };
             let attributes = overflow.filter(|o| !o.is_null(i)).map(|o| o.value(i));
             let mut labels = row_labels(attributes, None, None);
-            if let Some(name) = names.filter(|n| !n.is_null(i)) {
-                labels.insert(NAME_LABEL.to_owned(), name.value(i).to_owned());
+            if let Some(name) = cell(names, i) {
+                labels.insert(NAME_LABEL.to_owned(), name.to_owned());
             }
-            by_labels
-                .entry(labels)
-                .or_default()
-                .insert(timestamps.value(i), values.value(i));
+            for (extra, value) in samples {
+                let mut labels = labels.clone();
+                if let Some((key, text)) = extra {
+                    labels.insert(key.to_owned(), text);
+                }
+                by_labels
+                    .entry(labels)
+                    .or_default()
+                    .insert(timestamps.value(i), value);
+            }
         }
     }
     Ok(by_labels
@@ -160,5 +211,67 @@ mod tests {
         .unwrap();
         assert_eq!(out.num_rows(), 1);
         assert_eq!(out.schema(), range_vector_schema());
+    }
+
+    /// QL-5: a histogram row becomes the classic series its selector
+    /// asked for.
+    #[test]
+    fn histogram_rows_expand_into_classic_series() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                TIMESTAMP,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(VALUE, DataType::Float64, true),
+            Field::new(OVERFLOW, DataType::Utf8, true),
+            Field::new(NAME_LABEL, DataType::Utf8, true),
+            Field::new(HISTOGRAM, DataType::Utf8, true),
+            Field::new(EXPAND, DataType::Utf8, true),
+        ]));
+        let point = r#"{"count":3,"sum":30.0,"bounds":[10.0,20.0],"counts":[1,2,0]}"#;
+        let batch = |form: &str| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(TimestampNanosecondArray::from(vec![10, 20])),
+                    Arc::new(Float64Array::from(vec![None, Some(7.0)])),
+                    Arc::new(StringArray::from(vec![Some(r#"{"attr.job":"api"}"#); 2])),
+                    Arc::new(StringArray::from(vec![Some("latency_bucket"); 2])),
+                    Arc::new(StringArray::from(vec![Some(point), None])),
+                    Arc::new(StringArray::from(vec![Some(form); 2])),
+                ],
+            )
+            .unwrap()
+        };
+        let series = series_of(&[batch("bucket")]).unwrap();
+        let les: Vec<(String, f64)> = series
+            .iter()
+            .filter_map(|s| Some((s.labels.get("le")?.clone(), s.samples[0].1)))
+            .collect();
+        assert_eq!(
+            les,
+            vec![
+                ("+Inf".to_owned(), 3.0),
+                ("10".to_owned(), 1.0),
+                ("20".to_owned(), 3.0)
+            ],
+            "cumulative counts per upper bound, in label order"
+        );
+        let near = |series: &[Series], value: f64| {
+            series
+                .iter()
+                .any(|s| (s.samples[0].1 - value).abs() < f64::EPSILON)
+        };
+        assert!(
+            series.iter().any(
+                |s| !s.labels.contains_key("le") && (s.samples[0].1 - 7.0).abs() < f64::EPSILON
+            ),
+            "a plain row beside them stays a plain sample"
+        );
+        let sums = series_of(&[batch("sum")]).unwrap();
+        assert!(near(&sums, 30.0), "{sums:?}");
+        let counts = series_of(&[batch("count")]).unwrap();
+        assert!(near(&counts, 3.0), "{counts:?}");
     }
 }

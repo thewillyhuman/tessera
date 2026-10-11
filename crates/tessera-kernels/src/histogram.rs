@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! Merging histogram points (CO-8): the JSON a metric row stores for a
-//! classic histogram (`bounds` and `counts`) or an exponential one
-//! (`scale`, `zero_count` and `positive` and `negative` buckets at an
-//! offset), folded over an interval so that downsampled points still
-//! answer `histogram_quantile` and the rate functions. Classic
-//! histograms merge when their bounds agree; exponential ones are
-//! brought to the coarser scale first, halving buckets as the
+//! Histogram points: the JSON a metric row stores for a classic
+//! histogram (`bounds` and `counts`), an exponential one (`scale`,
+//! `zero_count` and `positive` and `negative` buckets at an offset) or
+//! a summary (`quantiles`).
+//!
+//! Merging (CO-8) folds the points of an interval so that downsampled
+//! points still answer `histogram_quantile` and the rate functions.
+//! Classic histograms merge when their bounds agree; exponential ones
+//! are brought to the coarser scale first, halving buckets as the
 //! `OpenTelemetry` mapping does.
+//!
+//! Reading as classic series (QL-5) gives `PromQL` a point's cumulative
+//! `le` buckets, its count and sum, or a summary's quantiles, so that a
+//! stored histogram answers `name_bucket`, `name_count` and `name_sum`
+//! as a scraped one would.
 
 use std::collections::BTreeMap;
 
@@ -124,6 +131,87 @@ fn counts(value: Option<&Value>) -> Option<Vec<u64>> {
     value?.as_array()?.iter().map(Value::as_u64).collect()
 }
 
+/// The classic buckets of `point` as `(upper bound, cumulative count)`
+/// in bound order, `+Inf` last. An exponential histogram's buckets are
+/// the upper bounds of its positive buckets at its scale, the zero
+/// bucket and every negative value counted below them; a point of
+/// another shape, or one that does not parse, gives none.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn classic_buckets(point: &str) -> Option<Vec<(f64, f64)>> {
+    let object = parse(point)?;
+    let total = object.get("count").and_then(Value::as_f64);
+    let mut out = Vec::new();
+    let mut cumulative = 0.0;
+    if let Some(bounds) = object.get("bounds").and_then(Value::as_array) {
+        let counts = counts(object.get("counts"))?;
+        for (bound, count) in bounds.iter().zip(&counts) {
+            cumulative += *count as f64;
+            out.push((bound.as_f64()?, cumulative));
+        }
+        cumulative += counts.get(bounds.len()).copied().unwrap_or(0) as f64;
+    } else if let Some(scale) = object.get("scale").and_then(Value::as_i64) {
+        let (negative_offset, negative) = buckets(object.get("negative"));
+        let _ = negative_offset;
+        cumulative += negative.iter().sum::<u64>() as f64;
+        cumulative += object
+            .get("zero_count")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let threshold = object
+            .get("zero_threshold")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        out.push((threshold, cumulative));
+        let (offset, positive) = buckets(object.get("positive"));
+        let base = 2f64.powf(2f64.powi(-i32::try_from(scale).unwrap_or(0)));
+        for (i, count) in positive.iter().enumerate() {
+            cumulative += *count as f64;
+            let index = offset + i64::try_from(i).unwrap_or(i64::MAX);
+            out.push((
+                base.powi(i32::try_from(index + 1).unwrap_or(i32::MAX)),
+                cumulative,
+            ));
+        }
+    } else {
+        return None;
+    }
+    out.push((f64::INFINITY, total.unwrap_or(cumulative)));
+    Some(out)
+}
+
+/// The count and the sum of `point`, the sum when it has one.
+#[must_use]
+pub fn count_and_sum(point: &str) -> Option<(f64, Option<f64>)> {
+    let object = parse(point)?;
+    Some((
+        object.get("count").and_then(Value::as_f64)?,
+        object.get("sum").and_then(Value::as_f64),
+    ))
+}
+
+/// The quantiles of a summary `point` as `(quantile, value)`; none for
+/// a point of another shape.
+#[must_use]
+pub fn quantiles(point: &str) -> Option<Vec<(f64, f64)>> {
+    parse(point)?
+        .get("quantiles")?
+        .as_array()?
+        .iter()
+        .map(|pair| {
+            let pair = pair.as_array()?;
+            Some((pair.first()?.as_f64()?, pair.get(1)?.as_f64()?))
+        })
+        .collect()
+}
+
+fn parse(point: &str) -> Option<Map<String, Value>> {
+    match serde_json::from_str::<Value>(point).ok()? {
+        Value::Object(object) => Some(object),
+        _ => None,
+    }
+}
+
 /// A side's buckets as their offset and counts; none means empty.
 fn buckets(value: Option<&Value>) -> (i64, Vec<u64>) {
     value
@@ -163,6 +251,29 @@ mod tests {
 
     fn parsed(text: &str) -> Value {
         serde_json::from_str(text).unwrap()
+    }
+
+    /// QL-5: stored points read as the classic series Prometheus
+    /// scrapes.
+    #[test]
+    fn points_read_as_classic_buckets_counts_sums_and_quantiles() {
+        let classic = r#"{"count":3,"sum":30.0,"bounds":[10.0,20.0],"counts":[1,2,0]}"#;
+        assert_eq!(
+            classic_buckets(classic).unwrap(),
+            vec![(10.0, 1.0), (20.0, 3.0), (f64::INFINITY, 3.0)]
+        );
+        assert_eq!(count_and_sum(classic).unwrap(), (3.0, Some(30.0)));
+        let exponential = r#"{"count":7,"scale":0,"zero_count":1,"zero_threshold":0.0,"positive":{"offset":1,"counts":[2,3]},"negative":{"offset":0,"counts":[1]}}"#;
+        assert_eq!(
+            classic_buckets(exponential).unwrap(),
+            vec![(0.0, 2.0), (4.0, 4.0), (8.0, 7.0), (f64::INFINITY, 7.0)],
+            "scale 0 doubles per bucket: index 1 ends at 4, index 2 at 8"
+        );
+        let summary = r#"{"count":2,"sum":5.0,"quantiles":[[0.5,2.5],[0.99,4.0]]}"#;
+        assert_eq!(quantiles(summary).unwrap(), vec![(0.5, 2.5), (0.99, 4.0)]);
+        assert!(classic_buckets(summary).is_none());
+        assert!(quantiles(classic).is_none());
+        assert!(count_and_sum("not json").is_none());
     }
 
     #[test]

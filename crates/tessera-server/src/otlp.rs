@@ -253,6 +253,70 @@ pub(crate) mod testing {
         }
     }
 
+    /// One histogram point of metric `name`, labelled `job`, at
+    /// `offset` seconds, with `bounds` and the `counts` of its buckets.
+    pub fn export_histogram(
+        service: &str,
+        name: &str,
+        job: &str,
+        offset: u64,
+        bounds: &[f64],
+        counts: &[u64],
+    ) -> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            AggregationTemporality, Histogram, HistogramDataPoint, Metric, ResourceMetrics,
+            ScopeMetrics, metric,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".into(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue(service.into())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: name.into(),
+                        data: Some(metric::Data::Histogram(Histogram {
+                            data_points: vec![HistogramDataPoint {
+                                attributes: vec![KeyValue {
+                                    key: "job".into(),
+                                    value: Some(AnyValue {
+                                        value: Some(any_value::Value::StringValue(job.into())),
+                                    }),
+                                    ..Default::default()
+                                }],
+                                time_unix_nano: 1_700_000_000_000_000_000 + offset * 1_000_000_000,
+                                count: counts.iter().sum(),
+                                sum: Some(
+                                    f64::from(
+                                        u32::try_from(counts.iter().sum::<u64>())
+                                            .unwrap_or(u32::MAX),
+                                    ) * 10.0,
+                                ),
+                                bucket_counts: counts.to_vec(),
+                                explicit_bounds: bounds.to_vec(),
+                                ..Default::default()
+                            }],
+                            aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                        })),
+                        ..Default::default()
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
     /// The export of `spans`, one resource per span, each span carrying
     /// `attr.n` set to its index and one event named `log`.
     pub fn export_spans(spans: &[SpanSpec]) -> ExportTraceServiceRequest {
