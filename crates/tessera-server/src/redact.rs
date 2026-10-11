@@ -77,10 +77,12 @@ mod tests {
                         Redaction {
                             path: "attr.user.*".into(),
                             action: RedactionAction::Hash,
+                            pattern: None,
                         },
                         Redaction {
                             path: "body".into(),
                             action: RedactionAction::Mask,
+                            pattern: None,
                         },
                     ],
                     ..TenantSettings::default()

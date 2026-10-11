@@ -2,11 +2,13 @@
 
 //! Applying redaction rules (SE-4) to a batch before it is written: the
 //! attributes in `_overflow` that a rule names are dropped, hashed or
-//! masked, and so is a log's `body` when a rule names it.
+//! masked, and so is a log's `body` when a rule names it; a rule with
+//! a pattern acts on the matching parts of a value alone.
 
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
+use regex::Regex;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tessera_types::event::{BODY, OVERFLOW};
@@ -24,21 +26,31 @@ pub fn apply(rows: &RecordBatch, rules: &[Redaction]) -> Result<RecordBatch, Ker
     if rules.is_empty() {
         return Ok(rows.clone());
     }
+    let rules: Vec<Compiled<'_>> = rules
+        .iter()
+        .map(|rule| {
+            rule.compiled()
+                .map(|pattern| Compiled { rule, pattern })
+                .map_err(|e| KernelError::Unsupported(format!("redaction {}: {e}", rule.path)))
+        })
+        .collect::<Result<_, _>>()?;
     let mut columns = rows.columns().to_vec();
     if let Ok(index) = rows.schema().index_of(OVERFLOW) {
         if let Some(overflow) = rows.column(index).as_any().downcast_ref::<StringArray>() {
-            columns[index] = redact_overflow(overflow, rules);
+            columns[index] = redact_overflow(overflow, &rules);
         }
     }
-    let body_rules: Vec<&Redaction> = rules.iter().filter(|r| r.path == BODY).collect();
-    if let (Ok(index), Some(rule)) = (rows.schema().index_of(BODY), body_rules.first()) {
+    let body_rules: Vec<&Compiled<'_>> = rules.iter().filter(|r| r.rule.path == BODY).collect();
+    if let (Ok(index), false) = (rows.schema().index_of(BODY), body_rules.is_empty()) {
         if let Some(body) = rows.column(index).as_any().downcast_ref::<StringArray>() {
             let redacted: StringArray = (0..body.len())
                 .map(|i| {
                     if body.is_null(i) {
                         return None;
                     }
-                    redacted_text(body.value(i), rule.action)
+                    body_rules
+                        .iter()
+                        .try_fold(body.value(i).to_owned(), |text, rule| rule.redact(&text))
                 })
                 .collect();
             columns[index] = Arc::new(redacted);
@@ -47,8 +59,37 @@ pub fn apply(rows: &RecordBatch, rules: &[Redaction]) -> Result<RecordBatch, Ker
     Ok(RecordBatch::try_new(rows.schema(), columns)?)
 }
 
-/// The overflow column with the rules applied to every object.
-fn redact_overflow(overflow: &StringArray, rules: &[Redaction]) -> ArrayRef {
+/// A rule with its pattern compiled once per batch.
+struct Compiled<'a> {
+    rule: &'a Redaction,
+    pattern: Option<Regex>,
+}
+
+impl Compiled<'_> {
+    /// `text` after the rule: nothing when dropped. With a pattern, the
+    /// matching parts are hashed or masked, and the value is dropped
+    /// only when it matches.
+    fn redact(&self, text: &str) -> Option<String> {
+        let Some(pattern) = &self.pattern else {
+            return redacted_text(text, self.rule.action);
+        };
+        match self.rule.action {
+            RedactionAction::Drop if pattern.is_match(text) => None,
+            RedactionAction::Drop => Some(text.to_owned()),
+            action => Some(
+                pattern
+                    .replace_all(text, |found: &regex::Captures<'_>| {
+                        redacted_text(&found[0], action).unwrap_or_default()
+                    })
+                    .into_owned(),
+            ),
+        }
+    }
+}
+
+/// The overflow column with every rule naming a path applied to its
+/// value, in order.
+fn redact_overflow(overflow: &StringArray, rules: &[Compiled<'_>]) -> ArrayRef {
     let redacted: StringArray = (0..overflow.len())
         .map(|i| {
             if overflow.is_null(i) {
@@ -60,22 +101,21 @@ fn redact_overflow(overflow: &StringArray, rules: &[Redaction]) -> ArrayRef {
             };
             let mut out = Map::with_capacity(object.len());
             for (path, value) in object {
-                match rules.iter().find(|r| r.matches(&path)) {
-                    None => {
-                        out.insert(path, value);
-                    }
-                    Some(rule) => match rule.action {
-                        RedactionAction::Drop => {}
-                        action => {
-                            let text = match &value {
-                                Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            if let Some(replaced) = redacted_text(&text, action) {
-                                out.insert(path, Value::String(replaced));
-                            }
-                        }
-                    },
+                let applicable: Vec<&Compiled<'_>> =
+                    rules.iter().filter(|r| r.rule.matches(&path)).collect();
+                if applicable.is_empty() {
+                    out.insert(path, value);
+                    continue;
+                }
+                let text = match &value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let kept = applicable
+                    .iter()
+                    .try_fold(text, |text, rule| rule.redact(&text));
+                if let Some(kept) = kept {
+                    out.insert(path, Value::String(kept));
                 }
             }
             if out.is_empty() {
@@ -142,20 +182,72 @@ mod tests {
         serde_json::from_str(column.value(0)).unwrap()
     }
 
+    /// SE-4: a rule with a pattern touches the matching parts only.
+    #[test]
+    fn patterns_redact_the_matching_parts_and_drop_only_on_a_match() {
+        let rules = [
+            Redaction {
+                path: "body".into(),
+                action: RedactionAction::Mask,
+                pattern: Some(r"\d{4}".into()),
+            },
+            Redaction {
+                path: "attr.user.email".into(),
+                action: RedactionAction::Hash,
+                pattern: Some("^[^@]+".into()),
+            },
+            Redaction {
+                path: "attr.http.method".into(),
+                action: RedactionAction::Drop,
+                pattern: Some("^POST$".into()),
+            },
+        ];
+        let out = apply(&rows(), &rules).unwrap();
+        let body = out
+            .column_by_name(BODY)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_owned();
+        assert_eq!(body, "card ***");
+        let attributes = overflow(&out);
+        let email = attributes["attr.user.email"].as_str().unwrap();
+        assert!(
+            email.ends_with("@b.c") && !email.starts_with('a'),
+            "{email}"
+        );
+        assert_eq!(
+            attributes["attr.http.method"], "GET",
+            "a value that does not match stays"
+        );
+        assert_eq!(attributes["attr.user.id"], 7);
+        let broken = [Redaction {
+            path: "body".into(),
+            action: RedactionAction::Mask,
+            pattern: Some("(".into()),
+        }];
+        assert!(apply(&rows(), &broken).is_err());
+    }
+
     #[test]
     fn attributes_are_dropped_hashed_or_masked_and_the_rest_kept() {
         let rules = [
             Redaction {
                 path: "attr.user.email".into(),
                 action: RedactionAction::Hash,
+                pattern: None,
             },
             Redaction {
                 path: "attr.user.id".into(),
                 action: RedactionAction::Drop,
+                pattern: None,
             },
             Redaction {
                 path: "body".into(),
                 action: RedactionAction::Mask,
+                pattern: None,
             },
         ];
         let redacted = apply(&rows(), &rules).unwrap();
@@ -182,6 +274,7 @@ mod tests {
         let rules = [Redaction {
             path: "attr.*".into(),
             action: RedactionAction::Drop,
+            pattern: None,
         }];
         let redacted = apply(&rows(), &rules).unwrap();
         assert!(redacted.column_by_name(OVERFLOW).unwrap().is_null(0));

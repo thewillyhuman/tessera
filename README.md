@@ -287,7 +287,8 @@ stores a tombstone that hides the matching rows at once and has
 compaction remove them, one node collecting tombstones once every file
 beyond L1 is clean and thirty days have passed (SE-5). Redaction rules
 as tenant settings drop, hash or mask attributes and log bodies at
-ingest, before anything is written (SE-4). A container image, a Helm
+ingest, before anything is written, whole or the parts a pattern
+matches (SE-4). A container image, a Helm
 chart and a CI image build (OP-10). Node records announce the newest
 data format a build reads, and a node refuses to start beside one that
 cannot read what it writes (OP-7).
@@ -300,9 +301,7 @@ Gaps left in M10: no OIDC or mutual TLS (SE-1); no
 row-filter roles; no per-tenant encryption keys (SE-2); no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a
-cluster, and the binary is not statically linked; redaction by a
-pattern over values is not
-implemented; membership still comes from the registry alone, not
+cluster, and the binary is not statically linked; membership still comes from the registry alone, not
 gossip or DNS.
 
 ## Layout

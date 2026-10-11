@@ -180,6 +180,14 @@ pub enum InvalidSettings {
         /// Why.
         reason: InvalidBudget,
     },
+    /// A redaction rule's pattern is not a regular expression.
+    #[error("redactions.{path}: {reason}")]
+    Redaction {
+        /// The rule's path.
+        path: String,
+        /// Why.
+        reason: String,
+    },
     /// A limit is zero, which would refuse every query.
     #[error("{0} must be greater than zero")]
     Zero(String),
@@ -241,6 +249,13 @@ impl TenantSettings {
                 format!("team_ingest_budgets.{team}"),
                 team_budget.validate_for_ingest(),
             )?;
+        }
+        for rule in &self.redactions {
+            rule.validate()
+                .map_err(|reason| InvalidSettings::Redaction {
+                    path: rule.path.clone(),
+                    reason,
+                })?;
         }
         let limits = [
             ("query_max_scan_bytes", self.query_max_scan_bytes),
