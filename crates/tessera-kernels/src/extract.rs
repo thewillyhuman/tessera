@@ -9,6 +9,11 @@
 //! Label names follow QL-19: nested JSON properties flatten with `_` and
 //! every name is sanitized, so a derived label can be referenced the way
 //! a stored one is.
+//!
+//! A `json` or `logfmt` stage over a row whose body ingest already
+//! parsed (DM-10) takes the labels from the stored `body.*` attributes
+//! instead of parsing the line again (QL-10); a row without stored
+//! fields is parsed.
 
 use std::collections::BTreeMap;
 
@@ -29,7 +34,9 @@ pub struct Extracted {
     pub line: Option<StringArray>,
 }
 
-/// Runs `stage` over `text`, merging into `existing` labels.
+/// Runs `stage` over `text`, merging into `existing` labels; `stored`
+/// is the rows' `_overflow`, whose `body.*` attributes serve a `json`
+/// or `logfmt` stage instead of the line (QL-10).
 ///
 /// # Errors
 ///
@@ -38,8 +45,10 @@ pub fn extract(
     stage: &ExtractStage,
     text: &StringArray,
     existing: Option<&StringArray>,
+    stored: Option<&StringArray>,
 ) -> Result<Extracted, KernelError> {
     let parser = Parser::new(stage)?;
+    let resolves_stored = matches!(stage, ExtractStage::Json | ExtractStage::Logfmt);
     let mut labels: Vec<Option<String>> = Vec::with_capacity(text.len());
     let mut lines: Vec<Option<String>> = Vec::with_capacity(text.len());
     for i in 0..text.len() {
@@ -54,7 +63,17 @@ pub fn extract(
             })
             .unwrap_or_default();
         let mut line = None;
-        if !text.is_null(i) {
+        let from_store = if resolves_stored {
+            stored
+                .filter(|s| !s.is_null(i))
+                .map(|s| stored_labels(s.value(i)))
+                .filter(|found| !found.is_empty())
+        } else {
+            None
+        };
+        if let Some(found) = from_store {
+            merged.extend(found);
+        } else if !text.is_null(i) {
             let (found, new_line) = parser.parse(text.value(i));
             merged.extend(found);
             line = new_line;
@@ -145,6 +164,29 @@ fn parser_error(kind: &str, details: impl std::fmt::Display) -> BTreeMap<String,
         (ERROR_LABEL.to_owned(), kind.to_owned()),
         (ERROR_DETAILS_LABEL.to_owned(), details.to_string()),
     ])
+}
+
+/// The labels the stored `body.*` attributes of a row give (QL-10),
+/// named as the `json` stage names them; a list stays out as it would
+/// from the stage.
+fn stored_labels(overflow: &str) -> BTreeMap<String, String> {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(overflow) else {
+        return BTreeMap::new();
+    };
+    object
+        .into_iter()
+        .filter(|(path, _)| path.starts_with("body."))
+        .filter_map(|(path, value)| match value {
+            Value::String(s)
+                if s.starts_with('[') && serde_json::from_str::<Vec<Value>>(&s).is_ok() =>
+            {
+                None
+            }
+            Value::String(s) => Some((label_name(&path), s)),
+            Value::Null | Value::Array(_) => None,
+            other => Some((label_name(&path), other.to_string())),
+        })
+        .collect()
 }
 
 /// The labels of a JSON object line; with `unpack`, `_entry` is the new
@@ -325,12 +367,52 @@ mod tests {
 
     fn run(stage: &ExtractStage, lines: &[&str]) -> Vec<Option<String>> {
         let text = StringArray::from(lines.to_vec());
-        extract(stage, &text, None)
+        extract(stage, &text, None, None)
             .unwrap()
             .labels
             .iter()
             .map(|l| l.map(str::to_owned))
             .collect()
+    }
+
+    /// QL-10: a row with stored body fields is not parsed again; one
+    /// without is.
+    #[test]
+    fn json_and_logfmt_stages_read_stored_body_fields_first() {
+        let text = StringArray::from(vec![
+            Some("{\"user\":\"from the line\",\"http\":{\"status\":200}}"),
+            Some("{\"user\":\"parsed\"}"),
+            Some("level=info msg=hi"),
+        ]);
+        let stored = StringArray::from(vec![
+            Some(
+                "{\"attr.k\":\"v\",\"body.user\":\"stored\",\"body.http.status\":500,\"body.tags\":\"[1,2]\"}",
+            ),
+            None,
+            Some("{\"body.msg\":\"stored hi\"}"),
+        ]);
+        let json = extract(&ExtractStage::Json, &text, None, Some(&stored)).unwrap();
+        let first: Value = serde_json::from_str(json.labels.value(0)).unwrap();
+        assert_eq!(first["user"], "stored");
+        assert_eq!(first["http_status"], "500");
+        assert!(first.get("tags").is_none(), "a list is no label");
+        let second: Value = serde_json::from_str(json.labels.value(1)).unwrap();
+        assert_eq!(second["user"], "parsed");
+        let logfmt = extract(&ExtractStage::Logfmt, &text, None, Some(&stored)).unwrap();
+        let third: Value = serde_json::from_str(logfmt.labels.value(2)).unwrap();
+        assert_eq!(third["msg"], "stored hi");
+        let pattern = extract(
+            &ExtractStage::Pattern("<level>=<rest>".into()),
+            &text,
+            None,
+            Some(&stored),
+        )
+        .unwrap();
+        assert!(
+            pattern.labels.value(2).contains("level"),
+            "other stages always parse: {}",
+            pattern.labels.value(2)
+        );
     }
 
     #[test]
@@ -390,6 +472,7 @@ mod tests {
             extract(
                 &ExtractStage::Pattern("<a><b>".into()),
                 &StringArray::from(vec!["x"]),
+                None,
                 None
             )
             .is_err()
@@ -398,6 +481,7 @@ mod tests {
             extract(
                 &ExtractStage::Regexp("(".into()),
                 &StringArray::from(vec!["x"]),
+                None,
                 None
             )
             .is_err()
@@ -408,7 +492,7 @@ mod tests {
     fn stages_merge_and_unpack_replaces_the_line() {
         let text = StringArray::from(vec![r#"{"_entry":"real line","app":"a"}"#, "plain"]);
         let existing = StringArray::from(vec![Some(r#"{"app":"old","keep":"1"}"#), None]);
-        let out = extract(&ExtractStage::Unpack, &text, Some(&existing)).unwrap();
+        let out = extract(&ExtractStage::Unpack, &text, Some(&existing), None).unwrap();
         assert_eq!(out.labels.value(0), r#"{"app":"a","keep":"1"}"#);
         let line = out.line.unwrap();
         assert_eq!(line.value(0), "real line");

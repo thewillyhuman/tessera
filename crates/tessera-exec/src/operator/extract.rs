@@ -48,7 +48,10 @@ impl Operator for Extract {
         let existing = rows
             .column_by_name(EXTRACTED)
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-        let extracted = extract(&self.stage, text, existing)?;
+        let stored = rows
+            .column_by_name(OVERFLOW)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let extracted = extract(&self.stage, text, existing, stored)?;
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.schema.fields().len());
         for field in self.schema.fields() {
             let column: ArrayRef =

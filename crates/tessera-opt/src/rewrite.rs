@@ -611,7 +611,13 @@ fn push_projection_text(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
             source,
             stage,
         } => {
-            let needed = needed.map(|n| add(n, &source));
+            // A stage reads its source, and the stored body fields that
+            // may answer it instead (QL-10).
+            let needed = needed.map(|n| {
+                let mut n = add(n, &source);
+                n.insert(OVERFLOW.to_owned());
+                n
+            });
             Plan::Extract {
                 input: Box::new(push_projection(*input, needed, true)),
                 source,
