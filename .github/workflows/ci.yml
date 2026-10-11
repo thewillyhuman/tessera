@@ -64,3 +64,27 @@ jobs:
       - run: cargo test -p tessera-compat-logql -- --nocapture
         env:
           TESSERA_LOKI_URL: http://127.0.0.1:3100
+
+  traceql:
+    name: traceql differential suite against tempo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: start tempo
+        run: |
+          docker run -d --name tempo -p 3200:3200 -p 4318:4318 \
+            -v "$PWD/compat/traceql/tempo.yaml:/etc/tempo.yaml:ro" \
+            grafana/tempo:2.7.1 -config.file=/etc/tempo.yaml
+          for i in $(seq 1 120); do
+            if [ "$(curl -s http://127.0.0.1:3200/ready)" = "ready" ]; then exit 0; fi
+            sleep 1
+          done
+          docker logs tempo >&2
+          echo "tempo did not become ready" >&2
+          exit 1
+      - run: cargo test -p tessera-compat-traceql -- --nocapture
+        env:
+          TESSERA_TEMPO_URL: http://127.0.0.1:3200
+          TESSERA_TEMPO_OTLP_URL: http://127.0.0.1:4318
