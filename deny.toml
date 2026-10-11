@@ -23,6 +23,13 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# The Mozilla root certificate store that the HTTP client ships, under
+# the Community Data License Agreement, permissive: data, not code, and
+# it carries no obligation on the project's own license.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
