@@ -257,6 +257,37 @@ impl DatasetLog {
         Ok(())
     }
 
+    /// The value score of `kind` (section 13.3): bytes read over bytes
+    /// stored, as the advisor last measured it; none until it has.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be read.
+    pub async fn value_score(&self, kind: Kind) -> Result<Option<f64>, DatasetLogError> {
+        let snapshot = self.log.snapshot().await?;
+        Ok(snapshot
+            .state()
+            .get(&format!("value_score/{kind}"))
+            .and_then(|s| s.parse::<f64>().ok()))
+    }
+
+    /// Records the value score of `kind`.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be committed.
+    pub async fn set_value_score(&self, kind: Kind, score: f64) -> Result<(), DatasetLogError> {
+        self.log
+            .update(|_| {
+                Ok::<_, DatasetLogError>(vec![Action::Kv(KvMutation::Put {
+                    key: format!("value_score/{kind}"),
+                    value: score.to_string(),
+                })])
+            })
+            .await?;
+        Ok(())
+    }
+
     /// The advisor's last report for `kind`, if any.
     ///
     /// # Errors
@@ -368,6 +399,9 @@ mod tests {
         log.set_window(Duration::from_secs(3_600)).await.unwrap();
         assert_eq!(log.window().await.unwrap(), Duration::from_secs(3_600));
         assert!(log.advice(Kind::Log).await.unwrap().is_none());
+        assert!(log.value_score(Kind::Log).await.unwrap().is_none());
+        log.set_value_score(Kind::Log, 0.25).await.unwrap();
+        assert_eq!(log.value_score(Kind::Log).await.unwrap(), Some(0.25));
         let advice = Advice {
             at: Timestamp::from_nanos(5),
             proposed: LayoutRecord::default_for(Kind::Log),

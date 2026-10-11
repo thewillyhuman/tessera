@@ -2461,6 +2461,7 @@ dependencies = [
  "serde_json",
  "tessera-commit",
  "tessera-format",
+ "tessera-ir",
  "tessera-kernels",
  "tessera-manifest",
  "tessera-object",

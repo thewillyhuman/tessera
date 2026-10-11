@@ -339,6 +339,7 @@ async fn compact_all(store: &Arc<MemoryStore>, env: &Env) {
                 &manifest,
                 &job,
                 &LayoutRecord::default_for(job.partition.kind),
+                None,
             )
             .await
             .unwrap();

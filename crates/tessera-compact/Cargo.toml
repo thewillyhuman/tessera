@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 tessera-format.workspace = true
+tessera-ir.workspace = true
 tessera-kernels.workspace = true
 tessera-manifest.workspace = true
 tessera-object.workspace = true

@@ -28,6 +28,10 @@ pub struct Policy {
     /// The dataset's current layout epoch (AD-9); compacted files of an
     /// older epoch are re-clustered. Zero asks for no re-clustering.
     pub layout_epoch: u64,
+    /// The age from which a retention policy applies to the partition
+    /// (CO-9): its compacted files are rewritten to L3 once the
+    /// partition's window ended that long ago. None asks for nothing.
+    pub retention_after: Option<Duration>,
 }
 
 impl Default for Policy {
@@ -37,6 +41,7 @@ impl Default for Policy {
             lone_file_age: Duration::from_secs(3_600),
             max_input_bytes: 512 << 20,
             layout_epoch: 0,
+            retention_after: None,
         }
     }
 }
@@ -75,12 +80,43 @@ pub fn plan(
     };
     let due = inputs.len() >= policy.min_inputs || inputs.iter().any(old_enough);
     if inputs.is_empty() || !due {
-        return recluster(partition, state, policy);
+        return retire(partition, state, now, policy)
+            .or_else(|| recluster(partition, state, policy));
     }
     Some(Job {
         partition: partition.clone(),
         inputs: take_within(inputs, policy.max_input_bytes),
         level: Level::L2,
+    })
+}
+
+/// A job that rewrites a partition's files below L3 into one L3 file once
+/// a retention policy is due for it (CO-9), so that the policy is
+/// applied; `None` when none is due or everything is L3 already.
+fn retire(
+    partition: &PartitionId,
+    state: &ManifestState,
+    now: Timestamp,
+    policy: &Policy,
+) -> Option<Job> {
+    let after = policy.retention_after?;
+    let age = now.duration_since(partition.window.end())?;
+    if age < after {
+        return None;
+    }
+    let mut inputs: Vec<FileMeta> = state
+        .files()
+        .filter(|f| f.level != Level::L3)
+        .cloned()
+        .collect();
+    if inputs.is_empty() {
+        return None;
+    }
+    inputs.sort_by_key(|f| f.max_timestamp);
+    Some(Job {
+        partition: partition.clone(),
+        inputs: take_within(inputs, policy.max_input_bytes),
+        level: Level::L3,
     })
 }
 
@@ -219,6 +255,33 @@ mod tests {
         let job = plan(&partition(), &state(&files), now, &newer).unwrap();
         assert_eq!(job.inputs.len(), 2, "both compacted files are stale");
         assert_eq!(job.inputs[0].layout_epoch, 0, "oldest epoch first");
+    }
+
+    #[test]
+    fn a_due_retention_policy_retires_the_partition_to_l3() {
+        let mut random = SeededRandom::new(3);
+        let files = [
+            file(&mut random, Level::L2, 1, 10),
+            file(&mut random, Level::L2, 1, 20),
+            file(&mut random, Level::L3, 1, 30),
+        ];
+        let window_end = partition().window.end().as_nanos();
+        let policy = Policy {
+            retention_after: Some(Duration::from_secs(3_600)),
+            layout_epoch: 1,
+            ..Policy::default()
+        };
+        let young = Timestamp::from_nanos(window_end + 60 * 1_000_000_000);
+        assert!(
+            plan(&partition(), &state(&files), young, &policy).is_none(),
+            "not old enough"
+        );
+        let old = Timestamp::from_nanos(window_end + 7_200 * 1_000_000_000);
+        let job = plan(&partition(), &state(&files), old, &policy).unwrap();
+        assert_eq!(job.level, Level::L3);
+        assert_eq!(job.inputs.len(), 2, "the L3 file stays as it is");
+        let only_l3 = [file(&mut random, Level::L3, 1, 30)];
+        assert!(plan(&partition(), &state(&only_l3), old, &policy).is_none());
     }
 
     #[test]

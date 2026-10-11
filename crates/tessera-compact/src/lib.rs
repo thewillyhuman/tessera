@@ -19,6 +19,7 @@ pub mod gc;
 pub mod patterns;
 pub mod plan;
 pub mod promote;
+pub mod retention;
 pub mod run;
 
 use tessera_format::FormatError;
@@ -29,6 +30,7 @@ use tessera_wal::WalError;
 pub use gc::{LogCollection, collect_files, collect_log};
 pub use plan::{Job, Policy, input_bytes, plan};
 pub use promote::promote;
+pub use retention::{Applied, Retain};
 pub use run::{Compactor, Outcome, stored_usage};
 
 /// Why compaction or collection failed.

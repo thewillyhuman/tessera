@@ -119,6 +119,7 @@ async fn advise_dataset(
         previous,
     });
     log.set_advice(kind, &outcome.advice).await?;
+    log.set_value_score(kind, outcome.value_score).await?;
     if let Some(record) = outcome.adopt {
         let set = log.set_layout(kind, record).await?;
         tracing::info!(%tenant, %dataset, %kind, epoch = set.epoch, sort_key = ?set.sort_key, dedicated = ?set.dedicated, "layout adopted");

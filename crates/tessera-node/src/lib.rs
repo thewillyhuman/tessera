@@ -15,6 +15,7 @@ mod evaluator;
 mod heartbeat;
 mod leases;
 mod peers;
+mod retention;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -419,6 +420,10 @@ impl Shared {
                 interval: config.background,
                 datasets: Arc::new(DatasetLogs::new(Arc::clone(&self.store), self.env.clone())),
                 meter,
+                controls: Arc::new(ControlStores::new(
+                    Arc::clone(&self.store),
+                    self.env.clone(),
+                )),
             })));
         }
         (Some(leases), Some((stop, task)))

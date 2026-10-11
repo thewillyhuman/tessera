@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tessera_catalog::Catalog;
+use tessera_catalog::{Catalog, ControlStores, Table};
 use tessera_cluster::Membership;
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan};
@@ -24,11 +24,13 @@ use tessera_format::FileFormat;
 use tessera_manifest::{DatasetLogs, Manifest, Registration, intake, list_partitions, registry};
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
-    DatasetName, Env, Kind, Level, Meter, PoolId, TenantId, Window, WorkKind, WriterId,
+    DatasetName, Env, Kind, Level, Meter, PoolId, RetentionPolicy, TenantId, Window, WorkKind,
+    WriterId,
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
 use crate::leases::Owned;
+use crate::retention;
 
 /// How often the background work runs by default.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
@@ -67,6 +69,8 @@ pub struct Background {
     pub datasets: Arc<DatasetLogs>,
     /// Where compaction reports what it stores (CO-2).
     pub meter: Arc<dyn Meter>,
+    /// The control stores, for retention policies (section 13.3).
+    pub controls: Arc<ControlStores>,
 }
 
 /// Runs the background work forever. Failures are logged and retried on
@@ -139,8 +143,18 @@ async fn round(
             }
         }
         let mut budget = RECLUSTER_BUDGET;
+        let policies = policies_of(background, tenant).await;
         for kind in Kind::ALL {
-            compact_and_collect(background, compactor, tenant, &dataset, kind, &mut budget).await?;
+            compact_and_collect(
+                background,
+                compactor,
+                tenant,
+                &dataset,
+                kind,
+                &mut budget,
+                &policies,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -149,6 +163,7 @@ async fn round(
 /// Compacts every partition of a dataset and kind that is due, rewrites
 /// files of an older layout epoch within `budget`, recent partitions
 /// first (AD-10), and collects replaced files.
+#[allow(clippy::too_many_arguments)]
 async fn compact_and_collect(
     background: &Background,
     compactor: &Compactor,
@@ -156,13 +171,12 @@ async fn compact_and_collect(
     dataset: &DatasetName,
     kind: Kind,
     budget: &mut u64,
+    policies: &[RetentionPolicy],
 ) -> Result<(), Failure> {
     let now = background.env.clock.now();
-    let record = background
-        .datasets
-        .open(tenant, dataset)
-        .layout(kind)
-        .await?;
+    let log = background.datasets.open(tenant, dataset);
+    let record = log.layout(kind).await?;
+    let value_score = log.value_score(kind).await?;
     let mut partitions = list_partitions(&*background.store, tenant, dataset, kind).await?;
     partitions.sort_by_key(|p| std::cmp::Reverse(p.window.start()));
     for partition in partitions {
@@ -178,8 +192,30 @@ async fn compact_and_collect(
             background.env.clone(),
         );
         let snapshot = manifest.snapshot().await?;
+        let age = now
+            .duration_since(partition.window.end())
+            .unwrap_or(Duration::ZERO);
+        let decision = retention::decide(policies, tenant, dataset, kind, age, value_score);
+        let mut retain = None;
+        let mut retention_after = None;
+        match decision {
+            retention::Decision::Keep => {}
+            retention::Decision::Drop => {
+                if !snapshot.state().is_dropped() {
+                    manifest.drop_partition().await?;
+                    tracing::info!(%tenant, %dataset, %kind, window = %partition.window, "partition dropped by retention");
+                }
+                collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION).await?;
+                continue;
+            }
+            retention::Decision::Retire { retain: r, after } => {
+                retain = Some(r);
+                retention_after = Some(after);
+            }
+        }
         let policy = Policy {
             layout_epoch: record.epoch,
+            retention_after,
             ..Policy::default()
         };
         let job = plan(&partition, snapshot.state(), now, &policy).filter(|job| {
@@ -196,7 +232,10 @@ async fn compact_and_collect(
         });
         if let Some(job) = job {
             let inputs = job.inputs.len();
-            match compactor.run(&manifest, &job, &record).await? {
+            match compactor
+                .run(&manifest, &job, &record, retain.as_ref())
+                .await?
+            {
                 Outcome::Replaced {
                     output,
                     rows,
@@ -216,6 +255,28 @@ async fn compact_and_collect(
         }
     }
     Ok(())
+}
+
+/// The enabled retention policies of `tenant`; a store or a document
+/// that fails is logged and treated as no policy.
+async fn policies_of(background: &Background, tenant: &TenantId) -> Vec<RetentionPolicy> {
+    let rows = match background
+        .controls
+        .open(tenant)
+        .rows(Table::RetentionPolicies)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%tenant, error = %error, "retention policies not read");
+            return Vec::new();
+        }
+    };
+    let (policies, bad) = tessera_eval::rule::decode_rows::<RetentionPolicy>(&rows);
+    for problem in bad {
+        tracing::warn!(%tenant, problem, "retention policy does not decode");
+    }
+    policies.into_iter().filter(|p| p.enabled).collect()
 }
 
 /// Collects adopted segments of every writer log in the store.

@@ -17,9 +17,10 @@ use tessera_format::layout::SERVICE;
 use tessera_manifest::{LayoutRecord, Manifest};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::event::{EVENT_ID, NAME, PATTERN_ID};
-use tessera_types::{Env, FileId, FileMeta, FileSource, Kind, Meter, PartitionId, Stored};
+use tessera_types::{Env, FileId, FileMeta, FileSource, Kind, Level, Meter, PartitionId, Stored};
 
 use crate::plan::Job;
+use crate::retention::{self, Retain};
 use crate::{CompactError, patterns, promote};
 
 /// Runs compaction jobs against the pools.
@@ -160,6 +161,7 @@ impl Compactor {
         manifest: &Manifest,
         job: &Job,
         record: &LayoutRecord,
+        retain: Option<&Retain>,
     ) -> Result<Outcome, CompactError> {
         let mut batches = Vec::new();
         for input in &job.inputs {
@@ -175,8 +177,17 @@ impl Compactor {
         wanted.extend(record.sort_key.iter().filter(|c| is_path(c)).cloned());
         let format = Arc::clone(&self.format);
         let partition = job.partition.clone();
+        let retain = retain.filter(|_| job.level == Level::L3).cloned();
         let (written, duplicates, stored) = tokio::task::spawn_blocking(move || {
             let (rows, duplicates) = deduplicate(&batches)?;
+            let rows = match &retain {
+                Some(retain) => {
+                    let (rows, applied) = retention::apply(&rows, partition.kind, retain)?;
+                    tracing::info!(partition = %partition, ?applied, "retention applied");
+                    rows
+                }
+                None => rows,
+            };
             let (rows, _) = promote::promote(&rows, &wanted, promote::MAX_DEDICATED)?;
             let (rows, templates) = if partition.kind == Kind::Log {
                 patterns::assign(&rows)?

@@ -125,6 +125,9 @@ pub struct Outcome {
     pub adopt: Option<LayoutRecord>,
     /// The partition window to set for new partitions.
     pub window: Duration,
+    /// The value score (section 13.3): the decayed bytes the workload
+    /// read over the bytes stored, zero when nothing is read.
+    pub value_score: f64,
 }
 
 /// The weight of an event `age` old (AD-2).
@@ -163,35 +166,14 @@ pub fn advise(inputs: &Inputs) -> Outcome {
     if let Some(pinned) = &pins.dedicated {
         dedicated.extend(pinned.iter().cloned());
     }
-    let defaults = LayoutRecord::default_for(inputs.kind);
-    let mut bloom: BTreeSet<String> = defaults.bloom.iter().cloned().collect();
-    bloom.extend(bloom_candidates(&weighted));
-    if let Some(pinned) = &pins.bloom {
-        bloom.extend(pinned.iter().cloned());
-    }
-    let mut term: BTreeSet<String> = defaults.term.iter().cloned().collect();
-    let mut trigram: BTreeSet<String> = defaults.trigram.iter().cloned().collect();
-    for (column, op) in weighted
-        .iter()
-        .flat_map(|w| w.observation.predicates.iter())
-    {
-        match op.as_str() {
-            "search" => {
-                term.insert(column.clone());
-            }
-            "like" => {
-                trigram.insert(column.clone());
-            }
-            _ => {}
-        }
-    }
+    let (bloom, term, trigram) = indexes(&weighted, inputs.kind, &pins);
     let proposed = LayoutRecord {
         epoch: inputs.current.epoch,
         sort_key: chosen.clone(),
         dedicated: dedicated.into_iter().collect(),
-        bloom: bloom.into_iter().collect(),
-        term: term.into_iter().collect(),
-        trigram: trigram.into_iter().collect(),
+        bloom,
+        term,
+        trigram,
     };
     let same_as_current = layout_matches(&proposed, &inputs.current);
     let streak = match &inputs.previous {
@@ -223,11 +205,60 @@ pub fn advise(inputs: &Inputs) -> Outcome {
         Some(seconds) => Duration::from_secs(seconds.max(60)),
         None => window_for(&inputs.files),
     };
+    let read: f64 = weighted
+        .iter()
+        .map(|w| w.weight * bytes_of(&w.observation))
+        .sum();
+    #[allow(clippy::cast_precision_loss)]
+    let stored: f64 = inputs
+        .files
+        .iter()
+        .map(|f| f.size_bytes as f64)
+        .sum::<f64>()
+        .max(1.0);
     Outcome {
         advice,
         adopt: adopt.then_some(proposed),
         window,
+        value_score: read / stored,
     }
+}
+
+/// The indexes the workload calls for (8.4) on top of the kind's
+/// defaults: Bloom filters for selective equality columns and pins,
+/// term indexes for searched text, trigram indexes for `LIKE`d text.
+fn indexes(
+    weighted: &[Weighted],
+    kind: Kind,
+    pins: &Pins,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let defaults = LayoutRecord::default_for(kind);
+    let mut bloom: BTreeSet<String> = defaults.bloom.iter().cloned().collect();
+    bloom.extend(bloom_candidates(weighted));
+    if let Some(pinned) = &pins.bloom {
+        bloom.extend(pinned.iter().cloned());
+    }
+    let mut term: BTreeSet<String> = defaults.term.iter().cloned().collect();
+    let mut trigram: BTreeSet<String> = defaults.trigram.iter().cloned().collect();
+    for (column, op) in weighted
+        .iter()
+        .flat_map(|w| w.observation.predicates.iter())
+    {
+        match op.as_str() {
+            "search" => {
+                term.insert(column.clone());
+            }
+            "like" => {
+                trigram.insert(column.clone());
+            }
+            _ => {}
+        }
+    }
+    (
+        bloom.into_iter().collect(),
+        term.into_iter().collect(),
+        trigram.into_iter().collect(),
+    )
 }
 
 /// An observation with its decayed weight.
@@ -591,6 +622,11 @@ mod tests {
             LayoutRecord::default_for(Kind::Log).sort_key
         );
         assert!(outcome.adopt.is_none());
+        assert!(
+            outcome.value_score > 0.0 && outcome.value_score < 1.0,
+            "{}",
+            outcome.value_score
+        );
 
         let mut pinned = inputs(workload, None);
         pinned.pins = Some(Pins {
