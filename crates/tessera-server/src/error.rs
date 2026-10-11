@@ -33,6 +33,12 @@ impl ApiError {
         &self.message
     }
 
+    /// The status, for transports that frame errors their own way.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
     /// A malformed request.
     #[must_use]
     pub fn bad_request(message: impl Into<String>) -> Self {

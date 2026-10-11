@@ -16,6 +16,7 @@ tessera-ir.workspace = true
 tessera-kernels.workspace = true
 tessera-logql.workspace = true
 tessera-object.workspace = true
+tessera-promql.workspace = true
 tessera-sql.workspace = true
 tessera-traceql.workspace = true
 tessera-types.workspace = true
@@ -24,6 +25,7 @@ arrow = { version = "60", default-features = false }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
+form_urlencoded = "1"
 futures = "0.3"
 pgwire = { version = "0.41", default-features = false, features = ["server-api", "pg-type-chrono"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "metrics", "trace", "with-serde"] }

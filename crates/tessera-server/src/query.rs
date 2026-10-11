@@ -2,7 +2,9 @@
 
 //! Queries over HTTP: `POST /api/v1/query` with a JSON body
 //! `{"query": "...", "language": "sql", "dataset": "prod"}`. The
-//! language defaults to SQL and the dataset to `default`.
+//! language defaults to SQL and the dataset to `default`. The same
+//! route with a form body is Prometheus' instant query, which the
+//! `prometheus` module answers.
 //!
 //! A query answers `{"columns": [{"name", "type"}], "rows": [[...]]}`;
 //! an `EXPLAIN` answers `{"explain": "..."}`. Timestamps are RFC 3339
@@ -11,7 +13,10 @@
 
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::{HeaderMap, header};
+use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::post;
 use serde::{Deserialize, Serialize};
 use tessera_exec::{Response, explain_text, query};
@@ -56,9 +61,31 @@ enum QueryResponse {
     },
 }
 
-async fn run_query(
-    State(state): State<AppState>,
-    Json(request): Json<QueryRequest>,
+/// Dispatches on the content type: JSON is the native query, anything
+/// else Prometheus' form-encoded instant query.
+async fn run_query(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> HttpResponse {
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("application/json"));
+    if !json {
+        return crate::prometheus::instant_query_raw(&state, &headers, &body).await;
+    }
+    let request: QueryRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return ApiError::bad_request(format!("invalid request: {error}")).into_response();
+        }
+    };
+    match run_native(&state, request).await {
+        Ok(response) => response.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn run_native(
+    state: &AppState,
+    request: QueryRequest,
 ) -> Result<Json<QueryResponse>, ApiError> {
     if request.language != "sql" {
         return Err(ApiError::bad_request(format!(
