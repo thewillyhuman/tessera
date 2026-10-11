@@ -261,7 +261,8 @@ budget, since queries carry no principal; Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a
 query reads their samples, not a rollup; a rollup starts at
-its creation and does not backfill; a query whose range is not aligned
+its creation unless `BACKFILL <interval>` says how far back its first
+rounds reach; a query whose range is not aligned
 to a rollup's windows or reaches past its progress mark reads the raw
 rows whole; narrow integers come back from a rollup as 64-bit.
 

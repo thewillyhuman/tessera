@@ -115,6 +115,8 @@ pub struct CreateRollup {
     pub every: Option<(String, Span)>,
     /// `INTO`, the derived dataset.
     pub target: Option<String>,
+    /// `BACKFILL`, as written: how far back the first rounds reach.
+    pub backfill: Option<(String, Span)>,
     /// The query.
     pub query: Query,
     /// The query's text, as written.

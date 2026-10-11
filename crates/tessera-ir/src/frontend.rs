@@ -280,6 +280,8 @@ pub struct RollupDefinition {
     pub every: Option<Duration>,
     /// `INTO`, the derived dataset, if given.
     pub target: Option<DatasetName>,
+    /// `BACKFILL`, if given: how far back the first rounds reach.
+    pub backfill: Option<Duration>,
     /// The query, as written.
     pub query: String,
     /// The dataset an unqualified table in the query means.

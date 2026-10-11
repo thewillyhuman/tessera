@@ -93,6 +93,7 @@ fn rollup() -> Rollup {
         every_seconds: 60,
         origin: Origin::User,
         enabled: true,
+        backfill_seconds: 0,
     }
 }
 

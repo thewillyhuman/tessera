@@ -89,7 +89,12 @@ pub fn due_windows(
     let window = nanos(rollup.window());
     let closed_until = now.as_nanos().saturating_sub(nanos(LATENESS));
     let last_end = closed_until.div_euclid(window) * window;
-    let mut start = done_through.map_or(last_end - window, Timestamp::as_nanos);
+    // The first round reaches back as far as the backfill says, in whole
+    // windows, the newest closed one at least; later rounds continue.
+    let back = (nanos(rollup.backfill()) / window)
+        .max(1)
+        .saturating_mul(window);
+    let mut start = done_through.map_or(last_end.saturating_sub(back), Timestamp::as_nanos);
     let mut due = Vec::new();
     while start + window <= last_end && due.len() < MAX_WINDOWS_PER_ROUND {
         due.push(TimeRange::new(
@@ -328,6 +333,7 @@ mod tests {
             every_seconds: window_seconds,
             origin: crate::rollup::Origin::User,
             enabled: true,
+            backfill_seconds: 0,
         }
     }
 
@@ -344,6 +350,27 @@ mod tests {
             not_yet,
             [TimeRange::new(at(960), at(1_020))],
             "1080 is inside the lateness"
+        );
+    }
+
+    #[test]
+    fn a_backfill_starts_the_first_round_further_back() {
+        let backfilled = Rollup {
+            backfill_seconds: 300,
+            ..rollup(60)
+        };
+        let due = due_windows(&backfilled, None, at(1_090));
+        assert_eq!(due.len(), 5, "five minutes of whole windows: {due:?}");
+        assert_eq!(due[0], TimeRange::new(at(780), at(840)));
+        assert_eq!(due[4], TimeRange::new(at(1_020), at(1_080)));
+        let partial = Rollup {
+            backfill_seconds: 90,
+            ..rollup(60)
+        };
+        assert_eq!(
+            due_windows(&partial, None, at(1_090)).len(),
+            1,
+            "a backfill shorter than two windows is one window"
         );
     }
 

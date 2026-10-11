@@ -222,6 +222,7 @@ fn lower_rollup(
             name: rollup.name.clone(),
             every: duration(rollup.every.as_ref())?,
             target,
+            backfill: duration(rollup.backfill.as_ref())?,
             query: rollup.query_text.clone(),
             dataset: ctx.dataset.clone(),
         },

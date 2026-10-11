@@ -265,12 +265,14 @@ impl Parser<'_> {
     /// then `AS` and the query.
     fn create_rollup(&mut self) -> Result<CreateRollup, Diagnostic> {
         let (name, _) = self.identifier()?;
-        let (mut every, mut target) = (None, None);
+        let (mut every, mut target, mut backfill) = (None, None, None);
         loop {
             if self.eat_keyword("every") {
                 every = Some(self.duration_text()?);
             } else if self.eat_keyword("into") {
                 target = Some(self.identifier()?.0);
+            } else if self.eat_keyword("backfill") {
+                backfill = Some(self.duration_text()?);
             } else {
                 break;
             }
@@ -286,6 +288,7 @@ impl Parser<'_> {
             name,
             every,
             target,
+            backfill,
             query,
             query_text: self.text[start..end].to_owned(),
         })
@@ -1050,7 +1053,8 @@ const RESERVED: [&str; 22] = [
 
 /// Keywords of `CREATE ALERT` and `CREATE ROLLUP` options and retention
 /// clauses, which end a duration's unit.
-const ALERT_KEYWORDS: [&str; 12] = [
+const ALERT_KEYWORDS: [&str; 13] = [
+    "backfill",
     "except",
     "severity",
     "for",
@@ -1133,7 +1137,7 @@ mod tests {
     #[test]
     fn create_rollup_takes_every_and_into_and_keeps_the_query_text() {
         let Statement::CreateRollup(rollup) = parse(
-            "CREATE ROLLUP errors_by_service EVERY 5m INTO errors_1m AS \
+            "CREATE ROLLUP errors_by_service EVERY 5m INTO errors_1m BACKFILL 7d AS \
              SELECT attr.service AS service, count(*) AS n FROM logs \
              GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
         )
@@ -1143,6 +1147,7 @@ mod tests {
         assert_eq!(rollup.name, "errors_by_service");
         assert_eq!(rollup.every.as_ref().map(|e| e.0.as_str()), Some("5m"));
         assert_eq!(rollup.target.as_deref(), Some("errors_1m"));
+        assert_eq!(rollup.backfill.as_ref().map(|b| b.0.as_str()), Some("7d"));
         assert!(rollup.query_text.starts_with("SELECT attr.service"));
         assert!(rollup.query_text.ends_with("INTERVAL '1 minute')"));
         assert!(parse("CREATE ROLLUP x AS SELECT 1").is_ok());

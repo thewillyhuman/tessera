@@ -48,6 +48,10 @@ pub struct Rollup {
     /// Whether it is maintained and read.
     #[serde(default = "enabled")]
     pub enabled: bool,
+    /// How far back the first rounds reach, in seconds; the newest
+    /// closed window alone when zero.
+    #[serde(default)]
+    pub backfill_seconds: u64,
 }
 
 fn user() -> Origin {
@@ -86,6 +90,7 @@ impl Rollup {
             every_seconds: definition.every.map_or(0, |d| d.as_secs()),
             origin: Origin::User,
             enabled: true,
+            backfill_seconds: definition.backfill.map_or(0, |d| d.as_secs()),
         };
         let shape = rollup.shape(tenant)?;
         if shape.hop.is_some() {
@@ -178,6 +183,12 @@ impl Rollup {
     pub fn every(&self) -> Duration {
         Duration::from_secs(self.every_seconds.max(self.window_seconds).max(1))
     }
+
+    /// How far back the first rounds reach.
+    #[must_use]
+    pub fn backfill(&self) -> Duration {
+        Duration::from_secs(self.backfill_seconds)
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +201,7 @@ mod tests {
             every: None,
             target: None,
             query: query.into(),
+            backfill: None,
             dataset: DatasetName::new("prod").unwrap(),
         }
     }

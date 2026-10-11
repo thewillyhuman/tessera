@@ -163,6 +163,7 @@ async fn propose_rollups(advisor: &Advisor, tenant: &TenantId) -> Result<(), Fai
             every: None,
             target: None,
             query: proposal.sql.clone(),
+            backfill: None,
             dataset: DatasetName::new(&proposal.dataset)?,
         };
         let rollup = match Rollup::from_definition(&definition, tenant) {
