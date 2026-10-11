@@ -343,6 +343,9 @@ pub enum ExprKind {
     Timestamp(String),
     /// `INTERVAL '...'`.
     Interval(String),
+    /// A query parameter `$n`, numbered from 1, that the client binds a
+    /// value to before the statement runs.
+    Parameter(usize),
     /// A binary operation.
     Binary {
         /// The operator.

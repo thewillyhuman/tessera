@@ -24,6 +24,9 @@ pub enum Token {
     String(String),
     /// Punctuation or an operator.
     Symbol(&'static str),
+    /// A query parameter `$n`, numbered from 1 in the order the client
+    /// binds values.
+    Parameter(usize),
 }
 
 /// A token and where it came from.
@@ -87,6 +90,25 @@ pub fn tokenize(text: &str) -> Result<Vec<Spanned>, Diagnostic> {
                 token: Token::Number(text[start..i].to_owned()),
                 span: Span::new(start, i),
             });
+            continue;
+        }
+        if c == b'$' {
+            let mut end = i + 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let number = text[i + 1..end].parse::<usize>().ok().filter(|n| *n > 0);
+            let Some(number) = number else {
+                return Err(Diagnostic::at(
+                    Span::new(start, end),
+                    "a parameter is $1, $2, ... in the order of binding",
+                ));
+            };
+            tokens.push(Spanned {
+                token: Token::Parameter(number),
+                span: Span::new(start, end),
+            });
+            i = end;
             continue;
         }
         if c.is_ascii_alphabetic() || c == b'_' {
@@ -227,5 +249,32 @@ mod tests {
         assert_eq!(error.span, Some(Span::new(7, 12)));
         let error = tokenize("a # b").unwrap_err();
         assert_eq!(error.span, Some(Span::new(2, 3)));
+    }
+
+    #[test]
+    fn parameters_are_numbered_from_one() {
+        assert_eq!(
+            tokens("x = $1 AND y < $12"),
+            vec![
+                Token::Ident {
+                    name: "x".into(),
+                    quoted: false
+                },
+                Token::Symbol("="),
+                Token::Parameter(1),
+                Token::Ident {
+                    name: "and".into(),
+                    quoted: false
+                },
+                Token::Ident {
+                    name: "y".into(),
+                    quoted: false
+                },
+                Token::Symbol("<"),
+                Token::Parameter(12),
+            ]
+        );
+        assert!(tokenize("x = $0").is_err(), "parameters start at $1");
+        assert!(tokenize("x = $").is_err(), "a bare dollar is nothing");
     }
 }

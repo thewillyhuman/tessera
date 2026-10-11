@@ -32,7 +32,7 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldInfo, QueryResponse,
     Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, METADATA_DATABASE, PgWireServerHandlers, Type};
 use pgwire::api::{PgWireConnectionState, PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -42,10 +42,10 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::{TlsAcceptor, process_socket};
 use tessera_catalog::Principal;
 use tessera_exec::{QueryError, RunOptions, explain_text, query};
-use tessera_ir::{BindContext, Frontend, Plan, Statement};
+use tessera_ir::{BindContext, Plan, Statement};
 use tessera_opt::optimize;
-use tessera_sql::SqlFrontend;
-use tessera_types::{DatasetName, TenantId};
+use tessera_sql::{BoundSql, Parameter};
+use tessera_types::{DatasetName, TenantId, Timestamp};
 use tokio::net::TcpListener;
 
 use crate::AppState;
@@ -53,7 +53,57 @@ use crate::AppState;
 /// The handlers of one node.
 pub struct PgServer {
     state: AppState,
-    parser: Arc<NoopQueryParser>,
+    parser: Arc<Parser>,
+}
+
+/// A statement as the extended protocol stores it: its text, and the
+/// parameter types the client declared, none where it left them to
+/// the server.
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    text: String,
+    declared: Vec<Option<Type>>,
+}
+
+/// Keeps the text and the declared parameter types; the handlers
+/// describe statements themselves, with the client's context.
+#[derive(Debug, Default)]
+pub struct Parser;
+
+#[async_trait]
+impl QueryParser for Parser {
+    type Statement = Prepared;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Option<Prepared>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(Some(Prepared {
+            text: sql.to_owned(),
+            declared: types.to_vec(),
+        }))
+    }
+
+    fn get_parameter_types(&self, statement: &Prepared) -> PgWireResult<Vec<Type>> {
+        Ok(statement
+            .declared
+            .iter()
+            .map(|declared| declared.clone().unwrap_or(Type::UNKNOWN))
+            .collect())
+    }
+
+    fn get_result_schema(
+        &self,
+        _statement: &Prepared,
+        _column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        Ok(Vec::new())
+    }
 }
 
 impl PgServer {
@@ -62,8 +112,34 @@ impl PgServer {
     pub fn new(state: AppState) -> Arc<Self> {
         Arc::new(PgServer {
             state,
-            parser: Arc::new(NoopQueryParser::new()),
+            parser: Arc::new(Parser),
         })
+    }
+
+    /// `prepared` with its parameters unbound: the type of each, what
+    /// the client declared, else what the statement implies, else text;
+    /// and the statement, none for one that only concerns the session.
+    async fn lower_unbound<C: ClientInfo>(
+        &self,
+        client: &C,
+        prepared: &Prepared,
+    ) -> PgWireResult<(Vec<Type>, Option<Statement>)> {
+        if session_statement(&prepared.text).is_some() {
+            return Ok((Vec::new(), None));
+        }
+        let (ctx, _) = self.context(client).await?;
+        let described = tessera_sql::describe(&prepared.text, &ctx)
+            .map_err(|e| query_error(&QueryError::Syntax(e), &prepared.text))?;
+        let types = described
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(i, inferred)| match prepared.declared.get(i) {
+                Some(Some(declared)) if *declared != Type::UNKNOWN => declared.clone(),
+                _ => inferred.as_ref().map_or(Type::TEXT, pg_type),
+            })
+            .collect();
+        Ok((types, Some(described.statement)))
     }
 
     /// The principal of a connection: the key it gave as its password,
@@ -95,12 +171,14 @@ impl PgServer {
         Ok((ctx, principal))
     }
 
-    /// Runs `text` and encodes the result in `format`.
+    /// Runs `text` with its `$n` parameters bound to `parameters` and
+    /// encodes the result in `format`.
     async fn execute<C: ClientInfo>(
         &self,
         client: &C,
         text: &str,
         format: &Format,
+        parameters: Vec<Parameter>,
     ) -> PgWireResult<Response> {
         if let Some(tag) = session_statement(text) {
             return Ok(Response::Execution(Tag::new(tag)));
@@ -116,7 +194,8 @@ impl PgServer {
             limits: Some(crate::params::limits(&self.state, &ctx.tenant)),
             ..RunOptions::default()
         };
-        let response = query::run_with(&self.state.engine, &SqlFrontend, text, &ctx, options)
+        let frontend = BoundSql { parameters };
+        let response = query::run_with(&self.state.engine, &frontend, text, &ctx, options)
             .await
             .map_err(|e| query_error(&e, text))?;
         match response {
@@ -172,24 +251,18 @@ impl PgServer {
         }
     }
 
-    /// The row description of `text` without running it.
-    async fn describe<C: ClientInfo>(
+    /// The row description of `statement`, lowered from `text`, without
+    /// running it.
+    fn fields_of(
         &self,
-        client: &C,
+        statement: Option<Statement>,
         text: &str,
         format: &Format,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        if session_statement(text).is_some() {
-            return Ok(Vec::new());
-        }
-        let (ctx, _) = self.context(client).await?;
-        let statement = SqlFrontend
-            .lower(text, &ctx)
-            .map_err(|e| query_error(&QueryError::Syntax(e), text))?;
         let plan: Plan = match statement {
-            Statement::Query(plan) => plan,
-            Statement::Control(_) => return Ok(Vec::new()),
-            Statement::Explain { .. } => {
+            Some(Statement::Query(plan)) => plan,
+            None | Some(Statement::Control(_)) => return Ok(Vec::new()),
+            Some(Statement::Explain { .. }) => {
                 return Ok(vec![FieldInfo::new(
                     "QUERY PLAN".into(),
                     None,
@@ -360,7 +433,7 @@ impl SimpleQueryHandler for PgServer {
         let mut responses = Vec::new();
         for statement in query.split(';').filter(|s| !s.trim().is_empty()) {
             responses.push(
-                self.execute(client, statement, &Format::UnifiedText)
+                self.execute(client, statement, &Format::UnifiedText, Vec::new())
                     .await?,
             );
         }
@@ -373,8 +446,8 @@ impl SimpleQueryHandler for PgServer {
 
 #[async_trait]
 impl ExtendedQueryHandler for PgServer {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type Statement = Prepared;
+    type QueryParser = Parser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::clone(&self.parser)
@@ -389,10 +462,14 @@ impl ExtendedQueryHandler for PgServer {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        let prepared = &portal.statement.statement;
+        let (types, _) = self.lower_unbound(client, prepared).await?;
+        let parameters = bind(portal, &types)?;
         self.execute(
             client,
-            &portal.statement.statement,
+            &prepared.text,
             &portal.result_column_format,
+            parameters,
         )
         .await
     }
@@ -405,10 +482,10 @@ impl ExtendedQueryHandler for PgServer {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let fields = self
-            .describe(client, &statement.statement, &Format::UnifiedBinary)
-            .await?;
-        Ok(DescribeStatementResponse::new(Vec::new(), fields))
+        let prepared = &statement.statement;
+        let (types, lowered) = self.lower_unbound(client, prepared).await?;
+        let fields = self.fields_of(lowered, &prepared.text, &Format::UnifiedBinary)?;
+        Ok(DescribeStatementResponse::new(types, fields))
     }
 
     async fn do_describe_portal<C>(
@@ -419,15 +496,68 @@ impl ExtendedQueryHandler for PgServer {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let fields = self
-            .describe(
-                client,
-                &portal.statement.statement,
-                &portal.result_column_format,
-            )
-            .await?;
+        let prepared = &portal.statement.statement;
+        let (_, lowered) = self.lower_unbound(client, prepared).await?;
+        let fields = self.fields_of(lowered, &prepared.text, &portal.result_column_format)?;
         Ok(DescribePortalResponse::new(fields))
     }
+}
+
+/// The values a portal binds, read in `types`, one per parameter.
+fn bind(portal: &Portal<Prepared>, types: &[Type]) -> PgWireResult<Vec<Parameter>> {
+    if portal.parameters.len() != types.len() {
+        return Err(user_error(
+            "08P01",
+            format!(
+                "bind message supplies {} parameters, but the statement requires {}",
+                portal.parameters.len(),
+                types.len()
+            ),
+        ));
+    }
+    types
+        .iter()
+        .enumerate()
+        .map(|(index, pg_type)| parameter(portal, index, pg_type))
+        .collect()
+}
+
+/// The parameter at `index`, read as `pg_type` in the portal's format:
+/// booleans, integers, floats, timestamps and text; a null is a null.
+fn parameter(portal: &Portal<Prepared>, index: usize, pg_type: &Type) -> PgWireResult<Parameter> {
+    let value = match pg_type.name() {
+        "bool" => portal
+            .parameter::<bool>(index, pg_type)?
+            .map(Parameter::Bool),
+        "int2" => portal
+            .parameter::<i16>(index, pg_type)?
+            .map(|v| Parameter::Int(i64::from(v))),
+        "int4" => portal
+            .parameter::<i32>(index, pg_type)?
+            .map(|v| Parameter::Int(i64::from(v))),
+        "int8" => portal.parameter::<i64>(index, pg_type)?.map(Parameter::Int),
+        "float4" => portal
+            .parameter::<f32>(index, pg_type)?
+            .map(|v| Parameter::Float(f64::from(v))),
+        "float8" => portal
+            .parameter::<f64>(index, pg_type)?
+            .map(Parameter::Float),
+        "timestamp" | "timestamptz" => portal
+            .parameter::<SystemTime>(index, pg_type)?
+            .map(|t| Parameter::Timestamp(Timestamp::from_system_time(t))),
+        "text" | "varchar" | "bpchar" | "name" | "unknown" => portal
+            .parameter::<String>(index, pg_type)?
+            .map(Parameter::Text),
+        other => {
+            return Err(user_error(
+                "0A000",
+                format!(
+                    "parameters of type {other} are not supported; cast the value in the query"
+                ),
+            ));
+        }
+    };
+    Ok(value.unwrap_or(Parameter::Null))
 }
 
 /// The connection metadata entry that holds the key a client gave.
@@ -726,6 +856,79 @@ mod tests {
         );
         let error = client.simple_query("SELEC 1").await.unwrap_err();
         assert_eq!(error.as_db_error().unwrap().code().code(), "42601");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn parameters_bind_over_the_extended_protocol() {
+        let (address, server) = node().await;
+        let client = connect(address, "prod").await;
+
+        // Text against a text column.
+        let rows = client
+            .query("SELECT body FROM logs WHERE body = $1", &[&"second"])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let body: String = rows[0].get(0);
+        assert_eq!(body, "second");
+
+        // A timestamp against the timestamp column, inferred for the
+        // client, which then sends it in binary.
+        let since = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let rows = client
+            .query(
+                "SELECT body FROM logs WHERE timestamp > $1 ORDER BY timestamp",
+                &[&since],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "the two rows after the epoch second");
+
+        // A cast says the type; the value is computed with.
+        let row = client
+            .query_one("SELECT $1::int + 1 AS n FROM logs LIMIT 1", &[&41i64])
+            .await
+            .unwrap();
+        let n: i64 = row.get(0);
+        assert_eq!(n, 42);
+
+        // A declared type wins over inference, and a null binds as NULL.
+        let statement = client
+            .prepare_typed(
+                "SELECT count(*) AS n FROM logs WHERE body = $1 OR $2 IS NULL",
+                &[
+                    tokio_postgres::types::Type::TEXT,
+                    tokio_postgres::types::Type::INT8,
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            statement.params(),
+            &[
+                tokio_postgres::types::Type::TEXT,
+                tokio_postgres::types::Type::INT8
+            ]
+        );
+        let row = client
+            .query_one(&statement, &[&"nothing", &None::<i64>])
+            .await
+            .unwrap();
+        let n: f64 = row.get(0);
+        assert!(
+            (n - 3.0).abs() < f64::EPSILON,
+            "NULL IS NULL keeps every row"
+        );
+
+        // Too few values is the client's error, caught before the query.
+        let refused = client
+            .query(
+                "SELECT body FROM logs WHERE body = $1 AND $2 IS NULL",
+                &[&"x"],
+            )
+            .await;
+        assert!(refused.is_err());
         server.abort();
     }
 }

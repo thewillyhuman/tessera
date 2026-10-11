@@ -9,6 +9,7 @@
 //! expression, an aggregate, or an expression over those, as in
 //! `PostgreSQL`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -32,35 +33,76 @@ use crate::ast;
 /// The first name, function or literal that cannot be resolved, with its
 /// position.
 pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement, Diagnostic> {
+    lower_with(statement, ctx, &Parameters::Bound(&[]))
+}
+
+/// A value bound to a `$n` parameter, as a client sends it.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Parameter {
+    /// SQL `NULL`.
+    Null,
+    /// A boolean.
+    Bool(bool),
+    /// An integer.
+    Int(i64),
+    /// A floating-point number.
+    Float(f64),
+    /// Text; against a timestamp column it reads as a timestamp, as a
+    /// text literal does.
+    Text(String),
+    /// A timestamp.
+    Timestamp(Timestamp),
+}
+
+impl Parameter {
+    /// The literal the parameter stands for.
+    fn literal(&self) -> Literal {
+        match self {
+            Parameter::Null => Literal::Null,
+            Parameter::Bool(b) => Literal::from(*b),
+            Parameter::Int(i) => Literal::from(*i),
+            Parameter::Float(f) => Literal::from(*f),
+            Parameter::Text(t) => Literal::from(t.as_str()),
+            Parameter::Timestamp(t) => Literal::from(*t),
+        }
+    }
+}
+
+/// How `$n` parameters are read while lowering.
+#[derive(Debug)]
+pub enum Parameters<'a> {
+    /// Each stands for the value at its position.
+    Bound(&'a [Parameter]),
+    /// None has a value yet: a client is asking what types the
+    /// statement takes. Each lowers as a null and the type of what it
+    /// is compared with or cast to is recorded at its position.
+    Inferring(RefCell<Vec<Option<DataType>>>),
+}
+
+/// Lowers `statement` with its `$n` parameters read as `parameters` say.
+///
+/// # Errors
+///
+/// As [`lower`], and when a parameter has no value.
+pub fn lower_with(
+    statement: &ast::Statement,
+    ctx: &BindContext,
+    parameters: &Parameters,
+) -> Result<Statement, Diagnostic> {
     let registry = Registry::builtin();
     match statement {
-        ast::Statement::Select(query) => Ok(Statement::Query(lower_query(query, ctx, &registry)?)),
+        ast::Statement::Select(query) => Ok(Statement::Query(lower_query(
+            query, ctx, &registry, parameters,
+        )?)),
         ast::Statement::Explain { analyze, query } => Ok(Statement::Explain {
-            plan: lower_query(query, ctx, &registry)?,
+            plan: lower_query(query, ctx, &registry, parameters)?,
             analyze: *analyze,
         }),
-        ast::Statement::CreateAlert(alert) => {
-            // The query must be one the engine can run before the rule
-            // is stored.
-            lower_query(&alert.query, ctx, &registry)?;
-            Ok(Statement::Control(ControlStatement::CreateAlert(
-                AlertDefinition {
-                    name: alert.name.clone(),
-                    severity: alert.severity.clone(),
-                    hold: duration(alert.hold.as_ref())?,
-                    every: duration(alert.every.as_ref())?,
-                    notify: alert.notify.clone(),
-                    labels: alert.labels.clone(),
-                    annotations: alert.annotations.clone(),
-                    query: alert.query_text.clone(),
-                    dataset: ctx.dataset.clone(),
-                },
-            )))
-        }
+        ast::Statement::CreateAlert(alert) => lower_alert(alert, ctx, &registry, parameters),
         ast::Statement::DropAlert { name } => Ok(Statement::Control(ControlStatement::DropAlert {
             name: name.clone(),
         })),
-        ast::Statement::CreateRollup(rollup) => lower_rollup(rollup, ctx, &registry),
+        ast::Statement::CreateRollup(rollup) => lower_rollup(rollup, ctx, &registry, parameters),
         ast::Statement::DropRollup { name } => {
             Ok(Statement::Control(ControlStatement::DropRollup {
                 name: name.clone(),
@@ -121,7 +163,14 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
             table,
             filter,
             filter_text,
-        } => lower_delete(table, filter.as_ref(), filter_text, ctx, &registry),
+        } => lower_delete(
+            table,
+            filter.as_ref(),
+            filter_text,
+            ctx,
+            &registry,
+            parameters,
+        ),
     }
 }
 
@@ -134,6 +183,7 @@ fn lower_delete(
     filter_text: &str,
     ctx: &BindContext,
     registry: &Registry,
+    parameters: &Parameters,
 ) -> Result<Statement, Diagnostic> {
     own_tenant(table)?;
     if table.dataset.as_deref() == Some("system") {
@@ -156,6 +206,7 @@ fn lower_delete(
     let lowerer = Lowerer {
         ctx,
         registry,
+        parameters,
         scope: Scope::single(TableScope {
             name: table.table.clone(),
             schema: event::schema(kind),
@@ -202,14 +253,39 @@ fn equalities_of(filter: &ast::Expr) -> Result<Vec<(String, ast::Expr)>, Diagnos
     }
 }
 
+/// `CREATE ALERT`: the query must be one the engine can run before the
+/// rule is stored.
+fn lower_alert(
+    alert: &ast::CreateAlert,
+    ctx: &BindContext,
+    registry: &Registry,
+    parameters: &Parameters,
+) -> Result<Statement, Diagnostic> {
+    lower_query(&alert.query, ctx, registry, parameters)?;
+    Ok(Statement::Control(ControlStatement::CreateAlert(
+        AlertDefinition {
+            name: alert.name.clone(),
+            severity: alert.severity.clone(),
+            hold: duration(alert.hold.as_ref())?,
+            every: duration(alert.every.as_ref())?,
+            notify: alert.notify.clone(),
+            labels: alert.labels.clone(),
+            annotations: alert.annotations.clone(),
+            query: alert.query_text.clone(),
+            dataset: ctx.dataset.clone(),
+        },
+    )))
+}
+
 /// `CREATE ROLLUP`: the query must be one the engine can run, and the
 /// target a dataset name, before the rollup is stored.
 fn lower_rollup(
     rollup: &ast::CreateRollup,
     ctx: &BindContext,
     registry: &Registry,
+    parameters: &Parameters,
 ) -> Result<Statement, Diagnostic> {
-    lower_query(&rollup.query, ctx, registry)?;
+    lower_query(&rollup.query, ctx, registry, parameters)?;
     let target = match &rollup.target {
         Some(name) => Some(
             DatasetName::new(name)
@@ -539,6 +615,7 @@ struct Substitution {
 struct Lowerer<'a> {
     ctx: &'a BindContext,
     registry: &'a Registry,
+    parameters: &'a Parameters<'a>,
     scope: Scope,
     substitution: Option<Substitution>,
 }
@@ -547,11 +624,12 @@ fn lower_query(
     query: &ast::Query,
     ctx: &BindContext,
     registry: &Registry,
+    parameters: &Parameters,
 ) -> Result<Plan, Diagnostic> {
     let Some(from) = &query.from else {
-        return lower_constant_query(query, ctx, registry);
+        return lower_constant_query(query, ctx, registry, parameters);
     };
-    let (table, mut plan) = source(from, ctx, registry)?;
+    let (table, mut plan) = source(from, ctx, registry, parameters)?;
     let mut scope = Scope::single(table);
     if let [_, second, ..] = query.joins.as_slice() {
         return Err(Diagnostic::at(
@@ -560,7 +638,7 @@ fn lower_query(
         ));
     }
     if let Some(join) = query.joins.first() {
-        let (right, right_plan) = source(&join.table, ctx, registry)?;
+        let (right, right_plan) = source(&join.table, ctx, registry, parameters)?;
         if scope.table(&right.name).is_some() {
             return Err(Diagnostic::at(
                 join.table.span,
@@ -576,6 +654,7 @@ fn lower_query(
         let lowerer = Lowerer {
             ctx,
             registry,
+            parameters,
             scope,
             substitution: None,
         };
@@ -594,6 +673,7 @@ fn lower_query(
     let mut lowerer = Lowerer {
         ctx,
         registry,
+        parameters,
         scope,
         substitution: None,
     };
@@ -618,9 +698,10 @@ fn source(
     from: &ast::TableRef,
     ctx: &BindContext,
     registry: &Registry,
+    parameters: &Parameters,
 ) -> Result<(TableScope, Plan), Diagnostic> {
     if let Some(query) = &from.subquery {
-        let plan = lower_query(query, ctx, registry)?;
+        let plan = lower_query(query, ctx, registry, parameters)?;
         let schema = plan
             .schema(registry)
             .map_err(|e| Diagnostic::at(from.span, e.to_string()))?;
@@ -869,10 +950,12 @@ fn lower_constant_query(
     query: &ast::Query,
     ctx: &BindContext,
     registry: &Registry,
+    parameters: &Parameters,
 ) -> Result<Plan, Diagnostic> {
     let lowerer = Lowerer {
         ctx,
         registry,
+        parameters,
         scope: Scope::empty(),
         substitution: None,
     };
@@ -1000,6 +1083,40 @@ fn apply_limit(plan: Plan, query: &ast::Query) -> Plan {
 
 fn timestamp_type() -> DataType {
     DataType::Timestamp(TimeUnit::Nanosecond, None)
+}
+
+/// The type a literal has on its own; none for a null or a duration,
+/// which no parameter carries.
+fn literal_type(literal: &Literal) -> Option<DataType> {
+    Some(match literal {
+        Literal::Bool(_) => DataType::Boolean,
+        Literal::Int(_) => DataType::Int64,
+        Literal::Float(_) => DataType::Float64,
+        Literal::Text(_) => DataType::Utf8,
+        Literal::Timestamp(_) => timestamp_type(),
+        Literal::Null | Literal::Duration(_) | Literal::Bytes(_) => return None,
+    })
+}
+
+/// Lowers `statement` with its `$n` parameters unbound, each read as a
+/// null, and tells the types they take, by position, from the columns
+/// they are compared with or the types they are cast to; none where
+/// nothing says. This is what a client asking about a statement before
+/// binding it needs.
+///
+/// # Errors
+///
+/// As [`lower`], short of the unbound parameters.
+pub fn describe(
+    statement: &ast::Statement,
+    ctx: &BindContext,
+) -> Result<(Statement, Vec<Option<DataType>>), Diagnostic> {
+    let parameters = Parameters::Inferring(RefCell::new(Vec::new()));
+    let lowered = lower_with(statement, ctx, &parameters)?;
+    let Parameters::Inferring(types) = parameters else {
+        unreachable!("inferring parameters stay inferring")
+    };
+    Ok((lowered, types.into_inner()))
 }
 
 impl Lowerer<'_> {
@@ -1291,6 +1408,7 @@ impl Lowerer<'_> {
             ast::ExprKind::Interval(text) => interval(text)
                 .map(Expr::literal)
                 .ok_or_else(|| Diagnostic::at(expr.span, format!("invalid interval {text:?}"))),
+            ast::ExprKind::Parameter(n) => self.parameter(*n, expr.span),
             ast::ExprKind::Binary { op, left, right } => self.binary(*op, left, right),
             ast::ExprKind::Not(inner) => Ok(Expr::Not(Box::new(self.expr(inner)?))),
             ast::ExprKind::Negate(inner) => match self.expr(inner)? {
@@ -1317,21 +1435,7 @@ impl Lowerer<'_> {
                 expr: tested,
                 list,
                 negated,
-            } => {
-                let tested = self.expr(tested)?;
-                let list = list
-                    .iter()
-                    .map(|item| match self.expr(item)? {
-                        Expr::Literal(literal) => Ok(self.coerce_literal(&tested, literal)),
-                        _ => Err(Diagnostic::at(item.span, "IN needs constant values")),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Expr::InList {
-                    expr: Box::new(tested),
-                    list,
-                    negated: *negated,
-                })
-            }
+            } => self.in_list(tested, list, *negated),
             ast::ExprKind::Between {
                 expr: tested,
                 low,
@@ -1355,12 +1459,99 @@ impl Lowerer<'_> {
             ast::ExprKind::Cast {
                 expr: inner,
                 type_name,
-            } => Ok(Expr::Cast {
-                expr: Box::new(self.expr(inner)?),
-                to: data_type(type_name).ok_or_else(|| {
+            } => {
+                let to = data_type(type_name).ok_or_else(|| {
                     Diagnostic::at(expr.span, format!("unknown type {type_name}"))
-                })?,
-            }),
+                })?;
+                self.infer_as(inner, to.clone());
+                Ok(Expr::Cast {
+                    expr: Box::new(self.expr(inner)?),
+                    to,
+                })
+            }
+        }
+    }
+
+    /// `tested [NOT] IN (list)`: the list is constants, read in the
+    /// tested expression's type as literals are.
+    fn in_list(
+        &self,
+        tested: &ast::Expr,
+        list: &[ast::Expr],
+        negated: bool,
+    ) -> Result<Expr, Diagnostic> {
+        let tested = self.expr(tested)?;
+        for item in list {
+            self.infer(item, &tested);
+        }
+        let list = list
+            .iter()
+            .map(|item| match self.expr(item)? {
+                Expr::Literal(literal) => Ok(self.coerce_literal(&tested, literal)),
+                _ => Err(Diagnostic::at(item.span, "IN needs constant values")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Expr::InList {
+            expr: Box::new(tested),
+            list,
+            negated,
+        })
+    }
+
+    /// `$n`: the value bound at `n`, or, while types are inferred, a
+    /// null whose position is noted.
+    fn parameter(&self, n: usize, span: Span) -> Result<Expr, Diagnostic> {
+        let index = n.saturating_sub(1);
+        match self.parameters {
+            Parameters::Bound(values) => values
+                .get(index)
+                .map(|value| Expr::Literal(value.literal()))
+                .ok_or_else(|| {
+                    Diagnostic::at(
+                        span,
+                        format!(
+                            "parameter ${n} is not bound: {} value(s) were given",
+                            values.len()
+                        ),
+                    )
+                }),
+            Parameters::Inferring(types) => {
+                let mut types = types.borrow_mut();
+                if types.len() < n {
+                    types.resize(n, None);
+                }
+                Ok(Expr::Literal(Literal::Null))
+            }
+        }
+    }
+
+    /// Notes the type `parameter`, if it is a `$n`, takes from `other`,
+    /// the expression it meets: a column's or a literal's type.
+    fn infer(&self, parameter: &ast::Expr, other: &Expr) {
+        let inferred = match other {
+            Expr::Literal(literal) => literal_type(literal),
+            _ => self.target_type(other),
+        };
+        if let Some(inferred) = inferred {
+            self.infer_as(parameter, inferred);
+        }
+    }
+
+    /// Notes that `parameter`, if it is a `$n`, has `data_type`; the
+    /// first note wins.
+    fn infer_as(&self, parameter: &ast::Expr, data_type: DataType) {
+        let (ast::ExprKind::Parameter(n), Parameters::Inferring(types)) =
+            (&parameter.kind, self.parameters)
+        else {
+            return;
+        };
+        let mut types = types.borrow_mut();
+        if types.len() < *n {
+            types.resize(*n, None);
+        }
+        let slot = &mut types[n - 1];
+        if slot.is_none() {
+            *slot = Some(data_type);
         }
     }
 
@@ -1442,8 +1633,11 @@ impl Lowerer<'_> {
             ast::BinaryOp::Div => BinaryOp::Div,
             ast::BinaryOp::Rem => BinaryOp::Rem,
         };
+        let (left_syntax, right_syntax) = (left, right);
         let mut left = self.expr(left)?;
         let mut right = self.expr(right)?;
+        self.infer(left_syntax, &right);
+        self.infer(right_syntax, &left);
         if op.is_comparison() {
             // A text literal against a timestamp column is a timestamp, as
             // PostgreSQL reads an untyped literal in the column's type.
@@ -1460,19 +1654,24 @@ impl Lowerer<'_> {
     /// `literal` read in the type of `target` where SQL would: text as a
     /// timestamp against a timestamp column.
     fn coerce_literal(&self, target: &Expr, literal: Literal) -> Literal {
-        let target_type = match target {
+        match (&literal, self.target_type(target)) {
+            (Literal::Text(text), Some(t)) if t == timestamp_type() => text
+                .parse::<Timestamp>()
+                .map_or(literal, Literal::Timestamp),
+            _ => literal,
+        }
+    }
+
+    /// The type a literal compared with `target` is read in: a column's
+    /// type, or a cast's.
+    fn target_type(&self, target: &Expr) -> Option<DataType> {
+        match target {
             Expr::Column(name) => self
                 .scope
                 .column_type(name)
                 .or_else(|| self.substituted_type(name)),
             Expr::Cast { to, .. } => Some(to.clone()),
             _ => None,
-        };
-        match (&literal, target_type) {
-            (Literal::Text(text), Some(t)) if t == timestamp_type() => text
-                .parse::<Timestamp>()
-                .map_or(literal, Literal::Timestamp),
-            _ => literal,
         }
     }
 
@@ -2328,5 +2527,75 @@ mod tests {
         assert_eq!(interval(""), None);
         assert_eq!(interval("5"), None);
         assert_eq!(interval("x minutes"), None);
+    }
+
+    #[test]
+    fn parameters_bind_to_the_values_given() {
+        let statement =
+            parse("SELECT body FROM logs WHERE body = $1 AND timestamp > $2 AND $3 IS NULL")
+                .unwrap();
+        let values = [
+            Parameter::Text("x".into()),
+            Parameter::Text("2024-01-01".into()),
+            Parameter::Null,
+        ];
+        let plan = match lower_with(&statement, &ctx(), &Parameters::Bound(&values)).unwrap() {
+            Statement::Query(plan) => plan,
+            other => panic!("not a query: {other:?}"),
+        };
+        let Plan::Project { input, .. } = plan else {
+            panic!("{plan:?}")
+        };
+        let Plan::Filter { predicate, .. } = *input else {
+            panic!("{input:?}")
+        };
+        let text = predicate.to_string();
+        assert!(text.contains("body = 'x'"), "{text}");
+        assert!(
+            text.contains("timestamp > TIMESTAMP '2024-01-01T00:00:00Z'"),
+            "text binds as a timestamp against a timestamp column: {text}"
+        );
+        assert!(text.contains("NULL IS NULL"), "{text}");
+    }
+
+    #[test]
+    fn an_unbound_parameter_is_an_error() {
+        let statement = parse("SELECT body FROM logs WHERE body = $2").unwrap();
+        let values = [Parameter::Text("x".into())];
+        let error = lower_with(&statement, &ctx(), &Parameters::Bound(&values)).unwrap_err();
+        assert_eq!(
+            error.message,
+            "parameter $2 is not bound: 1 value(s) were given"
+        );
+        assert!(error.span.is_some(), "the error points at the parameter");
+        assert!(
+            lower(&statement, &ctx()).is_err(),
+            "without values none is bound"
+        );
+    }
+
+    #[test]
+    fn parameter_types_follow_what_they_are_compared_with() {
+        let statement = parse(
+            "SELECT body FROM logs WHERE timestamp > $1 AND body = $2 AND $3::int = 1 \
+             AND severity_number IN ($4, 3) AND $5 = 1.5 AND $6 IS NULL",
+        )
+        .unwrap();
+        let (lowered, types) = describe(&statement, &ctx()).unwrap();
+        assert!(matches!(lowered, Statement::Query(_)));
+        assert_eq!(
+            types,
+            vec![
+                Some(timestamp_type()),
+                Some(DataType::Utf8),
+                Some(DataType::Int64),
+                Some(DataType::Int32),
+                Some(DataType::Float64),
+                None,
+            ]
+        );
+        let constant = parse("SELECT $1 AS t, $2 AS n").unwrap();
+        let (_, types) = describe(&constant, &ctx()).unwrap();
+        assert_eq!(types, vec![None, None], "nothing says what they are");
     }
 }

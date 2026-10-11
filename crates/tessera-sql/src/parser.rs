@@ -51,6 +51,7 @@ fn describe(token: &Token) -> String {
         Token::Number(n) => format!("number {n}"),
         Token::String(s) => format!("string {s:?}"),
         Token::Symbol(s) => format!("{s:?}"),
+        Token::Parameter(n) => format!("${n}"),
     }
 }
 
@@ -963,6 +964,10 @@ impl Parser<'_> {
                 kind: ExprKind::String(s),
                 span,
             }),
+            Token::Parameter(n) => Ok(Expr {
+                kind: ExprKind::Parameter(n),
+                span,
+            }),
             Token::Symbol("(") => {
                 let inner = self.expr()?;
                 let end = self.expect_symbol(")")?;
@@ -1477,5 +1482,23 @@ mod tests {
         assert_eq!(error.message, "unexpected \"extra\" after the statement");
         let error = parse("SELECT (1 FROM logs").unwrap_err();
         assert!(error.message.starts_with("expected \")\""));
+    }
+
+    #[test]
+    fn parameters_are_expressions() {
+        let q = query("SELECT body FROM logs WHERE body = $1 AND n IN ($2, 3)");
+        let filter = q.filter.unwrap();
+        let ExprKind::Binary { left, right, .. } = &filter.kind else {
+            panic!("{filter:?}")
+        };
+        assert!(matches!(
+            &left.kind,
+            ExprKind::Binary { right, .. } if right.kind == ExprKind::Parameter(1)
+        ));
+        assert!(matches!(
+            &right.kind,
+            ExprKind::InList { list, .. } if list[0].kind == ExprKind::Parameter(2)
+        ));
+        assert!(parse("SELECT $ FROM logs").is_err());
     }
 }

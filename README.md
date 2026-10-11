@@ -47,7 +47,8 @@ Gaps left in M2: joins are hash joins on equality keys, inner or left,
 one `JOIN` per query, with the build side's keys as a runtime filter on
 the other side but no `ASOF`, merge or lookup variants; a subquery
 is a derived table in `FROM` only, not a predicate; no window
-functions; no query parameters over the PostgreSQL protocol;
+functions; `$n` parameters bind over the PostgreSQL protocol with
+their types inferred from the columns they meet, but not in `LIMIT`;
 sorts and trace groups spill sorted runs to local disk when their
 memory grant runs out and read them back merged, while aggregates,
 joins and top-k still fail past the grant; pipelines run one plan
