@@ -1122,6 +1122,7 @@ mod tests {
                 range: None,
                 offset: 0,
                 at: None,
+                equal: Vec::new(),
             },
             start: Timestamp::from_nanos(0),
             end: Timestamp::from_nanos(60_000_000_000),

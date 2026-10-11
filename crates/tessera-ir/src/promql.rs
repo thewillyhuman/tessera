@@ -182,6 +182,9 @@ pub enum PromExpr {
         offset: i64,
         /// The evaluation time in nanoseconds, when pinned with `@`.
         at: Option<i64>,
+        /// The selector's equality matchers, which `absent` reports as
+        /// the labels of the missing series.
+        equal: Vec<(String, String)>,
     },
     /// A number.
     Number(f64),
@@ -293,6 +296,7 @@ impl fmt::Display for PromExpr {
                 range,
                 offset,
                 at,
+                ..
             } => {
                 write!(f, "input{input}")?;
                 if let Some(range) = range {
@@ -379,6 +383,7 @@ mod tests {
                 range: Some(Duration::from_secs(300)),
                 offset: 60_000_000_000,
                 at: None,
+                equal: Vec::new(),
             }],
         };
         let expr = PromExpr::Binary {
@@ -397,6 +402,7 @@ mod tests {
                 range: None,
                 offset: 0,
                 at: Some(5),
+                equal: vec![("job".into(), "api".into())],
             }),
             matching: Some(Matching {
                 on: true,
