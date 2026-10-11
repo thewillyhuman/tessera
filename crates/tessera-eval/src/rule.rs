@@ -289,6 +289,56 @@ pub struct Acknowledgment {
     pub comment: String,
 }
 
+/// An inhibition rule (section 11.8), as Alertmanager has them: while
+/// an alert matching the source matchers fires, alerts matching the
+/// target matchers that agree with it on the `equal` labels are not
+/// notified. An alert never inhibits itself.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Inhibition {
+    /// The rule's identifier.
+    pub id: String,
+    /// Labels a firing alert must carry to inhibit.
+    pub source_matchers: BTreeMap<String, String>,
+    /// Labels an alert must carry to be inhibited.
+    pub target_matchers: BTreeMap<String, String>,
+    /// Labels source and target must agree on; one absent on both
+    /// sides agrees.
+    #[serde(default)]
+    pub equal: Vec<String>,
+    /// Why the rule exists.
+    #[serde(default)]
+    pub comment: String,
+}
+
+impl Inhibition {
+    /// The control table the rules live in.
+    pub const TABLE: Table = Table::Inhibitions;
+
+    /// Whether an alert with `labels` is inhibited while the alerts
+    /// with `firing` labels fire.
+    #[must_use]
+    pub fn inhibits(
+        &self,
+        labels: &BTreeMap<String, String>,
+        firing: &[BTreeMap<String, String>],
+    ) -> bool {
+        let matches = |matchers: &BTreeMap<String, String>, labels: &BTreeMap<String, String>| {
+            matchers
+                .iter()
+                .all(|(name, value)| labels.get(name) == Some(value))
+        };
+        matches(&self.target_matchers, labels)
+            && firing.iter().any(|source| {
+                source != labels
+                    && matches(&self.source_matchers, source)
+                    && self
+                        .equal
+                        .iter()
+                        .all(|name| source.get(name) == labels.get(name))
+            })
+    }
+}
+
 impl Acknowledgment {
     /// The table acknowledgments live in.
     pub const TABLE: Table = Table::Acknowledgments;
@@ -320,6 +370,46 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// Section 11.8: a target is held back while a source fires and
+    /// agrees on the equal labels; an alert never inhibits itself.
+    #[test]
+    fn an_inhibition_holds_a_target_behind_a_matching_source() {
+        let rule = Inhibition {
+            id: "db".into(),
+            source_matchers: labels(&[("alertname", "db_down")]),
+            target_matchers: labels(&[("severity", "warning")]),
+            equal: vec!["instance".into()],
+            comment: String::new(),
+        };
+        let target = labels(&[("severity", "warning"), ("instance", "a")]);
+        let source = labels(&[("alertname", "db_down"), ("instance", "a")]);
+        assert!(rule.inhibits(&target, std::slice::from_ref(&source)));
+        let elsewhere = labels(&[("alertname", "db_down"), ("instance", "b")]);
+        assert!(!rule.inhibits(&target, &[elsewhere]), "equal labels differ");
+        assert!(!rule.inhibits(&target, &[]), "nothing fires");
+        let critical = labels(&[("severity", "critical"), ("instance", "a")]);
+        assert!(
+            !rule.inhibits(&critical, &[source]),
+            "target does not match"
+        );
+        let both = labels(&[
+            ("alertname", "db_down"),
+            ("severity", "warning"),
+            ("instance", "a"),
+        ]);
+        assert!(
+            !both.is_empty() && !rule.inhibits(&both, std::slice::from_ref(&both)),
+            "not by itself"
+        );
+    }
 
     #[test]
     fn a_rule_round_trips_with_its_defaults() {

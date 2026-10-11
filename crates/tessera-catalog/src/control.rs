@@ -34,6 +34,8 @@ pub enum Table {
     Silences,
     /// Acknowledgments (section 11.8).
     Acknowledgments,
+    /// Inhibition rules (section 11.8).
+    Inhibitions,
     /// Where notifications go (section 11.9).
     NotificationRoutes,
     /// Retention policies (section 13.3).
@@ -50,11 +52,12 @@ pub enum Table {
 
 impl Table {
     /// Every table.
-    pub const ALL: [Table; 10] = [
+    pub const ALL: [Table; 11] = [
         Table::AlertRules,
         Table::Rollups,
         Table::Silences,
         Table::Acknowledgments,
+        Table::Inhibitions,
         Table::NotificationRoutes,
         Table::RetentionPolicies,
         Table::LayoutPins,
@@ -71,6 +74,7 @@ impl Table {
             Table::Rollups => "rollups",
             Table::Silences => "silences",
             Table::Acknowledgments => "acknowledgments",
+            Table::Inhibitions => "inhibitions",
             Table::NotificationRoutes => "notification_routes",
             Table::RetentionPolicies => "retention_policies",
             Table::LayoutPins => "layout_pins",

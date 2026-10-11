@@ -71,6 +71,8 @@ async fn a_new_owner_resumes_without_repeating_a_transition() {
         routes: &[],
         silences: &[],
         acknowledgments: &[],
+        inhibitions: &[],
+        firing: &[],
     };
     let delivered = second.deliver(&delivery, at(1_011)).await.unwrap();
     assert_eq!(

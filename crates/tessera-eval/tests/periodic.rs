@@ -149,6 +149,8 @@ async fn an_sql_rule_fires_per_group_after_its_hold_and_resolves() {
         routes: &[],
         silences: &[],
         acknowledgments: &[],
+        inhibitions: &[],
+        firing: &[],
     };
     assert_eq!(group.deliver(&delivery, at(1_401)).await.unwrap().events, 3);
     assert!(group.outbox().await.unwrap().is_empty());

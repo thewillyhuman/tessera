@@ -28,7 +28,8 @@ pub use mode::{Mode, mode_of};
 pub use notify::{HttpNotifier, MemoryNotifier, Notification, Notifier, payloads};
 pub use rollup::{Origin, Rollup};
 pub use rule::{
-    Acknowledgment, AlertRule, Language, NotificationRoute, RouteKind, Silence, UnknownLanguage,
+    Acknowledgment, AlertRule, Inhibition, Language, NotificationRoute, RouteKind, Silence,
+    UnknownLanguage,
 };
 pub use sink::{AlertSink, MemorySink};
 pub use state::{EvalState, StateLog};

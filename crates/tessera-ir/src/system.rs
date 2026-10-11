@@ -11,11 +11,12 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 /// The names of the tables, with `alert_instances` among them.
-pub const TABLES: [&str; 11] = [
+pub const TABLES: [&str; 12] = [
     "alert_rules",
     "alert_instances",
     "silences",
     "acknowledgments",
+    "inhibitions",
     "notification_routes",
     "rollups",
     "retention_policies",
@@ -148,6 +149,13 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("fingerprint"),
             time("until"),
             text("by"),
+            text("comment"),
+        ],
+        "inhibitions" => vec![
+            text("id"),
+            text("source_matchers"),
+            text("target_matchers"),
+            text("equal"),
             text("comment"),
         ],
         "notification_routes" => vec![

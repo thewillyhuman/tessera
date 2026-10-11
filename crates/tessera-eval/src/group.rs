@@ -25,7 +25,7 @@ use crate::evaluate::{EvalError, instance_labels, observe};
 use crate::incremental;
 use crate::lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
 use crate::notify::{Notification, Notifier};
-use crate::rule::{Acknowledgment, AlertRule, NotificationRoute, Silence};
+use crate::rule::{Acknowledgment, AlertRule, Inhibition, NotificationRoute, Silence};
 use crate::sink::AlertSink;
 use crate::state::{EvalState, StateLog};
 
@@ -312,7 +312,8 @@ impl RuleGroup {
     /// Delivers the outbox (CQ-15). Every pending transition is written
     /// as an alert event of its rule's dataset (CQ-14); then the firing
     /// and resolved ones go to their rule's routes unless a silence or
-    /// an acknowledgment covers the instance (section 11.8); then each
+    /// an acknowledgment covers the instance or an inhibition rule holds
+    /// it back behind a firing alert (section 11.8); then each
     /// is marked done, except one whose route could not be reached,
     /// which stays for the next delivery. Instances that keep firing
     /// are notified again after their route's repeat interval.
@@ -442,7 +443,7 @@ impl RuleGroup {
     }
 
     /// Tells the rule's routes about `transition`, unless it is not one
-    /// to notify or the instance is silenced or acknowledged.
+    /// to notify or the instance is silenced, acknowledged or inhibited.
     async fn notify(
         &self,
         delivery: &Delivery<'_>,
@@ -468,7 +469,11 @@ impl RuleGroup {
             .acknowledgments
             .iter()
             .any(|a| a.covers(&transition.fingerprint, now));
-        if silenced || acknowledged {
+        let inhibited = delivery
+            .inhibitions
+            .iter()
+            .any(|i| i.inhibits(&transition.labels, delivery.firing));
+        if silenced || acknowledged || inhibited {
             return Outcome::Suppressed;
         }
         let notification = Notification {
@@ -528,6 +533,11 @@ pub struct Delivery<'a> {
     pub silences: &'a [Silence],
     /// The tenant's acknowledgments.
     pub acknowledgments: &'a [Acknowledgment],
+    /// The tenant's inhibition rules.
+    pub inhibitions: &'a [Inhibition],
+    /// The labels of every alert firing in the tenant, across its rule
+    /// groups: what inhibition rules match their sources against.
+    pub firing: &'a [BTreeMap<String, String>],
 }
 
 /// What one delivery did.
@@ -537,7 +547,8 @@ pub struct Delivered {
     pub events: usize,
     /// Transitions notified.
     pub notified: usize,
-    /// Transitions held back by a silence or an acknowledgment.
+    /// Transitions held back by a silence, an acknowledgment or an
+    /// inhibition rule.
     pub suppressed: usize,
     /// Still-firing instances notified again.
     pub repeated: usize,

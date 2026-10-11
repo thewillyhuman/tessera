@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tessera_catalog::{AccessRole, ApiKey, ControlError, ControlStore, Row, Table, Transaction};
-use tessera_eval::{Acknowledgment, AlertRule, NotificationRoute, Rollup, Silence, mode_of};
+use tessera_eval::{
+    Acknowledgment, AlertRule, Inhibition, NotificationRoute, Rollup, Silence, mode_of,
+};
 use tessera_ir::{ControlStatement, Literal};
 use tessera_manifest::{DatasetLog, Tombstone};
 use tessera_types::{DatasetName, Kind, Random, RetentionPolicy, TenantId};
@@ -424,7 +426,7 @@ fn writable(name: &str) -> Result<Table, ApiError> {
 fn key_column(table: Table) -> &'static str {
     match table {
         Table::AlertRules | Table::NotificationRoutes | Table::Roles => "name",
-        Table::Silences | Table::ApiKeys => "id",
+        Table::Silences | Table::Inhibitions | Table::ApiKeys => "id",
         Table::Acknowledgments => "fingerprint",
         Table::Rollups | Table::RetentionPolicies | Table::LayoutPins | Table::SavedQueries => {
             "key"
@@ -453,6 +455,9 @@ fn validate(table: Table, document: &Value) -> Result<(), ApiError> {
         }
         Table::Acknowledgments => {
             serde_json::from_value::<Acknowledgment>(document.clone()).map_err(invalid)?;
+        }
+        Table::Inhibitions => {
+            serde_json::from_value::<Inhibition>(document.clone()).map_err(invalid)?;
         }
         Table::NotificationRoutes => {
             serde_json::from_value::<NotificationRoute>(document.clone()).map_err(invalid)?;
@@ -491,6 +496,7 @@ fn json_columns(table: Table) -> &'static [&'static str] {
     match table {
         Table::AlertRules => &["labels", "annotations", "notify"],
         Table::Silences => &["matchers"],
+        Table::Inhibitions => &["source_matchers", "target_matchers", "equal"],
         Table::ApiKeys => &["roles"],
         Table::Roles => &["read", "write"],
         Table::Acknowledgments | Table::NotificationRoutes => &[],

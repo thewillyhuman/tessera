@@ -18,8 +18,8 @@ use tessera_catalog::{Catalog, ControlStore, ControlStores, Table, TenantStatus}
 use tessera_cluster::Load;
 use tessera_eval::rule::decode_rows;
 use tessera_eval::{
-    Acknowledgment, AlertRule, AlertSink, Delivery, NotificationRoute, Notifier, Rollup, RuleGroup,
-    Silence, maintain,
+    Acknowledgment, AlertRule, AlertSink, Delivery, Inhibition, NotificationRoute, Notifier,
+    Rollup, RuleGroup, Silence, Status, maintain,
 };
 use tessera_exec::Engine;
 use tessera_object::ObjectStore;
@@ -95,6 +95,58 @@ async fn round(evaluator: &Evaluator, groups: &mut Groups) {
     evaluator.load.set_evaluator_lag(lag);
 }
 
+/// The labels of every alert firing in `tenant` across `groups`, from
+/// their state logs: what inhibition rules match their sources against
+/// (section 11.8).
+async fn firing_labels(
+    evaluator: &Evaluator,
+    tenant: &TenantId,
+    groups: &[String],
+) -> Result<Vec<BTreeMap<String, String>>, String> {
+    let mut firing = Vec::new();
+    for group in groups {
+        let log = tessera_eval::state::open(
+            Arc::clone(&evaluator.store),
+            tenant,
+            group,
+            0,
+            evaluator.env.clone(),
+        );
+        let snapshot = log.snapshot().await.map_err(|e| e.to_string())?;
+        firing.extend(
+            snapshot
+                .state()
+                .instances
+                .values()
+                .filter(|i| i.status == Status::Firing)
+                .map(|i| i.labels.clone()),
+        );
+    }
+    Ok(firing)
+}
+
+/// The tenant's routes, silences, acknowledgments and inhibition
+/// rules, as its control store holds them; rows that do not decode are
+/// skipped.
+async fn delivery_inputs(
+    control: &ControlStore,
+) -> Result<
+    (
+        Vec<NotificationRoute>,
+        Vec<Silence>,
+        Vec<Acknowledgment>,
+        Vec<Inhibition>,
+    ),
+    String,
+> {
+    let rows = |table: Table| async move { control.rows(table).await.map_err(|e| e.to_string()) };
+    let (routes, _) = decode_rows::<NotificationRoute>(&rows(Table::NotificationRoutes).await?);
+    let (silences, _) = decode_rows::<Silence>(&rows(Table::Silences).await?);
+    let (acknowledgments, _) = decode_rows::<Acknowledgment>(&rows(Table::Acknowledgments).await?);
+    let (inhibitions, _) = decode_rows::<Inhibition>(&rows(Table::Inhibitions).await?);
+    Ok((routes, silences, acknowledgments, inhibitions))
+}
+
 /// One round for `tenant`; returns how far its slowest owned group is
 /// behind.
 async fn tenant_round(
@@ -115,6 +167,7 @@ async fn tenant_round(
     for rule in rules {
         by_group.entry(rule.group.clone()).or_default().push(rule);
     }
+    let all_groups: Vec<String> = by_group.keys().cloned().collect();
     let owned: Vec<(String, Vec<AlertRule>)> = by_group
         .into_iter()
         .filter(|(group, _)| {
@@ -130,30 +183,20 @@ async fn tenant_round(
     if owned.is_empty() {
         return Ok(Duration::ZERO);
     }
-    let (routes, _) = decode_rows::<NotificationRoute>(
-        &control
-            .rows(Table::NotificationRoutes)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-    let (silences, _) = decode_rows::<Silence>(
-        &control
-            .rows(Table::Silences)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-    let (acknowledgments, _) = decode_rows::<Acknowledgment>(
-        &control
-            .rows(Table::Acknowledgments)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
+    let (routes, silences, acknowledgments, inhibitions) = delivery_inputs(&control).await?;
+    let firing = if inhibitions.is_empty() {
+        Vec::new()
+    } else {
+        firing_labels(evaluator, tenant, &all_groups).await?
+    };
     let delivery = Delivery {
         sink: &*evaluator.sink,
         notifier: &*evaluator.notifier,
         routes: &routes,
         silences: &silences,
         acknowledgments: &acknowledgments,
+        inhibitions: &inhibitions,
+        firing: &firing,
     };
     let mut lag = Duration::ZERO;
     for (name, rules) in owned {

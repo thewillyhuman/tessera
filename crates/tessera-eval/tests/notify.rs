@@ -82,6 +82,8 @@ async fn firing_reaches_the_route_once_and_repeats_after_the_interval() {
         routes: &routes,
         silences: &[],
         acknowledgments: &[],
+        inhibitions: &[],
+        firing: &[],
     };
     group.evaluate(&fx.engine, at(1_000)).await.unwrap();
     let first = group.deliver(&delivery, at(1_001)).await.unwrap();
@@ -129,6 +131,8 @@ async fn silences_and_acknowledgments_hold_notifications_back() {
         routes: &routes,
         silences: &silences,
         acknowledgments: &[],
+        inhibitions: &[],
+        firing: &[],
     };
     let held_back = group.deliver(&delivery, at(1_001)).await.unwrap();
     assert_eq!(
@@ -163,10 +167,71 @@ async fn silences_and_acknowledgments_hold_notifications_back() {
         routes: &routes,
         silences: &[],
         acknowledgments: &acknowledgments,
+        inhibitions: &[],
+        firing: &[],
     };
     let acknowledged = again.deliver(&delivery, at(1_001)).await.unwrap();
     assert_eq!(acknowledged.suppressed, 1);
     assert!(notifier.sent().is_empty());
+}
+
+/// Section 11.8: an inhibition rule holds a target back while an alert
+/// matching its source fires anywhere in the tenant.
+#[tokio::test]
+async fn inhibition_rules_hold_targets_back_while_the_source_fires() {
+    use tessera_eval::Inhibition;
+
+    let fx = fixture();
+    let group = always_group(&fx, "vector(1)", &["ops"]);
+    let sink = MemorySink::default();
+    let notifier = MemoryNotifier::default();
+    let routes = [route("ops", 300)];
+    let inhibitions = [Inhibition {
+        id: "db".into(),
+        source_matchers: BTreeMap::from([("alertname".to_owned(), "db_down".to_owned())]),
+        target_matchers: BTreeMap::from([("alertname".to_owned(), "always".to_owned())]),
+        equal: vec![],
+        comment: String::new(),
+    }];
+    let firing = [BTreeMap::from([(
+        "alertname".to_owned(),
+        "db_down".to_owned(),
+    )])];
+    group.evaluate(&fx.engine, at(1_000)).await.unwrap();
+    let delivery = Delivery {
+        sink: &sink,
+        notifier: &notifier,
+        routes: &routes,
+        silences: &[],
+        acknowledgments: &[],
+        inhibitions: &inhibitions,
+        firing: &firing,
+    };
+    let held_back = group.deliver(&delivery, at(1_001)).await.unwrap();
+    assert_eq!((held_back.notified, held_back.suppressed), (0, 1));
+    assert!(notifier.sent().is_empty());
+
+    // The same rule with nothing matching its source firing.
+    let again = RuleGroup::open(
+        fx.store.clone(),
+        TenantId::DEFAULT,
+        "g2",
+        group.rules().to_vec(),
+        fx.env.clone(),
+    );
+    again.evaluate(&fx.engine, at(1_000)).await.unwrap();
+    let delivery = Delivery {
+        sink: &sink,
+        notifier: &notifier,
+        routes: &routes,
+        silences: &[],
+        acknowledgments: &[],
+        inhibitions: &inhibitions,
+        firing: &[],
+    };
+    let sent = again.deliver(&delivery, at(1_001)).await.unwrap();
+    assert_eq!((sent.notified, sent.suppressed), (1, 0));
+    assert_eq!(notifier.sent().len(), 1);
 }
 
 #[tokio::test]
@@ -182,6 +247,8 @@ async fn an_unreachable_route_keeps_the_transition_pending() {
         routes: &routes,
         silences: &[],
         acknowledgments: &[],
+        inhibitions: &[],
+        firing: &[],
     };
     group.evaluate(&fx.engine, at(1_000)).await.unwrap();
     notifier.fail(true);

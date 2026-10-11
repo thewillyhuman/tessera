@@ -88,6 +88,7 @@ fn typed(table: Table) -> bool {
             | Table::Rollups
             | Table::Silences
             | Table::Acknowledgments
+            | Table::Inhibitions
             | Table::NotificationRoutes
             | Table::ApiKeys
             | Table::Roles
@@ -272,6 +273,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(value["rows"][0][0], "s1");
         assert_eq!(value["rows"][0][1], "2024-01-02T00:00:00Z");
+        let (status, value) = sql(
+            &state,
+            "INSERT INTO system.inhibitions (id, source_matchers, target_matchers, equal) \
+             VALUES ('db', '{\"alertname\":\"db_down\"}', '{\"severity\":\"warning\"}', '[\"instance\"]')",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, value) = sql(&state, "SELECT id, equal FROM system.inhibitions").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"][0][0], "db");
+        assert_eq!(value["rows"][0][1], "[\"instance\"]");
         let (status, value) = sql(&state, "SELECT count(*) FROM system.alert_instances").await;
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(value["rows"][0][0], 0.0, "nothing evaluated yet");
