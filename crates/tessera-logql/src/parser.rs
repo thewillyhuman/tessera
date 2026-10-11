@@ -7,6 +7,8 @@
 //! functions over log queries, aggregations with `by` and `without`,
 //! and binary operations with the usual precedence.
 
+use std::time::Duration;
+
 use tessera_ir::{Diagnostic, Span};
 
 use crate::ast::{
@@ -646,10 +648,17 @@ impl Parser {
             return Err(self.unexpected("expected a range such as [5m]"));
         };
         self.expect_symbol("]")?;
-        if self.eat_ident("offset") {
-            let span = self.span_here();
-            return Err(Diagnostic::at(span, "offset is not supported yet"));
-        }
+        let offset = if self.eat_ident("offset") {
+            match self.advance() {
+                Some(Spanned {
+                    token: Token::Duration(d),
+                    ..
+                }) => d,
+                _ => return Err(self.unexpected("expected a duration after offset")),
+            }
+        } else {
+            Duration::ZERO
+        };
         self.expect_symbol(")")?;
         let grouping = self.grouping()?;
         Ok(MetricExpr::Range {
@@ -657,6 +666,7 @@ impl Parser {
             parameter,
             log,
             range,
+            offset,
             grouping,
             span: Span::new(start.start, self.previous_end()),
         })
@@ -685,8 +695,6 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     fn log(text: &str) -> LogQuery {
@@ -899,7 +907,11 @@ mod tests {
         assert!(e.message.starts_with("unexpected \"extra\""));
         let e = parse(r#"{a="b"}[5m]"#).unwrap_err();
         assert!(e.message.starts_with("unexpected \"[\""));
-        let e = parse(r#"rate({a="b"}[5m] offset 1h)"#).unwrap_err();
-        assert!(e.message.contains("offset"));
+        let MetricExpr::Range { offset, .. } = metric(r#"rate({a="b"}[5m] offset 1h)"#) else {
+            panic!()
+        };
+        assert_eq!(offset, Duration::from_secs(3600));
+        let e = parse(r#"rate({a="b"}[5m] offset)"#).unwrap_err();
+        assert!(e.message.contains("duration after offset"));
     }
 }

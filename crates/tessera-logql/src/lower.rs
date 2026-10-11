@@ -397,6 +397,7 @@ fn metric_plan(
             parameter,
             log,
             range,
+            offset,
             grouping,
             span,
         } => {
@@ -404,6 +405,7 @@ fn metric_plan(
                 function,
                 parameter: *parameter,
                 range: *range,
+                offset: *offset,
                 grouping: grouping.as_ref(),
                 span: *span,
             };
@@ -429,18 +431,47 @@ struct RangeSpec<'a> {
     function: &'a str,
     parameter: Option<f64>,
     range: Duration,
+    offset: Duration,
     grouping: Option<&'a Grouping>,
     span: Span,
 }
 
 /// A range function over a log query: the scan starts one window early
-/// so that the first step has a full window.
+/// so that the first step has a full window. Under an offset the
+/// windows are read that much earlier and the steps moved back to the
+/// query's own grid.
 fn range_plan(
     spec: &RangeSpec<'_>,
     log: &LogQuery,
     ctx: &BindContext,
     params: RangeParams,
 ) -> Result<Plan, Diagnostic> {
+    if !spec.offset.is_zero() {
+        let back = |t: Timestamp| {
+            Timestamp::from_nanos(
+                t.as_nanos()
+                    .saturating_sub(i64::try_from(spec.offset.as_nanos()).unwrap_or(i64::MAX)),
+            )
+        };
+        let earlier = RangeParams {
+            start: back(params.start),
+            end: back(params.end),
+            step: params.step,
+        };
+        let unshifted = RangeSpec {
+            offset: Duration::ZERO,
+            ..*spec
+        };
+        return Ok(range_plan(&unshifted, log, ctx, earlier)?.project(vec![
+            NamedExpr::new(
+                Expr::column(TIMESTAMP)
+                    .binary(tessera_ir::BinaryOp::Add, Expr::literal(spec.offset)),
+                TIMESTAMP,
+            ),
+            NamedExpr::new(Expr::column(EXTRACTED), EXTRACTED),
+            NamedExpr::new(Expr::column(VALUE), VALUE),
+        ]));
+    }
     let function = range_function(spec.function, spec.parameter, spec.span)?;
     let window_start = Timestamp::from_nanos(
         params
@@ -888,6 +919,18 @@ mod tests {
         );
         let out = lowered("stdvar(rate({a=\"b\"}[1m]))", 30);
         assert!(out.plan.to_string().contains("stdvar_raw(value)"));
+        let shifted = lowered(r#"rate({a="b"}[5m] offset 1h)"#, 60);
+        let text = shifted.plan.to_string();
+        assert!(
+            text.starts_with(
+                "Project: (timestamp + INTERVAL '3600000000000 ns') AS timestamp, _extracted AS _extracted, value AS value\n  RangeVector: rate"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("steps=[1969-12-31T23:10:00Z, 1969-12-31T23:16:40Z]"),
+            "the windows are read an hour earlier: {text}"
+        );
         let folded = lowered("(2 + 3) * 4", 0);
         assert_eq!(folded.plan.to_string(), "Values: 1 rows\n");
         assert!(

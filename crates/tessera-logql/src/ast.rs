@@ -238,6 +238,8 @@ pub enum MetricExpr {
         log: LogQuery,
         /// The window.
         range: Duration,
+        /// How far back the window is read (`offset 1h`); zero for none.
+        offset: Duration,
         /// Grouping applied to the series before the window.
         grouping: Option<Grouping>,
         /// Where it was written.
