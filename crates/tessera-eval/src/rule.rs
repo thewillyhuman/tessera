@@ -202,6 +202,10 @@ pub enum RouteKind {
     Pagerduty,
     /// Alertmanager-compatible push to `/api/v2/alerts`.
     Alertmanager,
+    /// Email over SMTP: `url` is `smtp://user:pass@host:port` with
+    /// STARTTLS where the server offers it, or `smtps://` for TLS from
+    /// the first byte; `to` names the recipients.
+    Email,
 }
 
 /// Where notifications go. Rows of `system.notification_routes`, keyed
@@ -233,6 +237,12 @@ pub struct NotificationRoute {
     /// first; zero sends as alerts arrive.
     #[serde(default)]
     pub group_interval_seconds: u64,
+    /// The recipients of an email route.
+    #[serde(default)]
+    pub to: Vec<String>,
+    /// The sender of an email route; `tessera@localhost` when unset.
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 fn default_repeat() -> u64 {
@@ -426,6 +436,8 @@ mod tests {
             group_by: vec!["service".into(), "severity".into()],
             group_wait_seconds: 30,
             group_interval_seconds: 300,
+            to: vec![],
+            from: None,
         };
         let alert = labels(&[("service", "web"), ("severity", "page"), ("host", "h1")]);
         assert_eq!(route.group_of(&alert), "service=web,severity=page");
@@ -548,6 +560,8 @@ mod tests {
             group_by: vec![],
             group_wait_seconds: 0,
             group_interval_seconds: 0,
+            to: vec![],
+            from: None,
         };
         assert_eq!(route.repeat(), Duration::from_secs(60));
     }

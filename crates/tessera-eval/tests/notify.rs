@@ -33,6 +33,8 @@ fn route(name: &str, repeat_seconds: u64) -> NotificationRoute {
         group_by: vec![],
         group_wait_seconds: 0,
         group_interval_seconds: 0,
+        to: vec![],
+        from: None,
     }
 }
 

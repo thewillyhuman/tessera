@@ -167,6 +167,8 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("group_by"),
             int("group_wait_seconds"),
             int("group_interval_seconds"),
+            text("to"),
+            text("from"),
         ],
         "retention_policies" | "layout_pins" | "saved_queries" => {
             vec![text("key"), text("document")]

@@ -4,14 +4,19 @@
 //! then sent, then marked sent, so delivery is at least once and every
 //! request carries an idempotency key of rule, fingerprint and
 //! transition number. The sinks are a plain webhook, a Slack-compatible
-//! incoming webhook, `PagerDuty`-compatible Events API v2 and an
-//! Alertmanager-compatible push; the payloads are built here, the
-//! transport is a trait so that tests need no network.
+//! incoming webhook, `PagerDuty`-compatible Events API v2, an
+//! Alertmanager-compatible push and email over SMTP; the payloads are
+//! built here, the transport is a trait so that tests need no network.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
 use futures::future::BoxFuture;
+use lettre::message::header::{HeaderName, HeaderValue};
+use lettre::message::{Mailbox, Message};
+use lettre::transport::smtp::authentication::Credentials;
+use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::{SmtpTransport, Transport};
 use serde_json::{Value, json};
 
 use crate::lifecycle::{Status, Transition};
@@ -60,10 +65,12 @@ pub trait Notifier: Send + Sync {
 }
 
 /// The request bodies for `notifications` on `route`: one for a
-/// webhook, Slack or Alertmanager, one per notification for `PagerDuty`.
+/// webhook, Slack or Alertmanager, one per notification for `PagerDuty`;
+/// none for email, which [`email`] builds.
 #[must_use]
 pub fn payloads(route: &NotificationRoute, notifications: &[Notification]) -> Vec<Value> {
     match route.kind {
+        RouteKind::Email => Vec::new(),
         RouteKind::Webhook => vec![json!({
             "version": "1",
             "route": route.name,
@@ -110,6 +117,63 @@ pub fn payloads(route: &NotificationRoute, notifications: &[Notification]) -> Ve
                 .collect(),
         )],
     }
+}
+
+/// The sender of an email route when it names none.
+pub const DEFAULT_FROM: &str = "tessera@localhost";
+
+/// The email for `notifications` on `route`: the status and the rules
+/// in the subject, one line per alert in the body, the idempotency key
+/// in a header.
+///
+/// # Errors
+///
+/// When the route has no recipients or an address does not parse.
+pub fn email(route: &NotificationRoute, notifications: &[Notification]) -> Result<Message, String> {
+    if route.to.is_empty() {
+        return Err(format!("route {} has no recipients", route.name));
+    }
+    let mailbox = |address: &str| {
+        address
+            .parse::<Mailbox>()
+            .map_err(|e| format!("route {}: {address}: {e}", route.name))
+    };
+    let mut rules: Vec<&str> = notifications
+        .iter()
+        .map(|n| n.transition.rule.as_str())
+        .collect();
+    rules.sort_unstable();
+    rules.dedup();
+    let subject = format!(
+        "[{}:{}] {}",
+        overall_status(notifications).to_ascii_uppercase(),
+        notifications.len(),
+        rules.join(", ")
+    );
+    let key = notifications
+        .iter()
+        .map(Notification::idempotency_key)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut builder = Message::builder()
+        .from(mailbox(route.from.as_deref().unwrap_or(DEFAULT_FROM))?)
+        .subject(subject)
+        .raw_header(HeaderValue::new(
+            HeaderName::new_from_ascii_str("X-Idempotency-Key"),
+            key,
+        ));
+    for address in &route.to {
+        builder = builder.to(mailbox(address)?);
+    }
+    builder
+        .body(
+            notifications
+                .iter()
+                .map(line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .map_err(|e| format!("route {}: {e}", route.name))
 }
 
 /// The path appended to an Alertmanager route's URL when it names the
@@ -233,7 +297,8 @@ impl Notifier for MemoryNotifier {
     }
 }
 
-/// Posts the payloads over HTTP with a bounded timeout.
+/// Posts the payloads over HTTP, or hands an email to its SMTP server,
+/// with a bounded timeout.
 #[derive(Clone)]
 pub struct HttpNotifier {
     agent: ureq::Agent,
@@ -256,6 +321,15 @@ impl HttpNotifier {
                 .build()
                 .into(),
         }
+    }
+
+    /// Sends `notifications` as one email through the route's server.
+    fn mail(route: &NotificationRoute, notifications: &[Notification]) -> Result<(), String> {
+        let message = email(route, notifications)?;
+        smtp(route)?
+            .send(&message)
+            .map(|_| ())
+            .map_err(|e| format!("route {}: {e}", route.name))
     }
 
     fn post(&self, url: &str, key: &str, body: &Value) -> Result<(), String> {
@@ -283,6 +357,13 @@ impl Notifier for HttpNotifier {
         notifications: &'a [Notification],
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            if route.kind == RouteKind::Email {
+                let route = route.clone();
+                let notifications = notifications.to_vec();
+                return tokio::task::spawn_blocking(move || Self::mail(&route, &notifications))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             let url = url_of(route);
             let bodies = payloads(route, notifications);
             let keys: Vec<String> = match route.kind {
@@ -311,6 +392,38 @@ impl Notifier for HttpNotifier {
     }
 }
 
+/// The SMTP transport an email route's URL describes: `smtps://` for
+/// TLS from the first byte, `smtp://` for STARTTLS where the server
+/// offers it; credentials from the URL's user information; thirty
+/// seconds to connect and talk.
+fn smtp(route: &NotificationRoute) -> Result<SmtpTransport, String> {
+    let bad = |reason: String| format!("route {}: {}: {reason}", route.name, route.url);
+    let url = url::Url::parse(&route.url).map_err(|e| bad(e.to_string()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| bad("no host".into()))?
+        .to_owned();
+    let tls = TlsParameters::new(host.clone()).map_err(|e| bad(e.to_string()))?;
+    let mut builder = match url.scheme() {
+        "smtps" => SmtpTransport::builder_dangerous(host).tls(Tls::Wrapper(tls)),
+        "smtp" => SmtpTransport::builder_dangerous(host).tls(Tls::Opportunistic(tls)),
+        other => return Err(bad(format!("scheme {other} is not smtp or smtps"))),
+    };
+    builder = builder
+        .port(
+            url.port()
+                .unwrap_or(if url.scheme() == "smtps" { 465 } else { 587 }),
+        )
+        .timeout(Some(std::time::Duration::from_secs(30)));
+    if !url.username().is_empty() {
+        builder = builder.credentials(Credentials::new(
+            url.username().to_owned(),
+            url.password().unwrap_or_default().to_owned(),
+        ));
+    }
+    Ok(builder.build())
+}
+
 #[cfg(test)]
 mod tests {
     use tessera_types::Timestamp;
@@ -327,6 +440,8 @@ mod tests {
             group_by: vec![],
             group_wait_seconds: 0,
             group_interval_seconds: 0,
+            to: vec![],
+            from: None,
         }
     }
 
@@ -349,6 +464,103 @@ mod tests {
             annotations: BTreeMap::from([("summary".to_owned(), "too many".to_owned())]),
             repeat,
         }
+    }
+
+    /// Section 11.9: an email names the status and the rules in its
+    /// subject, one line per alert in its body, and the idempotency key
+    /// in a header; a route without recipients is refused.
+    #[test]
+    fn an_email_carries_the_alerts_and_their_idempotency_key() {
+        let mut mail = route(RouteKind::Email);
+        mail.url = "smtp://127.0.0.1:2525".into();
+        assert!(email(&mail, &[notification(Status::Firing, false)]).is_err());
+        mail.to = vec!["oncall@example.com".into()];
+        let message = email(
+            &mail,
+            &[
+                notification(Status::Firing, false),
+                notification(Status::Resolved, false),
+            ],
+        )
+        .unwrap();
+        let text = String::from_utf8(message.formatted()).unwrap();
+        assert!(text.contains("Subject: [FIRING:2] errors"), "{text}");
+        assert!(text.contains("To: oncall@example.com"), "{text}");
+        assert!(text.contains(&format!("From: {DEFAULT_FROM}")), "{text}");
+        assert!(
+            text.contains("X-Idempotency-Key: errors/abcd/2,errors/abcd/2"),
+            "{text}"
+        );
+        assert!(text.contains("[FIRING] errors"), "{text}");
+        assert!(text.contains("[RESOLVED] errors"), "{text}");
+    }
+
+    /// A minimal SMTP server on a free port: answers every command,
+    /// collects one message and hands it back.
+    fn fake_smtp() -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut say = |text: &str| writer.write_all(format!("{text}\r\n").as_bytes()).unwrap();
+            say("220 fake ESMTP");
+            let mut data = String::new();
+            let mut in_data = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if in_data {
+                    if line == ".\r\n" {
+                        in_data = false;
+                        say("250 queued");
+                        let _ = sender.send(std::mem::take(&mut data));
+                    } else {
+                        data.push_str(&line);
+                    }
+                    continue;
+                }
+                let command = line.to_ascii_uppercase();
+                if command.starts_with("EHLO") || command.starts_with("HELO") {
+                    say("250-fake");
+                    say("250 OK");
+                } else if command.starts_with("DATA") {
+                    say("354 go ahead");
+                    in_data = true;
+                } else if command.starts_with("QUIT") {
+                    say("221 bye");
+                    break;
+                } else {
+                    say("250 OK");
+                }
+            }
+        });
+        (port, receiver)
+    }
+
+    /// Section 11.9: the notifier hands an email route's message to its
+    /// SMTP server.
+    #[tokio::test]
+    async fn an_email_route_reaches_its_smtp_server() {
+        let (port, received) = fake_smtp();
+        let mut mail = route(RouteKind::Email);
+        mail.url = format!("smtp://127.0.0.1:{port}");
+        mail.to = vec!["oncall@example.com".into()];
+        HttpNotifier::new()
+            .send(&mail, &[notification(Status::Firing, false)])
+            .await
+            .unwrap();
+        let message = received
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert!(message.contains("Subject: [FIRING:1] errors"), "{message}");
+        assert!(message.contains("[FIRING] errors"), "{message}");
     }
 
     #[test]

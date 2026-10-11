@@ -499,7 +499,7 @@ fn json_columns(table: Table) -> &'static [&'static str] {
         Table::Inhibitions => &["source_matchers", "target_matchers", "equal"],
         Table::ApiKeys => &["roles"],
         Table::Roles => &["read", "write"],
-        Table::NotificationRoutes => &["group_by"],
+        Table::NotificationRoutes => &["group_by", "to"],
         Table::Acknowledgments => &[],
         Table::Rollups | Table::RetentionPolicies | Table::LayoutPins | Table::SavedQueries => {
             &["document"]

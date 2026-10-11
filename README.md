@@ -161,8 +161,8 @@ CQ-11); periodic re-execution through the engine for every other
 rule, with `EXPLAIN ALERT` saying which applies and why (CQ-8); every
 transition written as an `alert` event with a deterministic id
 (CQ-14); notifications from an outbox, at least once with an
-idempotency key, to webhook, Slack-compatible, PagerDuty-compatible
-and Alertmanager-compatible sinks, grouped per route by its
+idempotency key, to webhook, Slack-compatible, PagerDuty-compatible,
+Alertmanager-compatible and email sinks, grouped per route by its
 `group_by` labels after `group_wait` and then every `group_interval`,
 held back by silences, acknowledgments and inhibition rules and
 repeated at the route's interval (CQ-15, 11.8, 11.9);
@@ -174,7 +174,7 @@ Gaps left in M7: rollups and recording rules (M9); one state
 partition per rule group, so the group count rather than the key
 space bounds a group's parallelism (CQ-6); rebuilding window state
 from data files when a partition falls behind the WAL retention cap
-(section 11.7); email; the incremental subset is SQL only and counts
+(section 11.7); the incremental subset is SQL only and counts
 rows unweighted; the alert latency target is set by the evaluation
 interval (five seconds by default) rather than measured; sketches
 and histograms run periodically, while hopping windows,
@@ -561,6 +561,8 @@ log as rows arrive, anything else is re-executed at its interval:
 psql 'host=127.0.0.1 port=5432 dbname=prod' <<'SQL'
 INSERT INTO system.notification_routes (name, kind, url)
   VALUES ('oncall', 'webhook', 'http://hooks.example/tessera');
+INSERT INTO system.notification_routes (name, kind, url, "to")
+  VALUES ('mail', 'email', 'smtp://relay.example:587', '["oncall@example.com"]');
 CREATE ALERT checkout_errors SEVERITY critical FOR 2m NOTIFY oncall
   ANNOTATIONS (summary = 'checkout is failing') AS
   SELECT resource.service.name AS service, count(*) AS errors
