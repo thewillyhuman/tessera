@@ -65,6 +65,10 @@ struct RunArgs {
     /// the loopback interface and nothing anyone else can reach.
     #[arg(long)]
     no_anonymous: bool,
+    /// Writer logs the node appends to, one task each; writes go to them
+    /// in turn, so ingest takes as many cores.
+    #[arg(long, default_value_t = 1)]
+    ingest_writers: usize,
     /// The secret the nodes of a cluster present to each other on the
     /// `/internal` routes (SE-3); the same on every node. Without it
     /// those routes are open, which suits a private network only.
@@ -173,6 +177,7 @@ async fn main() -> ExitCode {
                     }),
                 ingest: tessera_ingest::IngestConfig {
                     linger: std::time::Duration::from_millis(args.linger_ms),
+                    writers: args.ingest_writers.max(1),
                     ..tessera_ingest::IngestConfig::default()
                 },
                 keyring,

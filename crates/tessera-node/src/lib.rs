@@ -205,7 +205,7 @@ pub struct Node {
     http: SocketAddr,
     pg: SocketAddr,
     ingest: IngestHandle,
-    ingest_task: JoinHandle<()>,
+    ingest_tasks: Vec<JoinHandle<()>>,
     registry: Arc<Registry>,
     membership: Arc<Membership>,
     leases: Option<Arc<Leases>>,
@@ -235,15 +235,8 @@ impl Node {
                 .with_keys(Arc::clone(&env.keys)),
         );
         let pools = Arc::new(Pools::new(pool.clone(), Arc::clone(&store)));
-        let ingester = Ingester::start(
-            Arc::clone(&store),
-            env.clone(),
-            config.ingest,
-            pool.clone(),
-            Arc::clone(&format),
-        );
-        tracing::info!(writer = %ingester.writer_id(), "ingest started");
-        let (ingest, ingest_task) = tessera_ingest::spawn(ingester, INGEST_TICK);
+        let ingesters = ingesters(&store, &env, config.ingest, &pool, &format);
+        let (ingest, ingest_tasks) = tessera_ingest::spawn_all(ingesters, INGEST_TICK);
 
         let listener = bind(config.listen).await?;
         let http = listener.local_addr().unwrap_or(config.listen);
@@ -312,7 +305,7 @@ impl Node {
             http,
             pg,
             ingest,
-            ingest_task,
+            ingest_tasks,
             registry,
             membership,
             leases,
@@ -402,8 +395,36 @@ impl Node {
         if let Some((_, task)) = &self.lease_loop {
             task.abort();
         }
-        self.ingest_task.abort();
+        for task in &self.ingest_tasks {
+            task.abort();
+        }
     }
+}
+
+/// The node's ingesters, one per writer the configuration asks for,
+/// each with a writer log of its own (ST-5).
+fn ingesters(
+    store: &Arc<dyn ObjectStore>,
+    env: &Env,
+    config: IngestConfig,
+    pool: &PoolId,
+    format: &Arc<dyn FileFormat>,
+) -> Vec<Ingester> {
+    let ingesters: Vec<Ingester> = (0..config.writers.max(1))
+        .map(|_| {
+            Ingester::start(
+                Arc::clone(store),
+                env.clone(),
+                config,
+                pool.clone(),
+                Arc::clone(format),
+            )
+        })
+        .collect();
+    for ingester in &ingesters {
+        tracing::info!(writer = %ingester.writer_id(), "ingest started");
+    }
+    ingesters
 }
 
 /// Runs a node until Ctrl-C.

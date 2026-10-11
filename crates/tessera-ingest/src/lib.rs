@@ -16,4 +16,4 @@ pub mod remote_write;
 pub mod service;
 
 pub use ingester::{Ack, IngestConfig, IngestError, Ingester};
-pub use service::{IngestHandle, spawn};
+pub use service::{IngestHandle, spawn, spawn_all};

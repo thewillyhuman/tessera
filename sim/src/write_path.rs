@@ -52,6 +52,7 @@ fn config() -> IngestConfig {
         window: Window::DEFAULT_LENGTH,
         max_log_age: Duration::from_secs(15),
         max_log_entries: 1_000_000,
+        writers: 1,
     }
 }
 

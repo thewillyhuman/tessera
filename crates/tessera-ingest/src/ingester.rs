@@ -49,6 +49,10 @@ pub struct IngestConfig {
     /// How many entries a writer log holds before a new one is started
     /// (ST-8).
     pub max_log_entries: u64,
+    /// How many writer logs the node appends to, each from a task of
+    /// its own (ST-5); writes go to them in turn, so ingest takes as
+    /// many cores. One by default.
+    pub writers: usize,
 }
 
 impl Default for IngestConfig {
@@ -61,6 +65,7 @@ impl Default for IngestConfig {
             window: Window::DEFAULT_LENGTH,
             max_log_age: Duration::from_secs(3600),
             max_log_entries: 1_000_000,
+            writers: 1,
         }
     }
 }
@@ -606,6 +611,7 @@ mod tests {
             window: Window::DEFAULT_LENGTH,
             max_log_age: Duration::from_secs(3600),
             max_log_entries: 1_000_000,
+            writers: 1,
         }
     }
 

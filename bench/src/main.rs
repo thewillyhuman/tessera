@@ -64,6 +64,10 @@ struct Args {
     /// absent.
     #[arg(long)]
     linger_ms: Option<u64>,
+    /// Writer logs the node appends to, each on a task of its own; the
+    /// node's default, one, when absent.
+    #[arg(long)]
+    writers: Option<usize>,
     /// Alert probes; zero skips the alert measurement.
     #[arg(long, default_value_t = 10)]
     alert_probes: usize,
@@ -111,7 +115,14 @@ impl Report {
     }
 }
 
-fn config(dir: &Path, linger: Option<Duration>) -> Config {
+/// What the run tunes on the node.
+#[derive(Clone, Copy)]
+struct Tuning {
+    linger: Option<Duration>,
+    writers: Option<usize>,
+}
+
+fn config(dir: &Path, tuning: Tuning) -> Config {
     let free: SocketAddr = "127.0.0.1:0"
         .parse()
         .unwrap_or_else(|_| unreachable!("a literal"));
@@ -123,17 +134,20 @@ fn config(dir: &Path, linger: Option<Duration>) -> Config {
     // Small L1 files, so that compaction has inputs to merge within the
     // run for metrics and traces as well as logs.
     config.ingest.flush_bytes = 2 << 20;
-    if let Some(linger) = linger {
+    if let Some(linger) = tuning.linger {
         config.ingest.linger = linger;
+    }
+    if let Some(writers) = tuning.writers {
+        config.ingest.writers = writers.max(1);
     }
     config
 }
 
 /// Starts a node over `dir` and waits until it serves; the node and
 /// its base URL and how long that took.
-async fn start(dir: &Path, linger: Option<Duration>) -> (Node, String, Duration) {
+async fn start(dir: &Path, tuning: Tuning) -> (Node, String, Duration) {
     let started = Instant::now();
-    let node = Node::start(config(dir, linger), Env::system())
+    let node = Node::start(config(dir, tuning), Env::system())
         .await
         .expect("the node starts");
     let base = format!("http://{}", node.http_address());
@@ -150,6 +164,10 @@ async fn main() {
         .clone()
         .unwrap_or_else(|| temp.path().to_path_buf());
     let linger = args.linger_ms.map(Duration::from_millis);
+    let tuning = Tuning {
+        linger,
+        writers: args.writers,
+    };
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     println!(
         "tessera-bench: {} log rows in batches of {} from {} clients, {} series x {} samples, {} traces; {} cores; root pool {}",
@@ -164,7 +182,7 @@ async fn main() {
     );
     let mut report = Report::default();
 
-    let (node, base, startup) = start(&dir, linger).await;
+    let (node, base, startup) = start(&dir, tuning).await;
     report.add(
         "New node serving",
         "<= 30 s from process start",
@@ -194,7 +212,7 @@ async fn main() {
 
     // Cold: the same node restarted over the same root pool, each query once.
     node.stop().await;
-    let (node, base, restart) = start(&dir, linger).await;
+    let (node, base, restart) = start(&dir, tuning).await;
     let queries = web::queries(&base, &traces.ids);
     let cold_runs: Vec<Duration> = queries
         .iter()
