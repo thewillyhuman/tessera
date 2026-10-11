@@ -118,7 +118,14 @@ fn call_range(
                     .into_iter()
                     .filter_map(|s| {
                         let value = range_function(function, &s.samples, end, range)?;
-                        Some((without_name(s.labels), value))
+                        // Prometheus keeps the metric name only where the
+                        // value is a sample's own: last_over_time.
+                        let labels = if function == "last_over_time" {
+                            s.labels
+                        } else {
+                            without_name(s.labels)
+                        };
+                        Some((labels, value))
                     })
                     .collect(),
             )
