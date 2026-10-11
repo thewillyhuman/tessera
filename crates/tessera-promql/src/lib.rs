@@ -6,9 +6,19 @@
 //!
 //! Every selector lowers to a projected scan of the metric rows its
 //! matchers admit, and the expression to a `PromQL` node the engine
-//! evaluates with Prometheus' semantics (QL-5). The deviations from
-//! Prometheus found by the differential suite (QL-4) are listed here
-//! as they are found.
+//! evaluates with Prometheus' semantics (QL-5).
+//!
+//! Not supported yet: native histograms and the `histogram_*`
+//! functions over them, `limitk`, `limit_ratio` and `info`, and the
+//! `promql(...)` table function in SQL (QL-3). OTLP histograms are
+//! stored as rows with their buckets, which `PromQL` does not read.
+//!
+//! The differential suite (QL-4) found no deviation from Prometheus
+//! 3.15 on its cases, which cover selectors, the rate family,
+//! `_over_time` functions, aggregations, vector matching, set
+//! operators, `histogram_quantile`, label functions, subqueries,
+//! `offset`, `@`, staleness and the result types. The compliance
+//! suite (QL-6) has not been run.
 
 pub mod ast;
 pub mod lexer;

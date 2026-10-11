@@ -87,7 +87,28 @@ intrinsics, `quantile_over_time` and `histogram_over_time`, and the
 for L3 compaction (M9); Grafana itself has not been run against the
 API yet.
 
-**M5, metrics: next.**
+**M5, metrics: done, with gaps listed below.** Metric data points
+over OTLP (gauges, sums, histograms, exponential histograms and
+summaries) and over Prometheus remote write, with series ids and
+Prometheus names derived from the OpenTelemetry name and unit
+(QL-19); a PromQL front end with a hand-written parser; an evaluator
+with Prometheus 3 semantics: lookback and staleness, counter resets
+and extrapolation in `rate` and `increase`, the `_over_time` family,
+aggregations, vector matching with `group_left` and `group_right`,
+set operators, subqueries, `offset` and `@`, `histogram_quantile`
+over classic buckets, label and calendar functions; and the
+Prometheus HTTP API: queries, series, labels, label values, metadata
+and remote write. The PromQL differential suite agrees with
+Prometheus 3.15.0 on every case.
+
+Gaps left in M5: native histograms (OTLP histograms are stored but
+not queryable through PromQL), `limitk`, `limit_ratio` and `info`,
+the `promql(...)` table function in SQL, exemplars, rules and alerts
+(M7), metric downsampling and rollups (M9); the PromQL compliance
+suite has not been run; Grafana itself has not been run against the
+API yet.
+
+**M6, distributed execution and cluster: next.**
 
 ## Layout
 
@@ -110,12 +131,14 @@ crates/
   tessera-search    the search syntax, lowered to a predicate
   tessera-logql     LogQL lexer, parser and lowering
   tessera-traceql   TraceQL lexer, parser and lowering
-  tessera-server    HTTP administration, OTLP ingest, SQL over HTTP, PostgreSQL wire protocol, Loki and Tempo APIs
+  tessera-promql    PromQL lexer, parser and lowering
+  tessera-server    HTTP administration, OTLP ingest, remote write, SQL over HTTP, PostgreSQL wire protocol, Loki, Tempo and Prometheus APIs
   tessera           the binary
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
 compat/sql/         SQL differential tests against SQLite
 compat/logql/       LogQL differential tests against a Loki instance
 compat/traceql/     TraceQL differential tests against a Tempo instance
+compat/promql/      PromQL differential tests against a Prometheus instance
 ```
 
 Dependencies between crates point downward only (spec section 18.1).
@@ -150,9 +173,11 @@ curl -X POST localhost:8080/v1/logs \
 ```
 
 Traces go to `/v1/traces` the same way; a span's events become events
-of their own and its links stay with the span. An OpenTelemetry
-Collector's `otlphttp` exporter pointed at `http://localhost:8080`
-works as is for logs and traces.
+of their own and its links stay with the span. Metrics go to
+`/v1/metrics`, one row per data point, or over Prometheus remote
+write at `/api/v1/write`. An OpenTelemetry Collector's `otlphttp`
+exporter pointed at `http://localhost:8080` works as is for logs,
+traces and metrics.
 
 Queries are SQL, over HTTP or over the PostgreSQL protocol. A table is
 a kind of event in a dataset (`logs`, `spans`, `metrics`, `events`,
@@ -201,6 +226,20 @@ curl -G localhost:8080/api/metrics/query_range \
      --data-urlencode 'step=60s'
 ```
 
+The Prometheus API lives under `/api/v1`: instant and range queries
+in PromQL, series, labels and label values. Point Grafana's
+Prometheus data source at `http://localhost:8080`. A metric ingested
+over OTLP is queried by the name Prometheus would give it, so
+`http.server.duration` in milliseconds is `http_server_duration_milliseconds`:
+
+```
+curl -G localhost:8080/api/v1/query_range \
+     --data-urlencode 'query=sum by (job) (rate(http_requests_total[5m]))' \
+     --data-urlencode "start=$(($(date +%s) - 3600))" --data-urlencode "end=$(date +%s)" \
+     --data-urlencode 'step=60'
+curl -G localhost:8080/api/v1/query --data-urlencode 'query=up'
+```
+
 Compaction, index building and garbage collection run in the
 background: a partition's L1 files become one indexed L2 file once
 there are four of them or a lone one is an hour old.
@@ -238,6 +277,16 @@ instance started with `compat/traceql/tempo.yaml`, reached through
 ```
 TESSERA_TEMPO_URL=http://127.0.0.1:3200 TESSERA_TEMPO_OTLP_URL=http://127.0.0.1:4318 \
     cargo test -p tessera-compat-traceql
+```
+
+The PromQL suite in `compat/promql` pushes the same samples over
+remote write to a Prometheus started with
+`--web.enable-remote-write-receiver` (configuration in
+`compat/promql/prometheus.yml`) and to an in-process node, reached
+through `TESSERA_PROMETHEUS_URL` (CI starts one):
+
+```
+TESSERA_PROMETHEUS_URL=http://127.0.0.1:9090 cargo test -p tessera-compat-promql
 ```
 
 Every commit passes `cargo fmt --check`, `cargo clippy --all-targets`
