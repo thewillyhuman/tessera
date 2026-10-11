@@ -238,6 +238,19 @@ async fn a_path_of_several_types_reads_the_same_in_every_layout() {
         let output = run(&engine, Plan::Scan(scan()).filter(predicate.clone())).await;
         assert_eq!(output.num_rows(), expected, "{predicate} after compaction");
     }
+    // Projected alone, with nothing else reading `_overflow`, the path
+    // comes from its sub-columns in the compacted files.
+    let output = run(
+        &engine,
+        Plan::Scan(scan()).project(vec![NamedExpr::new(code(DataType::Utf8), "code")]),
+    )
+    .await;
+    let nulls: usize = column::<arrow::array::StringArray>(&output.batches, "code")
+        .iter()
+        .map(arrow::array::Array::null_count)
+        .sum();
+    assert_eq!(output.num_rows(), 21);
+    assert_eq!(nulls, 0, "every row has a code, as a number or as text");
 }
 
 #[tokio::test]

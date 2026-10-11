@@ -25,7 +25,7 @@ use tessera_kernels::{evaluate_predicate, variant};
 use tessera_manifest::view;
 use tessera_object::layout;
 use tessera_opt::{Decision, PruneReport, bounds, decide, prune_files};
-use tessera_types::event::TIMESTAMP;
+use tessera_types::event::{TIMESTAMP, logical_path};
 use tessera_types::{FileMeta, Timestamp};
 
 use crate::engine::{Engine, EngineError};
@@ -293,11 +293,13 @@ pub(crate) async fn read_files(
     let mut fetches = stream::iter(files.into_iter().map(|file| {
         let mut request = request.clone();
         if let Some(projection) = &mut request.request.projection {
+            // A file holds a path as one column, or as a sub-column per
+            // type class (DM-5): every column of the path is read.
             projection.extend(
-                scan.paths
+                file.columns
                     .iter()
-                    .filter(|p| file.columns.iter().any(|c| c.name == p.path))
-                    .map(|p| p.path.clone()),
+                    .filter(|c| scan.paths.iter().any(|p| p.path == logical_path(&c.name)))
+                    .map(|c| c.name.clone()),
             );
         }
         fetch(engine, file, request)
