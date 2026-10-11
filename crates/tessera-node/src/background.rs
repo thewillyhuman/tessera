@@ -379,18 +379,23 @@ async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
             .await?;
         let (rules, _) = decode_rows::<AlertRule>(&rows);
         let groups: BTreeSet<String> = rules.into_iter().map(|r| r.group).collect();
+        let settings = background.catalog.settings_of(&tenant);
         for group in groups {
-            let log = tessera_eval::state::open(
-                Arc::clone(&background.store),
-                &tenant,
-                &group,
-                0,
-                background.env.clone(),
-            );
-            let snapshot = log.snapshot().await?;
-            for (writer, seq) in &snapshot.state().positions {
-                if let Ok(writer) = writer.parse::<WriterId>() {
-                    checkpoints.hold(writer, *seq);
+            // Every partition of the group reads the logs (CQ-6): the
+            // slowest holds the segments.
+            for part in 0..settings.rule_partitions_of(&group) {
+                let log = tessera_eval::state::open(
+                    Arc::clone(&background.store),
+                    &tenant,
+                    &group,
+                    part,
+                    background.env.clone(),
+                );
+                let snapshot = log.snapshot().await?;
+                for (writer, seq) in &snapshot.state().positions {
+                    if let Ok(writer) = writer.parse::<WriterId>() {
+                        checkpoints.hold(writer, *seq);
+                    }
                 }
             }
         }

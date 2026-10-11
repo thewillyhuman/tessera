@@ -257,9 +257,11 @@ impl AppState {
             weight: 1,
             state: PoolState::Active,
         };
-        let catalog = Catalog::open(Arc::new(store.clone()), root, env.clone())
-            .await
-            .expect("an in-memory catalog opens");
+        let catalog = Arc::new(
+            Catalog::open(Arc::new(store.clone()), root, env.clone())
+                .await
+                .expect("an in-memory catalog opens"),
+        );
         let config = IngestConfig {
             linger: Duration::from_millis(1),
             ..IngestConfig::default()
@@ -285,6 +287,7 @@ impl AppState {
             Arc::clone(&controls),
             Arc::new(store.clone()),
             env.clone(),
+            catalog.clone(),
         )))
         .with_rollups(Arc::new(rollups::RollupEntries::new(
             Arc::clone(&controls),
@@ -292,7 +295,7 @@ impl AppState {
             env.clone(),
         )));
         AppState {
-            catalog: Arc::new(catalog),
+            catalog,
             ingest,
             pools,
             format: Arc::new(ParquetFormat::default()),

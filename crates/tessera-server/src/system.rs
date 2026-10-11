@@ -16,9 +16,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef};
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tessera_catalog::{ControlStores, Table};
+use tessera_catalog::{ControlStores, Table, TenantSettingsSource};
 use tessera_eval::rule::decode_rows;
-use tessera_eval::{AlertRule, state};
+use tessera_eval::{AlertRule, partition};
 use tessera_exec::SystemTables;
 use tessera_ir::system_table_schema;
 use tessera_object::ObjectStore;
@@ -29,16 +29,26 @@ pub struct SystemTableRows {
     controls: Arc<ControlStores>,
     store: Arc<dyn ObjectStore>,
     env: Env,
+    /// Where each tenant's settings come from: how many partitions a
+    /// rule group's instances are spread over (CQ-6).
+    tenants: Arc<dyn TenantSettingsSource>,
 }
 
 impl SystemTableRows {
-    /// Rows from `controls` and the state logs in `store`.
+    /// Rows from `controls` and the state logs in `store`, the groups'
+    /// partition counts from `tenants`.
     #[must_use]
-    pub fn new(controls: Arc<ControlStores>, store: Arc<dyn ObjectStore>, env: Env) -> Self {
+    pub fn new(
+        controls: Arc<ControlStores>,
+        store: Arc<dyn ObjectStore>,
+        env: Env,
+        tenants: Arc<dyn TenantSettingsSource>,
+    ) -> Self {
         SystemTableRows {
             controls,
             store,
             env,
+            tenants,
         }
     }
 
@@ -53,11 +63,19 @@ impl SystemTableRows {
             let mut groups: Vec<String> = rules.iter().map(|r| r.group.clone()).collect();
             groups.sort();
             groups.dedup();
+            let settings = self.tenants.settings_of(tenant);
             let mut documents = Vec::new();
             for group in groups {
-                let log = state::open(Arc::clone(&self.store), tenant, &group, 0, self.env.clone());
-                let snapshot = log.snapshot().await.map_err(|e| e.to_string())?;
-                for instance in snapshot.state().instances.values() {
+                let merged = partition::merged(
+                    &self.store,
+                    tenant,
+                    &group,
+                    settings.rule_partitions_of(&group),
+                    &self.env,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                for instance in merged.instances.values() {
                     let mut document = serde_json::to_value(instance).map_err(|e| e.to_string())?;
                     document["group"] = Value::String(group.clone());
                     documents.push(document);

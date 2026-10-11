@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use tessera_catalog::{Catalog, ControlStore, ControlStores, Table, TenantStatus};
+use tessera_catalog::{
+    Catalog, ControlStore, ControlStores, Table, TenantSettings, TenantSettingsSource, TenantStatus,
+};
 use tessera_cluster::Load;
 use tessera_eval::rule::decode_rows;
 use tessera_eval::{
@@ -59,10 +61,11 @@ pub struct Evaluator {
     pub load: Arc<Load>,
 }
 
-/// The open rule groups, rebuilt when their rules change.
+/// The open rule group partitions, by tenant, group and partition,
+/// rebuilt when their rules or the group's partition count change.
 #[derive(Default)]
 struct Groups {
-    open: HashMap<(TenantId, String), Arc<RuleGroup>>,
+    open: HashMap<(TenantId, String, u32), Arc<RuleGroup>>,
 }
 
 /// Runs rounds forever. Failures are logged and retried next round.
@@ -103,6 +106,40 @@ async fn round(evaluator: &Evaluator, groups: &mut Groups) {
     evaluator.load.set_degraded_rules(degraded);
 }
 
+/// One partition of a rule group this node owns (CQ-6).
+struct Partition {
+    group: String,
+    part: u32,
+    parts: u32,
+    rules: Vec<AlertRule>,
+}
+
+/// The partitions of `tenant`'s rule groups this node owns: each is a
+/// slot of its own (CQ-6), the count per group from the settings.
+fn owned_partitions(
+    evaluator: &Evaluator,
+    tenant: &TenantId,
+    by_group: BTreeMap<String, Vec<AlertRule>>,
+    settings: &TenantSettings,
+) -> Vec<Partition> {
+    by_group
+        .into_iter()
+        .flat_map(|(group, rules)| {
+            let parts = settings.rule_partitions_of(&group);
+            (0..parts).map(move |part| Partition {
+                group: group.clone(),
+                part,
+                parts,
+                rules: rules.clone(),
+            })
+        })
+        .filter(|p| {
+            let item = format!("{tenant}/{}/{}", p.group, p.part);
+            evaluator.owned.owns(WorkKind::RuleGroup, item.as_bytes())
+        })
+        .collect()
+}
+
 /// What one tenant's round reports (OP-5).
 #[derive(Default)]
 struct Round {
@@ -119,20 +156,21 @@ async fn firing_labels(
     evaluator: &Evaluator,
     tenant: &TenantId,
     groups: &[String],
+    settings: &TenantSettings,
 ) -> Result<Vec<BTreeMap<String, String>>, String> {
     let mut firing = Vec::new();
     for group in groups {
-        let log = tessera_eval::state::open(
-            Arc::clone(&evaluator.store),
+        let state = tessera_eval::partition::merged(
+            &evaluator.store,
             tenant,
             group,
-            0,
-            evaluator.env.clone(),
-        );
-        let snapshot = log.snapshot().await.map_err(|e| e.to_string())?;
+            settings.rule_partitions_of(group),
+            &evaluator.env,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         firing.extend(
-            snapshot
-                .state()
+            state
                 .instances
                 .values()
                 .filter(|i| i.status == Status::Firing)
@@ -184,17 +222,11 @@ async fn tenant_round(
         by_group.entry(rule.group.clone()).or_default().push(rule);
     }
     let all_groups: Vec<String> = by_group.keys().cloned().collect();
-    let owned: Vec<(String, Vec<AlertRule>)> = by_group
-        .into_iter()
-        .filter(|(group, _)| {
-            evaluator
-                .owned
-                .owns(WorkKind::RuleGroup, format!("{tenant}/{group}").as_bytes())
-        })
-        .collect();
-    groups
-        .open
-        .retain(|(t, g), _| t != tenant || owned.iter().any(|(name, _)| name == g));
+    let settings = evaluator.catalog.settings_of(tenant);
+    let owned = owned_partitions(evaluator, tenant, by_group, &settings);
+    groups.open.retain(|(t, g, part), _| {
+        t != tenant || owned.iter().any(|p| p.group == *g && p.part == *part)
+    });
     rollups_round(evaluator, tenant, &control).await?;
     if owned.is_empty() {
         return Ok(Round::default());
@@ -203,7 +235,7 @@ async fn tenant_round(
     let firing = if inhibitions.is_empty() {
         Vec::new()
     } else {
-        firing_labels(evaluator, tenant, &all_groups).await?
+        firing_labels(evaluator, tenant, &all_groups, &settings).await?
     };
     let delivery = Delivery {
         sink: &*evaluator.sink,
@@ -215,17 +247,27 @@ async fn tenant_round(
         firing: &firing,
     };
     let mut round = Round::default();
-    for (name, rules) in owned {
-        let key = (tenant.clone(), name.clone());
+    for Partition {
+        group: name,
+        part,
+        parts,
+        rules,
+    } in owned
+    {
+        let key = (tenant.clone(), name.clone(), part);
         let group = match groups.open.get(&key) {
-            Some(group) if group.rules() == rules.as_slice() => Arc::clone(group),
+            Some(group) if group.rules() == rules.as_slice() && group.parts() == parts => {
+                Arc::clone(group)
+            }
             _ => {
-                let group = Arc::new(RuleGroup::open(
+                let group = Arc::new(RuleGroup::open_partition(
                     Arc::clone(&evaluator.store),
                     tenant.clone(),
                     name.clone(),
                     rules,
                     evaluator.env.clone(),
+                    part,
+                    parts,
                 ));
                 groups.open.insert(key, Arc::clone(&group));
                 group

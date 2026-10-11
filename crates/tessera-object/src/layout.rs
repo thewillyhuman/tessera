@@ -96,6 +96,14 @@ pub fn eval_log(tenant: &TenantId, group: &str, part: u32) -> Key {
     key(&[tenant.as_str(), "_eval", group, &part.to_string()])
 }
 
+/// The checkpoint partition 0 of a rule group writes when the group's
+/// partition count changes (CQ-6), named by the new count and the time
+/// of the change; the other partitions take their keys from it.
+#[must_use]
+pub fn eval_split(tenant: &TenantId, group: &str, name: &str) -> Key {
+    key(&[tenant.as_str(), "_eval", group, "_split", name])
+}
+
 /// Prefix of a dataset's log.
 #[must_use]
 pub fn dataset_log(tenant: &TenantId, dataset: &DatasetName) -> Key {

@@ -488,6 +488,14 @@ pub async fn ingest(
             .collect::<Vec<_>>(),
         now,
     );
+    if state.rebuild.contains(&rule.name) {
+        tracing::info!(
+            tenant = %source.tenant, rule = %rule.name,
+            "rebuilding the windows from the files after a re-split"
+        );
+        rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
+        return Ok(ingested);
+    }
     for registration in writers {
         let writer = registration.writer;
         let name = writer.to_string();
@@ -865,6 +873,9 @@ pub fn actions(
     horizon: Timestamp,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
+    if ingested.rebuilt.is_some() && state.rebuild.contains(&rule.name) {
+        actions.push(EvalState::delete_rebuild(&rule.name));
+    }
     match (
         degraded_mark(rule, shape, ingested, state, horizon),
         state.degraded.get(&rule.name),

@@ -166,6 +166,11 @@ pub struct TenantSettings {
     /// Query budgets per team, by the team of the role a query runs
     /// under (section 13.4); their action is alert or reject.
     pub team_query_budgets: BTreeMap<String, Budget>,
+    /// State partitions per rule group (CQ-6), by group name; one for a
+    /// group not named. Each partition owns the alert instances whose
+    /// fingerprint hashes to it and is a slot of its own. A change
+    /// re-splits the group's state at its next evaluation.
+    pub rule_partitions: BTreeMap<String, u32>,
     /// What is dropped, hashed or masked at ingest (SE-4); a patch
     /// with any rules replaces them all.
     pub redactions: Vec<Redaction>,
@@ -267,6 +272,12 @@ pub enum InvalidSettings {
     /// A limit is zero, which would refuse every query.
     #[error("{0} must be greater than zero")]
     Zero(String),
+    /// A rule group's partition count is out of range.
+    #[error("rule_partitions.{group}: must be between 1 and 64")]
+    RulePartitions {
+        /// The group.
+        group: String,
+    },
     /// A name is empty.
     #[error("{0} must not be empty")]
     Empty(String),
@@ -305,6 +316,12 @@ impl TenantSettings {
                 .iter()
                 .chain(&patch.team_query_budgets)
                 .map(|(team, budget)| (team.clone(), *budget))
+                .collect(),
+            rule_partitions: self
+                .rule_partitions
+                .iter()
+                .chain(&patch.rule_partitions)
+                .map(|(group, parts)| (group.clone(), *parts))
                 .collect(),
             redactions: if patch.redactions.is_empty() {
                 self.redactions.clone()
@@ -372,9 +389,28 @@ impl TenantSettings {
         {
             return Err(InvalidSettings::Empty("encryption_key".into()));
         }
+        if let Some((group, _)) = self
+            .rule_partitions
+            .iter()
+            .find(|(_, parts)| !(1..=MAX_RULE_PARTITIONS).contains(parts))
+        {
+            return Err(InvalidSettings::RulePartitions {
+                group: group.clone(),
+            });
+        }
         Ok(())
     }
+
+    /// The state partitions of rule group `group` (CQ-6): one unless the
+    /// settings say more.
+    #[must_use]
+    pub fn rule_partitions_of(&self, group: &str) -> u32 {
+        self.rule_partitions.get(group).copied().unwrap_or(1)
+    }
 }
+
+/// The most state partitions a rule group may have (CQ-6).
+pub const MAX_RULE_PARTITIONS: u32 = 64;
 
 /// One tenant as recorded in the catalog.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -621,5 +657,35 @@ mod tests {
             serde_json::to_string(&TenantStatus::Active).unwrap(),
             r#"{"state":"active"}"#
         );
+    }
+
+    #[test]
+    fn rule_partitions_merge_by_group_and_stay_within_range() {
+        let current = TenantSettings {
+            rule_partitions: BTreeMap::from([("a".to_owned(), 2)]),
+            ..TenantSettings::default()
+        };
+        let patch = TenantSettings {
+            rule_partitions: BTreeMap::from([("b".to_owned(), 4)]),
+            ..TenantSettings::default()
+        };
+        let merged = current.merged(&patch);
+        assert_eq!(merged.rule_partitions_of("a"), 2);
+        assert_eq!(merged.rule_partitions_of("b"), 4);
+        assert_eq!(merged.rule_partitions_of("c"), 1, "one unless said");
+        merged.validate().unwrap();
+        let zero = TenantSettings {
+            rule_partitions: BTreeMap::from([("a".to_owned(), 0)]),
+            ..TenantSettings::default()
+        };
+        assert_eq!(
+            zero.validate(),
+            Err(InvalidSettings::RulePartitions { group: "a".into() })
+        );
+        let many = TenantSettings {
+            rule_partitions: BTreeMap::from([("a".to_owned(), MAX_RULE_PARTITIONS + 1)]),
+            ..TenantSettings::default()
+        };
+        assert!(many.validate().is_err());
     }
 }

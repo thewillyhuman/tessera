@@ -564,6 +564,7 @@ impl Shared {
                 Arc::clone(&controls),
                 Arc::clone(&self.store),
                 self.env.clone(),
+                self.catalog.clone(),
             )))
             .with_rollups(Arc::new(RollupEntries::new(
                 Arc::clone(&controls),

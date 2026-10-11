@@ -173,9 +173,14 @@ the `eval` role running the rule groups it owns by slot;
 `system.alert_instances`, `GET /api/v1/rules` and `GET /api/v1/alerts`
 over the state logs.
 
-Gaps left in M7: one state
-partition per rule group, so the group count rather than the key
-space bounds a group's parallelism (CQ-6); a writer log removed whole
+A rule group's state is split over
+the partitions the tenant setting `rule_partitions` names for it
+(CQ-6): each is a slot of its own, evaluates every rule and keeps the
+instances whose fingerprint hashes to it, and a change of the count
+re-splits the state through a checkpoint partition 0 writes.
+
+Gaps left in M7: a partition reads every writer log and runs every
+query, so partitions divide the state but not the reading; a writer log removed whole
 after its writer ended is not detected as a gap by a rule still to
 read its last entries (section 11.7); the incremental subset is SQL
 only and counts rows unweighted; the alert latency target is set by the evaluation
@@ -448,7 +453,8 @@ rather than parsing the line again (QL-10); the tenant settings
 `parse_json_bodies` (on by default) and `parse_logfmt_bodies` (off)
 choose what is parsed. The tenant setting `encryption_key` names the
 key, in the nodes' keyring, the tenant's data is sealed under (SE-2),
-`storage_pool` the pool compaction places its files in, and
+`storage_pool` the pool compaction places its files in,
+`rule_partitions` how many state partitions each rule group has, and
 `features` switches `patterns`, `promotion`, `advisor` and `rollups`
 off for the tenant, each on by default (CT-7):
 

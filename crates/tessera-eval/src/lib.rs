@@ -14,6 +14,7 @@ pub mod lifecycle;
 pub mod materialize;
 pub mod mode;
 pub mod notify;
+pub mod partition;
 pub mod rollup;
 pub mod rule;
 pub mod sink;
@@ -26,6 +27,7 @@ pub use lifecycle::{Instance, Observation, Status, Transition, fingerprint, step
 pub use materialize::{Maintained, coverage, due_windows, maintain, materialize, progress_log};
 pub use mode::{Mode, mode_of};
 pub use notify::{HttpNotifier, MemoryNotifier, Notification, Notifier, payloads};
+pub use partition::partition_of;
 pub use rollup::{Origin, Rollup};
 pub use rule::{
     Acknowledgment, AlertRule, Inhibition, Language, NotificationRoute, RouteKind, Silence,

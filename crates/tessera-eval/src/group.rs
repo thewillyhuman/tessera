@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use tessera_commit::{Action, ApplyError, KvMutation, UpdateError};
+use tessera_commit::{Action, ApplyError, KvMutation, Snapshot, UpdateError};
 use tessera_exec::Engine;
 use tessera_object::ObjectStore;
 use tessera_types::event::{MetricType, Scalar, Temporality};
@@ -25,6 +25,7 @@ use crate::evaluate::{EvalError, RuleRun, instance_labels, observe};
 use crate::incremental;
 use crate::lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
 use crate::notify::{Notification, Notifier};
+use crate::partition;
 use crate::rule::{Acknowledgment, AlertRule, Inhibition, NotificationRoute, Silence};
 use crate::sink::AlertSink;
 use crate::state::{EvalState, StateLog};
@@ -36,7 +37,12 @@ pub struct RuleGroup {
     rules: Vec<AlertRule>,
     store: Arc<dyn ObjectStore>,
     keys: Arc<Keys>,
+    env: Env,
     log: StateLog,
+    /// Which partition this is (CQ-6).
+    part: u32,
+    /// How many partitions the group has.
+    parts: u32,
 }
 
 /// What one evaluation did.
@@ -68,7 +74,7 @@ pub struct Recorded {
 
 impl RuleGroup {
     /// The group `name` of `tenant` with `rules`, over its state log in
-    /// `store`.
+    /// `store`: the whole group as one partition.
     #[must_use]
     pub fn open(
         store: Arc<dyn ObjectStore>,
@@ -77,16 +83,37 @@ impl RuleGroup {
         rules: Vec<AlertRule>,
         env: Env,
     ) -> Self {
+        RuleGroup::open_partition(store, tenant, name, rules, env, 0, 1)
+    }
+
+    /// Partition `part` of the `parts` the group `name` of `tenant` is
+    /// split in (CQ-6), over its own state log in `store`. It evaluates
+    /// every rule and keeps the instances whose fingerprint hashes to
+    /// it; a count other than the one its state was written under makes
+    /// it re-split first.
+    #[must_use]
+    pub fn open_partition(
+        store: Arc<dyn ObjectStore>,
+        tenant: TenantId,
+        name: impl Into<String>,
+        rules: Vec<AlertRule>,
+        env: Env,
+        part: u32,
+        parts: u32,
+    ) -> Self {
         let name = name.into();
         let keys = Arc::clone(&env.keys);
-        let log = crate::state::open(Arc::clone(&store), &tenant, &name, 0, env);
+        let log = crate::state::open(Arc::clone(&store), &tenant, &name, part, env.clone());
         RuleGroup {
             tenant,
             name,
             rules,
             store,
             keys,
+            env,
             log,
+            part,
+            parts: parts.max(1),
         }
     }
 
@@ -94,6 +121,81 @@ impl RuleGroup {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Which partition this is.
+    #[must_use]
+    pub fn part(&self) -> u32 {
+        self.part
+    }
+
+    /// How many partitions the group has, as this one was opened.
+    #[must_use]
+    pub fn parts(&self) -> u32 {
+        self.parts
+    }
+
+    /// Whether an instance with `fingerprint` belongs to this partition.
+    fn owns(&self, fingerprint: &str) -> bool {
+        partition::partition_of(fingerprint, self.parts) == self.part
+    }
+
+    /// The state of this partition under the group's current partition
+    /// count, re-split first when the count changed (CQ-6): partition 0
+    /// merges the partitions the group had, writes the split checkpoint
+    /// and keeps its keys; another partition takes its keys from that
+    /// checkpoint, or waits, with nothing to evaluate, until it exists.
+    /// A partition past the count evaluates nothing.
+    async fn aligned(&self) -> Result<Option<Arc<Snapshot<EvalState>>>, EvalError> {
+        let state_error = |e: &dyn std::fmt::Display| EvalError::State(e.to_string());
+        let snapshot = self.log.snapshot().await.map_err(|e| state_error(&e))?;
+        if self.part >= self.parts {
+            return Ok(None);
+        }
+        if snapshot.state().parts == self.parts {
+            return Ok(Some(snapshot));
+        }
+        let (whole, split) = if self.part == 0 {
+            let mut states = vec![snapshot.state().clone()];
+            for part in 1..snapshot.state().parts {
+                states.push(
+                    partition::load(&self.store, &self.tenant, &self.name, part, &self.env).await?,
+                );
+            }
+            let whole = partition::merge(states);
+            let split = format!("{}-{}", self.parts, self.env.clock.now().as_nanos());
+            partition::save_split(&*self.store, &self.tenant, &self.name, &split, &whole).await?;
+            (whole, Some(split))
+        } else {
+            let first =
+                partition::load(&self.store, &self.tenant, &self.name, 0, &self.env).await?;
+            let checkpoint = match (first.parts == self.parts, &first.split) {
+                (true, Some(split)) => {
+                    partition::load_split(&*self.store, &self.tenant, &self.name, split).await?
+                }
+                _ => None,
+            };
+            let Some(whole) = checkpoint else {
+                tracing::info!(tenant = %self.tenant, group = %self.name, part = self.part, parts = self.parts, "waiting for partition 0 to write the split checkpoint");
+                return Ok(None);
+            };
+            (whole, None)
+        };
+        let mut next = partition::split(&whole, self.part, self.parts);
+        next.split = split;
+        next.rebuild = self
+            .rules
+            .iter()
+            .filter(|r| r.record.is_none() && incremental::shape_of(r, &self.tenant).is_ok())
+            .map(|r| r.name.clone())
+            .collect();
+        tracing::info!(tenant = %self.tenant, group = %self.name, part = self.part, parts = self.parts, from = whole.parts, instances = next.instances.len(), "rule group partition re-split");
+        self.log
+            .update(|state| Ok::<_, ApplyError>(state.replace_with(&next)))
+            .await
+            .map_err(|e: UpdateError<ApplyError>| state_error(&e))?;
+        let snapshot = self.log.snapshot().await.map_err(|e| state_error(&e))?;
+        Ok(Some(snapshot))
     }
 
     /// The rules.
@@ -166,11 +268,9 @@ impl RuleGroup {
     ///
     /// If the state log cannot be read or committed.
     pub async fn evaluate(&self, engine: &Engine, now: Timestamp) -> Result<Evaluated, EvalError> {
-        let snapshot = self
-            .log
-            .snapshot()
-            .await
-            .map_err(|e| EvalError::State(e.to_string()))?;
+        let Some(snapshot) = self.aligned().await? else {
+            return Ok(Evaluated::default());
+        };
         let mut observed: Vec<Observed<'_>> = Vec::new();
         let mut recorded = Vec::new();
         for rule in &self.rules {
@@ -236,7 +336,7 @@ impl RuleGroup {
         let transitions = Mutex::new(Vec::new());
         self.log
             .update(|state| {
-                let (actions, changed) = decide(state, &observed, now);
+                let (actions, changed) = decide(state, &observed, now, &|fp| self.owns(fp));
                 *transitions.lock().unwrap_or_else(PoisonError::into_inner) = changed;
                 Ok::<_, ApplyError>(actions)
             })
@@ -310,7 +410,11 @@ impl RuleGroup {
             engine,
             tenant: &self.tenant,
         };
-        let ingested = incremental::ingest(&source, rule, shape, state, now).await?;
+        let mut ingested = incremental::ingest(&source, rule, shape, state, now).await?;
+        // Another partition keeps the windows of the keys it owns.
+        ingested
+            .windows
+            .retain(|_, window| self.owns(&fingerprint(&window.keys)));
         if ingested.late_rows > 0 {
             tracing::info!(tenant = %self.tenant, rule = %rule.name, late_rows = ingested.late_rows, "late rows ignored");
         }
@@ -799,6 +903,7 @@ fn decide(
     state: &EvalState,
     observed: &[Observed<'_>],
     now: Timestamp,
+    owns: &dyn Fn(&str) -> bool,
 ) -> (Vec<Action>, Vec<Transition>) {
     let mut actions = Vec::new();
     let mut transitions = Vec::new();
@@ -824,6 +929,9 @@ fn decide(
         for observation in observations {
             let labels = instance_labels(rule, &observation.labels);
             let fp = fingerprint(&labels);
+            if !owns(&fp) {
+                continue;
+            }
             seen.insert(
                 fp,
                 Observation {

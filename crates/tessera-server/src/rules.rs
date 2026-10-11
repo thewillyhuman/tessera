@@ -22,9 +22,9 @@ use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tessera_catalog::{ControlError, Table};
+use tessera_catalog::{ControlError, Table, TenantSettingsSource};
 use tessera_eval::rule::decode_rows;
-use tessera_eval::{AlertRule, Instance, Language, Status, state};
+use tessera_eval::{AlertRule, Instance, Language, Status, partition};
 use tessera_types::{TenantId, Timestamp};
 
 use crate::AppState;
@@ -247,20 +247,26 @@ async fn groups_of(state: &AppState, tenant: &TenantId) -> Result<Vec<Group>, Ap
         by_group.entry(rule.group.clone()).or_default().push(rule);
     }
     let store = Arc::clone(state.pools.root().store());
+    let settings = state.catalog.settings_of(tenant);
     let mut groups = Vec::new();
     for (name, mut rules) in by_group {
         rules.sort_by(|a, b| (a.position, &a.name).cmp(&(b.position, &b.name)));
-        let log = state::open(Arc::clone(&store), tenant, &name, 0, state.env.clone());
-        let snapshot = log
-            .snapshot()
-            .await
-            .map_err(|e| ApiError::unavailable(e.to_string()))?;
+        // The group whole: every partition's instances (CQ-6).
+        let merged = partition::merged(
+            &store,
+            tenant,
+            &name,
+            settings.rule_partitions_of(&name),
+            &state.env,
+        )
+        .await
+        .map_err(|e| ApiError::unavailable(e.to_string()))?;
         groups.push(Group {
             name,
             rules,
-            instances: snapshot.state().instances.values().cloned().collect(),
-            evaluated: snapshot.state().evaluated.clone(),
-            degraded: snapshot.state().degraded.clone(),
+            instances: merged.instances.into_values().collect(),
+            evaluated: merged.evaluated,
+            degraded: merged.degraded,
         });
     }
     Ok(groups)

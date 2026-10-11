@@ -9,7 +9,7 @@
 //! Alert instance state lives here and never in a tenant-wide log
 //! (CQ-13).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use crate::incremental::WindowState;
 use crate::lifecycle::{Instance, Transition};
 
 /// The folded state of a rule group partition.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvalState {
     /// The remembered instances, by `rule/fingerprint`.
     pub instances: BTreeMap<String, Instance>,
@@ -48,9 +48,48 @@ pub struct EvalState {
     /// rebuild could have touched.
     #[serde(default)]
     pub degraded: BTreeMap<String, Timestamp>,
+    /// How many state partitions the group had when this partition was
+    /// last written (CQ-6); a count the settings no longer give means
+    /// the partition must re-split before it evaluates.
+    #[serde(default = "one_partition")]
+    pub parts: u32,
+    /// The split checkpoint partition 0 wrote for `parts`, by name,
+    /// which the other partitions take their keys from (CQ-6).
+    #[serde(default)]
+    pub split: Option<String>,
+    /// The rules whose windows the next ingest rebuilds from the files,
+    /// as after a re-split (CQ-6).
+    #[serde(default)]
+    pub rebuild: BTreeSet<String>,
+}
+
+const fn one_partition() -> u32 {
+    1
+}
+
+impl Default for EvalState {
+    /// Empty, as the whole of a group with one partition.
+    fn default() -> Self {
+        EvalState {
+            instances: BTreeMap::new(),
+            positions: BTreeMap::new(),
+            outbox: BTreeMap::new(),
+            evaluated: BTreeMap::new(),
+            watermarks: BTreeMap::new(),
+            windows: BTreeMap::new(),
+            group_sent: BTreeMap::new(),
+            degraded: BTreeMap::new(),
+            parts: one_partition(),
+            split: None,
+            rebuild: BTreeSet::new(),
+        }
+    }
 }
 
 const INSTANCE: &str = "instance/";
+const PARTS: &str = "parts";
+const SPLIT: &str = "split";
+const REBUILD: &str = "rebuild/";
 const POSITION: &str = "position/";
 const OUTBOX: &str = "outbox/";
 const EVALUATED: &str = "evaluated/";
@@ -132,6 +171,101 @@ impl EvalState {
         delete(format!("{DEGRADED}{rule}"))
     }
 
+    /// Records the group's partition count and, for partition 0, the
+    /// split checkpoint it wrote (CQ-6).
+    #[must_use]
+    pub fn put_parts(parts: u32, split: Option<&str>) -> Vec<Action> {
+        let mut actions = vec![put(PARTS.to_owned(), &parts)];
+        match split {
+            Some(name) => actions.push(put(SPLIT.to_owned(), &name)),
+            None => actions.push(delete(SPLIT.to_owned())),
+        }
+        actions
+    }
+
+    /// Asks the next ingest of `rule` to rebuild its windows.
+    #[must_use]
+    pub fn put_rebuild(rule: &str) -> Action {
+        put(format!("{REBUILD}{rule}"), &())
+    }
+
+    /// Clears the rebuild request of `rule`.
+    #[must_use]
+    pub fn delete_rebuild(rule: &str) -> Action {
+        delete(format!("{REBUILD}{rule}"))
+    }
+
+    /// The actions that turn this state into `next`, every key
+    /// included: how a partition takes the keys of a re-split (CQ-6).
+    #[must_use]
+    pub fn replace_with(&self, next: &EvalState) -> Vec<Action> {
+        let mut actions = Vec::new();
+        actions.extend(
+            self.instances
+                .keys()
+                .map(|k| delete(format!("{INSTANCE}{k}"))),
+        );
+        actions.extend(
+            self.positions
+                .keys()
+                .map(|k| delete(format!("{POSITION}{k}"))),
+        );
+        actions.extend(self.outbox.keys().map(|k| delete(format!("{OUTBOX}{k}"))));
+        actions.extend(
+            self.evaluated
+                .keys()
+                .map(|k| delete(format!("{EVALUATED}{k}"))),
+        );
+        actions.extend(
+            self.watermarks
+                .keys()
+                .map(|k| delete(format!("{WATERMARK}{k}"))),
+        );
+        actions.extend(self.windows.keys().map(|k| delete(format!("{WINDOW}{k}"))));
+        actions.extend(
+            self.group_sent
+                .keys()
+                .map(|k| delete(format!("{GROUP_SENT}{k}"))),
+        );
+        actions.extend(
+            self.degraded
+                .keys()
+                .map(|k| delete(format!("{DEGRADED}{k}"))),
+        );
+        actions.extend(self.rebuild.iter().map(|k| delete(format!("{REBUILD}{k}"))));
+        actions.extend(next.instances.values().map(EvalState::put_instance));
+        actions.extend(
+            next.positions
+                .iter()
+                .map(|(w, s)| EvalState::put_position(w, *s)),
+        );
+        actions.extend(next.outbox.values().map(EvalState::put_outbox));
+        actions.extend(
+            next.evaluated
+                .iter()
+                .map(|(r, at)| EvalState::put_evaluated(r, *at)),
+        );
+        actions.extend(
+            next.watermarks
+                .iter()
+                .map(|(w, at)| EvalState::put_watermark(w, *at)),
+        );
+        actions.extend(next.windows.values().map(EvalState::put_window));
+        actions.extend(
+            next.group_sent
+                .iter()
+                .map(|(k, at)| EvalState::put_group_sent(k, *at)),
+        );
+        actions.extend(
+            next.degraded
+                .iter()
+                .map(|(r, at)| EvalState::put_degraded(r, *at)),
+        );
+        actions.extend(next.rebuild.iter().map(|r| EvalState::put_rebuild(r)));
+        actions.extend(EvalState::put_parts(next.parts, next.split.as_deref()));
+        actions
+    }
+
     /// The outbox in transition order.
     #[must_use]
     pub fn pending_transitions(&self) -> Vec<&Transition> {
@@ -187,6 +321,12 @@ impl State for EvalState {
                     self.group_sent.insert(rest.to_owned(), decode(key, value)?);
                 } else if let Some(rest) = key.strip_prefix(DEGRADED) {
                     self.degraded.insert(rest.to_owned(), decode(key, value)?);
+                } else if let Some(rest) = key.strip_prefix(REBUILD) {
+                    self.rebuild.insert(rest.to_owned());
+                } else if key == PARTS {
+                    self.parts = decode(key, value)?;
+                } else if key == SPLIT {
+                    self.split = Some(decode(key, value)?);
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }
@@ -208,6 +348,10 @@ impl State for EvalState {
                     self.group_sent.remove(rest);
                 } else if let Some(rest) = key.strip_prefix(DEGRADED) {
                     self.degraded.remove(rest);
+                } else if let Some(rest) = key.strip_prefix(REBUILD) {
+                    self.rebuild.remove(rest);
+                } else if key == SPLIT {
+                    self.split = None;
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }
