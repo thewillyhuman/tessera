@@ -37,6 +37,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 http-body-util = "0.1"
+snap = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"
 tower = { version = "0.5", features = ["util"] }
