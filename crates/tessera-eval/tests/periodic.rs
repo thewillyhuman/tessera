@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, StringArray};
-use tessera_eval::{AlertRule, Language, MemorySink, RuleGroup, Status};
+use tessera_eval::{AlertRule, Delivery, Language, MemoryNotifier, MemorySink, RuleGroup, Status};
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::ParquetFormat;
 use tessera_manifest::registry;
@@ -142,13 +142,22 @@ async fn an_sql_rule_fires_per_group_after_its_hold_and_resolves() {
     );
 
     let sink = MemorySink::default();
-    assert_eq!(group.deliver(&sink, at(1_401)).await.unwrap(), 3);
+    let notifier = MemoryNotifier::default();
+    let delivery = Delivery {
+        sink: &sink,
+        notifier: &notifier,
+        routes: &[],
+        silences: &[],
+        acknowledgments: &[],
+    };
+    assert_eq!(group.deliver(&delivery, at(1_401)).await.unwrap().events, 3);
     assert!(group.outbox().await.unwrap().is_empty());
     assert_eq!(
-        group.deliver(&sink, at(1_402)).await.unwrap(),
+        group.deliver(&delivery, at(1_402)).await.unwrap().events,
         0,
         "delivered once"
     );
+    assert!(notifier.sent().is_empty(), "the rule names no route");
     let batches = sink.batches();
     assert_eq!(batches.len(), 1);
     let rows = batches[0].rows();

@@ -10,13 +10,15 @@
 pub mod evaluate;
 pub mod group;
 pub mod lifecycle;
+pub mod notify;
 pub mod rule;
 pub mod sink;
 pub mod state;
 
 pub use evaluate::{EvalError, observe};
-pub use group::{Evaluated, RuleGroup};
+pub use group::{Delivered, Delivery, Evaluated, RuleGroup};
 pub use lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
+pub use notify::{HttpNotifier, MemoryNotifier, Notification, Notifier, payloads};
 pub use rule::{
     Acknowledgment, AlertRule, Language, NotificationRoute, RouteKind, Silence, UnknownLanguage,
 };

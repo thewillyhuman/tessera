@@ -5,20 +5,23 @@
 //! evaluation observes every due rule through the engine, then commits
 //! in one go the instances, the transitions into the outbox and the
 //! evaluation times (CQ-12); delivery drains the outbox: the alert
-//! events are written (CQ-14) and the transitions marked done.
+//! events are written (CQ-14), the routes notified (CQ-15) and the
+//! transitions marked done.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
-use tessera_commit::{Action, ApplyError, UpdateError};
+use tessera_commit::{Action, ApplyError, KvMutation, UpdateError};
 use tessera_exec::Engine;
 use tessera_object::ObjectStore;
 use tessera_types::event::Scalar;
 use tessera_types::{Attributes, DatasetName, Env, EventBatch, EventRow, TenantId, Timestamp};
 
 use crate::evaluate::{EvalError, instance_labels, observe};
-use crate::lifecycle::{Instance, Observation, Transition, fingerprint, step};
-use crate::rule::AlertRule;
+use crate::lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
+use crate::notify::{Notification, Notifier};
+use crate::rule::{Acknowledgment, AlertRule, NotificationRoute, Silence};
 use crate::sink::AlertSink;
 use crate::state::{EvalState, StateLog};
 
@@ -151,29 +154,123 @@ impl RuleGroup {
         })
     }
 
-    /// Delivers the outbox: writes every pending transition as an alert
-    /// event of its rule's dataset (CQ-14) and marks it done. A sink
-    /// failure leaves the outbox as it is, to be delivered again.
+    /// Delivers the outbox (CQ-15). Every pending transition is written
+    /// as an alert event of its rule's dataset (CQ-14); then the firing
+    /// and resolved ones go to their rule's routes unless a silence or
+    /// an acknowledgment covers the instance (section 11.8); then each
+    /// is marked done, except one whose route could not be reached,
+    /// which stays for the next delivery. Instances that keep firing
+    /// are notified again after their route's repeat interval.
     ///
     /// # Errors
     ///
     /// If the state log cannot be read or committed, or the sink fails.
-    pub async fn deliver(&self, sink: &dyn AlertSink, now: Timestamp) -> Result<usize, EvalError> {
+    pub async fn deliver(
+        &self,
+        delivery: &Delivery<'_>,
+        now: Timestamp,
+    ) -> Result<Delivered, EvalError> {
         let snapshot = self
             .log
             .snapshot()
             .await
             .map_err(|e| EvalError::State(e.to_string()))?;
-        let pending: Vec<Transition> = snapshot.state().outbox.values().cloned().collect();
-        if pending.is_empty() {
-            return Ok(0);
-        }
-        let mut by_dataset: BTreeMap<String, Vec<EventRow>> = BTreeMap::new();
+        let state = snapshot.state();
+        let pending: Vec<Transition> = state.outbox.values().cloned().collect();
+        let mut delivered = Delivered::default();
+        self.write_events(delivery.sink, &pending, now).await?;
+        delivered.events = pending.len();
+
+        let mut done: Vec<&Transition> = Vec::new();
+        let mut notified: BTreeMap<String, Instance> = BTreeMap::new();
         for transition in &pending {
+            let instance = state
+                .instances
+                .get(&format!("{}/{}", transition.rule, transition.fingerprint));
+            let outcome = self
+                .notify(delivery, transition, instance, false, now)
+                .await;
+            match outcome {
+                Outcome::Sent(instance) => {
+                    delivered.notified += 1;
+                    if let Some(instance) = instance {
+                        notified.insert(instance.key(), instance);
+                    }
+                    done.push(transition);
+                }
+                Outcome::Suppressed => {
+                    delivered.suppressed += 1;
+                    done.push(transition);
+                }
+                Outcome::NotNotifiable => done.push(transition),
+                Outcome::Failed => delivered.failed += 1,
+            }
+        }
+        for instance in state.instances.values() {
+            if instance.status != Status::Firing || notified.contains_key(&instance.key()) {
+                continue;
+            }
+            let Some(last) = instance.notified_at else {
+                continue;
+            };
+            let Some(repeat) = self.repeat_of(delivery, &instance.rule) else {
+                continue;
+            };
+            if now.duration_since(last).is_none_or(|since| since < repeat) {
+                continue;
+            }
+            let again = Transition {
+                rule: instance.rule.clone(),
+                fingerprint: instance.fingerprint.clone(),
+                number: instance.transitions,
+                from: Status::Firing,
+                to: Status::Firing,
+                at: now,
+                labels: instance.labels.clone(),
+                value: instance.value,
+            };
+            match self
+                .notify(delivery, &again, Some(instance), true, now)
+                .await
+            {
+                Outcome::Sent(Some(instance)) => {
+                    delivered.repeated += 1;
+                    notified.insert(instance.key(), instance);
+                }
+                Outcome::Sent(None) | Outcome::NotNotifiable | Outcome::Suppressed => {}
+                Outcome::Failed => delivered.failed += 1,
+            }
+        }
+        let mut actions: Vec<Action> = done.iter().map(|t| EvalState::delete_outbox(t)).collect();
+        actions.extend(notified.values().map(EvalState::put_instance));
+        if !actions.is_empty() {
+            self.log
+                .update(|state| {
+                    Ok::<_, ApplyError>(
+                        actions
+                            .iter()
+                            .filter(|action| applies(state, action))
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .await
+                .map_err(|e: UpdateError<ApplyError>| EvalError::State(e.to_string()))?;
+        }
+        Ok(delivered)
+    }
+
+    /// Writes `pending` as alert events, one batch per dataset.
+    async fn write_events(
+        &self,
+        sink: &dyn AlertSink,
+        pending: &[Transition],
+        now: Timestamp,
+    ) -> Result<(), EvalError> {
+        let mut by_dataset: BTreeMap<String, Vec<EventRow>> = BTreeMap::new();
+        for transition in pending {
             let dataset = self
-                .rules
-                .iter()
-                .find(|r| r.name == transition.rule)
+                .rule(&transition.rule)
                 .map_or_else(|| "default".to_owned(), |r| r.dataset.clone());
             by_dataset
                 .entry(dataset)
@@ -186,27 +283,133 @@ impl RuleGroup {
                 .map_err(|e| EvalError::Sink(e.to_string()))?;
             sink.write(batch).await.map_err(EvalError::Sink)?;
         }
-        self.log
-            .update(|state| {
-                Ok::<_, ApplyError>(
-                    pending
-                        .iter()
-                        .filter(|t| state.outbox.contains_key(&outbox_key(t)))
-                        .map(EvalState::delete_outbox)
-                        .collect(),
-                )
-            })
-            .await
-            .map_err(|e: UpdateError<ApplyError>| EvalError::State(e.to_string()))?;
-        Ok(pending.len())
+        Ok(())
+    }
+
+    /// Tells the rule's routes about `transition`, unless it is not one
+    /// to notify or the instance is silenced or acknowledged.
+    async fn notify(
+        &self,
+        delivery: &Delivery<'_>,
+        transition: &Transition,
+        instance: Option<&Instance>,
+        repeat: bool,
+        now: Timestamp,
+    ) -> Outcome {
+        if !matches!(transition.to, Status::Firing | Status::Resolved) {
+            return Outcome::NotNotifiable;
+        }
+        let Some(rule) = self.rule(&transition.rule) else {
+            return Outcome::NotNotifiable;
+        };
+        if rule.notify.is_empty() {
+            return Outcome::NotNotifiable;
+        }
+        let silenced = delivery
+            .silences
+            .iter()
+            .any(|s| s.covers(&transition.labels, now));
+        let acknowledged = delivery
+            .acknowledgments
+            .iter()
+            .any(|a| a.covers(&transition.fingerprint, now));
+        if silenced || acknowledged {
+            return Outcome::Suppressed;
+        }
+        let notification = Notification {
+            transition: transition.clone(),
+            annotations: rule.annotations.clone(),
+            repeat,
+        };
+        let mut failed = false;
+        for name in &rule.notify {
+            let Some(route) = delivery.routes.iter().find(|r| &r.name == name) else {
+                tracing::warn!(tenant = %self.tenant, rule = %rule.name, route = %name, "unknown notification route");
+                continue;
+            };
+            if let Err(error) = delivery
+                .notifier
+                .send(route, std::slice::from_ref(&notification))
+                .await
+            {
+                tracing::warn!(tenant = %self.tenant, rule = %rule.name, route = %name, error = %error, "notification failed");
+                failed = true;
+            }
+        }
+        if failed {
+            return Outcome::Failed;
+        }
+        Outcome::Sent(instance.map(|i| Instance {
+            notified_at: Some(now),
+            ..i.clone()
+        }))
+    }
+
+    fn rule(&self, name: &str) -> Option<&AlertRule> {
+        self.rules.iter().find(|r| r.name == name)
+    }
+
+    /// The shortest repeat interval among a rule's routes.
+    fn repeat_of(&self, delivery: &Delivery<'_>, rule: &str) -> Option<Duration> {
+        let rule = self.rule(rule)?;
+        delivery
+            .routes
+            .iter()
+            .filter(|r| rule.notify.contains(&r.name))
+            .map(NotificationRoute::repeat)
+            .min()
     }
 }
 
-fn outbox_key(transition: &Transition) -> String {
-    format!(
-        "{}/{}/{:020}",
-        transition.rule, transition.fingerprint, transition.number
-    )
+/// What delivery needs besides the group.
+pub struct Delivery<'a> {
+    /// Where alert events go.
+    pub sink: &'a dyn AlertSink,
+    /// How routes are reached.
+    pub notifier: &'a dyn Notifier,
+    /// The tenant's routes.
+    pub routes: &'a [NotificationRoute],
+    /// The tenant's silences.
+    pub silences: &'a [Silence],
+    /// The tenant's acknowledgments.
+    pub acknowledgments: &'a [Acknowledgment],
+}
+
+/// What one delivery did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Delivered {
+    /// Transitions written as alert events.
+    pub events: usize,
+    /// Transitions notified.
+    pub notified: usize,
+    /// Transitions held back by a silence or an acknowledgment.
+    pub suppressed: usize,
+    /// Still-firing instances notified again.
+    pub repeated: usize,
+    /// Notifications that failed and stay pending.
+    pub failed: usize,
+}
+
+enum Outcome {
+    Sent(Option<Instance>),
+    Suppressed,
+    NotNotifiable,
+    Failed,
+}
+
+/// Whether a delivery action still makes sense on `state`: a deletion
+/// of an outbox entry that is there, or an instance update of an
+/// instance that is still remembered.
+fn applies(state: &EvalState, action: &Action) -> bool {
+    match action {
+        Action::Kv(KvMutation::Delete { key }) => key
+            .strip_prefix("outbox/")
+            .is_some_and(|k| state.outbox.contains_key(k)),
+        Action::Kv(KvMutation::Put { key, .. }) => key
+            .strip_prefix("instance/")
+            .is_some_and(|k| state.instances.contains_key(k)),
+        _ => false,
+    }
 }
 
 /// The actions that bring `state` up to date with what was observed,
