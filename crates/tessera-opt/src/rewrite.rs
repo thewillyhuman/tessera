@@ -24,7 +24,7 @@ use tessera_types::{TimeRange, Timestamp};
 pub fn rewrite(plan: Plan) -> Plan {
     let pushed = push_predicates(plan, Vec::new());
     let limited = push_limits(pushed);
-    push_projection(limited, None)
+    push_projection(limited, None, false)
 }
 
 /// Moves `pending` conjuncts down as far as they go, collecting more on
@@ -291,10 +291,13 @@ fn newest_first(plan: Plan) -> Plan {
 /// when everything above wants every column.
 /// `scan` narrowed to `needed` and the columns its own predicates read,
 /// in schema order; untouched when everything above wants every column.
-fn narrow_scan(mut scan: Scan, needed: Option<BTreeSet<String>>) -> Scan {
+fn narrow_scan(mut scan: Scan, needed: Option<BTreeSet<String>>, whole: bool) -> Scan {
     let Some(needed) = needed else {
+        // Everything is read, the whole overflow with it.
+        scan.overflow_whole = true;
         return scan;
     };
+    let whole = whole || scan.predicates.iter().any(Expr::needs_overflow_whole);
     let mut needed = scan.predicates.iter().fold(needed, |mut set, expr| {
         set.extend(expr.references());
         set
@@ -309,27 +312,30 @@ fn narrow_scan(mut scan: Scan, needed: Option<BTreeSet<String>>) -> Scan {
         .filter(|c| needed.contains(c))
         .collect();
     scan.projection = Some(columns);
+    scan.overflow_whole = whole;
     scan
 }
 
-fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
+fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) -> Plan {
     let add = |mut set: BTreeSet<String>, expr: &Expr| {
         set.extend(expr.references());
         set
     };
     match plan {
-        Plan::Scan(scan) => Plan::Scan(narrow_scan(scan, needed)),
+        Plan::Scan(scan) => Plan::Scan(narrow_scan(scan, needed, whole)),
         Plan::Values { schema, rows } => Plan::Values { schema, rows },
         Plan::SystemTable { tenant, table } => Plan::SystemTable { tenant, table },
         Plan::Filter { input, predicate } => {
             let needed = needed.map(|n| add(n, &predicate));
-            push_projection(*input, needed).filter(predicate)
+            let whole = whole || predicate.needs_overflow_whole();
+            push_projection(*input, needed, whole).filter(predicate)
         }
         Plan::Project { input, exprs } => {
             let needed = exprs
                 .iter()
                 .fold(BTreeSet::new(), |set, e| add(set, &e.expr));
-            push_projection(*input, Some(needed)).project(exprs)
+            let whole = whole || exprs.iter().any(|e| e.expr.needs_overflow_whole());
+            push_projection(*input, Some(needed), whole).project(exprs)
         }
         Plan::Aggregate {
             input,
@@ -345,20 +351,27 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
             // Weighted aggregates read the sample rate; harmless when the
             // input has none.
             needed.insert(SAMPLE_RATE.to_owned());
+            let whole = whole
+                || group_by.iter().any(|e| e.expr.needs_overflow_whole())
+                || aggregates
+                    .iter()
+                    .any(|a| a.args.iter().any(Expr::needs_overflow_whole));
             Plan::Aggregate {
-                input: Box::new(push_projection(*input, Some(needed))),
+                input: Box::new(push_projection(*input, Some(needed), whole)),
                 group_by,
                 aggregates,
             }
         }
         Plan::Sort { input, keys } => {
             let needed = needed.map(|n| keys.iter().fold(n, |set, k| add(set, &k.expr)));
-            push_projection(*input, needed).sort(keys)
+            let whole = whole || keys.iter().any(|k| k.expr.needs_overflow_whole());
+            push_projection(*input, needed, whole).sort(keys)
         }
         Plan::TopK { input, keys, k } => {
             let needed = needed.map(|n| keys.iter().fold(n, |set, k| add(set, &k.expr)));
+            let whole = whole || keys.iter().any(|k| k.expr.needs_overflow_whole());
             Plan::TopK {
-                input: Box::new(push_projection(*input, needed)),
+                input: Box::new(push_projection(*input, needed, whole)),
                 keys,
                 k,
             }
@@ -367,11 +380,11 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
             input,
             offset,
             count,
-        } => push_projection(*input, needed).limit(offset, count),
+        } => push_projection(*input, needed, whole).limit(offset, count),
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs
                 .into_iter()
-                .map(|i| push_projection(i, needed.clone()))
+                .map(|i| push_projection(i, needed.clone(), whole))
                 .collect(),
         },
         Plan::TraceGroup {
@@ -392,8 +405,8 @@ fn push_projection_trace(candidates: Option<Box<Plan>>, spans: Plan, spanset: Sp
     needed.insert(OVERFLOW.to_owned());
     needed.extend(spanset.references());
     Plan::TraceGroup {
-        candidates: candidates.map(|c| Box::new(push_projection(*c, Some(ids)))),
-        spans: Box::new(push_projection(spans, Some(needed))),
+        candidates: candidates.map(|c| Box::new(push_projection(*c, Some(ids), false))),
+        spans: Box::new(push_projection(spans, Some(needed), true)),
         spanset,
     }
 }
@@ -413,7 +426,7 @@ fn push_projection_text(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
         } => {
             let needed = needed.map(|n| add(n, &source));
             Plan::Extract {
-                input: Box::new(push_projection(*input, needed)),
+                input: Box::new(push_projection(*input, needed, true)),
                 source,
                 stage,
             }
@@ -440,7 +453,7 @@ fn push_projection_text(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
                 n
             });
             Plan::Format {
-                input: Box::new(push_projection(*input, needed)),
+                input: Box::new(push_projection(*input, needed, true)),
                 line,
                 labels,
                 drop,
@@ -485,7 +498,7 @@ fn push_projection_series(plan: Plan) -> Plan {
                 needed = add(needed, value);
             }
             Plan::RangeVector {
-                input: Box::new(push_projection(*input, Some(needed))),
+                input: Box::new(push_projection(*input, Some(needed), true)),
                 function,
                 value,
                 range,
@@ -509,7 +522,7 @@ fn push_projection_series(plan: Plan) -> Plan {
             Plan::PromQL {
                 inputs: inputs
                     .into_iter()
-                    .map(|i| push_projection(i, Some(needed.clone())))
+                    .map(|i| push_projection(i, Some(needed.clone()), true))
                     .collect(),
                 expr,
                 start,
@@ -523,11 +536,60 @@ fn push_projection_series(plan: Plan) -> Plan {
 
 #[cfg(test)]
 mod tests {
+    use arrow::datatypes::DataType;
     use tessera_ir::{AggregateExpr, NamedExpr, Registry};
-    use tessera_types::event::{BODY, SEVERITY_NUMBER};
+    use tessera_types::event::{BODY, OVERFLOW, SEVERITY_NUMBER};
     use tessera_types::{DatasetName, Kind, TenantId};
 
     use super::*;
+
+    fn scan_of(plan: &Plan) -> &Scan {
+        match plan {
+            Plan::Scan(scan) => scan,
+            other => other.inputs().into_iter().map(scan_of).next().unwrap(),
+        }
+    }
+
+    #[test]
+    fn the_overflow_is_whole_only_when_something_reads_it_whole() {
+        let scan = Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Log,
+        );
+        let host = Expr::Path {
+            path: "attr.host".into(),
+            data_type: DataType::Utf8,
+        };
+        let by_path = Plan::Scan(scan.clone())
+            .filter(host.clone().binary(BinaryOp::Eq, Expr::literal("h7")))
+            .project(vec![NamedExpr::new(Expr::column("body"), "body")]);
+        assert!(
+            !scan_of(&rewrite(by_path)).overflow_whole,
+            "paths read columns"
+        );
+        let by_label = Plan::Scan(scan.clone()).filter(
+            Expr::Label {
+                name: "host".into(),
+                data_type: DataType::Utf8,
+            }
+            .binary(BinaryOp::Eq, Expr::literal("h7")),
+        );
+        assert!(
+            scan_of(&rewrite(by_label)).overflow_whole,
+            "a label may be any attribute"
+        );
+        let selected = Plan::Scan(scan.clone())
+            .project(vec![NamedExpr::new(Expr::column(OVERFLOW), "attributes")]);
+        assert!(
+            scan_of(&rewrite(selected)).overflow_whole,
+            "the column itself"
+        );
+        assert!(
+            scan_of(&rewrite(Plan::Scan(scan))).overflow_whole,
+            "everything"
+        );
+    }
 
     fn scan() -> Plan {
         Plan::Scan(Scan::all(

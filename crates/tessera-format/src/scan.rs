@@ -63,6 +63,11 @@ pub struct ScanRequest {
     pub filter: Option<RowPredicate>,
     /// Only these row groups are read, when an index narrowed them.
     pub row_groups: Option<Vec<usize>>,
+    /// Whether a projected `_overflow` must carry every attribute, with
+    /// the ones the file keeps in dedicated columns merged back (AD-4).
+    /// Off, the column is returned as stored, which suits a reader that
+    /// takes attributes by path from the dedicated columns.
+    pub overflow_whole: bool,
 }
 
 /// What a scan did, for `EXPLAIN ANALYZE` (QE-8).

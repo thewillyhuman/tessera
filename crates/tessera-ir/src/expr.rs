@@ -311,6 +311,28 @@ impl Expr {
         columns
     }
 
+    /// Whether the expression reads `_overflow` as a whole: the column
+    /// itself, or a label, which may come from any attribute. A path
+    /// reads one attribute, which a dedicated column serves as well.
+    #[must_use]
+    pub fn needs_overflow_whole(&self) -> bool {
+        match self {
+            Expr::Column(name) => name == OVERFLOW,
+            Expr::Label { .. } => true,
+            Expr::Path { .. } | Expr::Literal(_) => false,
+            Expr::Binary { left, right, .. } => {
+                left.needs_overflow_whole() || right.needs_overflow_whole()
+            }
+            Expr::Not(expr)
+            | Expr::Negate(expr)
+            | Expr::IsNull { expr, .. }
+            | Expr::Like { expr, .. }
+            | Expr::InList { expr, .. }
+            | Expr::Cast { expr, .. } => expr.needs_overflow_whole(),
+            Expr::Call { args, .. } => args.iter().any(Expr::needs_overflow_whole),
+        }
+    }
+
     fn collect_references(&self, into: &mut BTreeSet<String>) {
         match self {
             Expr::Column(name) => {

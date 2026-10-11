@@ -13,11 +13,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use serde_json::Value;
-use tessera_types::event::{SCOPES, label_name};
+use tessera_types::event::{EXTRACTED, OVERFLOW, SCOPES, SEVERITY_TEXT, label_name};
 
 use crate::KernelError;
 
@@ -42,29 +43,45 @@ pub fn extract(
     typed(values, data_type, &format!("attribute {path}"))
 }
 
-/// Reads the label `name` of each row (QL-19): the attribute whose path
-/// maps to the name, the more specific scope first (QL-20), and `level`
-/// for the severity text when no attribute claims it. `rows` is the
-/// batch length, for batches without an overflow column.
+/// The label `name` of every row (QL-19, QL-20): a label a parser stage
+/// derived (`_extracted`), else the attribute whose path maps to the
+/// name, the more specific scope first, from the dedicated column when
+/// the batch has one and from `_overflow` otherwise, else a well-known
+/// column under its label name (`level` for the severity text).
 ///
 /// # Errors
 ///
 /// `Unsupported` for a type a label cannot be read as.
 pub fn label(
-    overflow: Option<&StringArray>,
-    extracted: Option<&StringArray>,
-    severity_text: Option<&StringArray>,
+    rows: &RecordBatch,
     name: &str,
     data_type: &DataType,
-    rows: usize,
 ) -> Result<ArrayRef, KernelError> {
-    let values = (0..rows).map(|i| {
+    let text = |column: &str| {
+        rows.column_by_name(column)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+    };
+    let (overflow, extracted, severity_text) =
+        (text(OVERFLOW), text(EXTRACTED), text(SEVERITY_TEXT));
+    // The dedicated column of the attribute under this label, by scope.
+    let schema = rows.schema();
+    let dedicated: Option<&ArrayRef> = SCOPES.iter().find_map(|scope| {
+        schema
+            .fields()
+            .iter()
+            .position(|f| f.name().starts_with(scope) && label_name(f.name()) == name)
+            .map(|i| rows.column(i))
+    });
+    let values = (0..rows.num_rows()).map(|i| {
         let from_extracted = extracted
             .filter(|e| !e.is_null(i))
             .and_then(|e| serde_json::from_str::<Value>(e.value(i)).ok())
             .and_then(|object| object.get(name).cloned());
         if from_extracted.is_some() {
             return from_extracted;
+        }
+        if let Some(value) = dedicated.and_then(|column| cell_json(column, i)) {
+            return Some(value);
         }
         let from_attributes = overflow
             .filter(|o| !o.is_null(i))
@@ -86,6 +103,30 @@ pub fn label(
         })
     });
     typed(values, data_type, name)
+}
+
+/// The value at `row` of a dedicated attribute column, as JSON.
+fn cell_json(column: &ArrayRef, row: usize) -> Option<Value> {
+    if column.is_null(row) {
+        return None;
+    }
+    let any = column.as_any();
+    match column.data_type() {
+        DataType::Utf8 => any
+            .downcast_ref::<StringArray>()
+            .map(|a| Value::String(a.value(row).to_owned())),
+        DataType::Int64 => any
+            .downcast_ref::<Int64Array>()
+            .map(|a| Value::from(a.value(row))),
+        DataType::Float64 => any
+            .downcast_ref::<Float64Array>()
+            .and_then(|a| serde_json::Number::from_f64(a.value(row)))
+            .map(Value::Number),
+        DataType::Boolean => any
+            .downcast_ref::<BooleanArray>()
+            .map(|a| Value::Bool(a.value(row))),
+        _ => None,
+    }
 }
 
 /// Every label of one row by name: derived labels first, then attributes
@@ -233,6 +274,25 @@ mod tests {
         ));
     }
 
+    /// A batch of the given text columns, each three rows.
+    fn batch_of(columns: &[(&str, StringArray)]) -> RecordBatch {
+        use arrow::datatypes::{Field, Schema};
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(
+                columns
+                    .iter()
+                    .map(|(name, _)| Field::new(*name, DataType::Utf8, true))
+                    .collect::<Vec<_>>(),
+            )),
+            columns
+                .iter()
+                .map(|(_, array)| Arc::new(array.clone()) as ArrayRef)
+                .collect(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn labels_resolve_by_scope_then_well_known_columns() {
         let overflow = StringArray::from(vec![
@@ -243,15 +303,11 @@ mod tests {
             None,
         ]);
         let severity = StringArray::from(vec![Some("ERROR"), None, Some("INFO")]);
-        let service = label(
-            Some(&overflow),
-            None,
-            Some(&severity),
-            "service_name",
-            &DataType::Utf8,
-            3,
-        )
-        .unwrap();
+        let rows = batch_of(&[
+            (OVERFLOW, overflow.clone()),
+            (SEVERITY_TEXT, severity.clone()),
+        ]);
+        let service = label(&rows, "service_name", &DataType::Utf8).unwrap();
         let service = service.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(
             service.value(0),
@@ -260,15 +316,7 @@ mod tests {
         );
         assert_eq!(service.value(1), "lib");
         assert!(service.is_null(2));
-        let method = label(
-            Some(&overflow),
-            None,
-            None,
-            "http_method",
-            &DataType::Utf8,
-            3,
-        )
-        .unwrap();
+        let method = label(&rows, "http_method", &DataType::Utf8).unwrap();
         assert_eq!(
             method
                 .as_any()
@@ -277,31 +325,17 @@ mod tests {
                 .value(0),
             "GET"
         );
-        let level = label(
-            Some(&overflow),
-            None,
-            Some(&severity),
-            "level",
-            &DataType::Utf8,
-            3,
-        )
-        .unwrap();
+        let level = label(&rows, "level", &DataType::Utf8).unwrap();
         let level = level.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(level.value(0), "ERROR");
         assert!(level.is_null(1));
         assert_eq!(level.value(2), "INFO");
-        let none = label(None, None, None, "x", &DataType::Int64, 2).unwrap();
+        let bare = batch_of(&[("body", StringArray::from(vec![Some("a"), Some("b")]))]);
+        let none = label(&bare, "x", &DataType::Int64).unwrap();
         assert_eq!(none.null_count(), 2);
         let extracted = StringArray::from(vec![Some(r#"{"service_name":"parsed"}"#), None, None]);
-        let parsed = label(
-            Some(&overflow),
-            Some(&extracted),
-            None,
-            "service_name",
-            &DataType::Utf8,
-            3,
-        )
-        .unwrap();
+        let rows = batch_of(&[(OVERFLOW, overflow), (EXTRACTED, extracted)]);
+        let parsed = label(&rows, "service_name", &DataType::Utf8).unwrap();
         let parsed = parsed.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(parsed.value(0), "parsed", "derived labels win");
         assert_eq!(parsed.value(1), "lib");
@@ -328,5 +362,31 @@ mod tests {
             ]
         );
         assert!(row_labels(None, None, None).is_empty());
+    }
+
+    #[test]
+    fn a_label_comes_from_the_dedicated_column_when_the_batch_has_one() {
+        use arrow::datatypes::{Field, Schema};
+
+        let rows = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(OVERFLOW, DataType::Utf8, true),
+                Field::new("attr.host", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"attr.host":"stale"}"#),
+                    None,
+                    Some(r#"{"resource.host":"r3"}"#),
+                ])),
+                Arc::new(StringArray::from(vec![Some("h1"), Some("h2"), None])),
+            ],
+        )
+        .unwrap();
+        let hosts = label(&rows, "host", &DataType::Utf8).unwrap();
+        let hosts = hosts.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(hosts.value(0), "h1", "the column, not the stored text");
+        assert_eq!(hosts.value(1), "h2");
+        assert_eq!(hosts.value(2), "r3", "the overflow when the column is null");
     }
 }

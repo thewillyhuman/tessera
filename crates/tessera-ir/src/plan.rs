@@ -134,6 +134,12 @@ pub struct Scan {
     /// from `_overflow` elsewhere.
     #[serde(default)]
     pub paths: Vec<PathColumn>,
+    /// Whether `_overflow` must carry every attribute, with the ones a
+    /// file keeps in dedicated columns merged back (AD-4): what label
+    /// sets and `_overflow` itself need, and what a plan that reads
+    /// attributes by path only does without. On until the optimizer
+    /// proves otherwise.
+    pub overflow_whole: bool,
 }
 
 /// An attribute path a scan materializes as a column named by the path.
@@ -158,6 +164,7 @@ impl Scan {
             projection: None,
             newest_first_limit: None,
             paths: Vec::new(),
+            overflow_whole: true,
         }
     }
 

@@ -22,7 +22,7 @@ use arrow::compute::kernels::{cmp, comparison, numeric};
 use arrow::compute::{and_kleene, cast, is_not_null, is_null, not, or_kleene, take};
 use arrow::datatypes::{DataType, TimeUnit};
 use tessera_ir::{BinaryOp, Expr, Literal};
-use tessera_types::event::{EXTRACTED, OVERFLOW, SEVERITY_TEXT};
+use tessera_types::event::OVERFLOW;
 
 use crate::{KernelError, time, units, variant};
 
@@ -156,22 +156,7 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
             Ok(Value::Column(variant::extract(overflow, path, data_type)?))
         }
         Expr::Label { name, data_type } => {
-            let merged = tessera_types::event::attributes_column(batch);
-            let overflow = merged.as_ref();
-            let extracted = batch
-                .column_by_name(EXTRACTED)
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            let severity = batch
-                .column_by_name(SEVERITY_TEXT)
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-            Ok(Value::Column(variant::label(
-                overflow,
-                extracted,
-                severity,
-                name,
-                data_type,
-                batch.num_rows(),
-            )?))
+            Ok(Value::Column(variant::label(batch, name, data_type)?))
         }
         Expr::Literal(lit) => Ok(Value::Constant(literal(lit))),
         Expr::Binary { op, left, right } => {

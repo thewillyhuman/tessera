@@ -256,6 +256,7 @@ pub(crate) async fn read_files(
             bounds: bounds(&scan.predicates, scan.time_range),
             filter: predicate.as_ref().map(|p| row_predicate(p.clone())),
             row_groups: None,
+            overflow_whole: scan.overflow_whole,
         },
         predicates_for_indexes: scan.predicates.clone(),
     };

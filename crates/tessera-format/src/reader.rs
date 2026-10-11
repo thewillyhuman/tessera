@@ -148,7 +148,7 @@ impl FileReader for ParquetReader {
 
         let columns = columns_to_read(schema, &request)?;
         let (projection, filter_columns) = (columns.projection, columns.filter);
-        let (merge_projection, merge_filter) = (columns.merge_projection, columns.merge_filter);
+        let merge_projection = columns.merge_projection;
         let requested = request.projection.clone();
 
         stats.row_groups = metadata.num_row_groups();
@@ -199,11 +199,6 @@ impl FileReader for ParquetReader {
                 let mask = ProjectionMask::roots(&parquet_schema, filter_columns);
                 let evaluate = filter.evaluate;
                 let predicate = ArrowPredicateFn::new(mask, move |batch| {
-                    let batch = if merge_filter {
-                        with_merged_overflow(&batch)?
-                    } else {
-                        batch
-                    };
                     evaluate(&batch).map_err(ArrowError::ComputeError)
                 });
                 builder = builder.with_row_filter(RowFilter::new(vec![Box::new(predicate)]));
@@ -232,15 +227,13 @@ struct ReadColumns {
     /// Whether the returned `_overflow` is rebuilt from dedicated
     /// attribute columns.
     merge_projection: bool,
-    /// Whether the filter's `_overflow` is.
-    merge_filter: bool,
 }
 
-/// Resolves the request's columns against `schema`. `_overflow` stands
-/// for every attribute, and a compacted file keeps the promoted ones in
-/// dedicated columns only (AD-4): a read of the overflow reads those
-/// columns too and merges them back, for the rows returned and for the
-/// filter alike.
+/// Resolves the request's columns against `schema`. A compacted file
+/// keeps promoted attributes in dedicated columns only (AD-4), so a
+/// filter over `_overflow` reads those columns too, for its label and
+/// path kernels to find, and a projection of `_overflow` that must be
+/// whole reads them and merges them back.
 fn columns_to_read(
     schema: &arrow::datatypes::SchemaRef,
     request: &ScanRequest,
@@ -271,10 +264,10 @@ fn columns_to_read(
     let wants_overflow = |columns: &[usize]| {
         !attribute_columns.is_empty() && index_of(OVERFLOW).is_some_and(|o| columns.contains(&o))
     };
-    let merge_projection = wants_overflow(&projection);
-    let merge_filter = wants_overflow(&filter);
-    let widen = |mut columns: Vec<usize>, merge: bool| {
-        if merge {
+    let merge_projection = request.overflow_whole && wants_overflow(&projection);
+    let widen_filter = wants_overflow(&filter);
+    let widen = |mut columns: Vec<usize>, widen: bool| {
+        if widen {
             columns.extend(attribute_columns.iter().copied());
             columns.sort_unstable();
             columns.dedup();
@@ -283,9 +276,8 @@ fn columns_to_read(
     };
     Ok(ReadColumns {
         projection: widen(projection, merge_projection),
-        filter: widen(filter, merge_filter),
+        filter: widen(filter, widen_filter),
         merge_projection,
-        merge_filter,
     })
 }
 
@@ -426,6 +418,7 @@ mod tests {
             }],
             filter: None,
             row_groups: None,
+            overflow_whole: false,
         };
         let fetched = reader.fetch(request).await.unwrap();
         assert_eq!(fetched.stats().row_groups_read, 1);
@@ -440,6 +433,7 @@ mod tests {
             }],
             filter: None,
             row_groups: None,
+            overflow_whole: false,
         };
         let fetched = reader.fetch(by_text).await.unwrap();
         assert_eq!(fetched.stats().row_groups_read, 1);
@@ -504,6 +498,7 @@ mod tests {
         let reader = promoted_file().await;
         let request = ScanRequest {
             projection: Some(vec!["timestamp".into(), OVERFLOW.into()]),
+            overflow_whole: true,
             ..ScanRequest::default()
         };
         let batches = reader.fetch(request).await.unwrap().decode().unwrap();
@@ -517,20 +512,22 @@ mod tests {
         assert_eq!(second, serde_json::json!({ "attr.host": "h2" }));
         assert_eq!(merged[2], None, "nothing stored on the third row");
 
-        // A filter over the overflow sees the promoted attribute too.
+        // A filter over the overflow is given the dedicated attribute
+        // columns as well, which is where the kernels take a path or a
+        // label from.
         let request = ScanRequest {
             projection: Some(vec!["timestamp".into()]),
             filter: Some(RowPredicate {
                 columns: vec![OVERFLOW.into()],
                 evaluate: Arc::new(|batch: &RecordBatch| {
-                    let overflow = batch
-                        .column_by_name(OVERFLOW)
-                        .unwrap()
+                    let hosts = batch
+                        .column_by_name("attr.host")
+                        .expect("the dedicated column rides along")
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .unwrap();
-                    Ok((0..overflow.len())
-                        .map(|i| !overflow.is_null(i) && overflow.value(i).contains("\"h2\""))
+                    Ok((0..hosts.len())
+                        .map(|i| !hosts.is_null(i) && hosts.value(i) == "h2")
                         .collect::<BooleanArray>())
                 }),
             }),
@@ -538,6 +535,18 @@ mod tests {
         };
         let batches = reader.fetch(request).await.unwrap().decode().unwrap();
         assert_eq!(timestamps(&batches), vec![1]);
+
+        // Not asked for whole, the overflow comes back as stored.
+        let request = ScanRequest {
+            projection: Some(vec![OVERFLOW.into(), "attr.host".into()]),
+            ..ScanRequest::default()
+        };
+        let batches = reader.fetch(request).await.unwrap().decode().unwrap();
+        assert_eq!(batches[0].num_columns(), 2);
+        assert_eq!(
+            overflow_of(&batches),
+            vec![Some(r#"{"attr.rare":1}"#.to_owned()), None, None]
+        );
     }
 
     #[tokio::test]
@@ -578,6 +587,7 @@ mod tests {
                 }),
             }),
             row_groups: None,
+            overflow_whole: false,
         };
         let fetched = reader.fetch(request).await.unwrap();
         let batches = fetched.decode().unwrap();
