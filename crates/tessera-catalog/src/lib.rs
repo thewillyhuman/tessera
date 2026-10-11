@@ -6,11 +6,13 @@
 //!
 //! The catalog is a library used by every role, not a process.
 
-pub mod catalog;
+pub mod auth;
+mod catalog;
 pub mod control;
 pub mod state;
 pub mod tenant;
 
+pub use auth::{ApiKey, IssuedKey, KeyText, Principal, Role as AccessRole};
 pub use catalog::{Catalog, CatalogError};
 pub use control::{
     ControlError, ControlStore, ControlStores, Row, Table, Transaction, UnknownTable,

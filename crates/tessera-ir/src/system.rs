@@ -102,6 +102,19 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("annotations"),
             text("notify"),
         ],
+        "api_keys" => vec![
+            text("id"),
+            text("name"),
+            text("roles"),
+            time("created_at"),
+            time("expires_at"),
+        ],
+        "roles" => vec![
+            text("name"),
+            text("read"),
+            text("write"),
+            Field::new("admin", DataType::Boolean, true),
+        ],
         "rollups" => vec![
             text("name"),
             text("expr"),
@@ -143,7 +156,7 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("routing_key"),
             int("repeat_seconds"),
         ],
-        "retention_policies" | "layout_pins" | "api_keys" | "roles" | "saved_queries" => {
+        "retention_policies" | "layout_pins" | "saved_queries" => {
             vec![text("key"), text("document")]
         }
         _ => return None,

@@ -89,6 +89,8 @@ fn typed(table: Table) -> bool {
             | Table::Silences
             | Table::Acknowledgments
             | Table::NotificationRoutes
+            | Table::ApiKeys
+            | Table::Roles
     )
 }
 

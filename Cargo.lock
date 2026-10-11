@@ -2418,6 +2418,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tessera-commit",
  "tessera-object",
  "tessera-types",
@@ -2716,6 +2718,7 @@ dependencies = [
  "arrow",
  "tessera-format",
  "tessera-ir",
+ "tessera-sql",
  "tessera-types",
  "thiserror",
 ]

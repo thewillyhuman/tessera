@@ -13,7 +13,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
-use tessera_catalog::{ControlError, ControlStore, Row, Table, Transaction};
+use tessera_catalog::{AccessRole, ApiKey, ControlError, ControlStore, Row, Table, Transaction};
 use tessera_eval::{Acknowledgment, AlertRule, NotificationRoute, Rollup, Silence, mode_of};
 use tessera_ir::{ControlStatement, Literal};
 use tessera_manifest::DatasetLog;
@@ -417,15 +417,12 @@ fn writable(name: &str) -> Result<Table, ApiError> {
 /// The column that keys each table's rows.
 fn key_column(table: Table) -> &'static str {
     match table {
-        Table::AlertRules | Table::NotificationRoutes => "name",
-        Table::Silences => "id",
+        Table::AlertRules | Table::NotificationRoutes | Table::Roles => "name",
+        Table::Silences | Table::ApiKeys => "id",
         Table::Acknowledgments => "fingerprint",
-        Table::Rollups
-        | Table::RetentionPolicies
-        | Table::LayoutPins
-        | Table::ApiKeys
-        | Table::Roles
-        | Table::SavedQueries => "key",
+        Table::Rollups | Table::RetentionPolicies | Table::LayoutPins | Table::SavedQueries => {
+            "key"
+        }
     }
 }
 
@@ -454,12 +451,13 @@ fn validate(table: Table, document: &Value) -> Result<(), ApiError> {
         Table::NotificationRoutes => {
             serde_json::from_value::<NotificationRoute>(document.clone()).map_err(invalid)?;
         }
-        Table::Rollups
-        | Table::RetentionPolicies
-        | Table::LayoutPins
-        | Table::ApiKeys
-        | Table::Roles
-        | Table::SavedQueries => {}
+        Table::ApiKeys => {
+            serde_json::from_value::<ApiKey>(document.clone()).map_err(invalid)?;
+        }
+        Table::Roles => {
+            serde_json::from_value::<AccessRole>(document.clone()).map_err(invalid)?;
+        }
+        Table::Rollups | Table::RetentionPolicies | Table::LayoutPins | Table::SavedQueries => {}
     }
     Ok(())
 }
@@ -487,13 +485,12 @@ fn json_columns(table: Table) -> &'static [&'static str] {
     match table {
         Table::AlertRules => &["labels", "annotations", "notify"],
         Table::Silences => &["matchers"],
+        Table::ApiKeys => &["roles"],
+        Table::Roles => &["read", "write"],
         Table::Acknowledgments | Table::NotificationRoutes => &[],
-        Table::Rollups
-        | Table::RetentionPolicies
-        | Table::LayoutPins
-        | Table::ApiKeys
-        | Table::Roles
-        | Table::SavedQueries => &["document"],
+        Table::Rollups | Table::RetentionPolicies | Table::LayoutPins | Table::SavedQueries => {
+            &["document"]
+        }
     }
 }
 
@@ -615,6 +612,27 @@ mod tests {
 
     fn result(value: &Value) -> &str {
         value["rows"][0][0].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn roles_are_typed_rows_of_system_roles() {
+        let state = crate::testing::state().await;
+        let (status, value) = sql(
+            &state,
+            "INSERT INTO system.roles (name, read, write, admin) \
+             VALUES ('payments', '[\"prod\"]', '[]', false)",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, listed) = sql(&state, "SELECT name, read, admin FROM system.roles").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed["rows"][0], json!(["payments", "[\"prod\"]", false]));
+        let (status, value) = sql(
+            &state,
+            "INSERT INTO system.roles (name, admin) VALUES ('broken', 'maybe')",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
     }
 
     #[tokio::test]
