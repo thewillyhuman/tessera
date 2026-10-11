@@ -194,7 +194,7 @@ fn times<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a TimestampNanoseco
         .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>())
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut out, b| {
         use std::fmt::Write;
         let _ = write!(out, "{b:02x}");

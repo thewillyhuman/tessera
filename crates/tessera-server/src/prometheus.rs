@@ -8,13 +8,16 @@
 //! The tenant and dataset come from the headers the `params` module
 //! reads (CT-5). Times are Unix seconds or RFC 3339, steps durations
 //! or seconds, as Prometheus takes them. Errors take Prometheus' shape
-//! (`status`, `errorType`, `error`). Rules, alerts and exemplars are
-//! empty until the control plane exists (M7).
+//! (`status`, `errorType`, `error`). Rules and alerts are served by
+//! the rules module; exemplars come from the trace ids the points
+//! carry (section 16).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use arrow::array::{Array, Float64Array, RecordBatch, StringArray, TimestampNanosecondArray};
+use arrow::array::{
+    Array, FixedSizeBinaryArray, Float64Array, RecordBatch, StringArray, TimestampNanosecondArray,
+};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -26,11 +29,13 @@ use axum::routing::{get, post};
 use serde_json::{Value, json};
 use tessera_exec::QueryError;
 use tessera_ingest::remote_write;
-use tessera_ir::{BindContext, Plan, VALUE};
+use tessera_ir::{BindContext, Expr, NamedExpr, Plan, Span, VALUE};
 use tessera_kernels::promql::format_value;
+use tessera_kernels::{attributes_column, row_labels};
 use tessera_opt::optimize;
+use tessera_promql::ast::{Expr as PromAst, Matcher};
 use tessera_promql::{Lowered, PromqlFrontend, RangeParams, ResultKind, parse, selector_plan};
-use tessera_types::event::{EXTRACTED, TIMESTAMP};
+use tessera_types::event::{EXTRACTED, SPAN_ID, TIMESTAMP, TRACE_ID};
 use tessera_types::{TimeRange, Timestamp};
 
 use crate::params::{Need, Scope, parse_step, parse_time, scope};
@@ -57,7 +62,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/labels", get(labels).post(labels))
         .route("/api/v1/label/{name}/values", get(label_values))
         .route("/api/v1/metadata", get(empty_object))
-        .route("/api/v1/query_exemplars", get(empty_list).post(empty_list))
+        .route(
+            "/api/v1/query_exemplars",
+            get(query_exemplars).post(query_exemplars),
+        )
         .with_state(state)
 }
 
@@ -79,8 +87,175 @@ async fn empty_object() -> Response {
     success(&json!({}))
 }
 
-async fn empty_list() -> Response {
-    success(&json!([]))
+/// Exemplars (section 16): the points of the query's selectors that
+/// carry a trace id within the range, as Prometheus lists them, one
+/// entry per series. A point's exemplar is the trace and span ids its
+/// producer attached (section 4.2).
+async fn query_exemplars(
+    State(state): State<AppState>,
+    parts: Parts,
+    RawForm(raw): RawForm,
+) -> Response {
+    answer(async {
+        let params = Params::parse(&raw);
+        let text = params
+            .get("query")
+            .filter(|q| !q.is_empty())
+            .ok_or_else(|| ApiError::bad_request("invalid parameter \"query\": empty"))?
+            .to_owned();
+        let scope = scope(&state, &parts, Need::Read).await?;
+        let _turn = state.admit_query(&scope.tenant).await?;
+        let now = state.env.clock.now();
+        let end = params.time("end", now, now)?;
+        let start = params.time(
+            "start",
+            Timestamp::from_nanos(end.as_nanos().saturating_sub(3_600_000_000_000)),
+            now,
+        )?;
+        let range = TimeRange::new(
+            start,
+            Timestamp::from_nanos(end.as_nanos().saturating_add(1)),
+        );
+        let ctx = BindContext::new(scope.tenant.clone(), scope.dataset.clone(), now);
+        let expr = parse(&text).map_err(|e| {
+            ApiError::bad_request(format!(
+                "invalid parameter \"query\": {}",
+                e.describe(&text)
+            ))
+        })?;
+        let mut selectors = Vec::new();
+        selectors_of(&expr, &mut selectors);
+        let mut by_series: BTreeMap<BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
+        for (name, matchers, span) in selectors {
+            let plan = selector_plan(&ctx, name, matchers, range, span)
+                .map_err(|e| ApiError::bad_request(e.describe(&text)))?;
+            let plan = with_exemplar_ids(plan).limit(0, Some(DISCOVERY_ROWS));
+            let batches = run(&state, &scope, plan).await?;
+            exemplars_of(&batches, &mut by_series);
+        }
+        Ok(json!(
+            by_series
+                .into_iter()
+                .map(
+                    |(labels, exemplars)| json!({ "seriesLabels": labels, "exemplars": exemplars })
+                )
+                .collect::<Vec<_>>()
+        ))
+    })
+    .await
+}
+
+/// Every selector of `expr`: its name, matchers and position.
+fn selectors_of<'a>(expr: &'a PromAst, into: &mut Vec<(Option<&'a str>, &'a [Matcher], Span)>) {
+    match expr {
+        PromAst::Selector {
+            name,
+            matchers,
+            span,
+            ..
+        } => into.push((name.as_deref(), matchers, *span)),
+        PromAst::Subquery { expr, .. } | PromAst::Unary { expr, .. } | PromAst::Paren(expr) => {
+            selectors_of(expr, into);
+        }
+        PromAst::Binary { left, right, .. } => {
+            selectors_of(left, into);
+            selectors_of(right, into);
+        }
+        PromAst::Aggregate { expr, param, .. } => {
+            selectors_of(expr, into);
+            if let Some(param) = param {
+                selectors_of(param, into);
+            }
+        }
+        PromAst::Call { args, .. } => {
+            for arg in args {
+                selectors_of(arg, into);
+            }
+        }
+        PromAst::Number(_) | PromAst::String(_) => {}
+    }
+}
+
+/// A selector's plan keeping the rows with a trace id and projecting
+/// the trace and span ids beside the series columns.
+fn with_exemplar_ids(plan: Plan) -> Plan {
+    match plan {
+        Plan::Project { input, mut exprs } => {
+            exprs.push(NamedExpr::new(Expr::column(TRACE_ID), TRACE_ID));
+            exprs.push(NamedExpr::new(Expr::column(SPAN_ID), SPAN_ID));
+            let traced = Expr::IsNull {
+                expr: Box::new(Expr::column(TRACE_ID)),
+                negated: true,
+            };
+            Plan::Project {
+                input: Box::new(input.filter(traced)),
+                exprs,
+            }
+        }
+        other => other,
+    }
+}
+
+/// Adds every row of `batches` with a value and a trace id to its
+/// series' exemplars.
+fn exemplars_of(
+    batches: &[RecordBatch],
+    by_series: &mut BTreeMap<BTreeMap<String, String>, Vec<Value>>,
+) {
+    for batch in batches {
+        let text = |name: &str| {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        };
+        let ids = |name: &str| {
+            batch
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+        };
+        let (Some(timestamps), Some(values), Some(traces)) = (
+            batch
+                .column_by_name(TIMESTAMP)
+                .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>()),
+            batch
+                .column_by_name(VALUE)
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>()),
+            ids(TRACE_ID),
+        ) else {
+            continue;
+        };
+        let spans = ids(SPAN_ID);
+        let merged = attributes_column(batch);
+        let names = text(tessera_kernels::promql::NAME_LABEL);
+        for i in 0..batch.num_rows() {
+            if values.is_null(i) || traces.is_null(i) {
+                continue;
+            }
+            let attributes = merged
+                .as_ref()
+                .filter(|o| !o.is_null(i))
+                .map(|o| o.value(i));
+            let mut labels = row_labels(attributes, None, None);
+            if let Some(name) = names.filter(|n| !n.is_null(i)) {
+                labels.insert(
+                    tessera_kernels::promql::NAME_LABEL.to_owned(),
+                    name.value(i).to_owned(),
+                );
+            }
+            let mut exemplar_labels =
+                BTreeMap::from([("trace_id", crate::tempo::hex(traces.value(i)))]);
+            if let Some(span) = spans.filter(|s| !s.is_null(i)) {
+                exemplar_labels.insert("span_id", crate::tempo::hex(span.value(i)));
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let seconds = timestamps.value(i) as f64 / 1e9;
+            by_series.entry(labels).or_default().push(json!({
+                "labels": exemplar_labels,
+                "value": format_value(values.value(i)),
+                "timestamp": seconds,
+            }));
+        }
+    }
 }
 
 fn success(data: &Value) -> Response {
@@ -656,6 +831,51 @@ mod tests {
             0,
             "the plain name has no sample type yet: {value}"
         );
+    }
+
+    /// Exemplars (section 16): a point ingested with an exemplar
+    /// answers a panel's query with the trace it names.
+    #[tokio::test]
+    async fn exemplars_come_from_the_points_trace_ids() {
+        use prost::Message;
+        let app = crate::router(crate::testing::state().await);
+        let metrics = crate::otlp::testing::export_gauge_with_exemplar(
+            "api", "up", "a", 1.0, [0xab; 16], [0xcd; 8],
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/metrics")
+            .header(header::CONTENT_TYPE, "application/x-protobuf")
+            .body(Body::from(metrics.encode_to_vec()))
+            .unwrap();
+        let (status, _) = call(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, value) = call(
+            &app,
+            get("/api/v1/query_exemplars?query=sum(rate(up%5B1m%5D))&start=1700000000&end=1700000060"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["status"], "success");
+        let data = value["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1, "{value}");
+        assert_eq!(data[0]["seriesLabels"]["__name__"], "up");
+        assert_eq!(data[0]["seriesLabels"]["job"], "a");
+        let exemplar = &data[0]["exemplars"][0];
+        assert_eq!(exemplar["labels"]["trace_id"], "ab".repeat(16));
+        assert_eq!(exemplar["labels"]["span_id"], "cd".repeat(8));
+        assert_eq!(exemplar["value"], "1");
+        assert_eq!(exemplar["timestamp"], 1_700_000_000.0);
+
+        let (_, value) = call(
+            &app,
+            get("/api/v1/query_exemplars?query=1%2B1&start=1700000000&end=1700000060"),
+        )
+        .await;
+        assert_eq!(value["data"], json!([]), "no selector, no exemplars");
+        let (status, _) = call(&app, get("/api/v1/query_exemplars?query=")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

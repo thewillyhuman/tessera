@@ -102,14 +102,14 @@ and extrapolation in `rate` and `increase`, the `_over_time` family,
 aggregations, vector matching with `group_left` and `group_right`,
 set operators, subqueries, `offset` and `@`, `histogram_quantile`
 over classic buckets, label and calendar functions; and the
-Prometheus HTTP API: queries, series, labels, label values, metadata
-and remote write. The PromQL differential suite agrees with
+Prometheus HTTP API: queries, series, labels, label values, metadata,
+exemplars and remote write. The PromQL differential suite agrees with
 Prometheus 3.15.0 on every case.
 
 Gaps left in M5: an OTLP histogram answers PromQL as the classic
 `_bucket`, `_count` and `_sum` series a scrape would give, but there
 is no native histogram sample type, so the `histogram_*` functions
-over one are absent; `info` and exemplars; the PromQL compliance
+over one are absent; `info`; the PromQL compliance
 suite has not been run; Grafana itself has not been run against the
 API yet.
 

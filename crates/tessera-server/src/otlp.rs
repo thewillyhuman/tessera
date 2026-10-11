@@ -253,6 +253,35 @@ pub(crate) mod testing {
         }
     }
 
+    /// One gauge point of `name`, labelled `job`, with `value` and an
+    /// exemplar naming `trace_id` and `span_id`.
+    pub fn export_gauge_with_exemplar(
+        service: &str,
+        name: &str,
+        job: &str,
+        value: f64,
+        trace_id: [u8; 16],
+        span_id: [u8; 8],
+    ) -> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::{Exemplar, exemplar, metric};
+
+        let mut request = export_gauges(service, name, &[(job, 0, value)]);
+        if let Some(metric::Data::Gauge(gauge)) = request.resource_metrics[0].scope_metrics[0]
+            .metrics[0]
+            .data
+            .as_mut()
+        {
+            gauge.data_points[0].exemplars = vec![Exemplar {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                trace_id: trace_id.to_vec(),
+                span_id: span_id.to_vec(),
+                value: Some(exemplar::Value::AsDouble(value)),
+                ..Default::default()
+            }];
+        }
+        request
+    }
+
     /// One histogram point of metric `name`, labelled `job`, at
     /// `offset` seconds, with `bounds` and the `counts` of its buckets.
     pub fn export_histogram(
