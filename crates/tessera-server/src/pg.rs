@@ -91,6 +91,7 @@ impl PgServer {
         };
         let mut ctx = BindContext::new(tenant, dataset, self.state.env.clock.now());
         ctx.tenants = crate::params::tenants(&self.state, &principal);
+        ctx.prices = crate::params::prices(&self.state);
         Ok((ctx, principal))
     }
 

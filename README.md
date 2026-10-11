@@ -218,7 +218,10 @@ and team, the team from a configurable attribute (CO-1); compaction
 records stored bytes per the same and per log pattern or name (CO-2);
 queries record bytes scanned, time taken, object-store requests,
 principal, language, source and fingerprint (CO-3); all of it is
-written as events of `_system.usage` and read back as `system.usage`
+written as events of `_system.usage` and read back as `system.usage`,
+whose `cost` column prices each row at the cluster settings
+`price.ingest_byte`, `price.stored_byte`, `price.scanned_byte`,
+`price.cpu_ms` and `price.request`, set over `PUT /api/v1/settings/{name}`
 (CO-4). Log patterns: compaction clusters log bodies into templates
 and gives each row a `pattern_id` that stays stable across files
 (CO-5); `system.log_patterns` lists them with their volumes. Value

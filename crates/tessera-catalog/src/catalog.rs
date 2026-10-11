@@ -445,6 +445,28 @@ impl Catalog {
         Ok(())
     }
 
+    /// Sets a cluster-wide setting (CT-7), or removes it with `None`:
+    /// unit prices for usage (CO-4), the drop grace period and the like.
+    ///
+    /// # Errors
+    ///
+    /// If the commit fails.
+    pub async fn set_setting(&self, name: &str, value: Option<String>) -> Result<(), CatalogError> {
+        let key = setting_key(name);
+        self.log
+            .update(|_| {
+                Ok(vec![Action::Kv(match &value {
+                    Some(value) => KvMutation::Put {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                    None => KvMutation::Delete { key: key.clone() },
+                })])
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Commits the tenant after `change` edits it.
     async fn modify_tenant(
         &self,
@@ -594,6 +616,30 @@ mod tests {
 
     fn name(text: &str) -> TenantName {
         TenantName::new(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn cluster_settings_are_set_listed_and_removed() {
+        let cluster = Cluster::new();
+        let catalog = cluster.node(1).await;
+        catalog
+            .set_setting("price.ingest_byte", Some("0.5".into()))
+            .await
+            .unwrap();
+        let state = catalog.snapshot().await.unwrap();
+        assert_eq!(state.state().setting("price.ingest_byte"), Some("0.5"));
+        assert!(
+            state
+                .state()
+                .settings()
+                .any(|(name, value)| name == "price.ingest_byte" && value == "0.5")
+        );
+        catalog
+            .set_setting("price.ingest_byte", None)
+            .await
+            .unwrap();
+        let state = catalog.snapshot().await.unwrap();
+        assert_eq!(state.state().setting("price.ingest_byte"), None);
     }
 
     #[tokio::test]

@@ -115,6 +115,7 @@ async fn run_native(
         state.env.clock.now(),
     );
     ctx.tenants = crate::params::tenants(state, &principal);
+    ctx.prices = crate::params::prices(state);
     let _turn = state.admit_query(&ctx.tenant).await?;
     let started = std::time::Instant::now();
     let reader = principal.clone();

@@ -28,8 +28,8 @@ pub mod typing;
 
 pub use expr::{BinaryOp, Expr, Literal, qualify, split_qualifier, unqualify};
 pub use frontend::{
-    AlertDefinition, BindContext, ControlStatement, Diagnostic, Frontend, RollupDefinition, Span,
-    Statement,
+    AlertDefinition, BindContext, ControlStatement, Diagnostic, Frontend, PRICE_SETTINGS,
+    RollupDefinition, Span, Statement,
 };
 pub use function::{AggregateFunction, Registry, ScalarFunction};
 pub use plan::{

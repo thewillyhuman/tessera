@@ -82,6 +82,7 @@ pub fn usage_schema() -> SchemaRef {
     for (name, _, numeric) in USAGE_COLUMNS {
         fields.push(if numeric { int(name) } else { text(name) });
     }
+    fields.push(Field::new("cost", DataType::Float64, true));
     Arc::new(Schema::new(fields))
 }
 

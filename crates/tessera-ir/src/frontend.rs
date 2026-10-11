@@ -106,7 +106,21 @@ pub struct BindContext {
     /// by name: the ones its principal has grants in. Empty for a query
     /// confined to its own tenant.
     pub tenants: BTreeMap<String, TenantId>,
+    /// The unit prices usage is costed with (CO-4), by the settings that
+    /// name them; a price nobody set is zero.
+    pub prices: BTreeMap<String, f64>,
 }
+
+/// The settings that price usage (CO-4): per byte received, stored
+/// and scanned, per millisecond of query CPU and per object-store
+/// request.
+pub const PRICE_SETTINGS: [&str; 5] = [
+    "price.ingest_byte",
+    "price.stored_byte",
+    "price.scanned_byte",
+    "price.cpu_ms",
+    "price.request",
+];
 
 impl BindContext {
     /// A context confined to `tenant`.
@@ -117,6 +131,7 @@ impl BindContext {
             dataset,
             now,
             tenants: BTreeMap::new(),
+            prices: BTreeMap::new(),
         }
     }
 
@@ -124,6 +139,12 @@ impl BindContext {
     #[must_use]
     pub fn tenant_named(&self, name: &str) -> Option<&TenantId> {
         self.tenants.get(name)
+    }
+
+    /// The unit price a setting names, zero when nobody set it.
+    #[must_use]
+    pub fn price(&self, setting: &str) -> f64 {
+        self.prices.get(setting).copied().unwrap_or(0.0)
     }
 }
 

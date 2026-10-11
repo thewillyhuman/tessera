@@ -303,6 +303,51 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// CO-4: usage is costed at the cluster's unit prices.
+    #[tokio::test]
+    async fn usage_is_shown_as_cost_once_prices_are_set() {
+        let state = crate::testing::state().await;
+        state
+            .catalog
+            .set_setting("price.ingest_byte", Some("2".into()))
+            .await
+            .unwrap();
+        let app = crate::router(state.clone());
+        let body = serde_json::json!({ "resourceLogs": [{ "scopeLogs": [{ "logRecords": [{
+            "timeUnixNano": "1700000000000000000", "body": { "stringValue": "priced" } }] }] }] });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(crate::otlp::DATASET_HEADER, "prod")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert!(
+            app.clone()
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        let value = sql(
+            &state,
+            "SELECT phase, bytes, cost FROM system.usage WHERE phase = 'ingest' AND dataset = 'prod'",
+        )
+        .await;
+        let rows = value["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{value}"));
+        assert!(!rows.is_empty(), "{value}");
+        let bytes = rows[0][1]
+            .as_f64()
+            .unwrap_or_else(|| panic!("bytes in {value}"));
+        let cost = rows[0][2]
+            .as_f64()
+            .unwrap_or_else(|| panic!("cost in {value}"));
+        assert!((cost - 2.0 * bytes).abs() < f64::EPSILON, "{value}");
+    }
+
     #[tokio::test]
     async fn ingest_and_queries_are_metered_into_system_usage() {
         let state = crate::testing::state().await;

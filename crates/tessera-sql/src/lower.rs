@@ -643,6 +643,7 @@ fn usage_source(ctx: &BindContext) -> (TableScope, Plan) {
             name,
         ));
     }
+    exprs.push(NamedExpr::new(usage_cost(ctx), "cost"));
     (
         TableScope {
             name: "usage".into(),
@@ -651,6 +652,50 @@ fn usage_source(ctx: &BindContext) -> (TableScope, Plan) {
         },
         scan.project(exprs),
     )
+}
+
+/// The cost of a usage row at the unit prices in `ctx` (CO-4): its
+/// bytes at the price of its phase, its CPU time and its requests at
+/// theirs. A phase picks its price through the comparison cast to a
+/// number, one for the phase and zero for the others.
+fn usage_cost(ctx: &BindContext) -> Expr {
+    // A row records the numbers of its phase only: the others count as
+    // zero rather than making the cost unknown.
+    let number = |path: &str| Expr::Call {
+        name: "coalesce".into(),
+        args: vec![
+            Expr::Path {
+                path: path.to_owned(),
+                data_type: DataType::Int64,
+            },
+            Expr::literal(0_i64),
+        ],
+    };
+    let price = |setting: &str| Expr::literal(ctx.price(setting));
+    let phase_is = |phase: &str| Expr::Cast {
+        expr: Box::new(Expr::column(event::NAME).binary(BinaryOp::Eq, Expr::literal(phase))),
+        to: DataType::Float64,
+    };
+    let per_byte = phase_is("ingest")
+        .binary(BinaryOp::Mul, price("price.ingest_byte"))
+        .binary(
+            BinaryOp::Add,
+            phase_is("stored").binary(BinaryOp::Mul, price("price.stored_byte")),
+        )
+        .binary(
+            BinaryOp::Add,
+            phase_is("query").binary(BinaryOp::Mul, price("price.scanned_byte")),
+        );
+    number("attr.bytes")
+        .binary(BinaryOp::Mul, per_byte)
+        .binary(
+            BinaryOp::Add,
+            number("attr.cpu_ms").binary(BinaryOp::Mul, price("price.cpu_ms")),
+        )
+        .binary(
+            BinaryOp::Add,
+            number("attr.requests").binary(BinaryOp::Mul, price("price.request")),
+        )
 }
 
 /// `system.log_patterns` (section 13.2): what compaction stored per
@@ -1628,6 +1673,27 @@ mod tests {
         .unwrap_err()
         .message;
         assert!(message.contains("request's tenant"), "{message}");
+    }
+
+    /// CO-4: `system.usage` carries a `cost` column at the configured
+    /// unit prices.
+    #[test]
+    fn usage_is_costed_at_the_configured_prices() {
+        let mut ctx = ctx();
+        ctx.prices.insert("price.ingest_byte".into(), 2.0);
+        let Statement::Query(plan) = lower(
+            &parse("SELECT phase, bytes, cost FROM system.usage WHERE cost > 0").unwrap(),
+            &ctx,
+        )
+        .unwrap() else {
+            panic!("not a query")
+        };
+        let schema = plan.schema(&Registry::builtin()).unwrap();
+        assert_eq!(
+            schema.field_with_name("cost").unwrap().data_type(),
+            &DataType::Float64
+        );
+        assert!(plan.to_string().contains("* 2"), "{plan}");
     }
 
     #[test]

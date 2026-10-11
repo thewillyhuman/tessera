@@ -81,6 +81,13 @@ impl CatalogState {
     pub fn setting(&self, name: &str) -> Option<&str> {
         self.settings.get(name).map(String::as_str)
     }
+
+    /// Every cluster-wide setting, by name.
+    pub fn settings(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.settings
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
 }
 
 /// The key under which a tenant record is committed.

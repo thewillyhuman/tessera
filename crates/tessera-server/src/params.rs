@@ -153,6 +153,24 @@ pub(crate) fn tenants(state: &AppState, principal: &Principal) -> BTreeMap<Strin
         .collect()
 }
 
+/// The unit prices the cluster settings hold (CO-4), by setting; a
+/// setting that is not a number is ignored.
+pub(crate) fn prices(state: &AppState) -> BTreeMap<String, f64> {
+    let cached = state.catalog.cached();
+    tessera_ir::PRICE_SETTINGS
+        .iter()
+        .filter_map(|setting| {
+            let value = cached
+                .state()
+                .setting(setting)?
+                .trim()
+                .parse::<f64>()
+                .ok()?;
+            Some(((*setting).to_owned(), value))
+        })
+        .collect()
+}
+
 /// The limits a query of `tenant` runs under (QE-18): the node's
 /// defaults, overridden by the tenant's settings.
 pub(crate) fn limits(state: &AppState, tenant: &TenantId) -> QueryLimits {

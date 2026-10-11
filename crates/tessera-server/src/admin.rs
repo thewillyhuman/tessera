@@ -15,6 +15,9 @@
 //! | `POST /api/v1/tenants/{name}/resume`   | Resume                          |
 //! | `DELETE /api/v1/tenants/{name}`        | Drop (restorable, CT-8)         |
 //! | `POST /api/v1/tenants/{name}/restore`  | Restore a dropped tenant        |
+//! | `GET /api/v1/settings`                 | Cluster-wide settings (CT-7)    |
+//! | `PUT /api/v1/settings/{name}`          | Set one: `{value}`              |
+//! | `DELETE /api/v1/settings/{name}`       | Remove one                      |
 //!
 //! Errors follow the shape described in the crate's error module.
 //! | `GET /api/v1/tenants/{name}/keys`      | List API keys, without secrets |
@@ -32,7 +35,7 @@ use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use tessera_catalog::{
@@ -59,6 +62,11 @@ pub fn router(state: AppState) -> Router {
             get(list_keys).post(issue_key),
         )
         .route("/api/v1/tenants/{name}/keys/{id}", delete(revoke_key))
+        .route("/api/v1/settings", get(list_settings))
+        .route(
+            "/api/v1/settings/{name}",
+            put(put_setting).delete(delete_setting),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_cluster_admin,
@@ -316,6 +324,69 @@ async fn alter_tenant(
     Ok(Json(tenant))
 }
 
+/// The value of a cluster-wide setting.
+#[derive(Deserialize)]
+struct SettingValue {
+    value: String,
+}
+
+async fn list_settings(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let cached = state.catalog.cached();
+    Json(serde_json::Value::Object(
+        cached
+            .state()
+            .settings()
+            .map(|(name, value)| (name.to_owned(), serde_json::Value::String(value.to_owned())))
+            .collect(),
+    ))
+}
+
+async fn put_setting(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+    Body(request): Body<SettingValue>,
+) -> Result<StatusCode, ApiError> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    {
+        return Err(ApiError::bad_request(
+            "a setting name is letters, digits, dots and underscores",
+        ));
+    }
+    state
+        .catalog
+        .set_setting(&name, Some(request.value.clone()))
+        .await?;
+    audit::record(
+        &state,
+        &principal,
+        &principal.tenant,
+        "setting.put",
+        &format!("{name} = {}", request.value),
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_setting(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.catalog.set_setting(&name, None).await?;
+    audit::record(
+        &state,
+        &principal,
+        &principal.tenant,
+        "setting.delete",
+        &name,
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn rename_tenant(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -437,6 +508,34 @@ mod tests {
             ))
         };
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn cluster_settings_are_managed_over_the_api() {
+        let app = app().await;
+        let (status, _) = call(
+            &app,
+            "PUT",
+            "/api/v1/settings/price.ingest_byte",
+            Some(r#"{"value":"0.001"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(
+            &app,
+            "PUT",
+            "/api/v1/settings/bad%20name",
+            Some(r#"{"value":"x"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, listed) = call(&app, "GET", "/api/v1/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["price.ingest_byte"], "0.001");
+        let (status, _) = call(&app, "DELETE", "/api/v1/settings/price.ingest_byte", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, listed) = call(&app, "GET", "/api/v1/settings", None).await;
+        assert!(listed.get("price.ingest_byte").is_none());
     }
 
     #[tokio::test]
