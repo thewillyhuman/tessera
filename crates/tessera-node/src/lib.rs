@@ -130,6 +130,7 @@ pub struct Node {
     registry: Arc<Registry>,
     membership: Arc<Membership>,
     leases: Option<Arc<Leases>>,
+    lease_loop: Option<(oneshot::Sender<()>, JoinHandle<()>)>,
     stop_servers: Vec<oneshot::Sender<()>>,
     servers: Vec<JoinHandle<()>>,
     loops: Vec<JoinHandle<()>>,
@@ -187,11 +188,11 @@ impl Node {
                 owned: Owned::default(),
             })
         });
+        let mut lease_loop = None;
         if let Some(leases) = &leases {
-            loops.push(tokio::spawn(leases::run(
-                Arc::clone(leases),
-                config.renewal,
-            )));
+            let (stop, stopped) = oneshot::channel();
+            let task = tokio::spawn(leases::run(Arc::clone(leases), config.renewal, stopped));
+            lease_loop = Some((stop, task));
             loops.push(tokio::spawn(background::run(background::Background {
                 store: Arc::clone(&store),
                 env: env.clone(),
@@ -205,17 +206,7 @@ impl Node {
         }
 
         let remote = HttpRemote::new();
-        let engine = Engine::new(
-            Arc::clone(&pools),
-            Arc::clone(&format),
-            env.clone(),
-            CpuPool::for_host(),
-            QueryLimits::default(),
-        )
-        .with_peers(
-            Arc::new(MembershipPeers::new(Arc::clone(&membership))),
-            Arc::new(remote.clone()),
-        );
+        let engine = engine(&pools, &format, &env, &membership, &remote);
         let state = AppState {
             catalog: Arc::clone(&catalog),
             ingest: ingest.clone(),
@@ -240,6 +231,7 @@ impl Node {
             registry,
             membership,
             leases,
+            lease_loop,
             stop_servers,
             servers,
             loops,
@@ -297,8 +289,9 @@ impl Node {
         for task in &self.loops {
             task.abort();
         }
-        if let Some(leases) = &self.leases {
-            leases.release_all().await;
+        if let Some((stop, task)) = self.lease_loop {
+            let _ = stop.send(());
+            let _ = task.await;
         }
         if let Err(error) = self.ingest.shutdown().await {
             tracing::warn!(error = %error, "ingest shutdown left work for recovery");
@@ -313,6 +306,9 @@ impl Node {
     /// withdrawn, so the rest of the cluster must notice by itself.
     pub fn abandon(self) {
         for task in self.servers.iter().chain(&self.loops) {
+            task.abort();
+        }
+        if let Some((_, task)) = &self.lease_loop {
             task.abort();
         }
         self.ingest_task.abort();
@@ -364,6 +360,28 @@ async fn open(
         "catalog open"
     );
     Ok((store, catalog, pool))
+}
+
+/// The query engine of this node, reading files on peers chosen by
+/// rendezvous hashing over the live query nodes (QE-15).
+fn engine(
+    pools: &Arc<Pools>,
+    format: &Arc<dyn FileFormat>,
+    env: &Env,
+    membership: &Arc<Membership>,
+    remote: &HttpRemote,
+) -> Engine {
+    Engine::new(
+        Arc::clone(pools),
+        Arc::clone(format),
+        env.clone(),
+        CpuPool::for_host(),
+        QueryLimits::default(),
+    )
+    .with_peers(
+        Arc::new(MembershipPeers::new(Arc::clone(membership))),
+        Arc::new(remote.clone()),
+    )
 }
 
 /// Announces the node under `roles` and `advertise`, and keeps the

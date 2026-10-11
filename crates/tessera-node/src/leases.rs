@@ -22,6 +22,7 @@ use tessera_catalog::Catalog;
 use tessera_cluster::{Membership, Role};
 use tessera_commit::{Lease, LeaseManager, Slot, SlotCount};
 use tessera_types::WorkKind;
+use tokio::sync::oneshot;
 
 /// The kinds of work a `compact` node owns slots of.
 pub const KINDS: [WorkKind; 3] = [WorkKind::Intake, WorkKind::Recovery, WorkKind::Partition];
@@ -79,6 +80,15 @@ impl Owned {
             .map(|held| std::mem::take(&mut held.leases))
             .unwrap_or_default()
     }
+
+    fn leases(&self, kind: WorkKind) -> BTreeMap<Slot, Lease> {
+        self.held
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&kind)
+            .map(|held| held.leases.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// The lease loop's dependencies.
@@ -95,11 +105,13 @@ pub struct Leases {
 
 impl Leases {
     /// One pass over every slot of every kind: acquire the preferred
-    /// ones, renew the held ones, release the rest.
+    /// ones, renew the held ones, release the rest. The owned view
+    /// changes once per kind, at the end of the pass, so a reader never
+    /// sees a slot missing while its renewal is in flight.
     pub async fn tick(&self) {
         for kind in KINDS {
             let count = self.catalog.cached().state().slot_count(kind);
-            let mut held = self.owned.take(kind);
+            let mut held = self.owned.leases(kind);
             let mut next = BTreeMap::new();
             for slot in count.slots() {
                 let preferred = self.is_preferred(kind, slot);
@@ -156,14 +168,20 @@ impl Leases {
     }
 }
 
-/// Runs [`Leases::tick`] every `renewal`, forever.
-pub async fn run(leases: Arc<Leases>, renewal: Duration) {
+/// Runs [`Leases::tick`] every `renewal` until `stop` fires, then gives
+/// every held slot up. A pass is never cut short: a renewal that
+/// completed in the store but not in the owned view would leave a lease
+/// that no release supersedes, held until it expires.
+pub async fn run(leases: Arc<Leases>, renewal: Duration, mut stop: oneshot::Receiver<()>) {
     let mut ticks = tokio::time::interval(renewal);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        ticks.tick().await;
-        leases.tick().await;
+        tokio::select! {
+            _ = &mut stop => break,
+            _ = ticks.tick() => leases.tick().await,
+        }
     }
+    leases.release_all().await;
 }
 
 #[cfg(test)]
