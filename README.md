@@ -136,7 +136,43 @@ range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.
 
-**M7, control store, continuous queries and alerting: next.**
+**M7, control store, continuous queries and alerting: done, with
+gaps listed below.** A per-tenant control store over the control log
+with serializable transactions and the ten tables of CS-3, exposed
+in SQL as `system.<table>` for `SELECT`, `INSERT`, `UPDATE` and
+`DELETE` (sections 12.3, 9.5); alert rules in SQL, PromQL and LogQL
+through `CREATE ALERT`, `DROP ALERT` and `EXPLAIN ALERT`, and
+through Prometheus and Loki rule files on the ruler API (CQ-3); the
+alert lifecycle of section 11.8 with `FOR`; rule-group state logs
+that record instances, input positions and the outbox in one commit,
+so a takeover repeats no transition (CQ-12, CQ-13); the incremental
+mode for SQL rules that filter, group by keys and a tumbling window
+and aggregate with mergeable functions, maintained from writer-log
+segments with eager firing for monotone conditions and watermark
+firing for the rest (CQ-1, CQ-2, CQ-4, CQ-5, CQ-7, CQ-9, CQ-10,
+CQ-11); periodic re-execution through the engine for every other
+rule, with `EXPLAIN ALERT` saying which applies and why (CQ-8); every
+transition written as an `alert` event with a deterministic id
+(CQ-14); notifications from an outbox, at least once with an
+idempotency key, to webhook, Slack-compatible, PagerDuty-compatible
+and Alertmanager-compatible sinks, held back by silences and
+acknowledgments and repeated at the route's interval (CQ-15, 11.9);
+the `eval` role running the rule groups it owns by slot;
+`system.alert_instances`, `GET /api/v1/rules` and `GET /api/v1/alerts`
+over the state logs.
+
+Gaps left in M7: rollups and recording rules (M9); one state
+partition per rule group, so the group count rather than the key
+space bounds a group's parallelism (CQ-6); rebuilding window state
+from data files when a partition falls behind the WAL retention cap
+(section 11.7); inhibition rules and Alertmanager-style grouping of
+notifications; email; the incremental subset is SQL only and counts
+rows unweighted; the alert latency target is set by the evaluation
+interval (five seconds by default) rather than measured; hopping and
+sliding windows, sketches and histograms, and absence detection run
+periodically.
+
+**M8, adaptive design: next.**
 
 ## Layout
 
@@ -161,7 +197,8 @@ crates/
   tessera-logql     LogQL lexer, parser and lowering
   tessera-traceql   TraceQL lexer, parser and lowering
   tessera-promql    PromQL lexer, parser and lowering
-  tessera-server    HTTP administration, OTLP ingest, remote write, SQL over HTTP, PostgreSQL wire protocol, Loki, Tempo and Prometheus APIs
+  tessera-eval      continuous queries and alerting: rules, lifecycle, state logs, incremental and periodic evaluation, notifications
+  tessera-server    HTTP administration, OTLP ingest, remote write, SQL over HTTP, PostgreSQL wire protocol, Loki, Tempo, Prometheus and ruler APIs
   tessera-node      one node: wires the roles, the background work and the APIs of a process
   tessera           the binary: the command line over tessera-node
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
@@ -282,6 +319,40 @@ curl -G localhost:8080/api/v1/query_range \
      --data-urlencode 'step=60'
 curl -G localhost:8080/api/v1/query --data-urlencode 'query=up'
 ```
+
+Alert rules are continuous queries whose sink is the alert state
+machine. They live in the tenant's control store, which SQL exposes
+as the `system` tables, and are evaluated by the `eval` role; a rule
+that filters, groups by keys and a tumbling window and aggregates with
+`count`, `sum`, `min`, `max` or `avg` is maintained from the write-ahead
+log as rows arrive, anything else is re-executed at its interval:
+
+```
+psql 'host=127.0.0.1 port=5432 dbname=prod' <<'SQL'
+INSERT INTO system.notification_routes (name, kind, url)
+  VALUES ('oncall', 'webhook', 'http://hooks.example/tessera');
+CREATE ALERT checkout_errors SEVERITY critical FOR 2m NOTIFY oncall
+  ANNOTATIONS (summary = 'checkout is failing') AS
+  SELECT resource.service.name AS service, count(*) AS errors
+  FROM logs
+  WHERE severity_number >= 17 AND resource.service.name = 'checkout'
+  GROUP BY resource.service.name, tumble(timestamp, INTERVAL '1 minute')
+  HAVING count(*) > 100;
+EXPLAIN ALERT checkout_errors;
+SELECT rule, status, labels, value FROM system.alert_instances;
+INSERT INTO system.silences (id, matchers, starts_at, ends_at, comment)
+  VALUES ('maint', '{"service": "checkout"}', now(), now() + INTERVAL '2 hours', 'planned');
+SQL
+```
+
+Prometheus and Loki rule files are accepted as written, on the ruler
+API of each: `POST /api/v1/rules/{namespace}` for PromQL groups and
+`POST /loki/api/v1/rules/{namespace}` for LogQL ones; their rules
+notify the route named `default`, which an Alertmanager-compatible
+route can point at an existing Alertmanager. `GET /api/v1/rules` and
+`GET /api/v1/alerts` answer in Prometheus' shape, so Grafana's alert
+list works. Every state transition is also an `alert` event of the
+rule's dataset, queryable like any other event.
 
 Compaction, index building and garbage collection run in the
 background: a partition's L1 files become one indexed L2 file once
