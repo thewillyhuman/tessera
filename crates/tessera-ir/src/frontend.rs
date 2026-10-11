@@ -138,6 +138,13 @@ pub enum ControlStatement {
         /// The rule.
         name: String,
     },
+    /// `CREATE ROLLUP ... AS <query>` (section 8.7).
+    CreateRollup(RollupDefinition),
+    /// `DROP ROLLUP name`.
+    DropRollup {
+        /// The rollup.
+        name: String,
+    },
     /// `EXPLAIN LAYOUT [dataset]`: the dataset's layout, the alternatives
     /// the advisor considered and the queries that drove it (AD-11).
     ExplainLayout {
@@ -201,6 +208,21 @@ pub struct AlertDefinition {
     /// `ANNOTATIONS`.
     pub annotations: Vec<(String, String)>,
     /// The query, as written, in the statement's language.
+    pub query: String,
+    /// The dataset an unqualified table in the query means.
+    pub dataset: DatasetName,
+}
+
+/// What `CREATE ROLLUP` said.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RollupDefinition {
+    /// The rollup's name.
+    pub name: String,
+    /// `EVERY`, if given.
+    pub every: Option<Duration>,
+    /// `INTO`, the derived dataset, if given.
+    pub target: Option<DatasetName>,
+    /// The query, as written.
     pub query: String,
     /// The dataset an unqualified table in the query means.
     pub dataset: DatasetName,

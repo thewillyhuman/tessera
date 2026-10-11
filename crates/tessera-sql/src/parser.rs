@@ -9,7 +9,7 @@
 use tessera_ir::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CreateAlert, CreateRetentionPolicy, Expr, ExprKind, OrderItem, Query,
+    BinaryOp, CreateAlert, CreateRetentionPolicy, CreateRollup, Expr, ExprKind, OrderItem, Query,
     RetentionActionAst, RetentionClauseAst, SelectItem, Statement, TableRef,
 };
 use crate::lexer::{Spanned, Token, tokenize};
@@ -179,6 +179,11 @@ impl Parser<'_> {
                     .create_retention_policy()
                     .map(Statement::CreateRetentionPolicy);
             }
+            if self.eat_keyword("rollup") {
+                return self
+                    .create_rollup()
+                    .map(|rollup| Statement::CreateRollup(Box::new(rollup)));
+            }
             self.expect_keyword("alert")?;
             return self
                 .create_alert()
@@ -189,6 +194,10 @@ impl Parser<'_> {
                 self.expect_keyword("policy")?;
                 let (name, _) = self.identifier()?;
                 return Ok(Statement::DropRetentionPolicy { name });
+            }
+            if self.eat_keyword("rollup") {
+                let (name, _) = self.identifier()?;
+                return Ok(Statement::DropRollup { name });
             }
             self.expect_keyword("alert")?;
             let (name, _) = self.identifier()?;
@@ -247,6 +256,36 @@ impl Parser<'_> {
             notify,
             labels,
             annotations,
+            query,
+            query_text: self.text[start..end].to_owned(),
+        })
+    }
+
+    /// After `CREATE ROLLUP`: the name, `EVERY` and `INTO` in any order,
+    /// then `AS` and the query.
+    fn create_rollup(&mut self) -> Result<CreateRollup, Diagnostic> {
+        let (name, _) = self.identifier()?;
+        let (mut every, mut target) = (None, None);
+        loop {
+            if self.eat_keyword("every") {
+                every = Some(self.duration_text()?);
+            } else if self.eat_keyword("into") {
+                target = Some(self.identifier()?.0);
+            } else {
+                break;
+            }
+        }
+        self.expect_keyword("as")?;
+        let start = self.span_here().start;
+        let query = self.query()?;
+        let end = self
+            .tokens
+            .get(self.at.saturating_sub(1))
+            .map_or(start, |t| t.span.end);
+        Ok(CreateRollup {
+            name,
+            every,
+            target,
             query,
             query_text: self.text[start..end].to_owned(),
         })
@@ -945,12 +984,13 @@ const RESERVED: [&str; 22] = [
     "in", "is", "like", "ilike", "between", "asc", "desc", "having", "explain", "analyze",
 ];
 
-/// Keywords of `CREATE ALERT` options and retention clauses, which end a
-/// duration's unit.
-const ALERT_KEYWORDS: [&str; 10] = [
+/// Keywords of `CREATE ALERT` and `CREATE ROLLUP` options and retention
+/// clauses, which end a duration's unit.
+const ALERT_KEYWORDS: [&str; 11] = [
     "severity",
     "for",
     "every",
+    "into",
     "notify",
     "labels",
     "annotations",
@@ -1018,6 +1058,29 @@ mod tests {
         assert!(parse("CREATE ALERT x AS SELECT 1").is_ok());
         assert!(parse("CREATE ALERT x FOR soon AS SELECT 1").is_err());
         assert!(parse("CREATE ALERT x").is_err(), "AS is required");
+    }
+
+    #[test]
+    fn create_rollup_takes_every_and_into_and_keeps_the_query_text() {
+        let Statement::CreateRollup(rollup) = parse(
+            "CREATE ROLLUP errors_by_service EVERY 5m INTO errors_1m AS \
+             SELECT attr.service AS service, count(*) AS n FROM logs \
+             GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
+        )
+        .unwrap() else {
+            panic!("not a create rollup");
+        };
+        assert_eq!(rollup.name, "errors_by_service");
+        assert_eq!(rollup.every.as_ref().map(|e| e.0.as_str()), Some("5m"));
+        assert_eq!(rollup.target.as_deref(), Some("errors_1m"));
+        assert!(rollup.query_text.starts_with("SELECT attr.service"));
+        assert!(rollup.query_text.ends_with("INTERVAL '1 minute')"));
+        assert!(parse("CREATE ROLLUP x AS SELECT 1").is_ok());
+        assert!(parse("CREATE ROLLUP x").is_err(), "AS is required");
+        assert_eq!(
+            parse("DROP ROLLUP x").unwrap(),
+            Statement::DropRollup { name: "x".into() }
+        );
     }
 
     #[test]

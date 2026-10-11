@@ -27,7 +27,8 @@ pub mod typing;
 
 pub use expr::{BinaryOp, Expr, Literal};
 pub use frontend::{
-    AlertDefinition, BindContext, ControlStatement, Diagnostic, Frontend, Span, Statement,
+    AlertDefinition, BindContext, ControlStatement, Diagnostic, Frontend, RollupDefinition, Span,
+    Statement,
 };
 pub use function::{AggregateFunction, Registry, ScalarFunction};
 pub use plan::{

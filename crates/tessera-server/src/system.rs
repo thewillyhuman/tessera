@@ -84,7 +84,11 @@ impl SystemTableRows {
 fn typed(table: Table) -> bool {
     matches!(
         table,
-        Table::AlertRules | Table::Silences | Table::Acknowledgments | Table::NotificationRoutes
+        Table::AlertRules
+            | Table::Rollups
+            | Table::Silences
+            | Table::Acknowledgments
+            | Table::NotificationRoutes
     )
 }
 

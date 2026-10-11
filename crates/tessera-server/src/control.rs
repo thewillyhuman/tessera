@@ -2,7 +2,8 @@
 
 //! Control statements carried out against the tenant's control store
 //! (section 9.5, CS-3): `CREATE ALERT`, `DROP ALERT`, `EXPLAIN ALERT`,
-//! `EXPLAIN LAYOUT`, `CREATE RETENTION POLICY`, `DROP RETENTION POLICY`,
+//! `CREATE ROLLUP`, `DROP ROLLUP`, `EXPLAIN LAYOUT`,
+//! `CREATE RETENTION POLICY`, `DROP RETENTION POLICY`,
 //! `EXPLAIN RETENTION` and `INSERT`, `UPDATE` and `DELETE` on the
 //! `system` tables. Each
 //! statement is one transaction (CS-1); the typed tables are checked
@@ -13,7 +14,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tessera_catalog::{ControlError, ControlStore, Row, Table, Transaction};
-use tessera_eval::{Acknowledgment, AlertRule, NotificationRoute, Silence, mode_of};
+use tessera_eval::{Acknowledgment, AlertRule, NotificationRoute, Rollup, Silence, mode_of};
 use tessera_ir::{ControlStatement, Literal};
 use tessera_manifest::DatasetLog;
 use tessera_types::{DatasetName, Kind, RetentionPolicy, TenantId};
@@ -68,6 +69,10 @@ pub async fn execute(
                 .map_err(control_error)?;
             Ok(format!("DROP ALERT {name}"))
         }
+        ControlStatement::CreateRollup(definition) => {
+            create_rollup(&control, tenant, &definition).await
+        }
+        ControlStatement::DropRollup { name } => drop_rollup(&control, &name).await,
         ControlStatement::ExplainAlert { name } => {
             let document = control
                 .get(Table::AlertRules, &name)
@@ -529,6 +534,50 @@ fn json_of(literal: &Literal) -> Value {
     }
 }
 
+/// `CREATE ROLLUP`: checked as a rollup, then stored unless the name is
+/// taken.
+async fn create_rollup(
+    control: &ControlStore,
+    tenant: &TenantId,
+    definition: &tessera_ir::RollupDefinition,
+) -> Result<String, ApiError> {
+    let rollup = Rollup::from_definition(definition, tenant)
+        .map_err(|reason| ApiError::bad_request(format!("CREATE ROLLUP: {reason}")))?;
+    let document = serde_json::to_value(&rollup).map_err(|e| internal(&e))?;
+    control
+        .transact(|txn| {
+            if txn.get(Table::Rollups, &rollup.name)?.is_some() {
+                return Err(ControlError::Rejected(format!(
+                    "rollup {} exists; DROP ROLLUP it first",
+                    rollup.name
+                )));
+            }
+            txn.put(Table::Rollups, &rollup.name, &document);
+            Ok(())
+        })
+        .await
+        .map_err(control_error)?;
+    Ok(format!(
+        "CREATE ROLLUP {} INTO {}",
+        rollup.name, rollup.target
+    ))
+}
+
+/// `DROP ROLLUP`.
+async fn drop_rollup(control: &ControlStore, name: &str) -> Result<String, ApiError> {
+    control
+        .transact(|txn| {
+            if txn.get(Table::Rollups, name)?.is_none() {
+                return Err(ControlError::Rejected(format!("unknown rollup {name}")));
+            }
+            txn.delete(Table::Rollups, name);
+            Ok(())
+        })
+        .await
+        .map_err(control_error)?;
+    Ok(format!("DROP ROLLUP {name}"))
+}
+
 fn control_error(error: ControlError) -> ApiError {
     match error {
         ControlError::Rejected(reason) => ApiError::bad_request(reason),
@@ -566,6 +615,48 @@ mod tests {
 
     fn result(value: &Value) -> &str {
         value["rows"][0][0].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_list_and_drop_a_rollup() {
+        let state = crate::testing::state().await;
+        let (status, value) = sql(
+            &state,
+            "CREATE ROLLUP errors EVERY 5m AS SELECT attr.service AS service, count(*) AS n \
+             FROM logs WHERE severity_number >= 17 \
+             GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(result(&value), "CREATE ROLLUP errors INTO rollup_errors");
+        let (status, listed) = sql(
+            &state,
+            "SELECT name, target, window_seconds, every_seconds, origin, enabled \
+             FROM system.rollups",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(
+            listed["rows"][0],
+            json!(["errors", "rollup_errors", 60, 300, "user", true])
+        );
+
+        let (status, value) = sql(
+            &state,
+            "CREATE ROLLUP wrong AS SELECT count(*) AS n FROM logs \
+             GROUP BY tumble(timestamp, INTERVAL '1m') HAVING count(*) > 1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert!(
+            value["error"].as_str().unwrap().contains("HAVING"),
+            "{value}"
+        );
+
+        let (status, value) = sql(&state, "DROP ROLLUP errors").await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let (status, value) = sql(&state, "DROP ROLLUP errors").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
     }
 
     #[tokio::test]

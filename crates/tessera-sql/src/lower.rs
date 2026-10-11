@@ -15,7 +15,7 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use tessera_ir::{
     AggregateExpr, AlertDefinition, BinaryOp, BindContext, ControlStatement, Diagnostic, Expr,
-    Literal, NamedExpr, Plan, Registry, Scan, SortKey, Span, Statement,
+    Literal, NamedExpr, Plan, Registry, RollupDefinition, Scan, SortKey, Span, Statement,
 };
 use tessera_types::{
     DatasetName, Kind, RetentionAction, RetentionClause, RetentionPolicy, TenantId, Timestamp,
@@ -59,6 +59,12 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
         ast::Statement::DropAlert { name } => Ok(Statement::Control(ControlStatement::DropAlert {
             name: name.clone(),
         })),
+        ast::Statement::CreateRollup(rollup) => lower_rollup(rollup, ctx, &registry),
+        ast::Statement::DropRollup { name } => {
+            Ok(Statement::Control(ControlStatement::DropRollup {
+                name: name.clone(),
+            }))
+        }
         ast::Statement::ExplainAlert { name } => {
             Ok(Statement::Control(ControlStatement::ExplainAlert {
                 name: name.clone(),
@@ -117,6 +123,32 @@ pub fn lower(statement: &ast::Statement, ctx: &BindContext) -> Result<Statement,
             }))
         }
     }
+}
+
+/// `CREATE ROLLUP`: the query must be one the engine can run, and the
+/// target a dataset name, before the rollup is stored.
+fn lower_rollup(
+    rollup: &ast::CreateRollup,
+    ctx: &BindContext,
+    registry: &Registry,
+) -> Result<Statement, Diagnostic> {
+    lower_query(&rollup.query, ctx, registry)?;
+    let target = match &rollup.target {
+        Some(name) => Some(
+            DatasetName::new(name)
+                .map_err(|e| Diagnostic::at(Span::new(0, 0), format!("INTO {name}: {e}")))?,
+        ),
+        None => None,
+    };
+    Ok(Statement::Control(ControlStatement::CreateRollup(
+        RollupDefinition {
+            name: rollup.name.clone(),
+            every: duration(rollup.every.as_ref())?,
+            target,
+            query: rollup.query_text.clone(),
+            dataset: ctx.dataset.clone(),
+        },
+    )))
 }
 
 /// The control table a statement writes: only `system.<table>` can be

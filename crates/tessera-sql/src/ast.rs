@@ -29,6 +29,13 @@ pub enum Statement {
         /// The rule.
         name: String,
     },
+    /// `CREATE ROLLUP ...`.
+    CreateRollup(Box<CreateRollup>),
+    /// `DROP ROLLUP name`.
+    DropRollup {
+        /// The rollup.
+        name: String,
+    },
     /// `EXPLAIN LAYOUT [dataset]`.
     ExplainLayout {
         /// The dataset, if named.
@@ -91,6 +98,21 @@ pub struct CreateAlert {
     pub labels: Vec<(String, String)>,
     /// `ANNOTATIONS`.
     pub annotations: Vec<(String, String)>,
+    /// The query.
+    pub query: Query,
+    /// The query's text, as written.
+    pub query_text: String,
+}
+
+/// `CREATE ROLLUP name [EVERY duration] [INTO dataset] AS query`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CreateRollup {
+    /// The rollup's name.
+    pub name: String,
+    /// `EVERY`, as written.
+    pub every: Option<(String, Span)>,
+    /// `INTO`, the derived dataset.
+    pub target: Option<String>,
     /// The query.
     pub query: Query,
     /// The query's text, as written.

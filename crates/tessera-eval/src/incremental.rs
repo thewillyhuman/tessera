@@ -75,6 +75,14 @@ pub struct Shape {
     pub firing: Firing,
 }
 
+impl Shape {
+    /// Whether the shape reads `dataset`.
+    #[must_use]
+    pub fn target_is(&self, dataset: &str) -> bool {
+        self.dataset.as_str() == dataset
+    }
+}
+
 /// The incremental shape of `rule`, or why it has none.
 ///
 /// # Errors
@@ -87,15 +95,25 @@ pub fn shape_of(rule: &AlertRule, tenant: &TenantId) -> Result<Shape, String> {
             rule.language
         ));
     }
-    let dataset = DatasetName::new(&rule.dataset).map_err(|e| e.to_string())?;
+    shape_of_sql(&rule.expr, &rule.dataset, tenant)
+}
+
+/// The shape of the SQL query `expr` over `dataset`, or why it has none.
+///
+/// # Errors
+///
+/// Why the query is not a grouped aggregation over one tumbling window
+/// of mergeable aggregates.
+pub fn shape_of_sql(expr: &str, dataset: &str, tenant: &TenantId) -> Result<Shape, String> {
+    let dataset = DatasetName::new(dataset).map_err(|e| e.to_string())?;
     let ctx = BindContext {
         tenant: tenant.clone(),
         dataset,
         now: Timestamp::from_nanos(0),
     };
     let plan = match SqlFrontend
-        .lower(&rule.expr, &ctx)
-        .map_err(|d| d.describe(&rule.expr))?
+        .lower(expr, &ctx)
+        .map_err(|d| d.describe(expr))?
     {
         Statement::Query(plan) => plan,
         Statement::Explain { .. } | Statement::Control(_) => {

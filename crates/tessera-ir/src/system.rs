@@ -102,6 +102,16 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("annotations"),
             text("notify"),
         ],
+        "rollups" => vec![
+            text("name"),
+            text("expr"),
+            text("dataset"),
+            text("target"),
+            int("window_seconds"),
+            int("every_seconds"),
+            text("origin"),
+            Field::new("enabled", DataType::Boolean, true),
+        ],
         "alert_instances" => vec![
             text("rule"),
             text("group"),
@@ -133,8 +143,9 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("routing_key"),
             int("repeat_seconds"),
         ],
-        "rollups" | "retention_policies" | "layout_pins" | "api_keys" | "roles"
-        | "saved_queries" => vec![text("key"), text("document")],
+        "retention_policies" | "layout_pins" | "api_keys" | "roles" | "saved_queries" => {
+            vec![text("key"), text("document")]
+        }
         _ => return None,
     };
     Some(Arc::new(Schema::new(fields)))
