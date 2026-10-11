@@ -186,7 +186,8 @@ mod tests {
             &state.engine,
             &SqlFrontend,
             "SELECT attr.dataset, attr.language, attr.predicates, attr.group_by, count(*) AS n \
-             FROM events GROUP BY attr.dataset, attr.language, attr.predicates, attr.group_by",
+             FROM events WHERE kind = 'event' \
+             GROUP BY attr.dataset, attr.language, attr.predicates, attr.group_by",
             &ctx,
         )
         .await

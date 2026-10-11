@@ -247,6 +247,80 @@ mod tests {
         );
     }
 
+    /// DM-1: `events` holds every kind on one set of columns, and a
+    /// `kind` predicate reads one kind alone.
+    #[tokio::test]
+    async fn the_events_table_holds_every_kind() {
+        let state = crate::testing::state().await;
+        let app = crate::router(state.clone());
+        let body = serde_json::to_vec(&export(&["first", "second"])).unwrap();
+        let write = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(crate::otlp::DATASET_HEADER, "prod")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(write).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let at = tessera_types::Timestamp::from_nanos(1_700_000_000_000_000_000);
+        let alert = tessera_types::EventRow {
+            timestamp: at,
+            observed_timestamp: at,
+            event_id: [9; 16],
+            trace_id: None,
+            span_id: None,
+            name: "errors".into(),
+            attributes: std::collections::BTreeMap::new(),
+        };
+        let alerts = tessera_types::EventBatch::from_alerts(
+            tessera_types::TenantId::DEFAULT,
+            tessera_types::DatasetName::new("prod").unwrap(),
+            &[alert],
+        )
+        .unwrap();
+        state.write(alerts).await.unwrap();
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "dataset": "prod",
+                "query": "SELECT kind, count(*) AS n FROM events GROUP BY kind ORDER BY kind"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value["rows"],
+            serde_json::json!([["alert", 1.0], ["log", 2.0]])
+        );
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "dataset": "prod",
+                "query": "SELECT name, body FROM events WHERE kind = 'alert'"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"], serde_json::json!([["errors", null]]));
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "dataset": "prod",
+                "query": "EXPLAIN SELECT body FROM events WHERE kind = 'log'"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let explain = value["explain"].as_str().unwrap();
+        assert!(
+            !explain.contains("Union"),
+            "one kind reads one scan: {explain}"
+        );
+    }
+
     #[tokio::test]
     async fn errors_are_bad_requests_with_positions() {
         let app = crate::router(crate::testing::state().await);

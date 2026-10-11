@@ -199,7 +199,7 @@ async fn read_shapes(
 ) -> Result<Vec<RepeatedShape>, Failure> {
     let sql = format!(
         "SELECT attr.dataset AS dataset, attr.shape AS shape, count(*) AS n \
-         FROM events WHERE attr.tenant = '{tenant}' AND attr.shape IS NOT NULL \
+         FROM events WHERE kind = 'event' AND attr.tenant = '{tenant}' AND attr.shape IS NOT NULL \
          AND timestamp > now() - INTERVAL '{} seconds' \
          GROUP BY attr.dataset, attr.shape",
         SHAPE_LOOKBACK.as_secs()
@@ -292,7 +292,7 @@ async fn read_observations(
         "SELECT timestamp, attr.columns AS columns, attr.predicates AS predicates, \
          attr.group_by AS group_by, attr.bytes_scanned::bigint AS bytes_scanned, \
          attr.rows_scanned::bigint AS rows_scanned, attr.selectivity::float AS selectivity \
-         FROM events WHERE attr.tenant = '{tenant}' AND attr.dataset = '{dataset}' \
+         FROM events WHERE kind = 'event' AND attr.tenant = '{tenant}' AND attr.dataset = '{dataset}' \
          AND attr.kind = '{kind}' AND timestamp > now() - INTERVAL '{} seconds' \
          ORDER BY timestamp DESC LIMIT {MAX_OBSERVATIONS}",
         LOOKBACK.as_secs()

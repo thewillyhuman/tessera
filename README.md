@@ -404,9 +404,11 @@ write at `/api/v1/write`. An OpenTelemetry Collector's `otlphttp`
 exporter pointed at `http://localhost:8080` works as is for logs,
 traces and metrics.
 
-Queries are SQL, over HTTP or over the PostgreSQL protocol. A table is
-a kind of event in a dataset (`logs`, `spans`, `metrics`, `events`,
-`alerts`), qualified as `prod.logs` or resolved against the request's
+Queries are SQL, over HTTP or over the PostgreSQL protocol. A dataset
+is one table, `events`, holding every kind of event on one set of
+columns, and the views `logs`, `spans`, `metrics` and `alerts` read one
+kind each, faster; span events are `events WHERE kind = 'event'`. A
+table is qualified as `prod.logs` or resolved against the request's
 dataset; attributes are paths such as `resource.service.name` and
 `attr.http.method`:
 

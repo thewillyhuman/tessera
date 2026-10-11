@@ -104,6 +104,32 @@ pub fn schema(kind: Kind) -> SchemaRef {
     Arc::clone(&schemas[index])
 }
 
+/// The schema of the `events` table (DM-1): every well-known column of
+/// every kind once, in the order the kinds introduce them, `_overflow`
+/// last. A column a kind lacks is null in its rows, so only the columns
+/// every kind has are required.
+pub fn unified_schema() -> SchemaRef {
+    static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+    Arc::clone(SCHEMA.get_or_init(|| {
+        let mut fields: Vec<Field> = Vec::new();
+        for kind in Kind::ALL {
+            for field in schema(kind).fields() {
+                if field.name() != OVERFLOW && fields.iter().all(|f| f.name() != field.name()) {
+                    let shared = [TIMESTAMP, OBSERVED_TIMESTAMP, KIND, SAMPLE_RATE];
+                    let nullable = !shared.contains(&field.name().as_str());
+                    fields.push(Field::new(
+                        field.name(),
+                        field.data_type().clone(),
+                        nullable,
+                    ));
+                }
+            }
+        }
+        fields.push(Field::new(OVERFLOW, DataType::Utf8, true));
+        Arc::new(Schema::new(fields))
+    }))
+}
+
 fn build_schema(kind: Kind) -> Schema {
     let ns = DataType::Timestamp(TimeUnit::Nanosecond, None);
     let mut fields = vec![
@@ -999,6 +1025,36 @@ fn bounds(rows: &RecordBatch, column: usize) -> (Timestamp, Timestamp) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_unified_schema_has_every_column_once_with_the_overflow_last() {
+        let unified = unified_schema();
+        let names: Vec<&str> = unified.fields().iter().map(|f| f.name().as_str()).collect();
+        for kind in Kind::ALL {
+            for field in schema(kind).fields() {
+                assert!(
+                    names.contains(&field.name().as_str()),
+                    "{} of {kind}",
+                    field.name()
+                );
+                assert_eq!(
+                    unified.field_with_name(field.name()).unwrap().data_type(),
+                    field.data_type()
+                );
+            }
+        }
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "no column twice");
+        assert_eq!(names.first(), Some(&TIMESTAMP));
+        assert_eq!(names.last(), Some(&OVERFLOW));
+        assert!(!unified.field_with_name(KIND).unwrap().is_nullable());
+        assert!(
+            unified.field_with_name(EVENT_ID).unwrap().is_nullable(),
+            "metrics have no event id"
+        );
+    }
+
     #[test]
     fn dedicated_attribute_columns_merge_back_into_the_overflow_view() {
         let schema = Arc::new(Schema::new(vec![

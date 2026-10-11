@@ -14,6 +14,9 @@
 //! 5. Through a join, a predicate or a needed column that names one
 //!    side only moves to that side with its qualifier removed; a left
 //!    join keeps the predicates on its right side above itself.
+//! 6. A branch of a union whose scan a `kind` predicate rules out is
+//!    dropped, so that `events WHERE kind = 'log'` reads the logs alone
+//!    (DM-1).
 
 use std::collections::BTreeSet;
 
@@ -22,15 +25,88 @@ use tessera_ir::{
     BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, Scan, SortKey, Spanset,
     VALUE as VALUE_COLUMN, unqualify,
 };
-use tessera_types::event::{BODY, EXTRACTED, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
-use tessera_types::{TimeRange, Timestamp};
+use tessera_types::event::{BODY, EXTRACTED, KIND, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
+use tessera_types::{Kind, TimeRange, Timestamp};
 
 /// Applies every rewrite to `plan`.
 #[must_use]
 pub fn rewrite(plan: Plan) -> Plan {
-    let pushed = push_predicates(plan, Vec::new());
+    let pushed = prune_kinds(push_predicates(plan, Vec::new()));
     let limited = push_limits(pushed);
     push_projection(limited, None, false)
+}
+
+/// Drops the branches of a union whose scan cannot satisfy a `kind`
+/// predicate pushed into it; a union of one branch is that branch. One
+/// branch stays when every one is ruled out, so the plan keeps a schema.
+fn prune_kinds(plan: Plan) -> Plan {
+    match plan {
+        Plan::Union { inputs } => {
+            let inputs: Vec<Plan> = inputs.into_iter().map(prune_kinds).collect();
+            let mut kept: Vec<Plan> = inputs
+                .iter()
+                .filter(|input| !excluded_by_kind(input))
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                kept.extend(inputs.into_iter().next());
+            }
+            if kept.len() == 1 {
+                return kept.remove(0);
+            }
+            Plan::Union { inputs: kept }
+        }
+        other => rebuild_inputs(other, prune_kinds),
+    }
+}
+
+/// Whether the scan under `plan`, through projections and filters,
+/// carries a predicate on `kind` that none of its rows satisfy.
+fn excluded_by_kind(plan: &Plan) -> bool {
+    match plan {
+        Plan::Scan(scan) => scan
+            .predicates
+            .iter()
+            .any(|p| contradicts_kind(p, scan.kind)),
+        Plan::Project { input, .. } | Plan::Filter { input, .. } => excluded_by_kind(input),
+        _ => false,
+    }
+}
+
+/// Whether `predicate` compares `kind` with names other than `kind`'s.
+fn contradicts_kind(predicate: &Expr, kind: Kind) -> bool {
+    let is_kind = |e: &Expr| matches!(e, Expr::Column(c) if c == KIND);
+    let named = |e: &Expr| match e {
+        Expr::Literal(Literal::Text(name)) => Some(name == kind.as_str()),
+        _ => None,
+    };
+    match predicate {
+        Expr::Binary { op, left, right } if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) => {
+            let same = if is_kind(left) {
+                named(right)
+            } else if is_kind(right) {
+                named(left)
+            } else {
+                None
+            };
+            match (op, same) {
+                (BinaryOp::Eq, Some(same)) => !same,
+                (BinaryOp::NotEq, Some(same)) => same,
+                _ => false,
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } if is_kind(expr) => {
+            let listed = list
+                .iter()
+                .any(|l| matches!(l, Literal::Text(name) if name == kind.as_str()));
+            listed == *negated
+        }
+        _ => false,
+    }
 }
 
 /// Moves `pending` conjuncts down as far as they go, collecting more on
@@ -688,6 +764,46 @@ mod tests {
                 "statement",
             ),
         ])
+    }
+
+    #[test]
+    fn a_kind_predicate_drops_the_other_branches_of_a_union() {
+        let dataset = DatasetName::new("prod").unwrap();
+        let branch = |kind: Kind| {
+            Plan::Scan(Scan::all(TenantId::DEFAULT, dataset.clone(), kind)).project(vec![
+                NamedExpr::new(Expr::column(KIND), KIND),
+                NamedExpr::new(Expr::column("timestamp"), "timestamp"),
+            ])
+        };
+        let union = Plan::Union {
+            inputs: Kind::ALL.iter().map(|k| branch(*k)).collect(),
+        };
+        let one = rewrite(
+            union
+                .clone()
+                .filter(Expr::column(KIND).binary(BinaryOp::Eq, Expr::literal("span"))),
+        );
+        assert_eq!(scan_of(&one).kind, Kind::Span);
+        assert!(!one.to_string().contains("Union"), "{one}");
+        let two = rewrite(union.clone().filter(Expr::InList {
+            expr: Box::new(Expr::column(KIND)),
+            list: vec![Literal::Text("log".into()), Literal::Text("alert".into())],
+            negated: false,
+        }));
+        assert_eq!(two.to_string().matches("Scan:").count(), 2, "{two}");
+        let all_but_one = rewrite(
+            union
+                .clone()
+                .filter(Expr::column(KIND).binary(BinaryOp::NotEq, Expr::literal("metric"))),
+        );
+        assert_eq!(all_but_one.to_string().matches("Scan:").count(), 4);
+        let none =
+            rewrite(union.filter(Expr::column(KIND).binary(BinaryOp::Eq, Expr::literal("nope"))));
+        assert_eq!(
+            none.to_string().matches("Scan:").count(),
+            1,
+            "one branch stays so the plan keeps a schema"
+        );
     }
 
     #[test]

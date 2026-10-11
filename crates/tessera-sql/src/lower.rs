@@ -158,7 +158,7 @@ fn lower_delete(
         scope: Scope::single(TableScope {
             name: table.table.clone(),
             schema: event::schema(kind),
-            kind: Some(kind),
+            kinds: vec![kind],
         }),
         substitution: None,
     };
@@ -371,9 +371,15 @@ struct TableScope {
     /// The alias, or the table's own name: what qualifies its columns.
     name: String,
     schema: SchemaRef,
-    /// The kind of event, for a telemetry table; a control table has
-    /// no attributes.
-    kind: Option<Kind>,
+    /// The kinds of event the table holds: one for a view, every kind
+    /// for `events`, none for a control table, which has no attributes.
+    kinds: Vec<Kind>,
+}
+
+impl TableScope {
+    fn has_attributes(&self) -> bool {
+        !self.kinds.is_empty()
+    }
 }
 
 /// The tables an expression may refer to. With one table its columns
@@ -535,20 +541,22 @@ fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan),
             TableScope {
                 name: from.table.clone(),
                 schema,
-                kind: None,
+                kinds: Vec::new(),
             },
             Plan::SystemTable {
                 tenant: ctx.tenant.clone(),
                 table: from.table.clone(),
             },
         )
+    } else if from.table == "events" {
+        events_source(ctx, &dataset_of(from, ctx)?)
     } else {
         let (dataset, kind) = resolve_table(from, ctx)?;
         (
             TableScope {
                 name: from.table.clone(),
                 schema: event::schema(kind),
-                kind: Some(kind),
+                kinds: vec![kind],
             },
             Plan::Scan(Scan::all(ctx.tenant.clone(), dataset, kind)),
         )
@@ -557,6 +565,45 @@ fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan),
         table.name.clone_from(alias);
     }
     Ok((table, plan))
+}
+
+/// `events`, the one table of a dataset (DM-1): every kind's rows on the
+/// unified columns, each kind a branch of a union with the columns it
+/// lacks null. Every branch keeps `_overflow` whole, so an attribute
+/// read above the union finds every attribute; the views read one kind
+/// through its dedicated columns and are the faster path.
+fn events_source(ctx: &BindContext, dataset: &DatasetName) -> (TableScope, Plan) {
+    let unified = event::unified_schema();
+    let inputs = Kind::ALL
+        .iter()
+        .map(|kind| {
+            let own = event::schema(*kind);
+            let exprs = unified
+                .fields()
+                .iter()
+                .map(|field| {
+                    let expr = if own.field_with_name(field.name()).is_ok() {
+                        Expr::column(field.name())
+                    } else {
+                        Expr::Cast {
+                            expr: Box::new(Expr::Literal(Literal::Null)),
+                            to: field.data_type().clone(),
+                        }
+                    };
+                    NamedExpr::new(expr, field.name())
+                })
+                .collect();
+            Plan::Scan(Scan::all(ctx.tenant.clone(), dataset.clone(), *kind)).project(exprs)
+        })
+        .collect();
+    (
+        TableScope {
+            name: "events".into(),
+            schema: unified,
+            kinds: Kind::ALL.to_vec(),
+        },
+        Plan::Union { inputs },
+    )
 }
 
 /// `system.usage` (CO-4): the `_system.usage` events with their
@@ -586,7 +633,7 @@ fn usage_source(ctx: &BindContext) -> (TableScope, Plan) {
         TableScope {
             name: "usage".into(),
             schema,
-            kind: None,
+            kinds: Vec::new(),
         },
         scan.project(exprs),
     )
@@ -633,7 +680,7 @@ fn log_patterns_source(ctx: &BindContext) -> (TableScope, Plan) {
         TableScope {
             name: "log_patterns".into(),
             schema: tessera_ir::log_patterns_schema(),
-            kind: None,
+            kinds: Vec::new(),
         },
         plan,
     )
@@ -687,23 +734,33 @@ fn resolve_table(
         "logs" => Kind::Log,
         "spans" => Kind::Span,
         "metrics" => Kind::Metric,
-        "events" => Kind::Event,
         "alerts" => Kind::Alert,
+        "events" => {
+            return Err(Diagnostic::at(
+                from.span,
+                "events holds every kind: use one of its views, logs, spans, metrics or alerts",
+            ));
+        }
         other => {
             return Err(Diagnostic::at(
                 from.span,
                 format!(
-                    "unknown table {other}: tables are logs, spans, metrics, events and alerts"
+                    "unknown table {other}: tables are events and its views logs, spans, \
+                     metrics and alerts"
                 ),
             ));
         }
     };
-    let dataset = match &from.dataset {
+    Ok((dataset_of(from, ctx)?, kind))
+}
+
+/// The dataset a table reference names, or the request's.
+fn dataset_of(from: &ast::TableRef, ctx: &BindContext) -> Result<DatasetName, Diagnostic> {
+    match &from.dataset {
         Some(name) => DatasetName::new(name.clone())
-            .map_err(|e| Diagnostic::at(from.span, format!("invalid dataset: {e}")))?,
-        None => ctx.dataset.clone(),
-    };
-    Ok((dataset, kind))
+            .map_err(|e| Diagnostic::at(from.span, format!("invalid dataset: {e}"))),
+        None => Ok(ctx.dataset.clone()),
+    }
 }
 
 /// The only table of `candidates`, none, or the ambiguity.
@@ -1125,7 +1182,7 @@ impl Lowerer<'_> {
         if column == event::PATTERN_ID {
             let logs: Vec<&TableScope> = tables
                 .iter()
-                .filter(|t| t.kind == Some(Kind::Log))
+                .filter(|t| t.kinds == [Kind::Log])
                 .copied()
                 .collect();
             if let Some(table) = one_of(&logs, &column, span)? {
@@ -1141,7 +1198,7 @@ impl Lowerer<'_> {
         if scoped {
             let telemetry: Vec<&TableScope> = tables
                 .iter()
-                .filter(|t| t.kind.is_some())
+                .filter(|t| t.has_attributes())
                 .copied()
                 .collect();
             if let Some(table) = one_of(&telemetry, &column, span)? {
@@ -1285,12 +1342,17 @@ impl Lowerer<'_> {
             ));
         };
         // Search syntax is read against one kind of event: the single
-        // telemetry table in scope.
-        let telemetry: Vec<Kind> = self.scope.tables.iter().filter_map(|t| t.kind).collect();
-        let [kind] = telemetry.as_slice() else {
+        // view in scope.
+        let kinds: Vec<Kind> = self
+            .scope
+            .tables
+            .iter()
+            .flat_map(|t| t.kinds.iter().copied())
+            .collect();
+        let [kind] = kinds.as_slice() else {
             return Err(Diagnostic::at(
                 span,
-                "search() needs a table of events, exactly one, in the query",
+                "search() needs a table of one kind: logs, spans, metrics or alerts",
             ));
         };
         let kind = *kind;
@@ -1450,6 +1512,56 @@ mod tests {
         assert!(
             schema.field_with_name("l.body").is_ok() && schema.field_with_name("s.name").is_ok()
         );
+    }
+
+    #[test]
+    fn the_events_table_unions_every_kind_on_one_schema() {
+        let plan = lowered("SELECT kind, name, body FROM events WHERE kind = 'span'");
+        let Plan::Project { input, .. } = &plan else {
+            panic!("project: {plan}")
+        };
+        let Plan::Filter { input, predicate } = input.as_ref() else {
+            panic!("filter: {plan}")
+        };
+        assert_eq!(predicate.to_string(), "(kind = 'span')");
+        let Plan::Union { inputs } = input.as_ref() else {
+            panic!("union: {plan}")
+        };
+        let kinds: Vec<Kind> = inputs
+            .iter()
+            .map(|branch| match branch {
+                Plan::Project { input, .. } => match input.as_ref() {
+                    Plan::Scan(scan) => scan.kind,
+                    other => panic!("scan: {other}"),
+                },
+                other => panic!("project: {other}"),
+            })
+            .collect();
+        assert_eq!(kinds, Kind::ALL);
+        assert_eq!(plan.schema(&Registry::builtin()).unwrap().fields().len(), 3);
+        let star = lowered("SELECT * FROM events");
+        let names: Vec<String> = star
+            .schema(&Registry::builtin())
+            .unwrap()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names.first().map(String::as_str), Some("timestamp"));
+        assert!(
+            ["body", "duration_ns", "value", "event_id"]
+                .iter()
+                .all(|c| names.contains(&(*c).to_owned()))
+        );
+        assert_eq!(names.last().map(String::as_str), Some("_overflow"));
+        lowered("SELECT attr.host FROM events WHERE resource.service.name = 'api'");
+        let message = lower(
+            &parse("DELETE FROM events WHERE kind = 'event'").unwrap(),
+            &ctx(),
+        )
+        .unwrap_err()
+        .message;
+        assert!(message.contains("use one of its views"), "{message}");
     }
 
     #[test]
