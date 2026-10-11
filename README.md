@@ -239,7 +239,11 @@ tenant and team for ingest and for queries, a query's team being that
 of the role its key runs under, as tenant settings; once a budget is
 reached, what arrives beyond it is
 admitted and recorded once a day (the default), sampled at ingest, or
-refused with 429, and a query is refused before it runs (13.4).
+refused with 429, and a query is refused before it runs (13.4). Each
+node publishes its day's counts to the root pool on every heartbeat
+and absorbs the others', so a budget reached on one node holds on
+all, and the counts a stopped node left keep the day's total for the
+rest.
 Rollups: `CREATE ROLLUP name [EVERY d] [INTO dataset] AS` a grouped
 aggregation over one tumbling window, maintained by the eval role
 from closed windows into a derived dataset of events, read by the
@@ -255,8 +259,7 @@ error spans of the files
 being compacted only, and traces referenced by alert events are not
 exempt; sketches are not merged when downsampling, and classic
 histograms whose bounds differ keep the interval's last point (CO-8);
-the budget ledger starts empty when every node restarts, not from
-`system.usage`; Prometheus recording rules
+Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a
 query reads their samples, not a rollup; a rollup starts at

@@ -25,6 +25,9 @@ use tessera_types::{Budget, BudgetAction, EventBatch, TenantId};
 use crate::metering::{self, Usage};
 use crate::{ApiError, AppState};
 
+/// Nanoseconds in a UTC day, the span of a budget.
+const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
 /// `batch` as the tenant's and its teams' ingest budgets admit it: the
 /// whole batch, the rows that remain, or nothing to write.
 ///
@@ -107,6 +110,11 @@ pub fn admit_ingest(state: &AppState, batch: EventBatch) -> Result<Option<EventB
 /// root pool and absorbs what every other node published, one round of
 /// the sharing the node repeats on its heartbeat (section 13.4).
 ///
+/// A node's id is new on every start, so the counts a stopped node
+/// published stay and keep today's totals for the nodes that remain;
+/// counts of an earlier day are removed as they are met, so the prefix
+/// holds one object per node that ran today.
+///
 /// # Errors
 ///
 /// When the root pool cannot be written or listed; a node's counts that
@@ -129,11 +137,17 @@ pub async fn share_budgets(state: &AppState) -> Result<(), String> {
         .try_collect()
         .await
         .map_err(|e| e.to_string())?;
+    let today = now.as_nanos().div_euclid(NANOS_PER_DAY);
     let mut others = Vec::new();
     for meta in listed.into_iter().filter(|m| m.key != own) {
         match store.get(&meta.key).await {
             Ok(bytes) => match serde_json::from_slice::<Counts>(&bytes) {
-                Ok(counts) => others.push(counts),
+                Ok(counts) if counts.day == today => others.push(counts),
+                Ok(_) => {
+                    if let Err(error) = store.delete(&meta.key).await {
+                        tracing::debug!(key = %meta.key, error = %error, "stale budget counts kept");
+                    }
+                }
                 Err(error) => {
                     tracing::debug!(key = %meta.key, error = %error, "budget counts unreadable");
                 }
@@ -513,6 +527,71 @@ mod tests {
             error.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "and a counts b's"
+        );
+    }
+
+    /// The counts a node published for an earlier day go when another
+    /// node meets them; today's, from a node that stopped, stay and
+    /// count.
+    #[tokio::test]
+    async fn stale_budget_counts_are_removed_and_todays_kept() {
+        use tessera_cluster::{Account, Counts, Phase};
+        use tessera_object::{ObjectStore, layout};
+        use tessera_types::NodeId;
+
+        let store = tessera_object::MemoryStore::new();
+        let state = AppState::in_memory_on(store.clone()).await;
+        let now = state.env.clock.now();
+        let today = now.as_nanos().div_euclid(NANOS_PER_DAY);
+        let account = Account {
+            tenant: TenantId::DEFAULT,
+            phase: Phase::Ingest,
+            team: None,
+        };
+        let publish = |node: u128, day: i64| {
+            let store = store.clone();
+            let account = account.clone();
+            async move {
+                let counts = Counts {
+                    day,
+                    bytes: vec![(account, 5)],
+                };
+                store
+                    .put(
+                        &layout::budget_counts(NodeId::from_u128(node)),
+                        serde_json::to_vec(&counts).unwrap().into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        publish(1, today - 1).await;
+        publish(2, today).await;
+        share_budgets(&state).await.unwrap();
+        assert!(
+            store
+                .head(&layout::budget_counts(NodeId::from_u128(1)))
+                .await
+                .is_err(),
+            "yesterday's counts are gone"
+        );
+        assert!(
+            store
+                .head(&layout::budget_counts(NodeId::from_u128(2)))
+                .await
+                .is_ok(),
+            "today's stay"
+        );
+        assert!(
+            state.budgets.exhausted(
+                &account,
+                &Budget {
+                    bytes_per_day: 5,
+                    action: BudgetAction::Reject,
+                },
+                now
+            ),
+            "and count against the budget"
         );
     }
 
