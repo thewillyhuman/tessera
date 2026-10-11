@@ -95,6 +95,23 @@ impl Grouper {
         self.keys.is_empty()
     }
 
+    /// The bucket, below `buckets`, of every group in group id order:
+    /// a hash of the group's key, the same for equal keys in any
+    /// grouper of this process, so that an operator can spill its
+    /// groups by bucket and fold each bucket back on its own (QE-11).
+    #[must_use]
+    pub fn buckets(&self, buckets: u32) -> Vec<u32> {
+        use std::hash::{Hash, Hasher};
+        self.keys
+            .iter()
+            .map(|key| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                u32::try_from(hasher.finish() % u64::from(buckets.max(1))).unwrap_or(0)
+            })
+            .collect()
+    }
+
     /// The key columns of every group, in group id order.
     ///
     /// # Errors
