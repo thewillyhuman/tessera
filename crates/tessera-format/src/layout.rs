@@ -5,7 +5,7 @@
 //! recorded per file (P3), so files of different layouts coexist.
 
 use tessera_types::Kind;
-use tessera_types::event::{BODY, NAME, SEVERITY_NUMBER, TIMESTAMP, TRACE_ID};
+use tessera_types::event::{BODY, NAME, SERIES_ID, SEVERITY_NUMBER, TIMESTAMP, TRACE_ID};
 
 use crate::sidecar::IndexSpec;
 
@@ -64,8 +64,15 @@ impl Layout {
                 row_group_rows: DEFAULT_ROW_GROUP_ROWS,
                 indexes: bloom_on_trace,
             },
-            Kind::Metric | Kind::Alert => Layout {
-                sort_key: vec![TIMESTAMP.to_owned()],
+            // Metrics sort by name, series and time (section 8.5), so that
+            // a series is contiguous and selectors on the name prune.
+            Kind::Metric => Layout {
+                sort_key: vec![NAME.to_owned(), SERIES_ID.to_owned(), TIMESTAMP.to_owned()],
+                row_group_rows: DEFAULT_ROW_GROUP_ROWS,
+                indexes: IndexSpec::default(),
+            },
+            Kind::Alert => Layout {
+                sort_key: vec![NAME.to_owned(), TIMESTAMP.to_owned()],
                 row_group_rows: DEFAULT_ROW_GROUP_ROWS,
                 indexes: IndexSpec::default(),
             },
@@ -124,6 +131,10 @@ mod tests {
         assert_eq!(
             Layout::default_for(Kind::Event).sort_key,
             vec!["name", "timestamp"]
+        );
+        assert_eq!(
+            Layout::default_for(Kind::Metric).sort_key,
+            vec!["name", "series_id", "timestamp"]
         );
     }
 }
