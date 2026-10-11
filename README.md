@@ -518,6 +518,77 @@ there are four of them or a lone one is an hour old.
 The routes are listed in the modules of `crates/tessera-server/src`.
 Logging is controlled by `TESSERA_LOG` (for example `TESSERA_LOG=debug`).
 
+## Benchmark
+
+`tessera-bench` runs one node in its own process over a local root
+pool and measures it against the targets of spec section 17.1 that one
+machine can speak to:
+
+```
+cargo run --release -p tessera-bench -- \
+    --rows 300000 --batch 2000 --clients 8 --linger-ms 50
+```
+
+It ingests representative application logs, gauge metrics and spans
+over the OTLP endpoints from concurrent clients, probes freshness along
+the way, waits for compaction, reports compression and bytes per
+sample with a per-column breakdown of the largest compacted files, runs
+the dashboard, search and trace queries warm and once more cold after a
+restart, and times an eager alert from acknowledgment to webhook. A
+local directory stands in for the object store, so the numbers bound
+what the code paths cost and say nothing about same-region storage
+latency, and the data is megabytes where some targets name terabytes.
+
+On an Apple M1 Pro (10 cores, 32 GB, local SSD), release build,
+2026-10-11, with 300,000 log rows (66.6 MB of OTLP protobuf, 75 MB as
+flat JSON lines), 144,000 metric samples and 2,000 traces:
+
+| Area | Target (17.1) | Measured |
+|------|---------------|----------|
+| New node serving | <= 30 s from process start | 0.02 s |
+| Write acknowledgment (durable) | p50 <= 200 ms, p99 <= 500 ms | p50 199 ms, p99 231 ms (linger 50 ms, 8 clients); p50 489 ms, p99 812 ms saturated (default linger 250 ms, 32 clients) |
+| Ingest throughput | >= 20 MB/s of OTLP per ingest core | 17.1 MB/s at 8 clients, 22.5 MB/s saturated, on one ingest task; 1.7 to 2.3 MB/s per machine core |
+| Freshness (acknowledged to queryable) | p99 <= 1 s | p50 145 ms, max 196 ms over 4 probes; max 849 ms saturated |
+| Log compression | >= 10x against raw JSON | 3.3x against flat JSON lines, 8.2x against OTLP JSON |
+| Metric storage | <= 3 bytes per sample after L2 | 19.2 bytes per sample |
+| Dashboard panel, SQL, 1 h by minute | p95 <= 200 ms warm | warm p50 130 ms, p95 134 ms; cold 162 ms |
+| Error count, SQL, 1 h | p95 <= 200 ms warm | warm p50 99 ms, p95 104 ms; cold 107 ms |
+| Line-filter search, LogQL, 1 h | p95 <= 5 s cold over 1 TB | warm p50 221 ms, p95 226 ms; cold 162 ms (megabytes, not a terabyte) |
+| Dashboard panel, PromQL, 1 h | p95 <= 200 ms warm | warm p50 117 ms, p95 124 ms; cold 79 ms |
+| Trace by id, Tempo | p99 <= 500 ms cold over 30 days | warm p50 36 ms, p95 51 ms; cold 1 ms (1 h of spans) |
+| Attribute search, TraceQL, 1 h | p95 <= 3 s cold over 24 h | warm p50 45 ms, p95 54 ms; cold 5 ms (1 h of spans) |
+| Alert, eager rule: write to notification | p99 <= 3 s | p50 150 ms, p99 499 ms over 10 probes |
+| Node restart serving | <= 30 s from process start | 0.00 s |
+
+What the numbers say:
+
+- The query, freshness, alert and start-up targets hold at this size
+  on local disk. They remain to be measured at the sizes the targets
+  name and against an object store.
+- Acknowledgment latency is the ingester's linger plus queueing. The
+  default linger of 250 ms puts p50 near 300 ms unloaded; at 50 ms it
+  meets the target until the ingest task saturates. The linger is not a
+  command-line option yet.
+- A node has one ingest task, which serializes every write (ST-5), so
+  the 17 to 22 MB/s it reaches is the throughput of one core: on the
+  target per ingest core, but a tenth of it per machine core. Taking
+  load across cores needs several writer logs per node.
+- Compression misses the target for reasons the column breakdown
+  names. Of 77 bytes per compacted log row, `_overflow` is 26: every
+  promoted attribute is stored twice, once in its column and once in
+  the JSON kept whole. The random 16-byte event id is 16 more. The
+  request id, the user id and the durations are random by construction
+  and cost 15. Timestamps cost 8.5 because rows in a file are not in
+  time order. Dropping promoted keys from `_overflow`, deriving event
+  ids after deduplication and delta-encoding sorted timestamps would
+  bring the row to about 30 bytes, near 8x; the rest is the data's
+  entropy.
+- Metric storage misses by the event id alone: 16 of 19.2 bytes per
+  sample is the random id stored per point, the value is 2.7 and
+  everything else rounds to zero. A metric's identity is its series
+  and timestamp; deriving it instead of storing one puts the figure at
+  3.2 bytes.
+
 ## Testing
 
 ```
