@@ -69,7 +69,25 @@ grouping of compaction inputs (CP-2) wait for column promotion (M8);
 L3, retention sampling and log patterns wait for M9; Grafana itself has
 not been run against the API yet.
 
-**M4, traces: next.**
+**M4, traces: done, with gaps listed below.** Spans with their span
+events (as `event` rows, DM-8) and links over OTLP; the `TraceGroup`
+operator that groups spans by trace and evaluates spanset expressions
+on each trace's tree, reading only the spans of the candidate traces
+(QL-13); TraceQL with a hand-written parser: spanset filters with
+intrinsics and scoped attributes, logical and structural operators,
+aggregate filters, pipelines, `select`, `by` and `coalesce`, and the
+metrics functions over steps; the Tempo HTTP API: search, traces by
+id (JSON and protobuf), tag names and values, metrics. The TraceQL
+differential suite agrees with Tempo 2.7.1 on every case; the
+deviations found are documented in the `tessera-traceql` crate.
+
+Gaps left in M4: the `event.` and `link.` scopes, the nested-set
+intrinsics, `quantile_over_time` and `histogram_over_time`, and the
+`traceql(...)` table function in SQL; trace completion (QL-14) waits
+for L3 compaction (M9); Grafana itself has not been run against the
+API yet.
+
+**M5, metrics: next.**
 
 ## Layout
 
@@ -91,11 +109,13 @@ crates/
   tessera-sql       SQL lexer, parser and lowering
   tessera-search    the search syntax, lowered to a predicate
   tessera-logql     LogQL lexer, parser and lowering
-  tessera-server    HTTP administration, OTLP ingest, SQL over HTTP, PostgreSQL wire protocol, Loki API
+  tessera-traceql   TraceQL lexer, parser and lowering
+  tessera-server    HTTP administration, OTLP ingest, SQL over HTTP, PostgreSQL wire protocol, Loki and Tempo APIs
   tessera           the binary
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
 compat/sql/         SQL differential tests against SQLite
 compat/logql/       LogQL differential tests against a Loki instance
+compat/traceql/     TraceQL differential tests against a Tempo instance
 ```
 
 Dependencies between crates point downward only (spec section 18.1).
@@ -129,8 +149,10 @@ curl -X POST localhost:8080/v1/logs \
      -d '{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"checkout"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1700000000000000000","severityText":"ERROR","body":{"stringValue":"payment failed"}}]}]}]}'
 ```
 
-An OpenTelemetry Collector's `otlphttp` exporter pointed at
-`http://localhost:8080` works as is for logs.
+Traces go to `/v1/traces` the same way; a span's events become events
+of their own and its links stay with the span. An OpenTelemetry
+Collector's `otlphttp` exporter pointed at `http://localhost:8080`
+works as is for logs and traces.
 
 Queries are SQL, over HTTP or over the PostgreSQL protocol. A table is
 a kind of event in a dataset (`logs`, `spans`, `metrics`, `events`,
@@ -163,6 +185,22 @@ curl -G localhost:8080/loki/api/v1/query_range \
      --data-urlencode 'query=sum by (app) (rate({app=~".+"}[5m]))' --data-urlencode 'since=1h' --data-urlencode 'step=1m'
 ```
 
+The Tempo API lives under `/api`: search with TraceQL, traces by id,
+tag names and values, and TraceQL metrics. Point Grafana's Tempo data
+source at `http://localhost:8080`; the tenant and dataset come from
+the same headers as the Loki API:
+
+```
+curl -G localhost:8080/api/search \
+     --data-urlencode 'q={ resource.service.name = "checkout" } >> { status = error }' \
+     --data-urlencode "start=$(($(date +%s) - 3600))" --data-urlencode "end=$(date +%s)"
+curl localhost:8080/api/traces/<trace id>
+curl -G localhost:8080/api/metrics/query_range \
+     --data-urlencode 'q={ status = error } | rate() by (resource.service.name)' \
+     --data-urlencode "start=$(($(date +%s) - 3600))" --data-urlencode "end=$(date +%s)" \
+     --data-urlencode 'step=60s'
+```
+
 Compaction, index building and garbage collection run in the
 background: a partition's L1 files become one indexed L2 file once
 there are four of them or a lone one is an hour old.
@@ -191,6 +229,15 @@ otherwise:
 
 ```
 TESSERA_LOKI_URL=http://127.0.0.1:3100 cargo test -p tessera-compat-logql
+```
+
+The TraceQL suite in `compat/traceql` does the same against a Tempo
+instance started with `compat/traceql/tempo.yaml`, reached through
+`TESSERA_TEMPO_URL` and `TESSERA_TEMPO_OTLP_URL` (CI starts one):
+
+```
+TESSERA_TEMPO_URL=http://127.0.0.1:3200 TESSERA_TEMPO_OTLP_URL=http://127.0.0.1:4318 \
+    cargo test -p tessera-compat-traceql
 ```
 
 Every commit passes `cargo fmt --check`, `cargo clippy --all-targets`
