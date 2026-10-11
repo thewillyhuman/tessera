@@ -12,6 +12,7 @@ tessera-catalog.workspace = true
 tessera-cluster.workspace = true
 tessera-commit.workspace = true
 tessera-compact.workspace = true
+tessera-eval.workspace = true
 tessera-exec.workspace = true
 tessera-format.workspace = true
 tessera-ingest.workspace = true
@@ -22,12 +23,14 @@ tessera-types.workspace = true
 tessera-wal.workspace = true
 
 axum = "0.8"
+futures = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["net", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
 serde_json = "1"
+tessera-catalog.workspace = true
 tessera-cluster.workspace = true
 tessera-manifest.workspace = true
 tessera-object.workspace = true

@@ -25,7 +25,32 @@ use tessera_types::WorkKind;
 use tokio::sync::oneshot;
 
 /// The kinds of work a `compact` node owns slots of.
-pub const KINDS: [WorkKind; 3] = [WorkKind::Intake, WorkKind::Recovery, WorkKind::Partition];
+pub const COMPACT_KINDS: [WorkKind; 3] =
+    [WorkKind::Intake, WorkKind::Recovery, WorkKind::Partition];
+/// The kinds of work an `eval` node owns slots of.
+pub const EVAL_KINDS: [WorkKind; 1] = [WorkKind::RuleGroup];
+
+/// The role whose live nodes share the slots of `kind`.
+#[must_use]
+pub fn role_of(kind: WorkKind) -> Role {
+    match kind {
+        WorkKind::RuleGroup => Role::Eval,
+        WorkKind::Intake | WorkKind::Recovery | WorkKind::Partition => Role::Compact,
+    }
+}
+
+/// The kinds of work a node with `roles` owns slots of.
+#[must_use]
+pub fn kinds_of(roles: &std::collections::BTreeSet<Role>) -> Vec<WorkKind> {
+    let mut kinds = Vec::new();
+    if roles.contains(&Role::Compact) {
+        kinds.extend(COMPACT_KINDS);
+    }
+    if roles.contains(&Role::Eval) {
+        kinds.extend(EVAL_KINDS);
+    }
+    kinds
+}
 
 /// The slots held for one kind, under the slot count they were taken
 /// with.
@@ -101,6 +126,8 @@ pub struct Leases {
     pub membership: Arc<Membership>,
     /// Where the held slots are published.
     pub owned: Owned,
+    /// The kinds this node takes slots of.
+    pub kinds: Vec<WorkKind>,
 }
 
 impl Leases {
@@ -109,7 +136,7 @@ impl Leases {
     /// changes once per kind, at the end of the pass, so a reader never
     /// sees a slot missing while its renewal is in flight.
     pub async fn tick(&self) {
-        for kind in KINDS {
+        for kind in self.kinds.iter().copied() {
             let count = self.catalog.cached().state().slot_count(kind);
             let mut held = self.owned.leases(kind);
             let mut next = BTreeMap::new();
@@ -150,7 +177,7 @@ impl Leases {
 
     /// Gives every held slot up, for a clean stop.
     pub async fn release_all(&self) {
-        for kind in KINDS {
+        for kind in self.kinds.iter().copied() {
             for lease in self.owned.take(kind).into_values() {
                 if let Err(error) = self.manager.release(&lease).await {
                     tracing::warn!(%kind, slot = %lease.slot, error = %error, "release failed");
@@ -161,7 +188,7 @@ impl Leases {
 
     fn is_preferred(&self, kind: WorkKind, slot: Slot) -> bool {
         let key = format!("{kind}/{slot}");
-        let preferred = self.membership.preferred(Role::Compact, key.as_bytes(), 1);
+        let preferred = self.membership.preferred(role_of(kind), key.as_bytes(), 1);
         preferred
             .first()
             .is_none_or(|record| record.node == self.membership.node())
@@ -260,6 +287,7 @@ mod tests {
             catalog: Arc::clone(&fixture.catalog),
             membership: Arc::new(membership),
             owned: Owned::default(),
+            kinds: COMPACT_KINDS.to_vec(),
         }
     }
 

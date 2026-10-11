@@ -66,6 +66,7 @@ impl Cluster {
             lease: Duration::from_secs(2),
             renewal: Duration::from_millis(50),
             background: Duration::from_millis(200),
+            eval: Duration::from_millis(200),
             ingest: IngestConfig {
                 linger: Duration::ZERO,
                 flush_bytes: 1,

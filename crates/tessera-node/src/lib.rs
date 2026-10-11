@@ -10,6 +10,7 @@
 //! from start to Ctrl-C.
 
 mod background;
+mod evaluator;
 mod heartbeat;
 mod leases;
 mod peers;
@@ -20,9 +21,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tessera_catalog::{Catalog, PoolConfig};
+use tessera_catalog::{Catalog, ControlStores, PoolConfig};
 use tessera_cluster::{Admission, Limits, Membership, Registry, Role, registry};
 use tessera_commit::LeaseManager;
+use tessera_eval::HttpNotifier;
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
@@ -32,6 +34,7 @@ use tessera_types::{Env, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+pub use evaluator::StateSink;
 pub use leases::{Leases, Owned};
 pub use peers::MembershipPeers;
 
@@ -69,6 +72,8 @@ pub struct Config {
     pub renewal: Duration,
     /// How often the background work of the `compact` role runs.
     pub background: Duration,
+    /// How often the `eval` role evaluates its rule groups.
+    pub eval: Duration,
     /// The ingester's tunables.
     pub ingest: IngestConfig,
 }
@@ -89,6 +94,7 @@ impl Config {
             lease: LeaseManager::DEFAULT_DURATION,
             renewal: LeaseManager::DEFAULT_RENEWAL,
             background: background::DEFAULT_INTERVAL,
+            eval: evaluator::DEFAULT_INTERVAL,
             ingest: IngestConfig::default(),
         }
     }
@@ -126,6 +132,7 @@ pub enum RunError {
 /// A running node.
 pub struct Node {
     state: AppState,
+    controls: Arc<ControlStores>,
     http: SocketAddr,
     pg: SocketAddr,
     ingest: IngestHandle,
@@ -170,7 +177,10 @@ impl Node {
         let pg = pg_listener.local_addr().unwrap_or(config.pg_listen);
         tracing::info!(address = %pg, "postgresql protocol listening");
 
-        let advertise = config.advertise.unwrap_or_else(|| format!("http://{http}"));
+        let advertise = config
+            .advertise
+            .clone()
+            .unwrap_or_else(|| format!("http://{http}"));
         let (registry, membership) = join(
             &store,
             &env,
@@ -180,56 +190,55 @@ impl Node {
             config.heartbeat,
         )
         .await?;
-        let leases = config.roles.contains(&Role::Compact).then(|| {
-            Arc::new(Leases {
-                manager: LeaseManager::new(
-                    Arc::clone(&store),
-                    layout::leases(),
-                    env.clone(),
-                    config.lease,
-                ),
-                catalog: Arc::clone(&catalog),
-                membership: Arc::clone(&membership),
-                owned: Owned::default(),
-            })
-        });
-        let mut lease_loop = None;
-        if let Some(leases) = &leases {
-            let (stop, stopped) = oneshot::channel();
-            let task = tokio::spawn(leases::run(Arc::clone(leases), config.renewal, stopped));
-            lease_loop = Some((stop, task));
-            loops.push(tokio::spawn(background::run(background::Background {
-                store: Arc::clone(&store),
-                env: env.clone(),
-                catalog: Arc::clone(&catalog),
-                format: Arc::clone(&format),
-                pool,
-                pools: Arc::clone(&pools),
-                owned: leases.owned.clone(),
-                membership: Arc::clone(&membership),
-                interval: config.background,
-            })));
-        }
-
-        let remote = HttpRemote::new();
-        let engine = engine(&pools, &format, &env, &membership, &remote);
-        let state = AppState {
-            catalog: Arc::clone(&catalog),
-            ingest: ingest.clone(),
-            pools,
-            format,
-            engine: Arc::new(engine),
+        let shared = Shared {
+            store,
             env,
+            catalog,
+            format,
+            pool,
+            pools,
+            membership,
+        };
+        let (leases, lease_loop) = shared.own_slots(&config, &mut loops);
+        let remote = HttpRemote::new();
+        let engine = Arc::new(engine(
+            &shared.pools,
+            &shared.format,
+            &shared.env,
+            &shared.membership,
+            &remote,
+        ));
+        let controls = Arc::new(ControlStores::new(
+            Arc::clone(&shared.store),
+            shared.env.clone(),
+        ));
+        let state = AppState {
+            catalog: Arc::clone(&shared.catalog),
+            ingest: ingest.clone(),
+            pools: Arc::clone(&shared.pools),
+            format: Arc::clone(&shared.format),
+            engine: Arc::clone(&engine),
+            env: shared.env.clone(),
             cluster: Some(Arc::new(Cluster {
-                membership: Arc::clone(&membership),
+                membership: Arc::clone(&shared.membership),
                 remote,
                 admission: Arc::new(Admission::new(Limits::default())),
                 preferred_ingesters: PREFERRED_INGESTERS,
             })),
         };
+        shared.evaluate_rules(
+            &config,
+            leases.as_ref(),
+            &state,
+            engine,
+            &controls,
+            &mut loops,
+        );
+        let membership = shared.membership;
         let (stop_servers, servers) = serve(state.clone(), listener, pg_listener);
         Ok(Node {
             state,
+            controls,
             http,
             pg,
             ingest,
@@ -248,6 +257,12 @@ impl Node {
     #[must_use]
     pub fn membership(&self) -> &Arc<Membership> {
         &self.membership
+    }
+
+    /// The tenants' control stores, as this node opens them.
+    #[must_use]
+    pub fn controls(&self) -> &Arc<ControlStores> {
+        &self.controls
     }
 
     /// The slots this node owns; none without the `compact` role.
@@ -367,6 +382,90 @@ async fn open(
     );
     Ok((store, catalog, pool))
 }
+
+/// What the node's loops share.
+struct Shared {
+    store: Arc<dyn ObjectStore>,
+    env: Env,
+    catalog: Arc<Catalog>,
+    format: Arc<dyn FileFormat>,
+    pool: PoolId,
+    pools: Arc<Pools>,
+    membership: Arc<Membership>,
+}
+
+impl Shared {
+    /// Starts the lease loop for the kinds of work the node's roles own
+    /// (section 14.2) and, on a compact node, the background work over
+    /// the owned slots. Returns the leases and the loop's stop handle.
+    fn own_slots(&self, config: &Config, loops: &mut Vec<JoinHandle<()>>) -> LeaseLoop {
+        let kinds = leases::kinds_of(&config.roles);
+        if kinds.is_empty() {
+            return (None, None);
+        }
+        let leases = Arc::new(Leases {
+            manager: LeaseManager::new(
+                Arc::clone(&self.store),
+                layout::leases(),
+                self.env.clone(),
+                config.lease,
+            ),
+            catalog: Arc::clone(&self.catalog),
+            membership: Arc::clone(&self.membership),
+            owned: Owned::default(),
+            kinds,
+        });
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(leases::run(Arc::clone(&leases), config.renewal, stopped));
+        if config.roles.contains(&Role::Compact) {
+            loops.push(tokio::spawn(background::run(background::Background {
+                store: Arc::clone(&self.store),
+                env: self.env.clone(),
+                catalog: Arc::clone(&self.catalog),
+                format: Arc::clone(&self.format),
+                pool: self.pool.clone(),
+                pools: Arc::clone(&self.pools),
+                owned: leases.owned.clone(),
+                membership: Arc::clone(&self.membership),
+                interval: config.background,
+            })));
+        }
+        (Some(leases), Some((stop, task)))
+    }
+
+    /// Starts the `eval` role's loop over the rule groups this node owns
+    /// (section 11.3), delivering through the node's own write path.
+    fn evaluate_rules(
+        &self,
+        config: &Config,
+        leases: Option<&Arc<Leases>>,
+        state: &AppState,
+        engine: Arc<Engine>,
+        controls: &Arc<ControlStores>,
+        loops: &mut Vec<JoinHandle<()>>,
+    ) {
+        let Some(leases) = leases.filter(|_| config.roles.contains(&Role::Eval)) else {
+            return;
+        };
+        loops.push(tokio::spawn(evaluator::run(evaluator::Evaluator {
+            store: Arc::clone(&self.store),
+            env: self.env.clone(),
+            catalog: Arc::clone(&self.catalog),
+            controls: Arc::clone(controls),
+            engine,
+            owned: leases.owned.clone(),
+            sink: Arc::new(evaluator::StateSink::new(state.clone())),
+            notifier: Arc::new(HttpNotifier::new()),
+            interval: config.eval,
+        })));
+    }
+}
+
+/// The leases a node holds and the handle that stops their loop.
+type LeaseLoop = (
+    Option<Arc<Leases>>,
+    Option<(oneshot::Sender<()>, JoinHandle<()>)>,
+);
 
 /// The query engine of this node, reading files on peers chosen by
 /// rendezvous hashing over the live query nodes (QE-15).

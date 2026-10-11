@@ -2639,12 +2639,14 @@ name = "tessera-node"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures",
  "serde_json",
  "tempfile",
  "tessera-catalog",
  "tessera-cluster",
  "tessera-commit",
  "tessera-compact",
+ "tessera-eval",
  "tessera-exec",
  "tessera-format",
  "tessera-ingest",
