@@ -57,14 +57,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/label/{name}/values", get(label_values))
         .route("/api/v1/metadata", get(empty_object))
         .route("/api/v1/query_exemplars", get(empty_list).post(empty_list))
-        .route(
-            "/api/v1/rules",
-            get(|| async { success(&json!({ "groups": [] })) }),
-        )
-        .route(
-            "/api/v1/alerts",
-            get(|| async { success(&json!({ "alerts": [] })) }),
-        )
         .with_state(state)
 }
 

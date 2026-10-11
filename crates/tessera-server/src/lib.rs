@@ -22,6 +22,7 @@ mod params;
 pub mod pg;
 pub mod prometheus;
 pub mod query;
+pub mod rules;
 pub mod system;
 pub mod tempo;
 
@@ -134,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .merge(loki::router(state.clone()))
         .merge(tempo::router(state.clone()))
         .merge(prometheus::router(state.clone()))
+        .merge(rules::router(state.clone()))
         .merge(query::router(state))
 }
 

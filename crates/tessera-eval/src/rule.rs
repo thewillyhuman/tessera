@@ -95,6 +95,10 @@ pub struct AlertRule {
     /// The notification routes transitions go to, by name.
     #[serde(default)]
     pub notify: Vec<String>,
+    /// The rule's place in its group, as written in a rule file; zero
+    /// when it has none.
+    #[serde(default)]
+    pub position: u64,
 }
 
 fn default_group() -> String {
@@ -132,6 +136,7 @@ impl AlertRule {
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             notify: Vec::new(),
+            position: 0,
         }
     }
 
@@ -151,6 +156,7 @@ impl AlertRule {
             labels: definition.labels.iter().cloned().collect(),
             annotations: definition.annotations.iter().cloned().collect(),
             notify: definition.notify.clone(),
+            position: 0,
         }
     }
 

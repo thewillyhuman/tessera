@@ -66,6 +66,15 @@ impl ApiError {
         }
     }
 
+    /// The named thing does not exist.
+    #[must_use]
+    pub fn not_found(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
     /// The tenant is over a limit; the client may retry later.
     #[must_use]
     pub fn too_many_requests(message: impl Into<String>) -> Self {
