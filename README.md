@@ -394,6 +394,10 @@ curl -X POST localhost:8080/api/v1/tenants/acme/suspend
 curl -X DELETE localhost:8080/api/v1/tenants/acme
 ```
 
+A node loads a tenant's state on first use and forgets what nobody
+used for ten minutes, so a tenant that sends and queries nothing costs
+storage only (CT-6).
+
 Logs are ingested over OTLP/HTTP, protobuf or JSON, with the dataset
 named by a header (`default` when absent). A log body that is a JSON
 object has its fields stored under `body.*` next to the text, so

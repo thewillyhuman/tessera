@@ -53,6 +53,10 @@ pub use peers::MembershipPeers;
 /// How often a node re-reads the catalog, so that a change made elsewhere
 /// takes effect within the bound of CT-3.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a node releases the state of tenants nobody used (CT-6).
+const RELEASE_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a tenant's state stays loaded after its last use (CT-6).
+const IDLE: Duration = Duration::from_secs(600);
 /// How often the catalog is checkpointed, if it changed.
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the ingester does its time-based work.
@@ -264,6 +268,7 @@ impl Node {
             &mut loops,
         );
         shared.advise_layouts(&config, leases.as_ref(), engine, &controls, &mut loops);
+        loops.push(tokio::spawn(release_idle(state.clone())));
         loops.push(tokio::spawn(observe::run_metrics(
             state.clone(),
             config.metrics,
@@ -734,6 +739,24 @@ async fn bind(address: SocketAddr) -> Result<tokio::net::TcpListener, RunError> 
 
 /// Re-reads the catalog every second and checkpoints it every minute if
 /// it changed. Failures are logged and retried on the next tick.
+/// Releases the state of tenants nobody used for [`IDLE`] every
+/// [`RELEASE_INTERVAL`] (CT-6): dataset logs, tombstone filters,
+/// control stores and cached principals. A tenant that sends and
+/// queries nothing then costs storage only.
+async fn release_idle(state: AppState) {
+    let mut ticks = tokio::time::interval(RELEASE_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let logs = state.engine.release_idle(IDLE);
+        let stores = state.controls.release_idle(IDLE);
+        state.auth.forget_expired();
+        if logs + stores > 0 {
+            tracing::debug!(logs, stores, "idle tenant state released");
+        }
+    }
+}
+
 async fn keep_fresh(catalog: Arc<Catalog>) {
     let mut checkpointed = catalog.cached().version();
     let mut last_checkpoint = tokio::time::Instant::now();

@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tessera_commit::{Action, CommitError, CommitLog, KvMutation, KvState, UpdateError};
@@ -449,8 +449,12 @@ impl DatasetLog {
 pub struct DatasetLogs {
     store: Arc<dyn ObjectStore>,
     env: Env,
-    open: Mutex<HashMap<(TenantId, DatasetName), Arc<DatasetLog>>>,
+    /// The open logs, each with when it was last asked for.
+    open: Mutex<HashMap<(TenantId, DatasetName), OpenLog>>,
 }
+
+/// An open log and when it was last asked for.
+type OpenLog = (Instant, Arc<DatasetLog>);
 
 impl DatasetLogs {
     /// Logs in `store`.
@@ -467,22 +471,54 @@ impl DatasetLogs {
     #[must_use]
     pub fn open(&self, tenant: &TenantId, dataset: &DatasetName) -> Arc<DatasetLog> {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(
-            open.entry((tenant.clone(), dataset.clone()))
-                .or_insert_with(|| {
-                    Arc::new(DatasetLog::open(
-                        Arc::clone(&self.store),
-                        tenant,
-                        dataset,
-                        self.env.clone(),
-                    ))
-                }),
-        )
+        let (used, log) = open
+            .entry((tenant.clone(), dataset.clone()))
+            .or_insert_with(|| {
+                let log =
+                    DatasetLog::open(Arc::clone(&self.store), tenant, dataset, self.env.clone());
+                (Instant::now(), Arc::new(log))
+            });
+        *used = Instant::now();
+        Arc::clone(log)
+    }
+
+    /// Forgets the logs nobody asked for in `idle` (CT-6), so that a
+    /// tenant that sends and queries nothing costs no memory here; the
+    /// next use opens the log again. Returns how many were forgotten.
+    pub fn release_idle(&self, idle: Duration) -> usize {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = open.len();
+        open.retain(|_, (used, _)| used.elapsed() < idle);
+        before - open.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_logs_are_released_and_reopened_on_use() {
+        use std::sync::Arc;
+
+        use tessera_object::MemoryStore;
+
+        let logs = DatasetLogs::new(
+            Arc::new(MemoryStore::new()),
+            Env::simulated(1, Timestamp::from_nanos(0)),
+        );
+        let dataset = DatasetName::new("prod").unwrap();
+        let first = logs.open(&TenantId::DEFAULT, &dataset);
+        assert!(Arc::ptr_eq(
+            &first,
+            &logs.open(&TenantId::DEFAULT, &dataset)
+        ));
+        assert_eq!(logs.release_idle(Duration::from_secs(60)), 0, "just used");
+        assert_eq!(logs.release_idle(Duration::ZERO), 1);
+        assert!(!Arc::ptr_eq(
+            &first,
+            &logs.open(&TenantId::DEFAULT, &dataset)
+        ));
+    }
+
     #[tokio::test]
     async fn a_tombstone_opens_the_next_epoch_and_is_removed_once_done() {
         use std::sync::Arc;

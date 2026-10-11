@@ -82,6 +82,14 @@ impl Auth {
         }
     }
 
+    /// Forgets the principals kept longer than they are valid (CT-6).
+    pub fn forget_expired(&self) {
+        self.kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, kept| kept.at.elapsed() < TTL);
+    }
+
     /// Forgets the principals of key `id`, after it was revoked.
     pub fn forget(&self, id: &str) {
         self.kept

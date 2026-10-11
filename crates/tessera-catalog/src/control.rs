@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tessera_commit::{Action, CommitError, CommitLog, KvMutation, KvState, Snapshot, UpdateError};
@@ -347,7 +348,8 @@ fn rows_of(state: &KvState, table: Table) -> Result<Vec<Row>, ControlError> {
 pub struct ControlStores {
     store: Arc<dyn ObjectStore>,
     env: Env,
-    open: Mutex<HashMap<TenantId, Arc<ControlStore>>>,
+    /// The open stores, each with when it was last asked for.
+    open: Mutex<HashMap<TenantId, (Instant, Arc<ControlStore>)>>,
 }
 
 impl ControlStores {
@@ -365,13 +367,23 @@ impl ControlStores {
     #[must_use]
     pub fn open(&self, tenant: &TenantId) -> Arc<ControlStore> {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        Arc::clone(open.entry(tenant.clone()).or_insert_with(|| {
-            Arc::new(ControlStore::open(
-                Arc::clone(&self.store),
-                tenant.clone(),
-                self.env.clone(),
-            ))
-        }))
+        let (used, store) = open.entry(tenant.clone()).or_insert_with(|| {
+            let store =
+                ControlStore::open(Arc::clone(&self.store), tenant.clone(), self.env.clone());
+            (Instant::now(), Arc::new(store))
+        });
+        *used = Instant::now();
+        Arc::clone(store)
+    }
+
+    /// Forgets the stores nobody asked for in `idle` (CT-6); the next
+    /// use opens the store again, reading its log. Returns how many were
+    /// forgotten.
+    pub fn release_idle(&self, idle: Duration) -> usize {
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = open.len();
+        open.retain(|_, (used, _)| used.elapsed() < idle);
+        before - open.len()
     }
 }
 
@@ -388,6 +400,17 @@ mod tests {
             Arc::new(MemoryStore::new()),
             Env::simulated(1, Timestamp::from_nanos(0)),
         )
+    }
+
+    #[test]
+    fn idle_stores_are_released_and_reopened_on_use() {
+        let (store, env) = stores();
+        let stores = ControlStores::new(store, env);
+        let first = stores.open(&TenantId::DEFAULT);
+        assert!(Arc::ptr_eq(&first, &stores.open(&TenantId::DEFAULT)));
+        assert_eq!(stores.release_idle(Duration::from_secs(60)), 0, "just used");
+        assert_eq!(stores.release_idle(Duration::ZERO), 1);
+        assert!(!Arc::ptr_eq(&first, &stores.open(&TenantId::DEFAULT)));
     }
 
     #[tokio::test]

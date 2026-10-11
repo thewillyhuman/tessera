@@ -333,6 +333,18 @@ impl Engine {
         &self.limits
     }
 
+    /// Forgets what the engine holds for tables nobody read in `idle`
+    /// (CT-6): dataset logs and tombstone filters. Manifests are bounded
+    /// by their capacity already, and results by their bytes. Returns
+    /// how many dataset logs were forgotten.
+    pub fn release_idle(&self, idle: Duration) -> usize {
+        self.tombstones
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, (at, _)| at.elapsed() < idle);
+        self.datasets.release_idle(idle)
+    }
+
     /// Runs an optimized `plan` under the node's default limits.
     ///
     /// # Errors
