@@ -6,6 +6,7 @@
 //! This crate depends on nothing else in the workspace (spec section
 //! 18.1), so any crate may use it without creating a cycle.
 
+pub mod budget;
 pub mod env;
 pub mod event;
 pub mod file;
@@ -20,6 +21,7 @@ pub mod time;
 pub mod usage;
 pub mod work;
 
+pub use budget::{Budget, BudgetAction, InvalidBudget};
 pub use env::Env;
 pub use event::{
     Attributes, EventBatch, EventRow, InvalidBatch, LogRow, MetricRow, MetricType, Scalar,

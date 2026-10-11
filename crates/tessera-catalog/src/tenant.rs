@@ -3,11 +3,12 @@
 //! Tenants (spec section 12.2): the isolation, accounting and
 //! authorization boundary, managed while the system runs.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use tessera_types::{TenantId, Timestamp};
+use tessera_types::{Budget, InvalidBudget, TenantId, Timestamp};
 
 const MAX_NAME_LEN: usize = 63;
 
@@ -140,6 +141,27 @@ pub struct TenantSettings {
     /// The attribute path that names the team a row belongs to, for
     /// metering by team (CO-1); none by default.
     pub team_attribute: Option<String>,
+    /// Bytes the tenant may ingest per UTC day (section 13.4).
+    pub ingest_budget: Option<Budget>,
+    /// Bytes the tenant's queries may scan per UTC day (section 13.4);
+    /// its action is alert or reject.
+    pub query_budget: Option<Budget>,
+    /// Ingest budgets per team, by the value of the team attribute.
+    pub team_ingest_budgets: BTreeMap<String, Budget>,
+}
+
+/// Why settings were refused.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidSettings {
+    /// A budget is not valid.
+    #[error("{setting}: {reason}")]
+    Budget {
+        /// Which setting: `ingest_budget`, `query_budget` or
+        /// `team_ingest_budgets.<team>`.
+        setting: String,
+        /// Why.
+        reason: InvalidBudget,
+    },
 }
 
 impl TenantSettings {
@@ -157,7 +179,39 @@ impl TenantSettings {
                 .team_attribute
                 .clone()
                 .or_else(|| self.team_attribute.clone()),
+            ingest_budget: patch.ingest_budget.or(self.ingest_budget),
+            query_budget: patch.query_budget.or(self.query_budget),
+            team_ingest_budgets: self
+                .team_ingest_budgets
+                .iter()
+                .chain(&patch.team_ingest_budgets)
+                .map(|(team, budget)| (team.clone(), *budget))
+                .collect(),
         }
+    }
+
+    /// Checks the settings before they are stored.
+    ///
+    /// # Errors
+    ///
+    /// If a budget is not valid for what it limits.
+    pub fn validate(&self) -> Result<(), InvalidSettings> {
+        let budget = |setting: String, result: Result<(), InvalidBudget>| {
+            result.map_err(|reason| InvalidSettings::Budget { setting, reason })
+        };
+        if let Some(ingest) = &self.ingest_budget {
+            budget("ingest_budget".into(), ingest.validate_for_ingest())?;
+        }
+        if let Some(query) = &self.query_budget {
+            budget("query_budget".into(), query.validate_for_queries())?;
+        }
+        for (team, team_budget) in &self.team_ingest_budgets {
+            budget(
+                format!("team_ingest_budgets.{team}"),
+                team_budget.validate_for_ingest(),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -186,6 +240,8 @@ impl Tenant {
 
 #[cfg(test)]
 mod tests {
+    use tessera_types::BudgetAction;
+
     use super::*;
 
     #[test]
@@ -228,6 +284,61 @@ mod tests {
         let merged = current.merged(&patch);
         assert_eq!(merged.retention_seconds, Some(10));
         assert_eq!(merged.query_concurrency, Some(4));
+    }
+
+    #[test]
+    fn merging_settings_merges_team_budgets_by_team() {
+        let budget = |bytes| Budget {
+            bytes_per_day: bytes,
+            action: BudgetAction::Alert,
+        };
+        let current = TenantSettings {
+            team_ingest_budgets: BTreeMap::from([
+                ("a".to_owned(), budget(1)),
+                ("b".to_owned(), budget(2)),
+            ]),
+            ..TenantSettings::default()
+        };
+        let patch = TenantSettings {
+            team_ingest_budgets: BTreeMap::from([("b".to_owned(), budget(3))]),
+            ..TenantSettings::default()
+        };
+        let merged = current.merged(&patch);
+        assert_eq!(merged.team_ingest_budgets["a"], budget(1));
+        assert_eq!(merged.team_ingest_budgets["b"], budget(3));
+    }
+
+    #[test]
+    fn validation_names_the_budget_that_is_wrong() {
+        let settings = TenantSettings {
+            query_budget: Some(Budget {
+                bytes_per_day: 1,
+                action: BudgetAction::Sample { rate: 0.5 },
+            }),
+            ..TenantSettings::default()
+        };
+        assert_eq!(
+            settings.validate().unwrap_err().to_string(),
+            "query_budget: a query budget cannot sample; use alert or reject"
+        );
+        let settings = TenantSettings {
+            team_ingest_budgets: BTreeMap::from([(
+                "ads".to_owned(),
+                Budget {
+                    bytes_per_day: 0,
+                    action: BudgetAction::Reject,
+                },
+            )]),
+            ..TenantSettings::default()
+        };
+        assert!(
+            settings
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .starts_with("team_ingest_budgets.ads:")
+        );
+        assert_eq!(TenantSettings::default().validate(), Ok(()));
     }
 
     #[test]

@@ -18,7 +18,9 @@ use tessera_object::{Key, ObjectStore, PoolState};
 use tessera_types::{Env, PoolId, TenantId, WorkKind};
 
 use crate::state::{pool_key, put_record, setting_key, slots_key, tenant_key};
-use crate::{CatalogState, PoolConfig, Tenant, TenantName, TenantSettings, TenantStatus};
+use crate::{
+    CatalogState, InvalidSettings, PoolConfig, Tenant, TenantName, TenantSettings, TenantStatus,
+};
 
 /// Why a catalog operation failed.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +34,9 @@ pub enum CatalogError {
     /// Names starting with `_` belong to built-in tenants.
     #[error("tenant name {0} is reserved")]
     ReservedName(TenantName),
+    /// The settings are not valid.
+    #[error("invalid settings: {0}")]
+    InvalidSettings(#[from] InvalidSettings),
     /// The `default` and `_system` tenants always exist (CT-4).
     #[error("tenant {0} is built in and cannot be dropped, suspended or renamed")]
     BuiltinTenant(TenantName),
@@ -157,6 +162,7 @@ impl Catalog {
         if name.is_reserved() {
             return Err(CatalogError::ReservedName(name));
         }
+        settings.validate()?;
         let id = TenantId::random(&mut self.env.random.clone());
         let created_at = self.env.clock.now();
         let tenant = Tenant {
@@ -189,7 +195,9 @@ impl Catalog {
         patch: TenantSettings,
     ) -> Result<Tenant, CatalogError> {
         self.modify_tenant(name, |tenant| {
-            tenant.settings = tenant.settings.merged(&patch);
+            let merged = tenant.settings.merged(&patch);
+            merged.validate()?;
+            tenant.settings = merged;
             Ok(())
         })
         .await
@@ -675,6 +683,33 @@ mod tests {
         let altered = catalog.alter_tenant(&name("acme"), patch).await.unwrap();
         assert_eq!(altered.settings.retention_seconds, Some(30));
         assert_eq!(altered.settings.query_concurrency, Some(64));
+    }
+
+    #[tokio::test]
+    async fn refuses_invalid_settings_on_create_and_alter() {
+        use tessera_types::{Budget, BudgetAction};
+
+        let catalog = Cluster::new().node(1).await;
+        let sampled_queries = TenantSettings {
+            query_budget: Some(Budget {
+                bytes_per_day: 1,
+                action: BudgetAction::Sample { rate: 0.5 },
+            }),
+            ..TenantSettings::default()
+        };
+        let error = catalog
+            .create_tenant(name("acme"), sampled_queries.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::InvalidSettings(_)), "{error}");
+        let error = catalog
+            .alter_tenant(&name("default"), sampled_queries)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::InvalidSettings(_)), "{error}");
+        let snapshot = catalog.cached();
+        let default = snapshot.state().tenant(&TenantId::DEFAULT).unwrap();
+        assert_eq!(default.settings.query_budget, None, "nothing was stored");
     }
 
     #[tokio::test]

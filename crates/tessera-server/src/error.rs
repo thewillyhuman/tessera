@@ -116,7 +116,9 @@ impl From<CatalogError> for ApiError {
     fn from(error: CatalogError) -> Self {
         let status = match &error {
             CatalogError::UnknownTenant(_) | CatalogError::UnknownPool(_) => StatusCode::NOT_FOUND,
-            CatalogError::ReservedName(_) => StatusCode::BAD_REQUEST,
+            CatalogError::ReservedName(_) | CatalogError::InvalidSettings(_) => {
+                StatusCode::BAD_REQUEST
+            }
             CatalogError::TenantExists(_)
             | CatalogError::BuiltinTenant(_)
             | CatalogError::WrongStatus { .. }

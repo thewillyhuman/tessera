@@ -16,4 +16,6 @@ pub use control::{
     ControlError, ControlStore, ControlStores, Row, Table, Transaction, UnknownTable,
 };
 pub use state::{CatalogState, PoolConfig};
-pub use tenant::{InvalidTenantName, Tenant, TenantName, TenantSettings, TenantStatus};
+pub use tenant::{
+    InvalidSettings, InvalidTenantName, Tenant, TenantName, TenantSettings, TenantStatus,
+};
