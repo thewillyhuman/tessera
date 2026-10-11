@@ -32,7 +32,7 @@ use tessera_object::ObjectStore;
 use tessera_opt::optimize;
 use tessera_sql::SqlFrontend;
 use tessera_types::event::TIMESTAMP;
-use tessera_types::{DatasetName, Kind, Seq, TenantId, Timestamp};
+use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, Timestamp};
 use tessera_wal::{EntryBody, reader};
 
 use crate::lifecycle::{Observation, fingerprint};
@@ -446,6 +446,7 @@ pub struct Ingested {
 /// cannot be evaluated.
 pub async fn ingest(
     store: &Arc<dyn ObjectStore>,
+    keys: &Arc<Keys>,
     tenant: &TenantId,
     rule: &AlertRule,
     shape: &Shape,
@@ -477,7 +478,7 @@ pub async fn ingest(
         let writer = registration.writer;
         let name = writer.to_string();
         let from = state.positions.get(&name).copied().unwrap_or(Seq::ZERO);
-        let mut entries = reader::entries(Arc::clone(store), writer, from);
+        let mut entries = reader::entries(Arc::clone(store), writer, from, Arc::clone(keys));
         while let Some(entry) = entries.try_next().await.map_err(|e| e.to_string())? {
             if entry.seq() <= from {
                 continue;

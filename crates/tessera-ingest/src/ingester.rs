@@ -501,7 +501,9 @@ mod tests {
     use tessera_manifest::{intake, view};
     use tessera_object::{FaultPolicy, FaultyStore, LostResponseStore, MemoryStore, Pools, layout};
     use tessera_types::event::EVENT_ID;
-    use tessera_types::{Clock, Kind, LogRow, ManualClock, NodeId, SeededRandom, SharedRandom};
+    use tessera_types::{
+        Clock, Keys, Kind, LogRow, ManualClock, NodeId, SeededRandom, SharedRandom,
+    };
     use tessera_wal::{Entry, EntryId, reader};
 
     use super::*;
@@ -578,6 +580,7 @@ mod tests {
                 Arc::new(self.store.clone()),
                 ingester.writer_id(),
                 Seq::ZERO,
+                Arc::new(Keys::none()),
             )
             .try_collect()
             .await
@@ -645,6 +648,57 @@ mod tests {
         assert_eq!(h.view_ids("prod").await, [0, 1]);
     }
 
+    /// SE-2: with a key named for the tenant, the segments an ingester
+    /// writes hold sealed blocks: readable with the keyring, not
+    /// without, and the view over them reads the rows.
+    #[tokio::test]
+    async fn segments_of_a_keyed_tenant_are_sealed_at_rest() {
+        use tessera_types::{KeyPolicy, Keyring, TenantKey};
+
+        struct Everyone;
+
+        impl KeyPolicy for Everyone {
+            fn key_name(&self, _: &TenantId) -> Option<String> {
+                Some("k".into())
+            }
+        }
+
+        let keys = || {
+            Keys::new(
+                Keyring::default().with("k", TenantKey::from_bytes([3; 32])),
+                Arc::new(Everyone),
+            )
+        };
+        let mut h = Harness::new();
+        h.env = h.env.clone().with_keys(keys());
+        let mut ingester = h.ingester(IngestConfig {
+            segment_bytes: 1,
+            ..config()
+        });
+        let mut ack = ingester.write(batch("prod", 0..2)).await;
+        assert_eq!(ack.try_now().unwrap().unwrap(), Seq::new(1));
+        let stored = reader::read(&h.store, ingester.writer_id(), Seq::new(1))
+            .await
+            .unwrap();
+        assert_eq!(stored.block_metas()[0].key.as_deref(), Some("k"));
+        assert!(
+            matches!(stored.block(0), Err(WalError::Sealed { .. })),
+            "sealed at rest"
+        );
+        assert!(stored.clone().unlock(&Keys::none()).is_err());
+        let opened: Vec<Entry> = reader::entries(
+            Arc::new(h.store.clone()),
+            ingester.writer_id(),
+            Seq::ZERO,
+            Arc::new(keys()),
+        )
+        .try_collect()
+        .await
+        .unwrap();
+        assert_eq!(opened[0].block(0).unwrap().len(), 2);
+        assert_eq!(h.view_ids("prod").await, [0, 1], "the view reads the tail");
+    }
+
     #[tokio::test]
     async fn a_full_buffer_is_written_at_once() {
         let h = Harness::new();
@@ -688,11 +742,15 @@ mod tests {
             h.entry_kinds(&ingester).await,
             ["segment", "segment", "segment", "flush", "flush"]
         );
-        let entries: Vec<Entry> =
-            reader::entries(Arc::new(h.store.clone()), ingester.writer_id(), Seq::new(3))
-                .try_collect()
-                .await
-                .unwrap();
+        let entries: Vec<Entry> = reader::entries(
+            Arc::new(h.store.clone()),
+            ingester.writer_id(),
+            Seq::new(3),
+            Arc::new(Keys::none()),
+        )
+        .try_collect()
+        .await
+        .unwrap();
         let EntryBody::Flush {
             dataset,
             after,
@@ -731,11 +789,15 @@ mod tests {
             .unwrap();
         h.clock.advance(Duration::from_secs(120));
         ingester.tick().await;
-        let entries: Vec<Entry> =
-            reader::entries(Arc::new(h.store.clone()), ingester.writer_id(), Seq::new(6))
-                .try_collect()
-                .await
-                .unwrap();
+        let entries: Vec<Entry> = reader::entries(
+            Arc::new(h.store.clone()),
+            ingester.writer_id(),
+            Seq::new(6),
+            Arc::new(Keys::none()),
+        )
+        .try_collect()
+        .await
+        .unwrap();
         let EntryBody::Flush { after, through, .. } = entries[0].body() else {
             panic!()
         };
@@ -819,10 +881,15 @@ mod tests {
         h.clock.advance(Duration::from_secs(60));
         ingester.tick().await;
         assert_ne!(ingester.writer_id(), first);
-        let entries: Vec<Entry> = reader::entries(Arc::new(h.store.clone()), first, Seq::ZERO)
-            .try_collect()
-            .await
-            .unwrap();
+        let entries: Vec<Entry> = reader::entries(
+            Arc::new(h.store.clone()),
+            first,
+            Seq::ZERO,
+            Arc::new(Keys::none()),
+        )
+        .try_collect()
+        .await
+        .unwrap();
         let kinds: Vec<&str> = entries
             .iter()
             .map(|e| match e.body() {

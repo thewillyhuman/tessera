@@ -28,6 +28,15 @@ pub enum WalError {
     /// The bytes are not a readable entry.
     #[error("unreadable writer log entry: {0}")]
     Unreadable(String),
+    /// A block is sealed and the entry was not unlocked (SE-2).
+    #[error("block is sealed under key {key} and the entry was not unlocked")]
+    Sealed {
+        /// The key's name.
+        key: String,
+    },
+    /// A tenant key is missing or does not open a block (SE-2).
+    #[error("tenant keys: {0}")]
+    Keys(#[from] tessera_types::KeyError),
     /// The entry was written by a newer release.
     #[error("writer log entry format {format} is newer than the supported format {supported}")]
     UnsupportedFormat {

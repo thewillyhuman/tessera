@@ -20,8 +20,9 @@ use crate::role::Role;
 /// The format of registry entries (OP-7).
 pub const FORMAT: u32 = 1;
 /// The format of the data this build writes: commit objects, writer-log
-/// entries, files, sidecar indexes and checkpoints (OP-7).
-pub const DATA_FORMAT: u32 = 1;
+/// entries, files, sidecar indexes and checkpoints (OP-7). 2 since
+/// writer-log blocks may be sealed under tenant keys (SE-2).
+pub const DATA_FORMAT: u32 = 2;
 /// The newest data format this build reads (OP-8).
 pub const READS_THROUGH: u32 = DATA_FORMAT;
 

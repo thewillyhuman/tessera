@@ -8,7 +8,7 @@ use std::sync::Arc;
 use futures::TryStreamExt;
 use futures::stream::{self, BoxStream};
 use tessera_object::{ObjectError, ObjectStore, layout};
-use tessera_types::{Seq, WriterId};
+use tessera_types::{Keys, Seq, WriterId};
 
 use crate::{Entry, WalError};
 
@@ -79,7 +79,8 @@ pub async fn read(store: &dyn ObjectStore, writer: WriterId, seq: Seq) -> Result
     })
 }
 
-/// The entries after `from`, in order, until the first missing position.
+/// The entries after `from`, in order, until the first missing position,
+/// their sealed blocks unlocked with `keys` (SE-2).
 ///
 /// Garbage collection deletes a log's oldest entries (GC-2), so reading
 /// starts at the first entry that still exists after `from`, found by
@@ -88,9 +89,11 @@ pub fn entries(
     store: Arc<dyn ObjectStore>,
     writer: WriterId,
     from: Seq,
+    keys: Arc<Keys>,
 ) -> BoxStream<'static, Result<Entry, WalError>> {
     Box::pin(stream::try_unfold((from, false), move |(seq, started)| {
         let store = Arc::clone(&store);
+        let keys = Arc::clone(&keys);
         async move {
             let next = if started {
                 seq.next()
@@ -101,7 +104,10 @@ pub fn entries(
                 }
             };
             match read(&*store, writer, next).await {
-                Ok(entry) => Ok(Some((entry, (next, true)))),
+                Ok(mut entry) => {
+                    entry.unlock(&keys)?;
+                    Ok(Some((entry, (next, true))))
+                }
                 Err(WalError::Store(ObjectError::NotFound { .. })) => Ok(None),
                 Err(error) => Err(error),
             }
@@ -128,11 +134,16 @@ mod tests {
         for _ in 0..3 {
             log.append(EntryBody::End).await.unwrap();
         }
-        let read: Vec<Seq> = entries(Arc::new(store.clone()), log.writer_id(), Seq::new(1))
-            .map_ok(|e| e.seq())
-            .try_collect()
-            .await
-            .unwrap();
+        let read: Vec<Seq> = entries(
+            Arc::new(store.clone()),
+            log.writer_id(),
+            Seq::new(1),
+            Arc::new(Keys::none()),
+        )
+        .map_ok(|e| e.seq())
+        .try_collect()
+        .await
+        .unwrap();
         assert_eq!(read, [Seq::new(2), Seq::new(3)]);
         assert_eq!(
             last(&store, log.writer_id()).await.unwrap(),
@@ -150,10 +161,15 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(last(&store, WriterId::from_u128(1)).await.unwrap(), None);
-        let read: Vec<Entry> = entries(Arc::new(store), WriterId::from_u128(1), Seq::ZERO)
-            .try_collect()
-            .await
-            .unwrap();
+        let read: Vec<Entry> = entries(
+            Arc::new(store),
+            WriterId::from_u128(1),
+            Seq::ZERO,
+            Arc::new(Keys::none()),
+        )
+        .try_collect()
+        .await
+        .unwrap();
         assert!(read.is_empty());
     }
 
@@ -170,9 +186,10 @@ mod tests {
             .unwrap();
         let error = read(&store, writer, Seq::new(1)).await.unwrap_err();
         assert!(matches!(error, WalError::Corrupt { .. }), "{error}");
-        let streamed: Result<Vec<Entry>, _> = entries(Arc::new(store), writer, Seq::ZERO)
-            .try_collect()
-            .await;
+        let streamed: Result<Vec<Entry>, _> =
+            entries(Arc::new(store), writer, Seq::ZERO, Arc::new(Keys::none()))
+                .try_collect()
+                .await;
         assert!(matches!(streamed, Err(WalError::Corrupt { .. })));
     }
 
@@ -193,17 +210,27 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let read: Vec<Seq> = entries(Arc::new(store.clone()), log.writer_id(), Seq::ZERO)
-            .map_ok(|e| e.seq())
-            .try_collect()
-            .await
-            .unwrap();
+        let read: Vec<Seq> = entries(
+            Arc::new(store.clone()),
+            log.writer_id(),
+            Seq::ZERO,
+            Arc::new(Keys::none()),
+        )
+        .map_ok(|e| e.seq())
+        .try_collect()
+        .await
+        .unwrap();
         assert_eq!(read, vec![Seq::new(3), Seq::new(4)]);
-        let after: Vec<Seq> = entries(Arc::new(store), log.writer_id(), Seq::new(3))
-            .map_ok(|e| e.seq())
-            .try_collect()
-            .await
-            .unwrap();
+        let after: Vec<Seq> = entries(
+            Arc::new(store),
+            log.writer_id(),
+            Seq::new(3),
+            Arc::new(Keys::none()),
+        )
+        .map_ok(|e| e.seq())
+        .try_collect()
+        .await
+        .unwrap();
         assert_eq!(after, vec![Seq::new(4)]);
     }
 

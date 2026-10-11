@@ -106,8 +106,11 @@ impl WriterLog {
     /// `Fenced` if recovery sealed the log; `Ended` after `end`; `Store` if
     /// the object store failed and the write did not land.
     pub async fn append_segment(&mut self, batches: &[EventBatch]) -> Result<Seq, WalError> {
-        self.append_with(|writer, seq, id, now| Entry::segment(writer, seq, id, now, batches))
-            .await
+        let keys = Arc::clone(&self.env.keys);
+        self.append_with(|writer, seq, id, now| {
+            Entry::segment(writer, seq, id, now, batches, &keys)
+        })
+        .await
     }
 
     /// Appends a flush record (section 6.3).

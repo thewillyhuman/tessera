@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::TryStreamExt;
-use tessera_types::{DatasetName, Env, EventBatch, Seq, TenantId, WriterId};
+use tessera_types::{DatasetName, Env, EventBatch, Keys, Seq, TenantId, WriterId};
 
 use crate::flush::{FlushTarget, write_l1_files};
 use crate::{Entry, EntryBody, WalError, WriterLog, reader};
@@ -64,7 +64,7 @@ pub async fn recover(
         Sealed::Alive => return Ok(Recovery::WriterAlive),
     };
 
-    let pending = unflushed(Arc::clone(store), writer, sealed_at).await?;
+    let pending = unflushed(Arc::clone(store), writer, sealed_at, Arc::clone(&env.keys)).await?;
     let mut log = WriterLog::resume(Arc::clone(store), env.clone(), writer, sealed_at.next());
     let mut flushes = 0;
     for ((tenant, dataset), rows) in pending {
@@ -144,10 +144,11 @@ async fn unflushed(
     store: Arc<dyn tessera_object::ObjectStore>,
     writer: WriterId,
     sealed_at: Seq,
+    keys: Arc<Keys>,
 ) -> Result<BTreeMap<(TenantId, DatasetName), Pending>, WalError> {
     let mut covered: BTreeMap<(TenantId, DatasetName), Seq> = BTreeMap::new();
     let mut segments: Vec<Entry> = Vec::new();
-    let mut entries = reader::entries(store, writer, Seq::ZERO);
+    let mut entries = reader::entries(store, writer, Seq::ZERO, keys);
     while let Some(entry) = entries.try_next().await? {
         if entry.seq() >= sealed_at {
             break;
@@ -225,10 +226,15 @@ mod tests {
     }
 
     async fn bodies(store: &MemoryStore, writer: WriterId) -> Vec<String> {
-        let entries: Vec<Entry> = reader::entries(Arc::new(store.clone()), writer, Seq::ZERO)
-            .try_collect()
-            .await
-            .unwrap();
+        let entries: Vec<Entry> = reader::entries(
+            Arc::new(store.clone()),
+            writer,
+            Seq::ZERO,
+            Arc::new(Keys::none()),
+        )
+        .try_collect()
+        .await
+        .unwrap();
         entries
             .iter()
             .map(|e| match e.body() {
@@ -316,11 +322,15 @@ mod tests {
                 "end"
             ]
         );
-        let entries: Vec<Entry> =
-            reader::entries(Arc::new(store.clone()), writer.writer_id(), Seq::new(5))
-                .try_collect()
-                .await
-                .unwrap();
+        let entries: Vec<Entry> = reader::entries(
+            Arc::new(store.clone()),
+            writer.writer_id(),
+            Seq::new(5),
+            Arc::new(Keys::none()),
+        )
+        .try_collect()
+        .await
+        .unwrap();
         let EntryBody::Flush { files, .. } = entries[0].body() else {
             panic!("flush expected")
         };

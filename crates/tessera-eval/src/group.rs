@@ -17,7 +17,7 @@ use tessera_exec::Engine;
 use tessera_object::ObjectStore;
 use tessera_types::event::{MetricType, Scalar, Temporality};
 use tessera_types::{
-    Attributes, DatasetName, Env, EventBatch, EventRow, MetricRow, Seq, TenantId, Timestamp,
+    Attributes, DatasetName, Env, EventBatch, EventRow, Keys, MetricRow, Seq, TenantId, Timestamp,
     stable_hash,
 };
 
@@ -35,6 +35,7 @@ pub struct RuleGroup {
     name: String,
     rules: Vec<AlertRule>,
     store: Arc<dyn ObjectStore>,
+    keys: Arc<Keys>,
     log: StateLog,
 }
 
@@ -70,12 +71,14 @@ impl RuleGroup {
         env: Env,
     ) -> Self {
         let name = name.into();
+        let keys = Arc::clone(&env.keys);
         let log = crate::state::open(Arc::clone(&store), &tenant, &name, 0, env);
         RuleGroup {
             tenant,
             name,
             rules,
             store,
+            keys,
             log,
         }
     }
@@ -282,8 +285,16 @@ impl RuleGroup {
         state: &EvalState,
         now: Timestamp,
     ) -> Result<(Vec<Observation>, Vec<Action>), String> {
-        let ingested =
-            incremental::ingest(&self.store, &self.tenant, rule, shape, state, now).await?;
+        let ingested = incremental::ingest(
+            &self.store,
+            &self.keys,
+            &self.tenant,
+            rule,
+            shape,
+            state,
+            now,
+        )
+        .await?;
         if ingested.late_rows > 0 {
             tracing::info!(tenant = %self.tenant, rule = %rule.name, late_rows = ingested.late_rows, "late rows ignored");
         }

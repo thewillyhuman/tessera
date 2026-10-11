@@ -122,7 +122,12 @@ pub async fn sources(
     let mut tail = Vec::new();
     for registration in writers {
         let writer = registration.writer;
-        let mut entries = reader::entries(Arc::clone(root), writer, Seq::ZERO);
+        let mut entries = reader::entries(
+            Arc::clone(root),
+            writer,
+            Seq::ZERO,
+            Arc::clone(&manifests.env().keys),
+        );
         while let Some(entry) = entries.try_next().await? {
             if !matches!(entry.body(), EntryBody::Segment { .. }) {
                 continue;

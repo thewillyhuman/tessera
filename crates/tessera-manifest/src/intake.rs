@@ -47,7 +47,7 @@ pub async fn run(
     writer: WriterId,
 ) -> Result<IntakeOutcome, ManifestError> {
     let mut outcome = IntakeOutcome::default();
-    let mut entries = reader::entries(Arc::clone(&store), writer, Seq::ZERO);
+    let mut entries = reader::entries(Arc::clone(&store), writer, Seq::ZERO, Arc::clone(&env.keys));
     while let Some(entry) = entries.try_next().await? {
         match entry.body() {
             EntryBody::Flush {

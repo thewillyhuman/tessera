@@ -11,8 +11,12 @@
 //! The header comes last so that a reader can fetch it with one range
 //! request from the end, then fetch only the blocks it needs (ST-7). Each
 //! block is one Arrow IPC stream holding the rows of one tenant, dataset
-//! and kind, compressed with LZ4.
+//! and kind, compressed with LZ4, and sealed under the tenant's key
+//! where the tenant has one (SE-2): the block's metadata names the key,
+//! and a reader unlocks the entry with its keyring before reading the
+//! block.
 
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 use arrow::array::RecordBatch;
@@ -23,14 +27,21 @@ use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use tessera_types::{
-    DatasetName, EventBatch, FileMeta, Id128, Kind, NodeId, Random, Seq, TenantId, Timestamp,
+    DatasetName, EventBatch, FileMeta, Id128, Keys, Kind, NodeId, Random, Seq, TenantId, Timestamp,
     WriterId,
 };
 
 use crate::WalError;
 
-/// The format version of entries this release writes (OP-7).
-pub const FORMAT: u32 = 1;
+/// The newest format version of entries this release writes and reads
+/// (OP-7): [`PLAIN_FORMAT`] for an entry without a sealed block,
+/// [`SEALED_FORMAT`] for one with.
+pub const FORMAT: u32 = SEALED_FORMAT;
+/// The format of entries whose blocks are all plain.
+const PLAIN_FORMAT: u32 = 1;
+/// The format of entries with a block sealed under a tenant key (SE-2),
+/// which a build without the keys module cannot read.
+const SEALED_FORMAT: u32 = 2;
 
 const MAGIC: &[u8; 4] = b"TWL1";
 const TRAILER_LEN: usize = 8;
@@ -76,6 +87,10 @@ pub struct BlockMeta {
     /// entries.
     #[serde(default = "Timestamp::max_value")]
     pub max_timestamp: Timestamp,
+    /// The name of the key the block is sealed under (SE-2); none for a
+    /// plain block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// What an entry means (section 6.3).
@@ -131,7 +146,11 @@ pub struct EntryHeader {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Entry {
     header: EntryHeader,
+    /// The blocks as stored: sealed where their metadata names a key.
     blocks: Bytes,
+    /// Sealed blocks that were opened, by index: by the writer that
+    /// sealed them, or by [`Entry::unlock`].
+    opened: BTreeMap<usize, Bytes>,
 }
 
 impl Entry {
@@ -146,7 +165,7 @@ impl Entry {
     ) -> Self {
         Entry {
             header: EntryHeader {
-                format: FORMAT,
+                format: PLAIN_FORMAT,
                 writer,
                 seq,
                 id,
@@ -154,23 +173,26 @@ impl Entry {
                 body,
             },
             blocks: Bytes::new(),
+            opened: BTreeMap::new(),
         }
     }
 
-    /// A segment holding `batches`, one block per tenant, dataset and kind.
-    /// Batches of the same tenant, dataset and kind are merged into one
-    /// block.
+    /// A segment holding `batches`, one block per tenant, dataset and kind,
+    /// each sealed under its tenant's key from `keys` where the tenant
+    /// has one (SE-2). Batches of the same tenant, dataset and kind are
+    /// merged into one block.
     ///
     /// # Errors
     ///
     /// `EmptySegment` if there are no batches; `Arrow` if a block cannot
-    /// be encoded.
+    /// be encoded; `Keys` if a tenant names a key the keyring lacks.
     pub fn segment(
         writer: WriterId,
         seq: Seq,
         id: EntryId,
         written_at: Timestamp,
         batches: &[EventBatch],
+        keys: &Keys,
     ) -> Result<Self, WalError> {
         if batches.is_empty() {
             return Err(WalError::EmptySegment);
@@ -187,7 +209,8 @@ impl Entry {
         }
         let mut bytes = BytesMut::new();
         let mut blocks = Vec::with_capacity(groups.len());
-        for (first, rows) in groups {
+        let mut opened = BTreeMap::new();
+        for (index, (first, rows)) in groups.into_iter().enumerate() {
             let offset = bytes.len() as u64;
             let merged = concat_batches(&first.rows().schema(), rows)?;
             let batch = EventBatch::new(
@@ -196,7 +219,17 @@ impl Entry {
                 first.kind(),
                 merged,
             )?;
-            bytes.extend_from_slice(&encode_block(batch.rows())?);
+            let encoded = encode_block(batch.rows())?;
+            let named = keys.for_tenant(batch.tenant())?;
+            match &named {
+                Some(named) => {
+                    bytes.extend_from_slice(
+                        &named.key.seal(&block_aad(writer, seq, index), &encoded),
+                    );
+                    opened.insert(index, Bytes::from(encoded));
+                }
+                None => bytes.extend_from_slice(&encoded),
+            }
             let (min_observed, max_observed) = batch.observed_bounds();
             let (min_timestamp, max_timestamp) = batch.time_bounds();
             blocks.push(BlockMeta {
@@ -210,12 +243,18 @@ impl Entry {
                 max_observed,
                 min_timestamp,
                 max_timestamp,
+                key: named.map(|n| n.name),
             });
         }
+        let format = if opened.is_empty() {
+            PLAIN_FORMAT
+        } else {
+            SEALED_FORMAT
+        };
         let body = EntryBody::Segment { blocks };
         Ok(Entry {
             header: EntryHeader {
-                format: FORMAT,
+                format,
                 writer,
                 seq,
                 id,
@@ -223,7 +262,46 @@ impl Entry {
                 body,
             },
             blocks: bytes.freeze(),
+            opened,
         })
+    }
+
+    /// Opens every sealed block with `keys`, so that the blocks can be
+    /// read; nothing to do for an entry without sealed blocks.
+    ///
+    /// # Errors
+    ///
+    /// `Keys` when a block's key is not in the keyring or does not open
+    /// the block.
+    pub fn unlock(&mut self, keys: &Keys) -> Result<(), WalError> {
+        let sealed: Vec<(usize, String)> = self
+            .block_metas()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.opened.contains_key(index))
+            .filter_map(|(index, meta)| meta.key.clone().map(|key| (index, key)))
+            .collect();
+        for (index, key) in sealed {
+            let stored = self.stored(index)?;
+            let aad = block_aad(self.header.writer, self.header.seq, index);
+            let plain = keys.open(&key, &aad, stored)?;
+            self.opened.insert(index, Bytes::from(plain));
+        }
+        Ok(())
+    }
+
+    /// The bytes of block `index` as stored.
+    fn stored(&self, index: usize) -> Result<&[u8], WalError> {
+        let meta = self
+            .block_metas()
+            .get(index)
+            .ok_or(WalError::NoSuchBlock(index))?;
+        let start = usize::try_from(meta.offset).map_err(|_| WalError::NoSuchBlock(index))?;
+        let end =
+            usize::try_from(meta.offset + meta.length).map_err(|_| WalError::NoSuchBlock(index))?;
+        self.blocks
+            .get(start..end)
+            .ok_or(WalError::NoSuchBlock(index))
     }
 
     /// The entry's metadata.
@@ -257,19 +335,18 @@ impl Entry {
     ///
     /// # Errors
     ///
-    /// `NoSuchBlock`, or `Arrow` or `Batch` if the block is corrupt.
+    /// `NoSuchBlock`; `Sealed` for a sealed block of an entry that was
+    /// not unlocked; `Arrow` or `Batch` if the block is corrupt.
     pub fn block(&self, index: usize) -> Result<EventBatch, WalError> {
         let meta = self
             .block_metas()
             .get(index)
             .ok_or(WalError::NoSuchBlock(index))?;
-        let start = usize::try_from(meta.offset).map_err(|_| WalError::NoSuchBlock(index))?;
-        let end =
-            usize::try_from(meta.offset + meta.length).map_err(|_| WalError::NoSuchBlock(index))?;
-        let slice = self
-            .blocks
-            .get(start..end)
-            .ok_or(WalError::NoSuchBlock(index))?;
+        let slice = match (self.opened.get(&index), &meta.key) {
+            (Some(opened), _) => opened.as_ref(),
+            (None, Some(key)) => return Err(WalError::Sealed { key: key.clone() }),
+            (None, None) => self.stored(index)?,
+        };
         let rows = decode_block(slice)?;
         Ok(EventBatch::new(
             meta.tenant.clone(),
@@ -356,12 +433,19 @@ impl Entry {
         Ok(Entry {
             header,
             blocks: bytes.slice(..header_start),
+            opened: BTreeMap::new(),
         })
     }
 }
 
 fn same_block(a: &EventBatch, b: &EventBatch) -> bool {
     a.tenant() == b.tenant() && a.dataset() == b.dataset() && a.kind() == b.kind()
+}
+
+/// What binds a sealed block to its entry and position, so that a block
+/// moved elsewhere does not open.
+fn block_aad(writer: WriterId, seq: Seq, index: usize) -> Vec<u8> {
+    format!("{writer}/{seq}/{index}").into_bytes()
 }
 
 fn encode_block(rows: &RecordBatch) -> Result<Vec<u8>, WalError> {
@@ -383,7 +467,10 @@ fn decode_block(bytes: &[u8]) -> Result<RecordBatch, WalError> {
 
 #[cfg(test)]
 mod tests {
-    use tessera_types::{LogRow, SeededRandom};
+    use std::sync::Arc;
+
+    use tessera_types::keys::KEY_LEN;
+    use tessera_types::{KeyError, KeyPolicy, Keyring, LogRow, SeededRandom, TenantKey};
 
     use super::*;
 
@@ -425,6 +512,7 @@ mod tests {
             id(),
             Timestamp::UNIX_EPOCH,
             &[logs("a", "prod", 0, 20)],
+            &Keys::none(),
         )
         .unwrap();
         let seeds = [end.encode(), segment.encode()];
@@ -433,6 +521,119 @@ mod tests {
             let input = tessera_types::mutated(&seeds[round % seeds.len()], &mut random);
             let _ = Entry::decode(&Bytes::from(input));
         }
+    }
+
+    /// Names key `k` for one tenant and none for the others.
+    struct Only(&'static str);
+
+    impl KeyPolicy for Only {
+        fn key_name(&self, tenant: &TenantId) -> Option<String> {
+            (tenant.as_str() == self.0).then(|| "k".to_owned())
+        }
+    }
+
+    fn keys_for(tenant: &'static str) -> Keys {
+        Keys::new(
+            Keyring::default().with("k", TenantKey::from_bytes([1; KEY_LEN])),
+            Arc::new(Only(tenant)),
+        )
+    }
+
+    /// SE-2: a keyed tenant's block is sealed under its key and named
+    /// for it; the writer reads what it sealed, a reader must unlock
+    /// the entry with the key, and plain blocks need no key.
+    #[test]
+    fn blocks_of_a_keyed_tenant_are_sealed_and_open_only_with_the_key() {
+        let keys = keys_for("a");
+        let batches = [logs("a", "prod", 0, 3), logs("b", "prod", 10, 2)];
+        let entry = Entry::segment(
+            WriterId::from_u128(1),
+            Seq::new(1),
+            id(),
+            Timestamp::UNIX_EPOCH,
+            &batches,
+            &keys,
+        )
+        .unwrap();
+        let metas = entry.block_metas();
+        assert_eq!(metas[0].key.as_deref(), Some("k"));
+        assert_eq!(metas[1].key, None);
+        assert_eq!(entry.header().format, SEALED_FORMAT);
+        assert_eq!(entry.block(0).unwrap().len(), 3, "the writer reads its own");
+        let stored = entry.encode();
+        let mut decoded = Entry::decode(&stored).unwrap();
+        assert_eq!(decoded.block(1).unwrap().len(), 2, "plain blocks open");
+        assert!(matches!(decoded.block(0), Err(WalError::Sealed { .. })));
+        assert!(matches!(
+            decoded.clone().unlock(&Keys::none()),
+            Err(WalError::Keys(KeyError::Missing { .. }))
+        ));
+        decoded.unlock(&keys).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(
+            decoded.block(0).unwrap().rows(),
+            entry.block(0).unwrap().rows()
+        );
+    }
+
+    /// SE-2: a sealed block is bound to its entry and position.
+    #[test]
+    fn a_sealed_block_does_not_open_at_another_position() {
+        let keys = keys_for("a");
+        let make = |seq| {
+            Entry::segment(
+                WriterId::from_u128(1),
+                Seq::new(seq),
+                id(),
+                Timestamp::UNIX_EPOCH,
+                &[logs("a", "prod", 0, 3)],
+                &keys,
+            )
+            .unwrap()
+        };
+        let moved = Entry {
+            header: make(2).header,
+            blocks: make(1).blocks,
+            opened: BTreeMap::new(),
+        };
+        let mut moved = Entry::decode(&moved.encode()).unwrap();
+        assert!(matches!(
+            moved.unlock(&keys),
+            Err(WalError::Keys(KeyError::Sealed { .. }))
+        ));
+    }
+
+    /// SE-2: a tenant whose key the keyring lacks is not written plain.
+    #[test]
+    fn a_tenant_whose_key_is_missing_is_not_written() {
+        let keys = Keys::new(Keyring::default(), Arc::new(Only("a")));
+        let refused = Entry::segment(
+            WriterId::from_u128(1),
+            Seq::new(1),
+            id(),
+            Timestamp::UNIX_EPOCH,
+            &[logs("a", "prod", 0, 3)],
+            &keys,
+        );
+        assert!(matches!(
+            refused,
+            Err(WalError::Keys(KeyError::Missing { .. }))
+        ));
+        assert_eq!(
+            Entry::segment(
+                WriterId::from_u128(1),
+                Seq::new(1),
+                id(),
+                Timestamp::UNIX_EPOCH,
+                &[logs("b", "prod", 0, 3)],
+                &keys,
+            )
+            .unwrap()
+            .header()
+            .format,
+            PLAIN_FORMAT,
+            "an unkeyed tenant is unaffected"
+        );
     }
 
     #[test]
@@ -448,6 +649,7 @@ mod tests {
             id(),
             Timestamp::UNIX_EPOCH,
             &batches,
+            &Keys::none(),
         )
         .unwrap();
         let decoded = Entry::decode(&entry.encode()).unwrap();
@@ -521,7 +723,8 @@ mod tests {
                 Seq::new(1),
                 id(),
                 Timestamp::UNIX_EPOCH,
-                &[]
+                &[],
+                &Keys::none()
             ),
             Err(WalError::EmptySegment)
         ));
@@ -560,6 +763,7 @@ mod tests {
             id(),
             Timestamp::UNIX_EPOCH,
             std::slice::from_ref(&batch),
+            &Keys::none(),
         )
         .unwrap();
         let raw = batch.rows().get_array_memory_size();
