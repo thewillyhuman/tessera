@@ -118,14 +118,12 @@ async fn load(
     };
     let mut rules = Vec::new();
     for (position, rule) in file.rules.iter().enumerate() {
-        if rule.record.is_some() {
-            return Err(ApiError::bad_request(
-                "recording rules are rollups, which arrive with M9; only alerting rules are accepted",
-            ));
-        }
+        // A recording rule writes its result as a metric of its name at
+        // every interval; an alerting rule judges it.
         let name = rule
             .alert
             .clone()
+            .or_else(|| rule.record.clone())
             .ok_or_else(|| ApiError::bad_request("a rule needs `alert` or `record`"))?;
         check_expression(language, &rule.expr)?;
         let hold = match &rule.hold {
@@ -149,6 +147,7 @@ async fn load(
             annotations: rule.annotations.clone(),
             notify: vec![DEFAULT_ROUTE.to_owned()],
             position: position as u64,
+            record: rule.record.clone(),
         });
     }
     let control = state.controls.open(&scope.tenant);
@@ -281,8 +280,24 @@ fn alert_json(instance: &Instance, annotations: &BTreeMap<String, String>) -> Va
     })
 }
 
-/// A rule as Prometheus lists it, with its active alerts.
+/// A rule as Prometheus lists it, with its active alerts; a recording
+/// rule in the recording shape.
 fn rule_json(group: &Group, rule: &AlertRule) -> Value {
+    let last_evaluation = group
+        .evaluated
+        .get(&rule.name)
+        .map_or_else(String::new, ToString::to_string);
+    if let Some(record) = &rule.record {
+        return json!({
+            "name": record,
+            "query": rule.expr,
+            "labels": rule.labels,
+            "health": "ok",
+            "evaluationTime": 0.0,
+            "lastEvaluation": last_evaluation,
+            "type": "recording",
+        });
+    }
     let active: Vec<&Instance> = group
         .instances
         .iter()
@@ -308,7 +323,7 @@ fn rule_json(group: &Group, rule: &AlertRule) -> Value {
         "alerts": active.iter().map(|i| alert_json(i, &rule.annotations)).collect::<Vec<_>>(),
         "health": "ok",
         "evaluationTime": 0.0,
-        "lastEvaluation": group.evaluated.get(&rule.name).map_or_else(String::new, ToString::to_string),
+        "lastEvaluation": last_evaluation,
         "type": "alerting",
     })
 }
@@ -382,9 +397,10 @@ async fn files_of(
             .map(|r| {
                 let mut labels = r.labels.clone();
                 labels.insert("severity".into(), r.severity.clone());
+                let short = r.name.rsplit('/').next().unwrap_or(&r.name).to_owned();
                 RuleFile {
-                    alert: Some(r.name.rsplit('/').next().unwrap_or(&r.name).to_owned()),
-                    record: None,
+                    alert: r.record.is_none().then_some(short),
+                    record: r.record.clone(),
                     expr: r.expr.clone(),
                     hold: (r.for_seconds > 0).then(|| format!("{}s", r.for_seconds)),
                     labels,
@@ -584,8 +600,18 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
         let recording = "name: g\nrules:\n  - record: job:up\n    expr: sum(up)\n";
         let (status, text) = call(&app, post("/api/v1/rules/ns", recording)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(text.contains("rollups"));
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a recording rule is accepted: {text}"
+        );
+        let (status, text) = call(&app, get("/api/v1/rules")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(text.contains("\"type\":\"recording\""), "{text}");
+        assert!(!text.contains("\"alerts\""), "{text}");
+        let (_, text) = call(&app, get("/api/v1/rules/ns")).await;
+        assert!(text.contains("record: job:up"), "{text}");
+        assert!(!text.contains("alert: job:up"), "{text}");
         let (status, _) = call(&app, post("/api/v1/rules/ns", "not: [yaml")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }

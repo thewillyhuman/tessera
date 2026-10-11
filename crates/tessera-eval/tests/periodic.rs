@@ -184,6 +184,59 @@ async fn an_sql_rule_fires_per_group_after_its_hold_and_resolves() {
     assert!(!ids.is_null(0));
 }
 
+/// A recording rule writes each sample of its result as a gauge of the
+/// recorded name with the sample's labels, and judges nothing.
+#[tokio::test]
+async fn a_recording_rule_writes_its_samples_as_gauges() {
+    let fx = fixture(&[
+        errors(at(1_000), 3, "checkout"),
+        errors(at(1_000), 1, "search"),
+    ])
+    .await;
+    let mut rule = AlertRule::new(
+        "service:errors",
+        Language::Sql,
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         WHERE timestamp > now() - INTERVAL '5 minutes' GROUP BY attr.service",
+    );
+    rule.dataset = "prod".into();
+    rule.record = Some("service:errors".into());
+    let group = RuleGroup::open(
+        fx.store.clone(),
+        TenantId::DEFAULT,
+        "default",
+        vec![rule],
+        fx.env.clone(),
+    );
+    let evaluated = group.evaluate(&fx.engine, at(1_010)).await.unwrap();
+    assert!(evaluated.transitions.is_empty(), "nothing is judged");
+    assert_eq!(evaluated.recorded.len(), 1);
+    let rows = &evaluated.recorded[0].rows;
+    assert_eq!(rows.len(), 2, "one gauge per service");
+    let checkout = rows
+        .iter()
+        .find(|r| r.attributes.get("attr.service") == Some(&Scalar::Text("checkout".into())))
+        .unwrap();
+    assert_eq!(checkout.name, "service:errors");
+    assert_eq!(checkout.value, Some(3.0));
+    assert_ne!(rows[0].series_id, rows[1].series_id);
+    let sink = MemorySink::default();
+    assert_eq!(group.record(&sink, &evaluated.recorded).await.unwrap(), 2);
+    let batches = sink.batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].kind(), tessera_types::Kind::Metric);
+    assert_eq!(batches[0].dataset().as_str(), "prod");
+    assert!(
+        group
+            .evaluate(&fx.engine, at(1_020))
+            .await
+            .unwrap()
+            .rules
+            .is_empty(),
+        "not due again before its interval"
+    );
+}
+
 #[tokio::test]
 async fn a_promql_rule_fires_at_once_and_a_bad_rule_is_only_logged() {
     let fx = fixture(&[]).await;

@@ -99,6 +99,12 @@ pub struct AlertRule {
     /// when it has none.
     #[serde(default)]
     pub position: u64,
+    /// The metric a recording rule writes its result as, a Prometheus
+    /// `record`: each sample of the result becomes a gauge of this name
+    /// with the sample's labels, in the rule's dataset. Such a rule has
+    /// no condition and no instances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
 }
 
 fn default_group() -> String {
@@ -137,6 +143,7 @@ impl AlertRule {
             annotations: BTreeMap::new(),
             notify: Vec::new(),
             position: 0,
+            record: None,
         }
     }
 
@@ -157,6 +164,7 @@ impl AlertRule {
             annotations: definition.annotations.iter().cloned().collect(),
             notify: definition.notify.clone(),
             position: 0,
+            record: None,
         }
     }
 

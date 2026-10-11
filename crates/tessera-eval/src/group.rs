@@ -15,8 +15,11 @@ use std::time::Duration;
 use tessera_commit::{Action, ApplyError, KvMutation, UpdateError};
 use tessera_exec::Engine;
 use tessera_object::ObjectStore;
-use tessera_types::event::Scalar;
-use tessera_types::{Attributes, DatasetName, Env, EventBatch, EventRow, Seq, TenantId, Timestamp};
+use tessera_types::event::{MetricType, Scalar, Temporality};
+use tessera_types::{
+    Attributes, DatasetName, Env, EventBatch, EventRow, MetricRow, Seq, TenantId, Timestamp,
+    stable_hash,
+};
 
 use crate::evaluate::{EvalError, instance_labels, observe};
 use crate::incremental;
@@ -42,6 +45,17 @@ pub struct Evaluated {
     pub rules: Vec<String>,
     /// The transitions committed to the outbox.
     pub transitions: Vec<Transition>,
+    /// What the recording rules produced, to be written as metrics.
+    pub recorded: Vec<Recorded>,
+}
+
+/// The result of one recording rule at one evaluation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Recorded {
+    /// The dataset the metrics go to.
+    pub dataset: String,
+    /// One gauge per sample of the result.
+    pub rows: Vec<MetricRow>,
 }
 
 impl RuleGroup {
@@ -148,8 +162,14 @@ impl RuleGroup {
             .await
             .map_err(|e| EvalError::State(e.to_string()))?;
         let mut observed: Vec<Observed<'_>> = Vec::new();
+        let mut recorded = Vec::new();
         for rule in &self.rules {
-            let incremental = incremental::shape_of(rule, &self.tenant).ok();
+            // A recording rule runs through the engine at its interval.
+            let incremental = if rule.record.is_some() {
+                None
+            } else {
+                incremental::shape_of(rule, &self.tenant).ok()
+            };
             let due =
                 incremental.is_some()
                     || snapshot.state().evaluated.get(&rule.name).is_none_or(|at| {
@@ -175,6 +195,18 @@ impl RuleGroup {
                     (None, Vec::new())
                 }
             };
+            // A recording rule's samples are written, not judged: the
+            // state machine sees nothing of it, but counts it evaluated.
+            let observations = match (&rule.record, observations) {
+                (Some(metric), Some(samples)) => {
+                    recorded.push(Recorded {
+                        dataset: rule.dataset.clone(),
+                        rows: metric_rows(metric, &samples, now),
+                    });
+                    Some(Vec::new())
+                }
+                (_, observations) => observations,
+            };
             observed.push(Observed {
                 rule,
                 observations,
@@ -184,6 +216,10 @@ impl RuleGroup {
         }
         if observed.is_empty() {
             return Ok(Evaluated::default());
+        }
+        let recorded_rules = recorded.len();
+        if recorded_rules > 0 {
+            tracing::debug!(tenant = %self.tenant, group = %self.name, rules = recorded_rules, "recording rules evaluated");
         }
         let transitions = Mutex::new(Vec::new());
         self.log
@@ -199,7 +235,41 @@ impl RuleGroup {
             transitions: transitions
                 .into_inner()
                 .unwrap_or_else(PoisonError::into_inner),
+            recorded,
         })
+    }
+
+    /// Writes what the recording rules produced (`recorded` of
+    /// [`Evaluated`]) as metrics of their datasets through `sink`, one
+    /// batch per dataset. Returns how many samples were written.
+    ///
+    /// # Errors
+    ///
+    /// If a batch cannot be built or written.
+    pub async fn record(
+        &self,
+        sink: &dyn AlertSink,
+        recorded: &[Recorded],
+    ) -> Result<usize, EvalError> {
+        let mut by_dataset: BTreeMap<&str, Vec<MetricRow>> = BTreeMap::new();
+        for result in recorded {
+            by_dataset
+                .entry(result.dataset.as_str())
+                .or_default()
+                .extend(result.rows.iter().cloned());
+        }
+        let mut written = 0;
+        for (dataset, rows) in by_dataset {
+            if rows.is_empty() {
+                continue;
+            }
+            let dataset = DatasetName::new(dataset).map_err(|e| EvalError::Sink(e.to_string()))?;
+            let batch = EventBatch::from_metrics(self.tenant.clone(), dataset, &rows)
+                .map_err(|e| EvalError::Sink(e.to_string()))?;
+            sink.write(batch).await.map_err(EvalError::Sink)?;
+            written += rows.len();
+        }
+        Ok(written)
     }
 
     /// The incremental path (CQ-1): read the new segments into the
@@ -569,6 +639,40 @@ fn decide(
 
 /// The alert event of a transition (CQ-14): named after the rule, with
 /// the instance's labels and the transition's facts as attributes.
+/// The samples of a recording rule as gauges named `metric`, labelled
+/// as the samples are, in series by name and labels.
+fn metric_rows(metric: &str, samples: &[Observation], now: Timestamp) -> Vec<MetricRow> {
+    samples
+        .iter()
+        .map(|sample| {
+            let attributes: Attributes = sample
+                .labels
+                .iter()
+                .map(|(k, v)| (format!("attr.{k}"), Scalar::Text(v.clone())))
+                .collect();
+            let series = sample
+                .labels
+                .iter()
+                .fold(metric.to_owned(), |series, (k, v)| {
+                    format!("{series}/{k}={v}")
+                });
+            let mut series_id = [0u8; 16];
+            series_id[..8].copy_from_slice(&stable_hash(series.as_bytes()).to_be_bytes());
+            MetricRow {
+                timestamp: now,
+                observed_timestamp: now,
+                name: metric.to_owned(),
+                metric_type: MetricType::Gauge,
+                value: Some(sample.value),
+                temporality: Temporality::Unspecified,
+                series_id,
+                attributes,
+                ..MetricRow::default()
+            }
+        })
+        .collect()
+}
+
 fn alert_event(tenant: &TenantId, transition: &Transition, now: Timestamp) -> EventRow {
     let mut attributes: Attributes = transition
         .labels

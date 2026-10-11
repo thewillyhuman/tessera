@@ -174,10 +174,16 @@ async fn tenant_round(
         };
         let now = evaluator.env.clock.now();
         match group.evaluate(&evaluator.engine, now).await {
-            Ok(evaluated) if !evaluated.transitions.is_empty() => {
-                tracing::info!(%tenant, group = %name, transitions = evaluated.transitions.len(), "alert transitions");
+            Ok(evaluated) => {
+                if !evaluated.transitions.is_empty() {
+                    tracing::info!(%tenant, group = %name, transitions = evaluated.transitions.len(), "alert transitions");
+                }
+                if !evaluated.recorded.is_empty() {
+                    if let Err(error) = group.record(delivery.sink, &evaluated.recorded).await {
+                        tracing::warn!(%tenant, group = %name, error = %error, "recording rules not written");
+                    }
+                }
             }
-            Ok(_) => {}
             Err(error) => {
                 tracing::warn!(%tenant, group = %name, error = %error, "rule group evaluation failed");
             }

@@ -258,7 +258,9 @@ exempt; histograms and sketches are not merged when downsampling
 (CO-7, CO-8); the budget ledger counts per node, so a tenant served by
 several ingesters gets up to that many budgets; teams have no query
 budget, since queries carry no principal; Prometheus recording rules
-are still refused rather than turned into rollups; a rollup starts at
+are evaluated at their interval and written as gauges of the recorded
+name to the rule's dataset rather than turned into rollups, so a
+query reads their samples, not a rollup; a rollup starts at
 its creation and does not backfill; a query whose range is not aligned
 to a rollup's windows or reaches past its progress mark reads the raw
 rows whole; narrow integers come back from a rollup as 64-bit.
