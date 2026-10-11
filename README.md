@@ -639,18 +639,18 @@ the default linger is 50 ms):
 | Area | Target (17.1) | Measured |
 |------|---------------|----------|
 | New node serving | <= 30 s from process start | 0.02 s |
-| Write acknowledgment (durable) | p50 <= 200 ms, p99 <= 500 ms | p50 198 ms, p99 204 ms (8 clients, one writer); p50 153 ms, p99 202 ms (8 clients, four writers); p50 465 ms, p99 818 ms saturated (32 clients, one writer) |
-| Ingest throughput | >= 20 MB/s of OTLP per ingest core | 18.7 MB/s at 8 clients, 22.7 MB/s saturated, on one writer log; 19.8 and 21.1 MB/s on four; 1.9 to 2.3 MB/s per machine core |
-| Freshness (acknowledged to queryable) | p99 <= 1 s | p50 107 ms, max 157 ms over 4 probes; max 849 ms saturated |
+| Write acknowledgment (durable) | p50 <= 200 ms, p99 <= 500 ms | p50 100 ms, p99 125 ms (8 clients, one writer); p50 116 ms, p99 190 ms saturated (32 clients, one writer); p50 74 ms, p99 140 ms saturated on four writers |
+| Ingest throughput | >= 20 MB/s of OTLP per ingest core | 30.4 MB/s at 8 clients, 48.6 MB/s saturated, on one writer log; 50.0 MB/s saturated on four; 3.0 to 5.0 MB/s per machine core |
+| Freshness (acknowledged to queryable) | p99 <= 1 s | p50 166 ms, max 176 ms over 4 probes; max 262 ms saturated |
 | Log compression | >= 10x against raw JSON | 5.3x against flat JSON lines, 13.4x against OTLP JSON (was 3.3x and 8.2x) |
 | Metric storage | <= 3 bytes per sample after L2 | 3.1 bytes per sample (was 19.2) |
-| Dashboard panel, SQL, 1 h by minute | p95 <= 200 ms warm | warm p50 121 ms, p95 126 ms; cold 161 ms |
-| Error count, SQL, 1 h | p95 <= 200 ms warm | warm p50 112 ms, p95 121 ms; cold 125 ms |
-| Line-filter search, LogQL, 1 h | p95 <= 5 s cold over 1 TB | warm p50 134 ms, p95 141 ms; cold 144 ms (megabytes, not a terabyte) |
-| Dashboard panel, PromQL, 1 h | p95 <= 200 ms warm | warm p50 179 ms, p95 188 ms; cold 142 ms |
-| Trace by id, Tempo | p99 <= 500 ms cold over 30 days | warm p50 43 ms, p95 55 ms; cold 2 ms (1 h of spans) |
-| Attribute search, TraceQL, 1 h | p95 <= 3 s cold over 24 h | warm p50 53 ms, p95 69 ms; cold 6 ms (1 h of spans) |
-| Alert, eager rule: write to notification | p99 <= 3 s | p50 156 ms, p99 348 ms over 10 probes |
+| Dashboard panel, SQL, 1 h by minute | p95 <= 200 ms warm | warm p50 117 ms, p95 120 ms; cold 153 ms |
+| Error count, SQL, 1 h | p95 <= 200 ms warm | warm p50 104 ms, p95 116 ms; cold 119 ms |
+| Line-filter search, LogQL, 1 h | p95 <= 5 s cold over 1 TB | warm p50 127 ms, p95 132 ms; cold 135 ms (megabytes, not a terabyte) |
+| Dashboard panel, PromQL, 1 h | p95 <= 200 ms warm | warm p50 174 ms, p95 182 ms; cold 136 ms |
+| Trace by id, Tempo | p99 <= 500 ms cold over 30 days | warm p50 43 ms, p95 58 ms; cold 2 ms (1 h of spans) |
+| Attribute search, TraceQL, 1 h | p95 <= 3 s cold over 24 h | warm p50 51 ms, p95 68 ms; cold 6 ms (1 h of spans) |
+| Alert, eager rule: write to notification | p99 <= 3 s | p50 150 ms, p99 599 ms over 10 probes |
 | Node restart serving | <= 30 s from process start | 0.00 s |
 
 What the numbers say:
@@ -662,14 +662,16 @@ What the numbers say:
   default 50 ms linger it meets the target until the ingest task
   saturates; `--linger-ms` trades it for larger segments.
 - A node appends to one writer log by default, from one task that
-  serializes every write (ST-5), and reaches 19 to 23 MB/s: on the
-  target per ingest core, a tenth of it per machine core. Four writer
-  logs on four tasks (`--writers 4`, `--ingest-writers` on a node)
-  lower the acknowledgment latency at eight clients but leave the
-  saturated throughput where it was, so the ingest task is not the
-  ceiling on this machine, where the clients, the OTLP decoding and
-  the local disk share the ten cores. Where the ceiling lies is still
-  to be measured.
+  serializes every write (ST-5). The first runs reached 19 to 23 MB/s
+  and more writer logs did not raise it; a profile showed every worker
+  thread waiting on the lock of the shared random source, taken twice
+  per record for its id. With the source forked once per batch the
+  same node reaches 30 MB/s at eight clients and 49 MB/s saturated: on
+  the target per ingest core, 3 to 5 MB/s per machine core where the
+  clients, the OTLP decoding and the local disk share the ten cores.
+  Four writer logs on four tasks (`--writers 4`, `--ingest-writers` on
+  a node) add little throughput now and lower the saturated
+  acknowledgment latency to a p50 of 74 ms.
 - Compression is short of the target for reasons the column breakdown
   names. Of 47 bytes per compacted log row, the random 16-byte event
   id is 16, and the request id, user id and durations, random by
