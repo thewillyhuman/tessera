@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! OTLP logs (IN-1): decoding an export request and normalizing it to an
-//! event batch (IN-5). Traces are in [`traces`], sharing the attribute
-//! normalization below.
+//! event batch (IN-5). Traces are in [`traces`] and metrics in
+//! [`metrics`], sharing the attribute normalization below.
 //!
 //! Resource, scope and record attributes are flattened to dotted paths
 //! under `resource.`, `scope.` and `attr.`; nested maps flatten into the
@@ -19,6 +19,7 @@ use tessera_types::{
     DatasetName, EventBatch, Id128, InvalidBatch, LogRow, Random, TenantId, Timestamp,
 };
 
+pub mod metrics;
 pub mod traces;
 
 /// The record attribute that carries a client-supplied identity.
