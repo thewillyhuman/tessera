@@ -39,7 +39,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use pgwire::tokio::process_socket;
+use pgwire::tokio::{TlsAcceptor, process_socket};
 use tessera_catalog::Principal;
 use tessera_exec::{QueryError, RunOptions, explain_text, query};
 use tessera_ir::{BindContext, Frontend, Plan, Statement};
@@ -512,8 +512,14 @@ impl PgWireServerHandlers for Handlers {
     }
 }
 
-/// Serves connections on `listener` until `shutdown` resolves.
-pub async fn serve(listener: TcpListener, state: AppState, shutdown: impl Future<Output = ()>) {
+/// Serves connections on `listener` until `shutdown` resolves, over
+/// TLS when `acceptor` is given (SE-3).
+pub async fn serve(
+    listener: TcpListener,
+    state: AppState,
+    acceptor: Option<TlsAcceptor>,
+    shutdown: impl Future<Output = ()>,
+) {
     let server = PgServer::new(state);
     tokio::pin!(shutdown);
     loop {
@@ -522,8 +528,9 @@ pub async fn serve(listener: TcpListener, state: AppState, shutdown: impl Future
             accepted = listener.accept() => match accepted {
                 Ok((socket, peer)) => {
                     let handlers = Handlers(Arc::clone(&server));
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = process_socket(socket, None, handlers).await {
+                        if let Err(error) = process_socket(socket, acceptor, handlers).await {
                             tracing::debug!(%peer, error = %error, "postgresql connection ended");
                         }
                     });
@@ -560,7 +567,7 @@ mod tests {
         assert_eq!(app.oneshot(write).await.unwrap().status(), StatusCode::OK);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve(listener, state, std::future::pending()));
+        let server = tokio::spawn(serve(listener, state, None, std::future::pending()));
         (address, server)
     }
 
@@ -599,7 +606,7 @@ mod tests {
         state.auth = Arc::new(crate::Auth::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(serve(listener, state, std::future::pending()));
+        let server = tokio::spawn(serve(listener, state, None, std::future::pending()));
 
         let base = format!("host={} port={} dbname=prod", address.ip(), address.port());
         let refused = tokio_postgres::connect(&format!("{base} user=tessera"), NoTls).await;

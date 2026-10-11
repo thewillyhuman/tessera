@@ -66,6 +66,19 @@ struct RunArgs {
     /// those routes are open, which suits a private network only.
     #[arg(long, env = "TESSERA_CLUSTER_SECRET")]
     cluster_secret: Option<String>,
+    /// The PEM certificate chain the HTTP API and the `PostgreSQL`
+    /// protocol serve TLS with (SE-3), with `--tls-key`. Without them
+    /// connections are plain.
+    #[arg(long, requires = "tls_key")]
+    tls_cert: Option<std::path::PathBuf>,
+    /// The PEM private key of `--tls-cert`.
+    #[arg(long, requires = "tls_cert")]
+    tls_key: Option<std::path::PathBuf>,
+    /// A PEM CA certificate the other nodes' certificates are checked
+    /// against, for a cluster with its own CA; the system's roots
+    /// otherwise.
+    #[arg(long)]
+    tls_ca: Option<std::path::PathBuf>,
     /// How long the ingester waits for more rows before writing a
     /// segment, in milliseconds (ST-6). Acknowledgment latency is this
     /// plus the store's write; a longer wait makes larger segments.
@@ -93,6 +106,14 @@ async fn main() -> ExitCode {
                 advertise: args.advertise,
                 allow_anonymous: !args.no_anonymous,
                 cluster_secret: args.cluster_secret,
+                tls: args
+                    .tls_cert
+                    .zip(args.tls_key)
+                    .map(|(cert, key)| tessera_node::Tls {
+                        cert,
+                        key,
+                        ca: args.tls_ca,
+                    }),
                 ingest: tessera_ingest::IngestConfig {
                     linger: std::time::Duration::from_millis(args.linger_ms),
                     ..tessera_ingest::IngestConfig::default()

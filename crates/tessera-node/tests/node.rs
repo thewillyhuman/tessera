@@ -61,6 +61,59 @@ async fn a_node_starts_serves_and_stops() {
     node.stop().await;
 }
 
+/// SE-3: with a certificate and key, the HTTP API serves TLS, the
+/// node advertises itself as https, and a client with the CA reaches
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_listeners_serve_https() {
+    let dir = tempfile::tempdir().unwrap();
+    let signed =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, signed.cert.pem()).unwrap();
+    std::fs::write(&key, signed.key_pair.serialize_pem()).unwrap();
+    let mut config = config(dir.path());
+    config.tls = Some(tessera_node::Tls {
+        cert: cert.clone(),
+        key,
+        ca: Some(cert.clone()),
+    });
+    let node = Node::start(config, Env::system()).await.unwrap();
+    let ca = ureq::tls::Certificate::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::new_with_certs(&[ca]))
+                .build(),
+        )
+        .build()
+        .into();
+    let url = format!("https://127.0.0.1:{}/healthz", node.http_address().port());
+    let status =
+        tokio::task::spawn_blocking(move || agent.get(&url).call().map(|r| r.status().as_u16()))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(status, 200);
+    let plain = format!("http://127.0.0.1:{}/healthz", node.http_address().port());
+    let answer =
+        tokio::task::spawn_blocking(move || ureq::get(&plain).call().map(|r| r.status().as_u16()))
+            .await
+            .unwrap();
+    assert!(answer.is_err(), "a plain request is not served: {answer:?}");
+    assert!(
+        node.membership()
+            .live(Role::Query)
+            .iter()
+            .all(|n| n.http.starts_with("https://")),
+        "the node advertises https"
+    );
+    node.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_refuses_to_start_beside_one_that_cannot_read_its_format() {
     use std::collections::BTreeSet;

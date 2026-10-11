@@ -18,6 +18,9 @@ mod leases;
 pub mod observe;
 mod peers;
 mod retention;
+pub mod tls;
+
+pub use tls::Tls;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -96,6 +99,9 @@ pub struct Config {
     /// The secret the nodes of a cluster present to each other on the
     /// `/internal` routes (SE-3); none leaves them open.
     pub cluster_secret: Option<String>,
+    /// The certificate both listeners serve TLS with and the CA peers
+    /// are checked against (SE-3); none serves plain connections.
+    pub tls: Option<Tls>,
     /// How often the node writes its load signals to `_system.metrics`
     /// (section 14.7).
     pub metrics: Duration,
@@ -122,6 +128,7 @@ impl Config {
             ingest: IngestConfig::default(),
             allow_anonymous: true,
             cluster_secret: None,
+            tls: None,
             metrics: observe::DEFAULT_INTERVAL,
         }
     }
@@ -157,6 +164,9 @@ pub enum RunError {
         /// The newest format it reads.
         reads_through: u32,
     },
+    /// TLS cannot be set up from the configured files.
+    #[error("tls: {0}")]
+    Tls(#[from] tls::TlsError),
     /// A listener cannot be bound or served.
     #[error("cannot serve on {address}: {source}")]
     Serve {
@@ -216,10 +226,12 @@ impl Node {
         let pg = pg_listener.local_addr().unwrap_or(config.pg_listen);
         tracing::info!(address = %pg, "postgresql protocol listening");
 
+        let acceptor = config.tls.as_ref().map(tls::acceptor).transpose()?;
+        let scheme = if acceptor.is_some() { "https" } else { "http" };
         let advertise = config
             .advertise
             .clone()
-            .unwrap_or_else(|| format!("http://{http}"));
+            .unwrap_or_else(|| format!("{scheme}://{http}"));
         let (registry, membership) = join(
             &store,
             &env,
@@ -241,7 +253,8 @@ impl Node {
         };
         let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
-        let (state, engine, controls) = shared.app_state(ingest.clone(), &config);
+        let (state, engine, controls) =
+            shared.app_state(ingest.clone(), &config, peer_client(&config)?);
         shared.evaluate_rules(
             &config,
             leases.as_ref(),
@@ -264,7 +277,7 @@ impl Node {
             Err(error) => tracing::warn!(error = %error, "default health rules not added"),
         }
         let membership = shared.membership;
-        let (stop_servers, servers) = serve(state.clone(), listener, pg_listener);
+        let (stop_servers, servers) = serve(state.clone(), listener, pg_listener, acceptor);
         Ok(Node {
             state,
             controls,
@@ -483,8 +496,8 @@ impl Shared {
         &self,
         ingest: IngestHandle,
         config: &Config,
+        remote: HttpRemote,
     ) -> (AppState, Arc<Engine>, Arc<ControlStores>) {
-        let remote = HttpRemote::new().with_secret(config.cluster_secret.clone());
         let controls = Arc::new(ControlStores::new(
             Arc::clone(&self.store),
             self.env.clone(),
@@ -658,17 +671,38 @@ async fn join(
     Ok((registry, membership))
 }
 
+/// The client of the other nodes' internal routes: presenting the
+/// cluster secret and trusting the cluster's CA (SE-3).
+fn peer_client(config: &Config) -> Result<HttpRemote, RunError> {
+    let ca = config.tls.as_ref().map(tls::ca_pem).transpose()?.flatten();
+    HttpRemote::new()
+        .with_secret(config.cluster_secret.clone())
+        .with_root_ca(ca)
+        .map_err(|error| {
+            RunError::Tls(tls::TlsError::Ca {
+                path: config
+                    .tls
+                    .as_ref()
+                    .and_then(|t| t.ca.clone())
+                    .unwrap_or_default(),
+                source: std::io::Error::other(error.to_string()),
+            })
+        })
+}
+
 /// Serves the HTTP API and the `PostgreSQL` protocol until told to stop:
 /// one sender and one task per server.
 fn serve(
     state: AppState,
     listener: tokio::net::TcpListener,
     pg_listener: tokio::net::TcpListener,
+    acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> (Vec<oneshot::Sender<()>>, Vec<JoinHandle<()>>) {
     let (stop_pg, pg_stopped) = oneshot::channel::<()>();
     let pg_server = tokio::spawn(tessera_server::pg::serve(
         pg_listener,
         state.clone(),
+        acceptor.clone(),
         async {
             let _ = pg_stopped.await;
         },
@@ -676,6 +710,10 @@ fn serve(
     let (stop_http, http_stopped) = oneshot::channel::<()>();
     let app = tessera_server::router(state);
     let http_server = tokio::spawn(async move {
+        if let Some(acceptor) = acceptor {
+            tls::serve_https(listener, acceptor, app, http_stopped).await;
+            return;
+        }
         let served = axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = http_stopped.await;

@@ -286,10 +286,11 @@ chart and a CI image build (OP-10). Node records announce the newest
 data format a build reads, and a node refuses to start beside one that
 cannot read what it writes (OP-7).
 
-Gaps left in M10: no OIDC or mutual TLS, and traffic is not encrypted
-in transit, so a cluster must run on a private network; node-to-node
-routes under `/internal` are guarded by a shared cluster secret
-(`--cluster-secret`, SE-3) rather than mutual TLS (SE-1); no
+Both listeners serve TLS from `--tls-cert` and `--tls-key`, and the
+nodes of a cluster check each other against `--tls-ca`; node-to-node
+routes under `/internal` take the shared `--cluster-secret` (SE-3).
+
+Gaps left in M10: no OIDC or mutual TLS (SE-1); no
 row-filter roles; no per-tenant encryption keys (SE-2); no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a

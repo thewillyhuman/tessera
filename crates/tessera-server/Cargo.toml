@@ -31,7 +31,7 @@ axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 form_urlencoded = "1"
 futures = "0.3"
-pgwire = { version = "0.41", default-features = false, features = ["server-api", "pg-type-chrono"] }
+pgwire = { version = "0.41", default-features = false, features = ["server-api-ring", "pg-type-chrono"] }
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "metrics", "trace", "with-serde"] }
 prost = "0.14"
 serde = { version = "1", features = ["derive"] }
@@ -41,7 +41,7 @@ serde_yaml_ng = "0.10"
 tessera-opt.workspace = true
 tokio = { version = "1", features = ["net", "rt", "macros"] }
 tracing = "0.1"
-ureq = { version = "3", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

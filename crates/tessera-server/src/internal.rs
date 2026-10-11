@@ -167,6 +167,30 @@ impl HttpRemote {
         self
     }
 
+    /// This client checking its peers' certificates against the CA in
+    /// `pem` (SE-3); the system's roots when there is none.
+    ///
+    /// # Errors
+    ///
+    /// If `pem` holds no certificate.
+    pub fn with_root_ca(mut self, pem: Option<Vec<u8>>) -> Result<Self, RemoteError> {
+        let Some(pem) = pem else {
+            return Ok(self);
+        };
+        let ca = ureq::tls::Certificate::from_pem(&pem)
+            .map_err(|e| RemoteError(format!("cluster CA: {e}")))?;
+        let tls = ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::new_with_certs(&[ca]))
+            .build();
+        self.agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(std::time::Duration::from_secs(60)))
+            .tls_config(tls)
+            .build()
+            .into();
+        Ok(self)
+    }
+
     /// Sends `body` to `url` and returns the response body, or the
     /// failure with the response text.
     fn post(

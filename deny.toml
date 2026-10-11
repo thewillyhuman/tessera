@@ -30,6 +30,13 @@ confidence-threshold = 0.9
 crate = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
 
+# pgwire's TLS support reads client certificates through x509-certificate,
+# which is MPL-2.0: a file-level copyleft that binds only changes to that
+# crate, which Tessera does not make.
+[[licenses.exceptions]]
+crate = "x509-certificate"
+allow = ["MPL-2.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
