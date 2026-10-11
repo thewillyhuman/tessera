@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use serde::{Deserialize, Serialize};
 use tessera_types::event::{EXTRACTED, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{DatasetName, Kind, TenantId, TimeRange, Timestamp, event};
 
@@ -106,7 +107,9 @@ impl fmt::Display for SortKey {
 }
 
 /// A read of one dataset and kind with everything pushed down into it.
-#[derive(Clone, PartialEq, Debug)]
+/// It serializes, so that a leaf task can be sent to another node
+/// (QE-14).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Scan {
     /// The tenant.
     pub tenant: TenantId,
@@ -1109,6 +1112,42 @@ mod tests {
             formatted.to_string(),
             "Format: line=\"{{.x}}\" drop=[y]\n  Scan: prod/log [all time) default\n"
         );
+    }
+
+    #[test]
+    fn scans_round_trip_through_json() {
+        let mut scan = scan();
+        scan.time_range = TimeRange::new(Timestamp::from_nanos(5), Timestamp::from_nanos(9));
+        scan.predicates = vec![
+            Expr::Path {
+                path: "attr.http.method".into(),
+                data_type: DataType::Utf8,
+            }
+            .binary(BinaryOp::Eq, Expr::literal("GET")),
+            Expr::InList {
+                expr: Box::new(Expr::column("trace_id")),
+                list: vec![Literal::Bytes(vec![1, 2]), Literal::Null],
+                negated: false,
+            },
+            Expr::Like {
+                expr: Box::new(Expr::column("body")),
+                pattern: "%x%".into(),
+                negated: true,
+                case_insensitive: true,
+            },
+            Expr::Call {
+                name: "time_bucket".into(),
+                args: vec![
+                    Expr::literal(Duration::from_secs(60)),
+                    Expr::column("timestamp"),
+                ],
+            },
+        ];
+        scan.projection = Some(vec!["timestamp".into(), "body".into()]);
+        scan.newest_first_limit = Some(10);
+        let json = serde_json::to_string(&scan).unwrap();
+        let back: Scan = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, scan);
     }
 
     #[test]

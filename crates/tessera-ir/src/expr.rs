@@ -12,12 +12,14 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use arrow::datatypes::{DataType, TimeUnit};
 use tessera_types::Timestamp;
 use tessera_types::event::{EXTRACTED, OVERFLOW, SEVERITY_TEXT};
 
 /// A constant.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Literal {
     /// SQL `NULL`; typed by context.
     Null,
@@ -76,7 +78,7 @@ impl fmt::Display for Literal {
 }
 
 /// A binary operator.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum BinaryOp {
     /// Logical and.
     And,
@@ -161,7 +163,7 @@ impl BinaryOp {
 }
 
 /// A scalar expression.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Expr {
     /// A dedicated column of the input, by name.
     Column(String),

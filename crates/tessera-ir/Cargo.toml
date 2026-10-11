@@ -11,7 +11,12 @@ repository.workspace = true
 tessera-types.workspace = true
 
 arrow = { version = "60", default-features = false }
+arrow-schema = { version = "60", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true
