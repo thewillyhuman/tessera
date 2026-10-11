@@ -57,10 +57,9 @@ async fn main() -> ExitCode {
     let result = match cli.command {
         Command::Run(args) => {
             tessera_node::run(tessera_node::Config {
-                data_dir: args.data_dir,
                 listen: args.listen,
                 pg_listen: args.pg_listen,
-                ingest: tessera_ingest::IngestConfig::default(),
+                ..tessera_node::Config::single_node(args.data_dir)
             })
             .await
         }

@@ -10,21 +10,27 @@
 //! from start to Ctrl-C.
 
 mod background;
+mod heartbeat;
+mod peers;
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, PoolConfig};
+use tessera_cluster::{Admission, Limits, Membership, Registry, Role, registry};
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools};
-use tessera_server::AppState;
+use tessera_server::{AppState, Cluster, HttpRemote};
 use tessera_types::{Env, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+pub use peers::MembershipPeers;
 
 /// How often a node re-reads the catalog, so that a change made elsewhere
 /// takes effect within the bound of CT-3.
@@ -33,6 +39,9 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the ingester does its time-based work.
 const INGEST_TICK: Duration = Duration::from_millis(50);
+/// How many ingesters a dataset's writes are spread over (IN-9). The
+/// spec lets the set grow with the dataset's volume; two is the start.
+const PREFERRED_INGESTERS: usize = 2;
 
 /// What a node needs to start (OP-11).
 #[derive(Clone, Debug)]
@@ -44,8 +53,33 @@ pub struct Config {
     /// Where the `PostgreSQL` wire protocol listens; port zero picks a
     /// free one.
     pub pg_listen: SocketAddr,
+    /// The roles this node runs; every role by default.
+    pub roles: BTreeSet<Role>,
+    /// The base URL peers reach this node's HTTP API at; by default the
+    /// listen address, which is right only when it is a real address.
+    pub advertise: Option<String>,
+    /// How often the node announces itself and re-reads the registry.
+    pub heartbeat: Duration,
     /// The ingester's tunables.
     pub ingest: IngestConfig,
+}
+
+impl Config {
+    /// Every role, loopback listeners, the default tunables, against
+    /// `data_dir`.
+    #[must_use]
+    pub fn single_node(data_dir: PathBuf) -> Self {
+        let loopback = |port| SocketAddr::from(([127, 0, 0, 1], port));
+        Config {
+            data_dir,
+            listen: loopback(8080),
+            pg_listen: loopback(5432),
+            roles: Role::ALL.into_iter().collect(),
+            advertise: None,
+            heartbeat: registry::HEARTBEAT,
+            ingest: IngestConfig::default(),
+        }
+    }
 }
 
 /// Why the node could not start or stopped.
@@ -63,6 +97,9 @@ pub enum RunError {
     /// The catalog cannot be opened.
     #[error("cannot open the catalog: {0}")]
     Catalog(#[from] tessera_catalog::CatalogError),
+    /// The node cannot announce itself.
+    #[error("cannot join the cluster: {0}")]
+    Registry(#[from] tessera_cluster::RegistryError),
     /// A listener cannot be bound or served.
     #[error("cannot serve on {address}: {source}")]
     Serve {
@@ -80,6 +117,8 @@ pub struct Node {
     http: SocketAddr,
     pg: SocketAddr,
     ingest: IngestHandle,
+    registry: Arc<Registry>,
+    membership: Arc<Membership>,
     stop_servers: Vec<oneshot::Sender<()>>,
     servers: Vec<JoinHandle<()>>,
     loops: Vec<JoinHandle<()>>,
@@ -121,12 +160,34 @@ impl Node {
         let pg_listener = bind(config.pg_listen).await?;
         let pg = pg_listener.local_addr().unwrap_or(config.pg_listen);
         tracing::info!(address = %pg, "postgresql protocol listening");
+
+        let advertise = config.advertise.unwrap_or_else(|| format!("http://{http}"));
+        let registry = Arc::new(Registry::new(
+            Arc::clone(&store),
+            env.clone(),
+            config.roles.clone(),
+            advertise.clone(),
+        ));
+        let own = registry.announce().await?;
+        tracing::info!(roles = ?config.roles, %advertise, "joined the cluster");
+        let membership = Arc::new(Membership::new(env.clone(), own));
+        loops.push(tokio::spawn(heartbeat::run(
+            Arc::clone(&registry),
+            Arc::clone(&membership),
+            config.heartbeat,
+        )));
+
+        let remote = HttpRemote::new();
         let engine = Engine::new(
             Arc::clone(&pools),
             Arc::clone(&format),
             env.clone(),
             CpuPool::for_host(),
             QueryLimits::default(),
+        )
+        .with_peers(
+            Arc::new(MembershipPeers::new(Arc::clone(&membership))),
+            Arc::new(remote.clone()),
         );
         let state = AppState {
             catalog: Arc::clone(&catalog),
@@ -135,7 +196,12 @@ impl Node {
             format,
             engine: Arc::new(engine),
             env,
-            cluster: None,
+            cluster: Some(Arc::new(Cluster {
+                membership: Arc::clone(&membership),
+                remote,
+                admission: Arc::new(Admission::new(Limits::default())),
+                preferred_ingesters: PREFERRED_INGESTERS,
+            })),
         };
         let (stop_servers, servers) = serve(state.clone(), listener, pg_listener);
         Ok(Node {
@@ -143,10 +209,18 @@ impl Node {
             http,
             pg,
             ingest,
+            registry,
+            membership,
             stop_servers,
             servers,
             loops,
         })
+    }
+
+    /// The cluster as this node sees it.
+    #[must_use]
+    pub fn membership(&self) -> &Arc<Membership> {
+        &self.membership
     }
 
     /// Where the HTTP API listens.
@@ -187,6 +261,9 @@ impl Node {
         }
         if let Err(error) = self.ingest.shutdown().await {
             tracing::warn!(error = %error, "ingest shutdown left work for recovery");
+        }
+        if let Err(error) = self.registry.withdraw().await {
+            tracing::warn!(error = %error, "the registry still lists this node");
         }
         tracing::info!("stopped");
     }

@@ -2382,7 +2382,6 @@ name = "tessera"
 version = "0.1.0"
 dependencies = [
  "clap",
- "tessera-ingest",
  "tessera-node",
  "tokio",
  "tracing",
@@ -2615,6 +2614,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tessera-catalog",
+ "tessera-cluster",
  "tessera-compact",
  "tessera-exec",
  "tessera-format",
