@@ -639,8 +639,8 @@ the default linger is 50 ms):
 | Area | Target (17.1) | Measured |
 |------|---------------|----------|
 | New node serving | <= 30 s from process start | 0.02 s |
-| Write acknowledgment (durable) | p50 <= 200 ms, p99 <= 500 ms | p50 199 ms, p99 205 ms (8 clients); p50 489 ms, p99 812 ms saturated (32 clients, linger 250 ms) |
-| Ingest throughput | >= 20 MB/s of OTLP per ingest core | 17.6 MB/s at 8 clients, 22.5 MB/s saturated, on one ingest task; 1.8 to 2.3 MB/s per machine core |
+| Write acknowledgment (durable) | p50 <= 200 ms, p99 <= 500 ms | p50 198 ms, p99 204 ms (8 clients, one writer); p50 153 ms, p99 202 ms (8 clients, four writers); p50 465 ms, p99 818 ms saturated (32 clients, one writer) |
+| Ingest throughput | >= 20 MB/s of OTLP per ingest core | 18.7 MB/s at 8 clients, 22.7 MB/s saturated, on one writer log; 19.8 and 21.1 MB/s on four; 1.9 to 2.3 MB/s per machine core |
 | Freshness (acknowledged to queryable) | p99 <= 1 s | p50 107 ms, max 157 ms over 4 probes; max 849 ms saturated |
 | Log compression | >= 10x against raw JSON | 5.3x against flat JSON lines, 13.4x against OTLP JSON (was 3.3x and 8.2x) |
 | Metric storage | <= 3 bytes per sample after L2 | 3.1 bytes per sample (was 19.2) |
@@ -661,10 +661,15 @@ What the numbers say:
 - Acknowledgment latency is the ingester's linger plus queueing. At the
   default 50 ms linger it meets the target until the ingest task
   saturates; `--linger-ms` trades it for larger segments.
-- A node has one ingest task, which serializes every write (ST-5), so
-  the 17 to 22 MB/s it reaches is the throughput of one core: on the
-  target per ingest core, but a tenth of it per machine core. Taking
-  load across cores needs several writer logs per node.
+- A node appends to one writer log by default, from one task that
+  serializes every write (ST-5), and reaches 19 to 23 MB/s: on the
+  target per ingest core, a tenth of it per machine core. Four writer
+  logs on four tasks (`--writers 4`, `--ingest-writers` on a node)
+  lower the acknowledgment latency at eight clients but leave the
+  saturated throughput where it was, so the ingest task is not the
+  ceiling on this machine, where the clients, the OTLP decoding and
+  the local disk share the ten cores. Where the ceiling lies is still
+  to be measured.
 - Compression is short of the target for reasons the column breakdown
   names. Of 47 bytes per compacted log row, the random 16-byte event
   id is 16, and the request id, user id and durations, random by

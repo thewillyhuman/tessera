@@ -190,7 +190,7 @@ async fn main() {
     );
     println!("node up in {:.2} s at {base}", startup.as_secs_f64());
 
-    let ingest = ingest_phase(&base, &args, cores, linger, &mut report).await;
+    let ingest = ingest_phase(&base, &args, cores, tuning, &mut report).await;
     let traces = load::ingest_traces(&base, args.traces);
     println!(
         "ingested {} traces of 5 spans in {:.1} s",
@@ -265,7 +265,7 @@ async fn ingest_phase(
     base: &str,
     args: &Args,
     cores: usize,
-    linger: Option<Duration>,
+    tuning: Tuning,
     report: &mut Report,
 ) -> load::Ingested {
     let ingest = load::ingest_logs(base, args.rows, args.batch, args.clients).await;
@@ -290,7 +290,8 @@ async fn ingest_phase(
             "p50 {} ms, p99 {} ms (linger {} ms, {} clients)",
             ack.p50.as_millis(),
             ack.p99.as_millis(),
-            linger
+            tuning
+                .linger
                 .unwrap_or_else(|| Config::single_node(PathBuf::new()).ingest.linger)
                 .as_millis(),
             args.clients
@@ -300,8 +301,9 @@ async fn ingest_phase(
         "Ingest throughput",
         ">= 20 MB/s of OTLP per ingest core",
         format!(
-            "{:.1} MB/s on one ingest task, {:.2} MB/s per machine core ({} clients)",
+            "{:.1} MB/s over {} writer task(s), {:.2} MB/s per machine core ({} clients)",
             otlp_mb / seconds,
+            tuning.writers.unwrap_or(1).max(1),
             per_core,
             args.clients
         ),
