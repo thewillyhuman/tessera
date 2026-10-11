@@ -19,11 +19,11 @@ use std::time::Duration;
 use tessera_catalog::Catalog;
 use tessera_cluster::Membership;
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
-use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, plan};
+use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan};
 use tessera_format::FileFormat;
 use tessera_manifest::{DatasetLogs, Manifest, Registration, intake, list_partitions, registry};
 use tessera_object::{ObjectStore, Pools};
-use tessera_types::{DatasetName, Env, Kind, PoolId, TenantId, Window, WorkKind, WriterId};
+use tessera_types::{DatasetName, Env, Kind, Level, PoolId, TenantId, Window, WorkKind, WriterId};
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
 use crate::leases::Owned;
@@ -36,6 +36,8 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 const DEAD_QUIET: Duration = Duration::from_secs(15);
 /// How long any foreign writer may be quiet before it is recovered.
 const RECOVER_AFTER: Duration = Duration::from_secs(300);
+/// Bytes of files of an older layout epoch rewritten per round (AD-10).
+const RECLUSTER_BUDGET: u64 = 256 << 20;
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
@@ -131,21 +133,24 @@ async fn round(
                 tracing::info!(%tenant, %dataset, %writer, ?recovered, "recovery");
             }
         }
+        let mut budget = RECLUSTER_BUDGET;
         for kind in Kind::ALL {
-            compact_and_collect(background, compactor, tenant, &dataset, kind).await?;
+            compact_and_collect(background, compactor, tenant, &dataset, kind, &mut budget).await?;
         }
     }
     Ok(())
 }
 
-/// Compacts every partition of a dataset and kind that is due and
-/// collects its replaced files.
+/// Compacts every partition of a dataset and kind that is due, rewrites
+/// files of an older layout epoch within `budget`, recent partitions
+/// first (AD-10), and collects replaced files.
 async fn compact_and_collect(
     background: &Background,
     compactor: &Compactor,
     tenant: &TenantId,
     dataset: &DatasetName,
     kind: Kind,
+    budget: &mut u64,
 ) -> Result<(), Failure> {
     let now = background.env.clock.now();
     let record = background
@@ -153,7 +158,9 @@ async fn compact_and_collect(
         .open(tenant, dataset)
         .layout(kind)
         .await?;
-    for partition in list_partitions(&*background.store, tenant, dataset, kind).await? {
+    let mut partitions = list_partitions(&*background.store, tenant, dataset, kind).await?;
+    partitions.sort_by_key(|p| std::cmp::Reverse(p.window.start()));
+    for partition in partitions {
         if !background
             .owned
             .owns(WorkKind::Partition, partition.to_string().as_bytes())
@@ -166,7 +173,23 @@ async fn compact_and_collect(
             background.env.clone(),
         );
         let snapshot = manifest.snapshot().await?;
-        if let Some(job) = plan(&partition, snapshot.state(), now, &Policy::default()) {
+        let policy = Policy {
+            layout_epoch: record.epoch,
+            ..Policy::default()
+        };
+        let job = plan(&partition, snapshot.state(), now, &policy).filter(|job| {
+            let reclustering = job.inputs.iter().all(|f| f.level != Level::L1);
+            if !reclustering {
+                return true;
+            }
+            let bytes = input_bytes(job);
+            if bytes > *budget {
+                return false;
+            }
+            *budget -= bytes;
+            true
+        });
+        if let Some(job) = job {
             let inputs = job.inputs.len();
             match compactor.run(&manifest, &job, &record).await? {
                 Outcome::Replaced {

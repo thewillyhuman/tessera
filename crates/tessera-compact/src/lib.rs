@@ -25,7 +25,7 @@ use tessera_object::{ObjectError, PoolError};
 use tessera_wal::WalError;
 
 pub use gc::{LogCollection, collect_files, collect_log};
-pub use plan::{Job, Policy, plan};
+pub use plan::{Job, Policy, input_bytes, plan};
 pub use run::{Compactor, Outcome};
 
 /// Why compaction or collection failed.

@@ -2458,6 +2458,7 @@ name = "tessera-compact"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "tessera-commit",
  "tessera-format",
  "tessera-manifest",
  "tessera-object",
