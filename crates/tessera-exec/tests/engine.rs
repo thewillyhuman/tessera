@@ -12,7 +12,7 @@ use arrow::array::{
 use tessera_exec::{CpuPool, Engine, QueryLimits, QueryOutput};
 use tessera_format::ParquetFormat;
 use tessera_ir::{AggregateExpr, BinaryOp, Expr, NamedExpr, Plan, Registry, Scan, SortKey};
-use tessera_manifest::{intake, registry};
+use tessera_manifest::{LayoutRecord, intake, registry};
 use tessera_object::{MemoryStore, Pools};
 use tessera_opt::optimize;
 use tessera_types::event::{BODY, SEVERITY_NUMBER, SEVERITY_TEXT, Scalar, TIMESTAMP};
@@ -333,7 +333,14 @@ async fn compact_all(store: &Arc<MemoryStore>, env: &Env) {
             tessera_manifest::Manifest::open(root.clone(), partition.clone(), env.clone());
         let snapshot = manifest.snapshot().await.unwrap();
         let job = plan(&partition, snapshot.state(), env.clock.now(), &policy).unwrap();
-        compactor.run(&manifest, &job).await.unwrap();
+        compactor
+            .run(
+                &manifest,
+                &job,
+                &LayoutRecord::default_for(job.partition.kind),
+            )
+            .await
+            .unwrap();
     }
 }
 

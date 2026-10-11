@@ -21,7 +21,7 @@ use tessera_cluster::Membership;
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, plan};
 use tessera_format::FileFormat;
-use tessera_manifest::{Manifest, Registration, intake, list_partitions, registry};
+use tessera_manifest::{DatasetLogs, Manifest, Registration, intake, list_partitions, registry};
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{DatasetName, Env, Kind, PoolId, TenantId, Window, WorkKind, WriterId};
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
@@ -59,6 +59,8 @@ pub struct Background {
     pub membership: Arc<Membership>,
     /// How often a round runs.
     pub interval: Duration,
+    /// The dataset logs, for each dataset's layout.
+    pub datasets: Arc<DatasetLogs>,
 }
 
 /// Runs the background work forever. Failures are logged and retried on
@@ -146,6 +148,11 @@ async fn compact_and_collect(
     kind: Kind,
 ) -> Result<(), Failure> {
     let now = background.env.clock.now();
+    let record = background
+        .datasets
+        .open(tenant, dataset)
+        .layout(kind)
+        .await?;
     for partition in list_partitions(&*background.store, tenant, dataset, kind).await? {
         if !background
             .owned
@@ -161,7 +168,7 @@ async fn compact_and_collect(
         let snapshot = manifest.snapshot().await?;
         if let Some(job) = plan(&partition, snapshot.state(), now, &Policy::default()) {
             let inputs = job.inputs.len();
-            match compactor.run(&manifest, &job).await? {
+            match compactor.run(&manifest, &job, &record).await? {
                 Outcome::Replaced {
                     output,
                     rows,

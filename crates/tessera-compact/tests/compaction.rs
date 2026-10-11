@@ -11,7 +11,7 @@ use std::time::Duration;
 use arrow::array::{Array, FixedSizeBinaryArray};
 use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, plan};
 use tessera_format::{ParquetFormat, Sidecar};
-use tessera_manifest::{Manifest, intake, list_partitions, registry, view};
+use tessera_manifest::{LayoutRecord, Manifest, intake, list_partitions, registry, view};
 use tessera_object::{MemoryStore, ObjectStore, Pools, layout};
 use tessera_types::event::{EVENT_ID, Scalar};
 use tessera_types::{
@@ -178,7 +178,14 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
         Arc::new(ParquetFormat::default()),
         node.env.clone(),
     );
-    let outcome = compactor.run(&manifest, &job).await.unwrap();
+    let outcome = compactor
+        .run(
+            &manifest,
+            &job,
+            &LayoutRecord::default_for(job.partition.kind),
+        )
+        .await
+        .unwrap();
     let Outcome::Replaced {
         output,
         rows,
@@ -247,12 +254,26 @@ async fn a_superseded_job_leaves_the_manifest_alone() {
         node.env.clone(),
     );
     assert!(matches!(
-        compactor.run(&manifest, &job).await.unwrap(),
+        compactor
+            .run(
+                &manifest,
+                &job,
+                &LayoutRecord::default_for(job.partition.kind)
+            )
+            .await
+            .unwrap(),
         Outcome::Replaced { .. }
     ));
     // The same job again: its inputs are gone.
     assert_eq!(
-        compactor.run(&manifest, &job).await.unwrap(),
+        compactor
+            .run(
+                &manifest,
+                &job,
+                &LayoutRecord::default_for(job.partition.kind)
+            )
+            .await
+            .unwrap(),
         Outcome::Superseded
     );
     let after = manifest.snapshot().await.unwrap();
@@ -278,7 +299,11 @@ async fn removed_files_are_deleted_after_the_retention_window() {
         Arc::new(ParquetFormat::default()),
         node.env.clone(),
     )
-    .run(&manifest, &job)
+    .run(
+        &manifest,
+        &job,
+        &LayoutRecord::default_for(job.partition.kind),
+    )
     .await
     .unwrap();
     let retention = Duration::from_secs(24 * 3_600);

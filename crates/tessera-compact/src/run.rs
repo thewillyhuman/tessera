@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, FixedSizeBinaryArray, RecordBatch};
 use arrow::compute::{concat_batches, filter_record_batch};
-use tessera_format::{FileFormat, Layout};
-use tessera_manifest::Manifest;
+use tessera_format::FileFormat;
+use tessera_manifest::{LayoutRecord, Manifest};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::event::EVENT_ID;
 use tessera_types::{Env, FileId, FileMeta, FileSource};
@@ -49,18 +49,24 @@ impl Compactor {
     }
 
     /// Runs `job` against `manifest`, which must be the manifest of the
-    /// job's partition.
+    /// job's partition, writing the output in `record`, the dataset's
+    /// current layout (AD-9).
     ///
     /// # Errors
     ///
     /// If an input cannot be read, the output cannot be written, or the
     /// manifest cannot be committed.
-    pub async fn run(&self, manifest: &Manifest, job: &Job) -> Result<Outcome, CompactError> {
+    pub async fn run(
+        &self,
+        manifest: &Manifest,
+        job: &Job,
+        record: &LayoutRecord,
+    ) -> Result<Outcome, CompactError> {
         let mut batches = Vec::new();
         for input in &job.inputs {
             batches.extend(self.read(input).await?);
         }
-        let layout = Layout::default_for(job.partition.kind);
+        let layout = record.to_layout();
         let format = Arc::clone(&self.format);
         let (written, duplicates) = tokio::task::spawn_blocking(move || {
             let (rows, duplicates) = deduplicate(&batches)?;
@@ -93,7 +99,7 @@ impl Compactor {
             max_timestamp: written.max_timestamp,
             row_count: written.row_count,
             size_bytes: written.bytes.len() as u64,
-            layout_epoch: 0,
+            layout_epoch: record.epoch,
             sort_key: written.sort_key,
             columns: written.columns,
             indexes: written.indexes,

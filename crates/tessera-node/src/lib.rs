@@ -28,6 +28,7 @@ use tessera_eval::HttpNotifier;
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
+use tessera_manifest::DatasetLogs;
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
 use tessera_server::{AppState, Cluster, HttpRemote, SystemTableRows};
 use tessera_types::{Env, PoolId};
@@ -403,6 +404,7 @@ impl Shared {
                 owned: leases.owned.clone(),
                 membership: Arc::clone(&self.membership),
                 interval: config.background,
+                datasets: Arc::new(DatasetLogs::new(Arc::clone(&self.store), self.env.clone())),
             })));
         }
         (Some(leases), Some((stop, task)))
