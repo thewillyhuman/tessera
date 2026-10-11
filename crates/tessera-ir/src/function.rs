@@ -172,6 +172,20 @@ fn text_to_float(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+fn numeric_to_float(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [t] if is_numeric(t) => Some(DataType::Float64),
+        _ => None,
+    }
+}
+
+fn quantile(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [t, q] if is_numeric(t) && is_numeric(q) => Some(DataType::Float64),
+        _ => None,
+    }
+}
+
 fn prometheus_name(args: &[DataType]) -> Option<DataType> {
     match args {
         [
@@ -272,6 +286,12 @@ const SCALARS: &[ScalarFunction] = &[
         name: "parse_bytes",
         return_type: text_to_float,
     },
+    // `TraceQL`'s `histogram_over_time` bucket (QL-12): the power of
+    // two at or above a value.
+    ScalarFunction {
+        name: "log2_bucket",
+        return_type: numeric_to_float,
+    },
 ];
 
 /// The aggregate functions of the core engine.
@@ -339,6 +359,13 @@ const AGGREGATES: &[AggregateFunction] = &[
         return_type: extremum,
         weighted: false,
     },
+    // The `q`-th quantile of the stored rows, interpolated between
+    // ranks as Prometheus does; a sampled row counts once (QE-13).
+    AggregateFunction {
+        name: "quantile",
+        return_type: quantile,
+        weighted: false,
+    },
 ];
 
 impl Registry {
@@ -389,6 +416,23 @@ mod tests {
         assert!(!registry.aggregate("min").unwrap().weighted);
         assert!(registry.is_aggregate("avg"));
         assert!(!registry.is_aggregate("lower"));
+    }
+
+    #[test]
+    fn quantiles_and_buckets_are_typed() {
+        let registry = Registry::builtin();
+        let quantile = registry.aggregate("quantile").unwrap();
+        assert_eq!(
+            (quantile.return_type)(&[DataType::Int64, DataType::Float64]),
+            Some(DataType::Float64)
+        );
+        assert_eq!((quantile.return_type)(&[DataType::Int64]), None);
+        let bucket = registry.scalar("log2_bucket").unwrap();
+        assert_eq!(
+            (bucket.return_type)(&[DataType::Int64]),
+            Some(DataType::Float64)
+        );
+        assert_eq!((bucket.return_type)(&[DataType::Utf8]), None);
     }
 
     #[test]

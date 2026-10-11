@@ -16,6 +16,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimeUnit};
+use tessera_ir::Literal;
 
 use crate::KernelError;
 
@@ -45,14 +46,17 @@ pub trait Accumulator: Send {
 }
 
 /// The accumulator for the function `name` over an argument of type
-/// `input` (`None` for `count(*)`).
+/// `input` (`None` for `count(*)`), with the constant `parameters`
+/// that follow the argument, such as the quantile of `quantile`.
 ///
 /// # Errors
 ///
-/// `Unsupported` if the function or the argument type is not known.
+/// `Unsupported` if the function, the argument type or the parameters
+/// are not known.
 pub fn accumulator(
     name: &str,
     input: Option<&DataType>,
+    parameters: &[Literal],
 ) -> Result<Box<dyn Accumulator>, KernelError> {
     let unsupported = || {
         KernelError::Unsupported(format!(
@@ -100,6 +104,17 @@ pub fn accumulator(
                 moments: Vec::new(),
             }))
         }
+        "quantile" if numeric(input) => {
+            let q = match parameters {
+                [q] => number(q),
+                _ => None,
+            }
+            .ok_or_else(|| KernelError::Unsupported("quantile needs a constant quantile".into()))?;
+            Ok(Box::new(Quantile {
+                q,
+                values: Vec::new(),
+            }))
+        }
         "min" | "max" => {
             let input = input.ok_or_else(unsupported)?;
             let keep_smaller = name == "min";
@@ -123,6 +138,16 @@ pub fn accumulator(
             }
         }
         _ => Err(unsupported()),
+    }
+}
+
+/// A constant parameter as a number.
+#[allow(clippy::cast_precision_loss)]
+fn number(literal: &Literal) -> Option<f64> {
+    match literal {
+        Literal::Float(f) => Some(*f),
+        Literal::Int(i) => Some(*i as f64),
+        _ => None,
     }
 }
 
@@ -439,6 +464,45 @@ impl Accumulator for ExtremeFloat {
     }
 }
 
+/// The exact `q`-th quantile of the stored values, interpolated between
+/// ranks as Prometheus does; null for a group without values.
+struct Quantile {
+    q: f64,
+    values: Vec<Vec<f64>>,
+}
+
+impl Accumulator for Quantile {
+    fn update(
+        &mut self,
+        groups: &[u32],
+        values: Option<&ArrayRef>,
+        _: Option<&Float64Array>,
+    ) -> Result<(), KernelError> {
+        let values =
+            values.ok_or_else(|| KernelError::Unsupported("quantile needs an argument".into()))?;
+        grow(&mut self.values, groups, Vec::new());
+        let floats = as_floats(values)?;
+        for (i, group) in groups.iter().enumerate() {
+            if floats.is_null(i) {
+                continue;
+            }
+            self.values[*group as usize].push(floats.value(i));
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, groups: usize) -> Result<ArrayRef, KernelError> {
+        self.values.resize(groups, Vec::new());
+        let q = self.q;
+        let out: Float64Array = self
+            .values
+            .iter_mut()
+            .map(|values| (!values.is_empty()).then(|| crate::promql::quantile(q, values)))
+            .collect();
+        Ok(Arc::new(out))
+    }
+}
+
 struct ExtremeText {
     keep_smaller: bool,
     values: Vec<Option<String>>,
@@ -513,20 +577,39 @@ mod tests {
     #[test]
     fn count_scales_by_the_inverse_sample_rate() {
         let rates = Float64Array::from(vec![1.0, 0.5, 0.25, 1.0]);
-        let mut weighted = accumulator("count", None).unwrap();
+        let mut weighted = accumulator("count", None, &[]).unwrap();
         weighted.update(&[0, 0, 1, 1], None, Some(&rates)).unwrap();
         assert_eq!(
             floats(&weighted.finish(2).unwrap()),
             vec![Some(3.0), Some(5.0)]
         );
-        let mut raw = accumulator("count_raw", None).unwrap();
+        let mut raw = accumulator("count_raw", None, &[]).unwrap();
         raw.update(&[0, 0, 1, 1], None, Some(&rates)).unwrap();
         assert_eq!(longs(&raw.finish(2).unwrap()), vec![Some(2), Some(2)]);
     }
 
     #[test]
+    fn quantiles_interpolate_between_ranks() {
+        let mut median =
+            accumulator("quantile", Some(&DataType::Int64), &[Literal::Float(0.5)]).unwrap();
+        median
+            .update(
+                &[0, 0, 0, 0, 1],
+                Some(&ints(&[Some(1), Some(2), Some(3), Some(4), None])),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            floats(&median.finish(2).unwrap()),
+            vec![Some(2.5), None],
+            "between the second and third of four; none for an empty group"
+        );
+        assert!(accumulator("quantile", Some(&DataType::Int64), &[]).is_err());
+    }
+
+    #[test]
     fn count_of_a_column_skips_nulls() {
-        let mut raw = accumulator("count_raw", Some(&DataType::Int64)).unwrap();
+        let mut raw = accumulator("count_raw", Some(&DataType::Int64), &[]).unwrap();
         raw.update(&[0, 0, 0], Some(&ints(&[Some(1), None, Some(3)])), None)
             .unwrap();
         assert_eq!(longs(&raw.finish(1).unwrap()), vec![Some(2)]);
@@ -536,22 +619,22 @@ mod tests {
     fn sums_and_averages_follow_weights() {
         let rates = Float64Array::from(vec![1.0, 0.5, 1.0]);
         let values = ints(&[Some(10), Some(20), None]);
-        let mut sum = accumulator("sum", Some(&DataType::Int64)).unwrap();
+        let mut sum = accumulator("sum", Some(&DataType::Int64), &[]).unwrap();
         sum.update(&[0, 0, 1], Some(&values), Some(&rates)).unwrap();
         assert_eq!(floats(&sum.finish(2).unwrap()), vec![Some(50.0), None]);
-        let mut sum_raw = accumulator("sum_raw", Some(&DataType::Int32)).unwrap();
+        let mut sum_raw = accumulator("sum_raw", Some(&DataType::Int32), &[]).unwrap();
         sum_raw
             .update(&[0, 0, 1], Some(&values), Some(&rates))
             .unwrap();
         assert_eq!(longs(&sum_raw.finish(2).unwrap()), vec![Some(30), None]);
-        let mut avg = accumulator("avg", Some(&DataType::Int64)).unwrap();
+        let mut avg = accumulator("avg", Some(&DataType::Int64), &[]).unwrap();
         avg.update(&[0, 0, 1], Some(&values), Some(&rates)).unwrap();
         // (10 * 1 + 20 * 2) / (1 + 2)
         assert_eq!(
             floats(&avg.finish(2).unwrap()),
             vec![Some(50.0 / 3.0), None]
         );
-        let mut avg_raw = accumulator("avg_raw", Some(&DataType::Int64)).unwrap();
+        let mut avg_raw = accumulator("avg_raw", Some(&DataType::Int64), &[]).unwrap();
         avg_raw
             .update(&[0, 0, 1], Some(&values), Some(&rates))
             .unwrap();
@@ -574,23 +657,23 @@ mod tests {
             None,
         ]));
         let groups = [0u32; 9];
-        let mut stddev = accumulator("stddev_raw", Some(&DataType::Float64)).unwrap();
+        let mut stddev = accumulator("stddev_raw", Some(&DataType::Float64), &[]).unwrap();
         stddev.update(&groups, Some(&values), None).unwrap();
         assert_eq!(floats(&stddev.finish(2).unwrap()), vec![Some(2.0), None]);
-        let mut stdvar = accumulator("stdvar_raw", Some(&DataType::Float64)).unwrap();
+        let mut stdvar = accumulator("stdvar_raw", Some(&DataType::Float64), &[]).unwrap();
         stdvar.update(&groups, Some(&values), None).unwrap();
         assert_eq!(floats(&stdvar.finish(1).unwrap()), vec![Some(4.0)]);
         // Two rows at rate 0.5 weigh like four rows of each value.
         let pair: ArrayRef = Arc::new(Float64Array::from(vec![Some(1.0), Some(3.0)]));
         let rates = Float64Array::from(vec![Some(0.5), Some(0.5)]);
-        let mut weighted = accumulator("stdvar", Some(&DataType::Float64)).unwrap();
+        let mut weighted = accumulator("stdvar", Some(&DataType::Float64), &[]).unwrap();
         weighted.update(&[0, 0], Some(&pair), Some(&rates)).unwrap();
         assert_eq!(floats(&weighted.finish(1).unwrap()), vec![Some(1.0)]);
     }
 
     #[test]
     fn extrema_keep_the_input_type() {
-        let mut min = accumulator("min", Some(&DataType::Int32)).unwrap();
+        let mut min = accumulator("min", Some(&DataType::Int32), &[]).unwrap();
         let narrow: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![Some(5), Some(3)]));
         min.update(&[0, 0], Some(&narrow), None).unwrap();
         let out = min.finish(1).unwrap();
@@ -606,11 +689,11 @@ mod tests {
 
     #[test]
     fn min_and_max_cover_numbers_text_and_time() {
-        let mut min = accumulator("min", Some(&DataType::Int64)).unwrap();
+        let mut min = accumulator("min", Some(&DataType::Int64), &[]).unwrap();
         min.update(&[0, 0, 1], Some(&ints(&[Some(5), Some(3), None])), None)
             .unwrap();
         assert_eq!(longs(&min.finish(2).unwrap()), vec![Some(3), None]);
-        let mut max = accumulator("max", Some(&DataType::Utf8)).unwrap();
+        let mut max = accumulator("max", Some(&DataType::Utf8), &[]).unwrap();
         let text: ArrayRef = Arc::new(StringArray::from(vec![Some("b"), Some("c"), Some("a")]));
         max.update(&[0, 0, 0], Some(&text), None).unwrap();
         let out = max.finish(1).unwrap();
@@ -619,7 +702,7 @@ mod tests {
             "c"
         );
         let ts_type = DataType::Timestamp(TimeUnit::Nanosecond, None);
-        let mut latest = accumulator("max", Some(&ts_type)).unwrap();
+        let mut latest = accumulator("max", Some(&ts_type), &[]).unwrap();
         let times: ArrayRef = Arc::new(TimestampNanosecondArray::from(vec![1, 9, 4]));
         latest.update(&[0, 0, 0], Some(&times), None).unwrap();
         let out = latest.finish(1).unwrap();
@@ -631,7 +714,7 @@ mod tests {
                 .value(0),
             9
         );
-        let mut fmax = accumulator("max", Some(&DataType::Float64)).unwrap();
+        let mut fmax = accumulator("max", Some(&DataType::Float64), &[]).unwrap();
         let f: ArrayRef = Arc::new(Float64Array::from(vec![1.5, 0.5]));
         fmax.update(&[0, 0], Some(&f), None).unwrap();
         assert_eq!(floats(&fmax.finish(1).unwrap()), vec![Some(1.5)]);
@@ -639,15 +722,15 @@ mod tests {
 
     #[test]
     fn unknown_functions_and_types_are_rejected() {
-        assert!(accumulator("median", Some(&DataType::Int64)).is_err());
-        assert!(accumulator("sum", Some(&DataType::Utf8)).is_err());
-        assert!(accumulator("min", Some(&DataType::Binary)).is_err());
-        assert!(accumulator("min", None).is_err());
+        assert!(accumulator("median", Some(&DataType::Int64), &[]).is_err());
+        assert!(accumulator("sum", Some(&DataType::Utf8), &[]).is_err());
+        assert!(accumulator("min", Some(&DataType::Binary), &[]).is_err());
+        assert!(accumulator("min", None, &[]).is_err());
     }
 
     #[test]
     fn groups_never_seen_get_empty_results() {
-        let mut sum = accumulator("sum_raw", Some(&DataType::Int64)).unwrap();
+        let mut sum = accumulator("sum_raw", Some(&DataType::Int64), &[]).unwrap();
         sum.update(&[1], Some(&ints(&[Some(4)])), None).unwrap();
         assert_eq!(longs(&sum.finish(3).unwrap()), vec![None, Some(4), None]);
     }

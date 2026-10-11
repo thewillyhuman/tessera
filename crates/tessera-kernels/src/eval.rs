@@ -542,6 +542,7 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
             Ok(text.with_array(Arc::new(matched)))
         }
         ("ip_matches", [text, pattern]) => ip_matches(text, pattern),
+        ("log2_bucket", [value]) => log2_bucket(value),
         ("links_match", [links, field, value]) => links_match(links, field, value),
         ("coalesce", [first, rest @ ..]) => {
             let mut acc = first.clone();
@@ -612,6 +613,22 @@ fn ip_matches(text: &Value, pattern: &Value) -> Result<Value, KernelError> {
         .map(|s| s.map(|s| matcher.matches(s)))
         .collect();
     Ok(text.with_array(Arc::new(hits)))
+}
+
+/// The power of two at or above each value, `TraceQL`'s histogram
+/// bucket (QL-12); null at or below zero.
+fn log2_bucket(value: &Value) -> Result<Value, KernelError> {
+    let floats = value.cast(&DataType::Float64)?;
+    let array = floats
+        .array()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| KernelError::Unsupported("log2_bucket needs a number".into()))?;
+    let buckets: Float64Array = array
+        .iter()
+        .map(|v| v.filter(|v| *v > 0.0).map(|v| 2f64.powf(v.log2().ceil())))
+        .collect();
+    Ok(floats.with_array(Arc::new(buckets)))
 }
 
 fn map_text_to_float(text: &Value, f: impl Fn(&str) -> Option<f64>) -> Result<Value, KernelError> {
@@ -832,6 +849,19 @@ mod tests {
         let after = Expr::column("timestamp")
             .binary(BinaryOp::Gt, Expr::literal(Timestamp::from_nanos(150)));
         assert_eq!(booleans(&after), vec![false, true, true]);
+    }
+
+    #[test]
+    fn log2_buckets_round_up_to_a_power_of_two() {
+        let bucket = Expr::Call {
+            name: "log2_bucket".into(),
+            args: vec![Expr::column("severity_number")],
+        };
+        let out = evaluate(&bucket, &batch()).unwrap();
+        let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((out.value(0) - 16.0).abs() < f64::EPSILON, "9 -> 16");
+        assert!((out.value(1) - 32.0).abs() < f64::EPSILON, "17 -> 32");
+        assert!(out.is_null(2));
     }
 
     #[test]

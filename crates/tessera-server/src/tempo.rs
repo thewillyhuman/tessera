@@ -1470,6 +1470,61 @@ mod tests {
         assert_eq!(value["tagValues"], json!(["api", "auth", "db"]));
     }
 
+    /// QL-12: a quantile series carries its quantile as `p`, a
+    /// histogram series its power-of-two bucket as `__bucket`, in
+    /// seconds for durations.
+    #[tokio::test]
+    async fn quantile_and_histogram_metrics_label_their_series() {
+        let app = pushed().await;
+        let (status, value) = call(
+            &app,
+            get("/api/metrics/query?q=%7B%20%7D%20%7C%20quantile_over_time(duration,%200.5)&start=1700000000&end=1700000002"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let series = value["series"].as_array().unwrap();
+        assert_eq!(series.len(), 1, "{value}");
+        assert_eq!(
+            series[0]["labels"][0],
+            json!({ "key": "p", "value": { "stringValue": "0.5" } })
+        );
+        let median = series[0]["value"].as_f64().unwrap();
+        assert!(
+            (median - 4e-5).abs() < 1e-12,
+            "the median of 10, 20, 40, 50 and 100 microseconds: {median}"
+        );
+
+        let (status, value) = call(
+            &app,
+            get("/api/metrics/query?q=%7B%20%7D%20%7C%20histogram_over_time(duration)&start=1700000000&end=1700000002"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let buckets: Vec<(f64, f64)> = value["series"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                assert_eq!(s["labels"][0]["key"], "__bucket", "{s}");
+                let bucket: f64 = s["labels"][0]["value"]["stringValue"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                (bucket, s["value"].as_f64().unwrap())
+            })
+            .collect();
+        assert_eq!(buckets.len(), 4, "{buckets:?}");
+        let shared = buckets
+            .iter()
+            .find(|(_, count)| (*count - 2.0).abs() < f64::EPSILON)
+            .expect("40 and 50 microseconds share a bucket");
+        assert!(
+            (shared.0 - 65.536e-6).abs() < 1e-12,
+            "the bucket above both, in seconds: {buckets:?}"
+        );
+    }
+
     #[tokio::test]
     async fn metrics_queries_return_series_per_step() {
         let app = pushed().await;

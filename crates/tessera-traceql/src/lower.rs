@@ -19,9 +19,10 @@
 //! `link.` scope reads the `links` column through a kernel that tests
 //! any link for equality.
 //!
-//! Not supported yet: the
-//! nested-set intrinsics, `quantile_over_time` and
-//! `histogram_over_time`.
+//! `quantile_over_time` is exact, one union branch per quantile with
+//! the quantile as the `p` label; `histogram_over_time` counts spans
+//! per power-of-two bucket of the value, the bucket as the `__bucket`
+//! label (QL-12). Not supported yet: the nested-set intrinsics.
 
 use std::time::Duration;
 
@@ -673,8 +674,15 @@ fn is_duration(expr: &FieldExpr) -> bool {
     }
 }
 
+/// The series label of `quantile_over_time`: the quantile, as Tempo
+/// labels it.
+const QUANTILE_LABEL: &str = "p";
+/// The series label of `histogram_over_time`: the bucket's upper bound.
+const BUCKET_LABEL: &str = "__bucket";
+
 /// The metrics plan over `input` rows of spans: one value per step
-/// bucket and series, with the series labels as written.
+/// bucket and series, with the series labels as written, then `p` for
+/// `quantile_over_time` and `__bucket` for `histogram_over_time`.
 fn metrics_plan(
     metrics: &Metrics,
     input: Plan,
@@ -711,27 +719,35 @@ fn metrics_plan(
         Some(arg) => Some(field(arg, Some(DataType::Float64), cx)?),
         None => None,
     };
-    let (function, args) = match (metrics.function.as_str(), value) {
-        ("rate" | "count_over_time", _) => ("count", Vec::new()),
-        ("min_over_time", Some(v)) => ("min", vec![v]),
-        ("max_over_time", Some(v)) => ("max", vec![v]),
-        ("avg_over_time", Some(v)) => ("avg", vec![v]),
-        ("sum_over_time", Some(v)) => ("sum", vec![v]),
-        (other, _) => {
-            return Err(Diagnostic::at(
-                metrics.span,
-                format!("{other} is not supported yet"),
-            ));
+    let duration = metrics.arg.as_ref().is_some_and(is_duration);
+    let function = metrics.function.as_str();
+    let aggregated = match (function, value) {
+        ("quantile_over_time", Some(v)) => {
+            if metrics.quantiles.is_empty() {
+                return Err(Diagnostic::at(
+                    metrics.span,
+                    "quantile_over_time needs at least one quantile",
+                ));
+            }
+            labels.push(QUANTILE_LABEL.into());
+            quantiles_plan(&input, &group_by, &v, &metrics.quantiles)
         }
-    };
-    let aggregated = Plan::Aggregate {
-        input: Box::new(input),
-        group_by,
-        aggregates: vec![AggregateExpr {
-            function: function.into(),
-            args,
-            name: VALUE.into(),
-        }],
+        ("histogram_over_time", Some(v)) => {
+            labels.push(BUCKET_LABEL.into());
+            histogram_plan(input, group_by, v, duration)
+        }
+        (function, value) => {
+            let (function, args) = simple_aggregate(function, value, metrics.span)?;
+            Plan::Aggregate {
+                input: Box::new(input),
+                group_by,
+                aggregates: vec![AggregateExpr {
+                    function: function.into(),
+                    args,
+                    name: VALUE.into(),
+                }],
+            }
+        }
     };
     let mut exprs = vec![NamedExpr::new(Expr::column(TIMESTAMP), TIMESTAMP)];
     for label in &labels {
@@ -742,9 +758,9 @@ fn metrics_plan(
         expr: Box::new(Expr::column(VALUE)),
         to: DataType::Float64,
     };
-    let value = if metrics.function == "rate" {
+    let value = if function == "rate" {
         value.binary(BinaryOp::Div, Expr::literal(step.as_secs_f64()))
-    } else if metrics.arg.as_ref().is_some_and(is_duration) {
+    } else if duration && function != "histogram_over_time" {
         // A duration is reported in seconds, as Tempo reports it.
         value.binary(BinaryOp::Div, Expr::literal(1e9))
     } else {
@@ -755,6 +771,87 @@ fn metrics_plan(
         .project(exprs)
         .sort(vec![SortKey::ascending(Expr::column(TIMESTAMP))]);
     Ok((plan, labels))
+}
+
+/// The engine aggregate of a plain metrics function over `value`.
+fn simple_aggregate(
+    function: &str,
+    value: Option<Expr>,
+    span: Span,
+) -> Result<(&'static str, Vec<Expr>), Diagnostic> {
+    match (function, value) {
+        ("rate" | "count_over_time", _) => Ok(("count", Vec::new())),
+        ("min_over_time", Some(v)) => Ok(("min", vec![v])),
+        ("max_over_time", Some(v)) => Ok(("max", vec![v])),
+        ("avg_over_time", Some(v)) => Ok(("avg", vec![v])),
+        ("sum_over_time", Some(v)) => Ok(("sum", vec![v])),
+        (other, _) => Err(Diagnostic::at(
+            span,
+            format!("{other} is not supported yet"),
+        )),
+    }
+}
+
+/// The spans of `input` counted per power-of-two bucket of `value`,
+/// the bucket a `__bucket` key after `group_by`; a duration is
+/// bucketed in nanoseconds and labelled in seconds, as Tempo labels it.
+fn histogram_plan(input: Plan, mut group_by: Vec<NamedExpr>, value: Expr, duration: bool) -> Plan {
+    let bucket = Expr::Call {
+        name: "log2_bucket".into(),
+        args: vec![value],
+    };
+    let bucket = if duration {
+        bucket.binary(BinaryOp::Div, Expr::literal(1e9))
+    } else {
+        bucket
+    };
+    group_by.push(NamedExpr::new(
+        Expr::Cast {
+            expr: Box::new(bucket),
+            to: DataType::Utf8,
+        },
+        BUCKET_LABEL,
+    ));
+    Plan::Aggregate {
+        input: Box::new(input),
+        group_by,
+        aggregates: vec![AggregateExpr {
+            function: "count".into(),
+            args: Vec::new(),
+            name: VALUE.into(),
+        }],
+    }
+}
+
+/// One branch per quantile, each the aggregate over its own scan of
+/// `input` with the quantile as the `p` label, in a union.
+fn quantiles_plan(input: &Plan, group_by: &[NamedExpr], value: &Expr, quantiles: &[f64]) -> Plan {
+    let mut branches: Vec<Plan> = quantiles
+        .iter()
+        .map(|q| {
+            let aggregated = Plan::Aggregate {
+                input: Box::new(input.clone()),
+                group_by: group_by.to_vec(),
+                aggregates: vec![AggregateExpr {
+                    function: "quantile".into(),
+                    args: vec![value.clone(), Expr::literal(*q)],
+                    name: VALUE.into(),
+                }],
+            };
+            let mut exprs: Vec<NamedExpr> = group_by
+                .iter()
+                .map(|key| NamedExpr::new(Expr::column(key.name.as_str()), key.name.as_str()))
+                .collect();
+            exprs.push(NamedExpr::new(Expr::literal(q.to_string()), QUANTILE_LABEL));
+            exprs.push(NamedExpr::new(Expr::column(VALUE), VALUE));
+            aggregated.project(exprs)
+        })
+        .collect();
+    if branches.len() == 1 {
+        branches.remove(0)
+    } else {
+        Plan::Union { inputs: branches }
+    }
 }
 
 #[cfg(test)]
@@ -968,6 +1065,64 @@ mod tests {
         );
     }
 
+    /// QL-12: quantiles are one union branch each, labelled `p`, and
+    /// histograms count per power-of-two bucket, labelled `__bucket`.
+    #[test]
+    fn quantiles_and_histograms_label_their_series() {
+        let quantiles = lower(
+            &parse("{ } | quantile_over_time(duration, 0.5, 0.99) by (resource.service.name)")
+                .unwrap(),
+            &ctx(),
+            params(1_000),
+        )
+        .unwrap();
+        assert_eq!(quantiles.labels, vec!["resource.service.name", "p"]);
+        let text = quantiles.plan.to_string();
+        assert!(text.contains("Union"), "{text}");
+        assert!(
+            text.contains("quantile(duration_ns, 0.5) AS value"),
+            "{text}"
+        );
+        assert!(
+            text.contains("quantile(duration_ns, 0.99) AS value"),
+            "{text}"
+        );
+        assert!(text.contains("'0.99' AS p"), "{text}");
+        assert!(
+            text.contains("(CAST(value AS Float64) / 1000000000.0) AS value"),
+            "durations in seconds: {text}"
+        );
+
+        let one = lower(
+            &parse("{ } | quantile_over_time(duration, 0.5)").unwrap(),
+            &ctx(),
+            params(0),
+        )
+        .unwrap();
+        assert!(
+            !one.plan.to_string().contains("Union"),
+            "one quantile, no union"
+        );
+
+        let histogram = lower(
+            &parse("{ } | histogram_over_time(duration)").unwrap(),
+            &ctx(),
+            params(1_000),
+        )
+        .unwrap();
+        assert_eq!(histogram.labels, vec!["__bucket"]);
+        let text = histogram.plan.to_string();
+        assert!(
+            text.contains("CAST((log2_bucket(duration_ns) / 1000000000.0) AS Utf8) AS __bucket"),
+            "{text}"
+        );
+        assert!(text.contains("count() AS value"), "{text}");
+        assert!(
+            !text.contains("(CAST(value AS Float64) / 1000000000.0)"),
+            "a count is not a duration: {text}"
+        );
+    }
+
     #[test]
     fn unsupported_constructs_are_reported_with_positions() {
         let error = lower(
@@ -982,13 +1137,13 @@ mod tests {
         let error = lower(&parse("{ nestedSetLeft > 0 }").unwrap(), &ctx(), params(0)).unwrap_err();
         assert!(error.message.contains("nestedSetLeft"), "{}", error.message);
         let error = lower(
-            &parse("{ } | quantile_over_time(duration, 0.9)").unwrap(),
+            &parse("{ } | quantile_over_time(duration)").unwrap(),
             &ctx(),
             params(0),
         )
         .unwrap_err();
         assert!(
-            error.message.contains("quantile_over_time"),
+            error.message.contains("quantile_over_time needs"),
             "{}",
             error.message
         );

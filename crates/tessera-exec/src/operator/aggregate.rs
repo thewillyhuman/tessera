@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Float64Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
-use tessera_ir::{AggregateExpr, NamedExpr};
+use tessera_ir::{AggregateExpr, Expr, Literal, NamedExpr};
 use tessera_kernels::{Accumulator, Grouper, accumulator, evaluate};
 use tessera_types::event::SAMPLE_RATE;
 
@@ -62,7 +62,16 @@ impl HashAggregate {
                     .map(|arg| tessera_ir::expr_type(arg, input, &registry))
                     .transpose()
                     .map_err(|e| ExecError::Unsupported(e.to_string()))?;
-                Ok(accumulator(&a.function, arg_type.as_ref())?)
+                let parameters: Vec<Literal> = a
+                    .args
+                    .iter()
+                    .skip(1)
+                    .filter_map(|arg| match arg {
+                        Expr::Literal(literal) => Some(literal.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(accumulator(&a.function, arg_type.as_ref(), &parameters)?)
             })
             .collect::<Result<Vec<_>, ExecError>>()?;
         let grouper = if group_by.is_empty() {

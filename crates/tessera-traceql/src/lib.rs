@@ -8,10 +8,8 @@
 //! traces (QL-13); a metrics query aggregates the matching spans per
 //! step and series label.
 //!
-//! Not supported yet: the `event.` and `link.` scopes (QL-15), the
-//! nested-set intrinsics, `quantile_over_time` and
-//! `histogram_over_time` (Tempo's are bucketed estimates), and the
-//! `traceql(...)` table function in SQL (QL-3).
+//! Not supported yet: the nested-set intrinsics and the `traceql(...)`
+//! table function in SQL (QL-3).
 //!
 //! Deviations from Tempo 2.7 found by the differential suite (QL-4):
 //!
@@ -26,6 +24,9 @@
 //! - An aggregate filter such as `count() > 2` adds its statistic to
 //!   the spanset's attributes in Tempo's search response; Tessera adds
 //!   only the `by()` labels.
+//! - `quantile_over_time` is exact and `histogram_over_time` counts
+//!   spans per power-of-two bucket of the value; Tempo estimates its
+//!   quantiles from such buckets, so the two differ on the same spans.
 //! - Tag discovery lists no `event` scope, since span events are rows
 //!   of their own (DM-8), and lists only the intrinsics Tessera
 //!   evaluates.
