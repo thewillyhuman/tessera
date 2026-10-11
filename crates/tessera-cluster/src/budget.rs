@@ -71,8 +71,9 @@ impl Ledger {
     }
 
     /// Counts `bytes` for `account` against `budget` at `now`. A request
-    /// that would take the day's total beyond the budget gets the
-    /// budget's action; one that is rejected is not counted.
+    /// that takes the day's total beyond the budget gets the budget's
+    /// action, and so does everything after it until the day ends: the
+    /// ledger counts what arrives, admitted or not.
     pub fn charge(&self, account: &Account, budget: &Budget, bytes: u64, now: Timestamp) -> Charge {
         let mut entries = self
             .entries
@@ -90,9 +91,7 @@ impl Ledger {
         let beyond = after > budget.bytes_per_day;
         let crossed = beyond && !entry.reached;
         entry.reached |= beyond;
-        if !(beyond && budget.action == BudgetAction::Reject) {
-            entry.bytes = after;
-        }
+        entry.bytes = after;
         Charge {
             action: beyond.then_some(budget.action),
             crossed,
@@ -152,16 +151,16 @@ mod tests {
     }
 
     #[test]
-    fn rejected_bytes_are_not_counted() {
+    fn once_reached_everything_after_gets_the_action() {
         let ledger = Ledger::new();
         let budget = budget(BudgetAction::Reject);
         ledger.charge(&account(), &budget, 90, NOON);
         let big = ledger.charge(&account(), &budget, 20, NOON);
         assert_eq!(big.action, Some(BudgetAction::Reject));
-        assert_eq!(big.total, 90);
+        assert_eq!(big.total, 110, "what arrived is counted");
         let small = ledger.charge(&account(), &budget, 5, NOON);
-        assert_eq!(small.action, None, "a smaller request still fits");
-        assert_eq!(small.total, 95);
+        assert_eq!(small.action, Some(BudgetAction::Reject));
+        assert!(ledger.exhausted(&account(), &budget, NOON));
     }
 
     #[test]
