@@ -147,6 +147,12 @@ pub struct TenantSettings {
     /// The longest one query may run, in seconds (QE-18); unlimited by
     /// default.
     pub query_max_seconds: Option<u64>,
+    /// Whether a log body that is a JSON object has its fields stored
+    /// under `body.*` (DM-10); on by default.
+    pub parse_json_bodies: Option<bool>,
+    /// Whether a log body that is a logfmt line has its pairs stored
+    /// under `body.*` (DM-10); off by default.
+    pub parse_logfmt_bodies: Option<bool>,
     /// The attribute path that names the team a row belongs to, for
     /// metering by team (CO-1); none by default.
     pub team_attribute: Option<String>,
@@ -193,6 +199,8 @@ impl TenantSettings {
             query_max_scan_bytes: patch.query_max_scan_bytes.or(self.query_max_scan_bytes),
             query_max_memory_bytes: patch.query_max_memory_bytes.or(self.query_max_memory_bytes),
             query_max_seconds: patch.query_max_seconds.or(self.query_max_seconds),
+            parse_json_bodies: patch.parse_json_bodies.or(self.parse_json_bodies),
+            parse_logfmt_bodies: patch.parse_logfmt_bodies.or(self.parse_logfmt_bodies),
             team_attribute: patch
                 .team_attribute
                 .clone()

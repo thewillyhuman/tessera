@@ -18,7 +18,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use serde_json::Value;
-use tessera_types::event::{EXTRACTED, OVERFLOW, SCOPES, SEVERITY_TEXT, label_name};
+use tessera_types::event::{EXTRACTED, LABEL_SCOPES, OVERFLOW, SEVERITY_TEXT, label_name};
 
 use crate::KernelError;
 
@@ -65,7 +65,7 @@ pub fn label(
         (text(OVERFLOW), text(EXTRACTED), text(SEVERITY_TEXT));
     // The dedicated column of the attribute under this label, by scope.
     let schema = rows.schema();
-    let dedicated: Option<&ArrayRef> = SCOPES.iter().find_map(|scope| {
+    let dedicated: Option<&ArrayRef> = LABEL_SCOPES.iter().find_map(|scope| {
         schema
             .fields()
             .iter()
@@ -88,7 +88,7 @@ pub fn label(
             .and_then(|o| serde_json::from_str::<Value>(o.value(i)).ok())
             .and_then(|object| {
                 let object = object.as_object()?;
-                SCOPES.iter().find_map(|scope| {
+                LABEL_SCOPES.iter().find_map(|scope| {
                     object
                         .iter()
                         .find(|(path, _)| path.starts_with(scope) && label_name(path) == name)
@@ -144,7 +144,7 @@ pub fn row_labels(
     }
     if let Some(Value::Object(object)) = overflow.and_then(|o| serde_json::from_str(o).ok()) {
         // Later scopes must not override earlier ones: insert in reverse.
-        for scope in SCOPES.iter().rev() {
+        for scope in LABEL_SCOPES.iter().rev() {
             for (path, value) in &object {
                 if path.starts_with(scope) {
                     if let Some(text) = as_text(value.clone()) {

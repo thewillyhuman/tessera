@@ -200,9 +200,14 @@ pub fn label_name(path: &str) -> String {
         .collect()
 }
 
-/// The attribute scopes of section 4.2, in the order a label name
-/// resolves against them (QL-20): the more specific scope wins.
-pub const SCOPES: [&str; 3] = ["attr.", "resource.", "scope."];
+/// The attribute scopes of section 4.2, and the fields of a
+/// structured log body (DM-10), which are attributes of the row too.
+pub const SCOPES: [&str; 4] = ["attr.", "resource.", "scope.", "body."];
+
+/// The scopes a label name resolves against (QL-20), in order: the
+/// more specific scope wins. Body fields are not labels until a parser
+/// stage makes them so, as in Loki.
+pub const LABEL_SCOPES: [&str; 3] = ["attr.", "resource.", "scope."];
 
 /// A scalar attribute value (section 4.3). Lists and nested maps are
 /// flattened or kept as JSON text by normalization (IN-5).

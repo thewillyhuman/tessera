@@ -14,6 +14,7 @@
 pub mod admin;
 pub mod audit;
 pub mod auth;
+mod bodies;
 mod budgets;
 mod control;
 pub mod encode;
@@ -124,7 +125,7 @@ impl AppState {
         let batch = if batch.tenant() == &TenantId::SYSTEM {
             batch
         } else {
-            let batch = redact::apply(self, batch)?;
+            let batch = bodies::apply(self, redact::apply(self, batch)?)?;
             let Some(admitted) = budgets::admit_ingest(self, batch)? else {
                 return Ok(());
             };

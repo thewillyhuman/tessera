@@ -15,6 +15,7 @@
 //! (RS-4); nothing here is async or touches storage.
 
 pub mod aggregate;
+pub mod bodies;
 pub mod eval;
 pub mod extract;
 pub mod group;
@@ -31,6 +32,7 @@ pub mod window;
 use arrow::error::ArrowError;
 
 pub use aggregate::{Accumulator, accumulator};
+pub use bodies::{BodyParsing, parse_bodies};
 pub use eval::{evaluate, evaluate_predicate};
 pub use extract::{ERROR_DETAILS_LABEL, ERROR_LABEL, Extracted, extract};
 pub use group::Grouper;

@@ -1231,9 +1231,11 @@ impl Lowerer<'_> {
                 });
             }
         }
-        let scoped = column
-            .split_once('.')
-            .is_some_and(|(prefix, _)| ["attr", "resource", "scope"].contains(&prefix));
+        let scoped = column.split_once('.').is_some_and(|(prefix, _)| {
+            event::SCOPES
+                .iter()
+                .any(|scope| scope.trim_end_matches('.') == prefix)
+        });
         if scoped {
             let telemetry: Vec<&TableScope> = tables
                 .iter()

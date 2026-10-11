@@ -191,7 +191,7 @@ fn flatten(prefix: &str, value: Value, into: &mut BTreeMap<String, String>) {
 
 /// `key=value` pairs; values may be double-quoted with `\"` escapes. A
 /// line without any pair yields the error labels.
-fn logfmt_labels(line: &str) -> BTreeMap<String, String> {
+pub(crate) fn logfmt_labels(line: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     if !line.contains('=') {
         return parser_error("LogfmtParserErr", "no key=value pair");
