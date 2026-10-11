@@ -29,7 +29,7 @@ use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
-use tessera_server::{AppState, Cluster, HttpRemote};
+use tessera_server::{AppState, Cluster, HttpRemote, SystemTableRows};
 use tessera_types::{Env, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -200,33 +200,7 @@ impl Node {
             membership,
         };
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops);
-        let remote = HttpRemote::new();
-        let engine = Arc::new(engine(
-            &shared.pools,
-            &shared.format,
-            &shared.env,
-            &shared.membership,
-            &remote,
-        ));
-        let controls = Arc::new(ControlStores::new(
-            Arc::clone(&shared.store),
-            shared.env.clone(),
-        ));
-        let state = AppState {
-            catalog: Arc::clone(&shared.catalog),
-            ingest: ingest.clone(),
-            pools: Arc::clone(&shared.pools),
-            format: Arc::clone(&shared.format),
-            engine: Arc::clone(&engine),
-            env: shared.env.clone(),
-            controls: Arc::clone(&controls),
-            cluster: Some(Arc::new(Cluster {
-                membership: Arc::clone(&shared.membership),
-                remote,
-                admission: Arc::new(Admission::new(Limits::default())),
-                preferred_ingesters: PREFERRED_INGESTERS,
-            })),
-        };
+        let (state, engine, controls) = shared.app_state(ingest.clone());
         shared.evaluate_rules(
             &config,
             leases.as_ref(),
@@ -432,6 +406,46 @@ impl Shared {
             })));
         }
         (Some(leases), Some((stop, task)))
+    }
+
+    /// The handlers' shared state: the engine with its peers and system
+    /// tables, the control stores and the cluster links.
+    fn app_state(&self, ingest: IngestHandle) -> (AppState, Arc<Engine>, Arc<ControlStores>) {
+        let remote = HttpRemote::new();
+        let controls = Arc::new(ControlStores::new(
+            Arc::clone(&self.store),
+            self.env.clone(),
+        ));
+        let engine = Arc::new(
+            engine(
+                &self.pools,
+                &self.format,
+                &self.env,
+                &self.membership,
+                &remote,
+            )
+            .with_system_tables(Arc::new(SystemTableRows::new(
+                Arc::clone(&controls),
+                Arc::clone(&self.store),
+                self.env.clone(),
+            ))),
+        );
+        let state = AppState {
+            catalog: Arc::clone(&self.catalog),
+            ingest,
+            pools: Arc::clone(&self.pools),
+            format: Arc::clone(&self.format),
+            engine: Arc::clone(&engine),
+            env: self.env.clone(),
+            controls: Arc::clone(&controls),
+            cluster: Some(Arc::new(Cluster {
+                membership: Arc::clone(&self.membership),
+                remote,
+                admission: Arc::new(Admission::new(Limits::default())),
+                preferred_ingesters: PREFERRED_INGESTERS,
+            })),
+        };
+        (state, engine, controls)
     }
 
     /// Starts the `eval` role's loop over the rule groups this node owns

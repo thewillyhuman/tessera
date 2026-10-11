@@ -21,6 +21,7 @@ pub mod frontend;
 pub mod function;
 pub mod plan;
 pub mod promql;
+pub mod system;
 pub mod trace;
 pub mod typing;
 
@@ -34,5 +35,6 @@ pub use plan::{
     SortKey, VALUE, range_vector_schema,
 };
 pub use promql::{Group, LOOKBACK, Matching, PromAggregate, PromExpr, PromOp};
+pub use system::system_table_schema;
 pub use trace::{Relation, SpanAggregate, Spanset, Structural, trace_group_schema};
 pub use typing::{TypeError, expr_type};

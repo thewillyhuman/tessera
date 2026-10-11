@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+
+//! The `system` schema (CS-3): the control tables and the view over the
+//! rule state logs (CQ-13) as the planner sees them. The typed tables
+//! expose their records' fields as columns; the others are a key and a
+//! JSON document. Where the rows come from is the node's business: the
+//! engine asks its system-table provider at run time.
+
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+
+/// The names of the tables, with `alert_instances` among them.
+pub const TABLES: [&str; 11] = [
+    "alert_rules",
+    "alert_instances",
+    "silences",
+    "acknowledgments",
+    "notification_routes",
+    "rollups",
+    "retention_policies",
+    "layout_pins",
+    "api_keys",
+    "roles",
+    "saved_queries",
+];
+
+fn text(name: &str) -> Field {
+    Field::new(name, DataType::Utf8, true)
+}
+
+fn int(name: &str) -> Field {
+    Field::new(name, DataType::Int64, true)
+}
+
+fn time(name: &str) -> Field {
+    Field::new(name, DataType::Timestamp(TimeUnit::Nanosecond, None), true)
+}
+
+/// The schema of `system.<table>`, or `None` for an unknown table.
+#[must_use]
+pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
+    let fields = match table {
+        "alert_rules" => vec![
+            text("name"),
+            text("group"),
+            text("language"),
+            text("expr"),
+            text("dataset"),
+            int("every_seconds"),
+            int("for_seconds"),
+            text("severity"),
+            text("labels"),
+            text("annotations"),
+            text("notify"),
+        ],
+        "alert_instances" => vec![
+            text("rule"),
+            text("group"),
+            text("fingerprint"),
+            text("status"),
+            time("since"),
+            Field::new("value", DataType::Float64, true),
+            text("labels"),
+            int("transitions"),
+            time("notified_at"),
+        ],
+        "silences" => vec![
+            text("id"),
+            text("matchers"),
+            time("starts_at"),
+            time("ends_at"),
+            text("comment"),
+        ],
+        "acknowledgments" => vec![
+            text("fingerprint"),
+            time("until"),
+            text("by"),
+            text("comment"),
+        ],
+        "notification_routes" => vec![
+            text("name"),
+            text("kind"),
+            text("url"),
+            text("routing_key"),
+            int("repeat_seconds"),
+        ],
+        "rollups" | "retention_policies" | "layout_pins" | "api_keys" | "roles"
+        | "saved_queries" => vec![text("key"), text("document")],
+        _ => return None,
+    };
+    Some(Arc::new(Schema::new(fields)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_table_has_a_schema_and_nothing_else_does() {
+        for table in TABLES {
+            assert!(system_table_schema(table).is_some(), "{table}");
+        }
+        assert!(system_table_schema("logs").is_none());
+        let rules = system_table_schema("alert_rules").unwrap();
+        assert_eq!(
+            rules.field_with_name("every_seconds").unwrap().data_type(),
+            &DataType::Int64
+        );
+    }
+}

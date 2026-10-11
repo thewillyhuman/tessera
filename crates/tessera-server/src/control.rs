@@ -94,7 +94,7 @@ async fn insert(
     let documents: Vec<(String, Value)> = rows
         .iter()
         .map(|row| {
-            let document = Value::Object(object(row));
+            let document = Value::Object(object(table, row)?);
             validate(table, &document)?;
             Ok((key_of(table, &document)?, document))
         })
@@ -124,7 +124,7 @@ async fn update(
     set: &[(String, Literal)],
     filter: &[(String, Literal)],
 ) -> Result<String, ApiError> {
-    let changes = object(set);
+    let changes = object(table, set)?;
     let (count, _) = control
         .transact(|txn| {
             let mut count = 0;
@@ -246,10 +246,37 @@ fn matching(
         .collect())
 }
 
-fn object(pairs: &[(String, Literal)]) -> Map<String, Value> {
+/// The columns whose values are JSON documents rather than text, so a
+/// text literal in them is parsed.
+fn json_columns(table: Table) -> &'static [&'static str] {
+    match table {
+        Table::AlertRules => &["labels", "annotations", "notify"],
+        Table::Silences => &["matchers"],
+        Table::Acknowledgments | Table::NotificationRoutes => &[],
+        Table::Rollups
+        | Table::RetentionPolicies
+        | Table::LayoutPins
+        | Table::ApiKeys
+        | Table::Roles
+        | Table::SavedQueries => &["document"],
+    }
+}
+
+/// The document a row's literals make, JSON columns parsed.
+fn object(table: Table, pairs: &[(String, Literal)]) -> Result<Map<String, Value>, ApiError> {
     pairs
         .iter()
-        .map(|(column, literal)| (column.clone(), json_of(literal)))
+        .map(|(column, literal)| {
+            let value = match literal {
+                Literal::Text(text) if json_columns(table).contains(&column.as_str()) => {
+                    serde_json::from_str(text).map_err(|e| {
+                        ApiError::bad_request(format!("{table}.{column} must be JSON: {e}"))
+                    })?
+                }
+                other => json_of(other),
+            };
+            Ok((column.clone(), value))
+        })
         .collect()
 }
 
@@ -360,14 +387,21 @@ mod tests {
         let (status, value) = sql(
             &state,
             "INSERT INTO system.silences (id, matchers, starts_at, ends_at, comment) \
-             VALUES ('s1', '{}', 0, 10, 'x')",
+             VALUES ('s1', 'nope', 0, 10, 'x')",
         )
         .await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "matchers must be an object: {value}"
+            "matchers must be JSON: {value}"
         );
+        let (status, value) = sql(
+            &state,
+            "INSERT INTO system.silences (id, matchers, starts_at, ends_at, comment) \
+             VALUES ('s1', '{\"service\": \"x\"}', 0, 10, 'x')",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
 
         let (status, value) = sql(
             &state,

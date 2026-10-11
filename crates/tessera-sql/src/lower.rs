@@ -194,18 +194,45 @@ fn lower_query(
     let Some(from) = &query.from else {
         return lower_constant_query(query, ctx, registry);
     };
-    let (dataset, kind) = resolve_table(from, ctx)?;
+    let (scope, mut plan) = if from.dataset.as_deref() == Some("system") {
+        let schema = tessera_ir::system_table_schema(&from.table).ok_or_else(|| {
+            Diagnostic::at(
+                from.span,
+                format!(
+                    "unknown system table {}: tables are {}",
+                    from.table,
+                    tessera_ir::system::TABLES.join(", ")
+                ),
+            )
+        })?;
+        (
+            Scope {
+                schema,
+                table: Some(from.table.clone()),
+                kind: None,
+            },
+            Plan::SystemTable {
+                tenant: ctx.tenant.clone(),
+                table: from.table.clone(),
+            },
+        )
+    } else {
+        let (dataset, kind) = resolve_table(from, ctx)?;
+        (
+            Scope {
+                schema: event::schema(kind),
+                table: Some(from.table.clone()),
+                kind: Some(kind),
+            },
+            Plan::Scan(Scan::all(ctx.tenant.clone(), dataset, kind)),
+        )
+    };
     let mut lowerer = Lowerer {
         ctx,
         registry,
-        scope: Scope {
-            schema: event::schema(kind),
-            table: Some(from.table.clone()),
-            kind: Some(kind),
-        },
+        scope,
         substitution: None,
     };
-    let mut plan = Plan::Scan(Scan::all(ctx.tenant.clone(), dataset, kind));
     if let Some(filter) = &query.filter {
         plan = plan.filter(lowerer.expr(filter)?);
     }
@@ -891,6 +918,24 @@ mod tests {
             Statement::Control(statement) => statement,
             other => panic!("not a control statement: {other:?}"),
         }
+    }
+
+    #[test]
+    fn system_tables_lower_to_their_own_node() {
+        let plan =
+            lowered("SELECT name, severity FROM system.alert_rules WHERE severity = 'critical'");
+        assert_eq!(
+            plan.to_string(),
+            "Project: name AS name, severity AS severity\n  \
+             Filter: (severity = 'critical')\n    \
+             SystemTable: default system.alert_rules\n"
+        );
+        plan.schema(&Registry::builtin()).unwrap();
+        assert!(
+            error("SELECT 1 FROM system.nope")
+                .message
+                .contains("unknown system table")
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ fn bind_plan(plan: Plan) -> Plan {
             Plan::Scan(scan)
         }
         Plan::Values { schema, rows } => Plan::Values { schema, rows },
+        Plan::SystemTable { tenant, table } => Plan::SystemTable { tenant, table },
         Plan::RangeVector {
             input,
             function,

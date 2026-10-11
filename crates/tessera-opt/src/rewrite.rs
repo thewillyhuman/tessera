@@ -104,7 +104,7 @@ fn wrap_filter(plan: Plan, predicates: Vec<Expr>) -> Plan {
 /// Applies `f` to each input of `plan`, keeping the node itself.
 fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
     match plan {
-        Plan::Scan(_) | Plan::Values { .. } => plan,
+        Plan::Scan(_) | Plan::Values { .. } | Plan::SystemTable { .. } => plan,
         Plan::RangeVector {
             input,
             function,
@@ -320,6 +320,7 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
     match plan {
         Plan::Scan(scan) => Plan::Scan(narrow_scan(scan, needed)),
         Plan::Values { schema, rows } => Plan::Values { schema, rows },
+        Plan::SystemTable { tenant, table } => Plan::SystemTable { tenant, table },
         Plan::Filter { input, predicate } => {
             let needed = needed.map(|n| add(n, &predicate));
             push_projection(*input, needed).filter(predicate)

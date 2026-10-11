@@ -22,6 +22,7 @@ mod params;
 pub mod pg;
 pub mod prometheus;
 pub mod query;
+pub mod system;
 pub mod tempo;
 
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use tessera_types::{Env, EventBatch, TenantId};
 
 pub use error::ApiError;
 pub use internal::HttpRemote;
+pub use system::SystemTableRows;
 
 /// What a node in a cluster adds: who else is there, how to reach
 /// them, and the limits every tenant runs under.
@@ -178,20 +180,26 @@ impl AppState {
         );
         let (ingest, _task) = tessera_ingest::spawn(ingester, Duration::from_millis(1));
         let pools = Arc::new(Pools::new(pool, Arc::new(store.clone())));
+        let controls = Arc::new(ControlStores::new(Arc::new(store.clone()), env.clone()));
         let engine = Engine::new(
             Arc::clone(&pools),
             Arc::new(ParquetFormat::default()),
             env.clone(),
             CpuPool::new(2),
             QueryLimits::default(),
-        );
+        )
+        .with_system_tables(Arc::new(SystemTableRows::new(
+            Arc::clone(&controls),
+            Arc::new(store),
+            env.clone(),
+        )));
         AppState {
             catalog: Arc::new(catalog),
             ingest,
             pools,
             format: Arc::new(ParquetFormat::default()),
             engine: Arc::new(engine),
-            controls: Arc::new(ControlStores::new(Arc::new(store), env.clone())),
+            controls,
             env,
             cluster: None,
         }

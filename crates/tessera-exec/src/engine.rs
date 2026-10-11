@@ -42,6 +42,7 @@ use crate::promql;
 use crate::remote::{LeafTask, Peers, RemoteScan};
 use crate::scan::{self, ScanAnalysis};
 use crate::scheduler::{CpuPool, TaskError};
+use crate::system::SystemTables;
 
 /// Why a query failed.
 #[derive(Debug, thiserror::Error)]
@@ -125,6 +126,8 @@ pub struct Engine {
     pub(crate) cpu: Arc<CpuPool>,
     pub(crate) partition_window: Duration,
     pub(crate) peers: Option<(Arc<dyn Peers>, Arc<dyn RemoteScan>)>,
+    /// Where the `system` tables' rows come from.
+    system_tables: Option<Arc<dyn SystemTables>>,
     /// The manifests this node has opened (section 10.8).
     pub(crate) manifests: Manifests,
     /// Results of closed-range queries (section 10.8).
@@ -156,11 +159,19 @@ impl Engine {
             cpu,
             partition_window: Window::DEFAULT_LENGTH,
             peers: None,
+            system_tables: None,
             manifests,
             results: ResultCache::new(cache::DEFAULT_BYTES),
             limits,
             registry: Registry::builtin(),
         }
+    }
+
+    /// The engine with a provider of the `system` tables' rows (CS-3).
+    #[must_use]
+    pub fn with_system_tables(mut self, provider: Arc<dyn SystemTables>) -> Self {
+        self.system_tables = Some(provider);
+        self
     }
 
     /// The engine keeping at most `bytes` of closed-range results.
@@ -265,6 +276,17 @@ impl Engine {
                     result
                 }
                 Plan::Values { schema, rows } => Ok(vec![values(schema, rows)?]),
+                Plan::SystemTable { tenant, table } => {
+                    let Some(provider) = &self.system_tables else {
+                        return Err(EngineError::Exec(ExecError::Unsupported(
+                            "system tables are not available on this engine".into(),
+                        )));
+                    };
+                    provider
+                        .rows(tenant, table)
+                        .await
+                        .map_err(|e| EngineError::Exec(ExecError::Unsupported(e)))
+                }
                 Plan::Union { inputs } => {
                     let mut batches = Vec::new();
                     for input in inputs {
@@ -406,6 +428,7 @@ impl Engine {
             )),
             Plan::Scan(_)
             | Plan::Values { .. }
+            | Plan::SystemTable { .. }
             | Plan::Union { .. }
             | Plan::TraceGroup { .. }
             | Plan::PromQL { .. } => {

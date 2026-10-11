@@ -25,6 +25,9 @@ use crate::typing::{TypeError, expr_type};
 /// Why a plan is not well formed.
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
 pub enum PlanError {
+    /// A `system` table the planner does not know.
+    #[error("unknown system table {0}")]
+    UnknownSystemTable(String),
     /// An expression has no type over its input.
     #[error("{0}")]
     Type(#[from] TypeError),
@@ -402,6 +405,14 @@ pub enum Plan {
         /// The rows, one literal per column.
         rows: Vec<Vec<Literal>>,
     },
+    /// The rows of a `system` table of a tenant (CS-3): the control
+    /// store's or the rule state logs', provided at run time.
+    SystemTable {
+        /// The tenant.
+        tenant: TenantId,
+        /// The table, a name of [`crate::system::TABLES`].
+        table: String,
+    },
     /// Evaluate a `PromQL` expression over the samples of its inputs at
     /// every step from `start` to `end` with Prometheus' semantics
     /// (QL-5); one row per series and step, like `RangeVector`.
@@ -474,7 +485,7 @@ impl Plan {
     #[must_use]
     pub fn inputs(&self) -> Vec<&Plan> {
         match self {
-            Plan::Scan(_) | Plan::Values { .. } => Vec::new(),
+            Plan::Scan(_) | Plan::Values { .. } | Plan::SystemTable { .. } => Vec::new(),
             Plan::Filter { input, .. }
             | Plan::Project { input, .. }
             | Plan::Aggregate { input, .. }
@@ -501,7 +512,7 @@ impl Plan {
     pub fn time_range(&self) -> TimeRange {
         match self {
             Plan::Scan(scan) => scan.time_range,
-            Plan::Values { .. } => TimeRange::ALL,
+            Plan::Values { .. } | Plan::SystemTable { .. } => TimeRange::ALL,
             Plan::Union { inputs } | Plan::PromQL { inputs, .. } => inputs
                 .iter()
                 .map(Plan::time_range)
@@ -540,6 +551,7 @@ impl Plan {
             Plan::Aggregate { .. }
             | Plan::Union { .. }
             | Plan::Values { .. }
+            | Plan::SystemTable { .. }
             | Plan::RangeVector { .. }
             | Plan::PromQL { .. }
             | Plan::TraceGroup { .. } => Vec::new(),
@@ -565,6 +577,8 @@ impl Plan {
         match self {
             Plan::Scan(scan) => scan.schema(),
             Plan::Values { schema, .. } => Ok(Arc::clone(schema)),
+            Plan::SystemTable { table, .. } => crate::system::system_table_schema(table)
+                .ok_or_else(|| PlanError::UnknownSystemTable(table.clone())),
             Plan::Filter { input, .. }
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. }
@@ -634,6 +648,9 @@ impl Plan {
                 inputs.iter().try_for_each(|i| i.fmt_tree(f, depth + 1))
             }
             Plan::Values { rows, .. } => writeln!(f, "{pad}Values: {} rows", rows.len()),
+            Plan::SystemTable { tenant, table } => {
+                writeln!(f, "{pad}SystemTable: {tenant} system.{table}")
+            }
             Plan::TraceGroup {
                 candidates,
                 spans,
@@ -716,6 +733,7 @@ impl Plan {
             Plan::Scan(_)
             | Plan::Union { .. }
             | Plan::Values { .. }
+            | Plan::SystemTable { .. }
             | Plan::TraceGroup { .. }
             | Plan::PromQL { .. } => Ok(()),
         }
