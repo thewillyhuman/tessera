@@ -31,6 +31,7 @@ use tessera_types::{Env, Window};
 
 use crate::ExecError;
 use crate::batch::Batch;
+use crate::cache::{self, ResultCache, ResultKey};
 use crate::memory::MemoryPool;
 use crate::operator::{
     CollectSink, Extract, Filter, Format, HashAggregate, Limit, Operator, Project, RangeVector,
@@ -79,6 +80,8 @@ pub enum EngineError {
 pub struct Analysis {
     /// One entry per scan, in plan order.
     pub scans: Vec<ScanAnalysis>,
+    /// Whether the rows came from the result cache, with no scan run.
+    pub result_cached: bool,
 }
 
 /// The rows of a query and what producing them took.
@@ -124,6 +127,8 @@ pub struct Engine {
     pub(crate) peers: Option<(Arc<dyn Peers>, Arc<dyn RemoteScan>)>,
     /// The manifests this node has opened (section 10.8).
     pub(crate) manifests: Manifests,
+    /// Results of closed-range queries (section 10.8).
+    results: ResultCache,
     limits: QueryLimits,
     registry: Registry,
 }
@@ -152,9 +157,17 @@ impl Engine {
             partition_window: Window::DEFAULT_LENGTH,
             peers: None,
             manifests,
+            results: ResultCache::new(cache::DEFAULT_BYTES),
             limits,
             registry: Registry::builtin(),
         }
+    }
+
+    /// The engine keeping at most `bytes` of closed-range results.
+    #[must_use]
+    pub fn with_result_cache(mut self, bytes: usize) -> Self {
+        self.results = ResultCache::new(bytes);
+        self
     }
 
     /// The engine with other nodes to share leaf tasks with (QE-14):
@@ -190,13 +203,50 @@ impl Engine {
     /// fails or exhausts its memory.
     pub async fn run(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
         let schema = plan.schema(&self.registry)?;
+        let key = if cache::is_closed(plan, self.manifests.env().clock.now()) {
+            Some(self.result_key(plan).await?)
+        } else {
+            None
+        };
+        if let Some(kept) = key.as_ref().and_then(|key| self.results.get(key)) {
+            return Ok(QueryOutput {
+                schema: Arc::clone(&kept.schema),
+                batches: kept.batches.clone(),
+                analysis: Analysis {
+                    scans: Vec::new(),
+                    result_cached: true,
+                },
+            });
+        }
         let memory = MemoryPool::new(self.limits.memory_bytes);
         let mut analysis = Analysis::default();
         let batches = self.execute(plan, &memory, &mut analysis).await?;
+        if let Some(key) = key {
+            self.results
+                .insert(key, Arc::clone(&schema), batches.clone());
+        }
         Ok(QueryOutput {
             schema,
             batches,
             analysis,
+        })
+    }
+
+    /// What a result of `plan` depends on: the plan and the versions of
+    /// every manifest its scans read.
+    async fn result_key(&self, plan: &Plan) -> Result<ResultKey, EngineError> {
+        let mut versions = Vec::new();
+        for scan in cache::scans(plan) {
+            versions.extend(
+                self.manifests
+                    .versions(&scan.tenant, &scan.dataset, scan.kind, scan.time_range)
+                    .await?,
+            );
+        }
+        versions.sort();
+        Ok(ResultKey {
+            fingerprint: cache::fingerprint(plan),
+            versions,
         })
     }
 

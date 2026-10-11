@@ -12,6 +12,7 @@
 //! runtime (RS-4).
 
 pub mod batch;
+pub mod cache;
 pub mod engine;
 pub mod memory;
 pub mod operator;
@@ -23,6 +24,7 @@ pub mod scan;
 pub mod scheduler;
 
 pub use batch::Batch;
+pub use cache::{ResultCache, ResultKey};
 pub use engine::{Analysis, Engine, EngineError, QueryLimits, QueryOutput};
 pub use memory::{MemoryPool, OutOfMemory};
 pub use operator::{CollectSink, Flow, Operator, Sink};

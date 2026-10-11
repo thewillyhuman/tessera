@@ -78,6 +78,9 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
     let Some(analysis) = analysis else {
         return out;
     };
+    if analysis.result_cached {
+        let _ = writeln!(out, "Result: from the cache, no scan run");
+    }
     for scan in &analysis.scans {
         let _ = writeln!(out, "Scan {}:", scan.source);
         let _ = writeln!(

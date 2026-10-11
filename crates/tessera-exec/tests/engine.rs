@@ -425,3 +425,122 @@ async fn footers_are_read_once_when_the_format_keeps_them() {
             .sum::<usize>()
     );
 }
+
+/// Writes two late rows into day 0 through a new writer and adopts them,
+/// which moves the day's manifest to a new version.
+async fn adopt_late_rows(store: &Arc<MemoryStore>, env: &Env) {
+    let mut log = WriterLog::start(store.clone(), env.clone());
+    registry::register(
+        &**store,
+        env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        log.writer_id(),
+    )
+    .await
+    .unwrap();
+    let target = FlushTarget {
+        store: store.clone(),
+        pool: PoolId::new("root").unwrap(),
+        format: Arc::new(ParquetFormat::default()),
+    };
+    let late = vec![batch(0, 20, 2)];
+    let through = log.append_segment(&late).await.unwrap();
+    let files = write_l1_files(
+        &target,
+        env,
+        log.writer_id(),
+        Seq::ZERO,
+        through,
+        Window::DEFAULT_LENGTH,
+        late,
+    )
+    .await
+    .unwrap();
+    log.append(EntryBody::Flush {
+        tenant: TenantId::DEFAULT,
+        dataset: dataset(),
+        after: Seq::ZERO,
+        through,
+        files,
+    })
+    .await
+    .unwrap();
+    intake::run(
+        store.clone(),
+        env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        log.writer_id(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn closed_range_results_are_served_from_the_cache_until_a_manifest_moves() {
+    let (store, env) = populate().await;
+    // The engine's clock stands a day after the data, so day 0 is closed.
+    let later = Env::new(
+        env.node,
+        Arc::new(tessera_types::ManualClock::new(Timestamp::from_nanos(
+            2 * 86_400 * 1_000_000_000,
+        ))),
+        env.random.clone(),
+    );
+    let pools = Pools::new(PoolId::new("root").unwrap(), store.clone());
+    let engine = Engine::new(
+        Arc::new(pools),
+        Arc::new(ParquetFormat::default()),
+        later,
+        CpuPool::new(2),
+        QueryLimits::default(),
+    );
+    let mut closed = scan();
+    closed.time_range = TimeRange::new(
+        Timestamp::from_nanos(0),
+        Timestamp::from_nanos(86_400 * 1_000_000_000),
+    );
+    let first = run(&engine, Plan::Scan(closed.clone())).await;
+    assert!(!first.analysis.result_cached);
+    assert_eq!(first.analysis.scans.len(), 1);
+    let second = run(&engine, Plan::Scan(closed.clone())).await;
+    assert!(
+        second.analysis.result_cached,
+        "the same plan over the same manifests"
+    );
+    assert!(second.analysis.scans.is_empty());
+    assert_eq!(
+        second
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        first
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+    );
+    let open = run(&engine, Plan::Scan(scan())).await;
+    assert!(!open.analysis.result_cached, "all time is never closed");
+    let again = run(&engine, Plan::Scan(scan())).await;
+    assert!(!again.analysis.result_cached);
+
+    adopt_late_rows(&store, &env).await;
+    let third = run(&engine, Plan::Scan(closed)).await;
+    assert!(!third.analysis.result_cached, "the manifest moved");
+    assert_eq!(
+        third
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        first
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+            + 2
+    );
+}
