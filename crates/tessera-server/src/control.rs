@@ -223,11 +223,22 @@ async fn explain_layout(
     );
     let mut out = String::new();
     let window = log.window().await.map_err(unavailable)?;
-    let _ = writeln!(
-        out,
-        "dataset {dataset}: partition window {}s",
-        window.as_secs()
-    );
+    let now = state.env.clock.now();
+    let in_force = window.length_at(now);
+    if window.latest() == in_force {
+        let _ = writeln!(
+            out,
+            "dataset {dataset}: partition window {}s",
+            in_force.as_secs()
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "dataset {dataset}: partition window {}s, {}s for the windows to come",
+            in_force.as_secs(),
+            window.latest().as_secs()
+        );
+    }
     for kind in Kind::ALL {
         let layout = log.layout(kind).await.map_err(unavailable)?;
         let _ = writeln!(

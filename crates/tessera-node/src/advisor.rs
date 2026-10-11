@@ -138,9 +138,9 @@ async fn advise_dataset(
         let set = log.set_layout(kind, record).await?;
         tracing::info!(%tenant, %dataset, %kind, epoch = set.epoch, sort_key = ?set.sort_key, dedicated = ?set.dedicated, "layout adopted");
     }
-    if outcome.window != log.window().await? {
+    if outcome.window != log.window().await?.latest() {
         log.set_window(outcome.window).await?;
-        tracing::info!(%tenant, %dataset, window_seconds = outcome.window.as_secs(), "partition window set");
+        tracing::info!(%tenant, %dataset, window_seconds = outcome.window.as_secs(), "partition window set for the windows to come");
     }
     Ok(())
 }

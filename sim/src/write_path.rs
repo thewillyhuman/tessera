@@ -49,7 +49,6 @@ fn config() -> IngestConfig {
         segment_bytes: 1 << 30,
         flush_bytes: 1 << 30,
         flush_age: Duration::from_secs(5),
-        window: Window::DEFAULT_LENGTH,
         max_log_age: Duration::from_secs(15),
         max_log_entries: 1_000_000,
         writers: 1,

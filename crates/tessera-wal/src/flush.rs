@@ -11,7 +11,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::array::{BooleanArray, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
@@ -20,7 +19,7 @@ use tessera_object::{ObjectStore, layout};
 use tessera_types::event::TIMESTAMP;
 use tessera_types::{
     Env, EventBatch, FileId, FileMeta, FileSource, Level, PartitionId, PoolId, Seq, Timestamp,
-    Window, WriterId,
+    Window, WindowSchedule, Windows, WriterId,
 };
 
 use crate::WalError;
@@ -45,8 +44,9 @@ impl std::fmt::Debug for FlushTarget {
 }
 
 /// Writes the rows of `batches`, which are the rows of segments
-/// `(after, through]` of `writer`, as one L1 file per partition, using
-/// `window` as the partition window length.
+/// `(after, through]` of `writer`, as one L1 file per partition, each
+/// row's partition placed by its dataset's window schedule in
+/// `windows` (MF-2).
 ///
 /// # Errors
 ///
@@ -58,11 +58,12 @@ pub async fn write_l1_files(
     writer: WriterId,
     after: Seq,
     through: Seq,
-    window: Duration,
+    windows: impl Into<Windows>,
     batches: Vec<EventBatch>,
 ) -> Result<Vec<FileMeta>, WalError> {
+    let windows = windows.into();
     let mut files = Vec::new();
-    for (partition, rows) in split_by_partition(batches, window)? {
+    for (partition, rows) in split_by_partition(batches, &windows)? {
         let format = Arc::clone(&target.format);
         let key = env.keys.for_tenant(&partition.tenant)?;
         let written =
@@ -103,10 +104,11 @@ pub async fn write_l1_files(
 /// Groups rows by the partition they belong to.
 fn split_by_partition(
     batches: Vec<EventBatch>,
-    window: Duration,
+    windows: &Windows,
 ) -> Result<BTreeMap<PartitionId, Vec<RecordBatch>>, WalError> {
     let mut groups: BTreeMap<PartitionId, Vec<RecordBatch>> = BTreeMap::new();
     for batch in batches {
+        let window = windows.schedule_for(batch.tenant(), batch.dataset());
         let timestamps = batch
             .rows()
             .column_by_name(TIMESTAMP)
@@ -115,8 +117,9 @@ fn split_by_partition(
         let mut windows: Vec<Window> = Vec::new();
         for value in timestamps.values() {
             let at = Timestamp::from_nanos(*value);
-            let found =
-                Window::containing(at, window).ok_or(WalError::Unwindowed { timestamp: at })?;
+            let found = window
+                .containing(at)
+                .ok_or(WalError::Unwindowed { timestamp: at })?;
             if !windows.contains(&found) {
                 windows.push(found);
             }
@@ -142,19 +145,20 @@ fn split_by_partition(
     Ok(groups)
 }
 
-fn windows_of(
-    timestamps: &TimestampNanosecondArray,
-    window: Duration,
-) -> impl Iterator<Item = Option<Window>> {
+fn windows_of<'a>(
+    timestamps: &'a TimestampNanosecondArray,
+    window: &'a WindowSchedule,
+) -> impl Iterator<Item = Option<Window>> + 'a {
     timestamps
         .values()
         .iter()
-        .map(move |v| Window::containing(Timestamp::from_nanos(*v), window))
+        .map(move |v| window.containing(Timestamp::from_nanos(*v)))
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, StringArray};
+    use std::time::Duration;
     use tessera_format::ParquetFormat;
     use tessera_object::MemoryStore;
     use tessera_types::event::BODY;
@@ -183,6 +187,68 @@ mod tests {
 
     fn batch(dataset: &str, rows: &[LogRow]) -> EventBatch {
         EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new(dataset).unwrap(), rows).unwrap()
+    }
+
+    /// MF-2: rows before a window change keep the old length and rows
+    /// from it on take the new one; another dataset keeps its own.
+    #[tokio::test]
+    async fn rows_are_placed_by_their_datasets_window_schedule() {
+        let store = MemoryStore::new();
+        let env = Env::simulated(1, Timestamp::UNIX_EPOCH);
+        let mut schedule = WindowSchedule::of(FIVE_MINUTES);
+        assert!(schedule.set(
+            Duration::from_secs(60),
+            Timestamp::from_nanos(400 * 1_000_000_000),
+        ));
+        assert_eq!(
+            schedule.changes().last().unwrap().from,
+            Timestamp::from_nanos(600 * 1_000_000_000)
+        );
+        let mut windows = Windows::from(Window::DEFAULT_LENGTH);
+        windows.insert(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            schedule,
+        );
+        let batches = vec![
+            batch(
+                "prod",
+                &[log(10, "a"), log(599, "b"), log(600, "c"), log(700, "d")],
+            ),
+            batch("staging", &[log(700, "e")]),
+        ];
+        let files = write_l1_files(
+            &target(&store),
+            &env,
+            WriterId::from_u128(5),
+            Seq::new(1),
+            Seq::new(2),
+            &windows,
+            batches,
+        )
+        .await
+        .unwrap();
+        let mut placed: Vec<(String, i64, u64)> = files
+            .iter()
+            .map(|f| {
+                (
+                    f.partition.dataset.as_str().to_owned(),
+                    f.partition.window.start().as_nanos() / 1_000_000_000,
+                    f.partition.window.length().as_secs(),
+                )
+            })
+            .collect();
+        placed.sort();
+        assert_eq!(
+            placed,
+            vec![
+                ("prod".to_owned(), 0, 300),
+                ("prod".to_owned(), 300, 300),
+                ("prod".to_owned(), 600, 60),
+                ("prod".to_owned(), 660, 60),
+                ("staging".to_owned(), 0, 86_400),
+            ]
+        );
     }
 
     #[tokio::test]

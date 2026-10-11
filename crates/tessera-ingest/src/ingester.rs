@@ -25,9 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_format::FileFormat;
-use tessera_manifest::registry;
+use tessera_manifest::{DatasetLogs, registry};
 use tessera_object::ObjectStore;
-use tessera_types::{DatasetName, Env, EventBatch, PoolId, Seq, TenantId, Timestamp, Window};
+use tessera_types::{DatasetName, Env, EventBatch, PoolId, Seq, TenantId, Timestamp};
 use tessera_wal::{EntryBody, FlushTarget, WalError, WriterLog, write_l1_files};
 use tokio::sync::oneshot;
 
@@ -42,8 +42,6 @@ pub struct IngestConfig {
     pub flush_bytes: usize,
     /// The age of a dataset's oldest unflushed row that triggers a flush.
     pub flush_age: Duration,
-    /// The partition window length (MF-1).
-    pub window: Duration,
     /// How long a writer log is used before a new one is started (ST-8).
     pub max_log_age: Duration,
     /// How many entries a writer log holds before a new one is started
@@ -62,7 +60,6 @@ impl Default for IngestConfig {
             segment_bytes: 8 << 20,
             flush_bytes: 64 << 20,
             flush_age: Duration::from_secs(120),
-            window: Window::DEFAULT_LENGTH,
             max_log_age: Duration::from_secs(3600),
             max_log_entries: 1_000_000,
             writers: 1,
@@ -91,6 +88,9 @@ pub enum IngestError {
     /// The registry failed.
     #[error(transparent)]
     Registry(#[from] tessera_manifest::ManifestError),
+    /// The dataset log could not be read.
+    #[error(transparent)]
+    Dataset(#[from] tessera_manifest::DatasetLogError),
 }
 
 /// A pending acknowledgement: resolves to the segment position once the
@@ -144,6 +144,8 @@ pub struct Ingester {
     config: IngestConfig,
     log: WriterLog,
     target: FlushTarget,
+    /// The dataset logs, for each dataset's partition windows (MF-2).
+    datasets: DatasetLogs,
     registered: BTreeSet<(TenantId, DatasetName)>,
     pending: Vec<(EventBatch, oneshot::Sender<Result<Seq, IngestError>>)>,
     pending_bytes: usize,
@@ -171,12 +173,14 @@ impl Ingester {
             format,
         };
         let log_started = env.clock.now();
+        let datasets = DatasetLogs::new(Arc::clone(&store), env.clone());
         Ingester {
             store,
             env,
             config,
             log,
             target,
+            datasets,
             registered: BTreeSet::new(),
             pending: Vec::new(),
             pending_bytes: 0,
@@ -464,13 +468,14 @@ impl Ingester {
             .max()
             .unwrap_or(after);
         let batches: Vec<EventBatch> = memtable.rows.iter().map(|(_, b)| b.clone()).collect();
+        let windows = self.datasets.open(&key.0, &key.1).window().await?;
         let files = write_l1_files(
             &self.target,
             &self.env,
             self.log.writer_id(),
             after,
             through,
-            self.config.window,
+            windows,
             batches,
         )
         .await?;
@@ -512,6 +517,7 @@ mod tests {
     use tessera_format::ParquetFormat;
     use tessera_manifest::{intake, view};
     use tessera_object::{FaultPolicy, FaultyStore, LostResponseStore, MemoryStore, Pools, layout};
+    use tessera_types::Window;
     use tessera_types::event::EVENT_ID;
     use tessera_types::{
         Clock, Keys, Kind, LogRow, ManualClock, NodeId, SeededRandom, SharedRandom,
@@ -615,7 +621,6 @@ mod tests {
             segment_bytes: 1 << 30,
             flush_bytes: 1 << 30,
             flush_age: Duration::from_secs(120),
-            window: Window::DEFAULT_LENGTH,
             max_log_age: Duration::from_secs(3600),
             max_log_entries: 1_000_000,
             writers: 1,

@@ -3,6 +3,7 @@
 //! Partitions (spec section 6.6): one tenant, dataset, kind and event-time
 //! window. The unit of manifest, compaction and retention.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -135,12 +136,229 @@ impl fmt::Display for PartitionId {
     }
 }
 
+/// One change of a dataset's partition window (MF-2): the length in
+/// force from `from` on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct WindowChange {
+    /// When the length takes effect.
+    pub from: Timestamp,
+    /// The window length from then on.
+    pub length: Duration,
+}
+
+/// A dataset's partition windows over time (MF-2): the window length in
+/// force at every instant, so that a timestamp maps to its partition by
+/// the dataset log alone. A change applies from the end of the window
+/// in force when it is made, so that the partitions that have started
+/// keep their window; the windows of each length are aligned to the
+/// epoch as [`Window::containing`] places them.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct WindowSchedule {
+    /// The changes, by `from`; the first from the beginning of time.
+    changes: Vec<WindowChange>,
+}
+
+impl WindowSchedule {
+    /// One length for all time.
+    #[must_use]
+    pub fn of(length: Duration) -> Self {
+        WindowSchedule {
+            changes: vec![WindowChange {
+                from: Timestamp::MIN,
+                length,
+            }],
+        }
+    }
+
+    /// The changes, in order of effect.
+    #[must_use]
+    pub fn changes(&self) -> &[WindowChange] {
+        &self.changes
+    }
+
+    /// The length in force at `at`.
+    #[must_use]
+    pub fn length_at(&self, at: Timestamp) -> Duration {
+        self.changes
+            .iter()
+            .rev()
+            .find(|c| c.from <= at)
+            .map_or(Window::DEFAULT_LENGTH, |c| c.length)
+    }
+
+    /// The length the schedule ends in: what windows not started yet
+    /// will have.
+    #[must_use]
+    pub fn latest(&self) -> Duration {
+        self.changes
+            .last()
+            .map_or(Window::DEFAULT_LENGTH, |c| c.length)
+    }
+
+    /// The window that contains `at`, or `None` before the epoch.
+    #[must_use]
+    pub fn containing(&self, at: Timestamp) -> Option<Window> {
+        Window::containing(at, self.length_at(at))
+    }
+
+    /// Schedules `length` for the windows that have not started by
+    /// `now`: from the end of the window containing `now`, a change
+    /// still pending after `now` replaced. Returns whether the schedule
+    /// changed: not when it already ended in `length`.
+    pub fn set(&mut self, length: Duration, now: Timestamp) -> bool {
+        if self.latest() == length {
+            return false;
+        }
+        let in_force = self.length_at(now);
+        self.changes.retain(|c| c.from <= now);
+        if self.latest() != length {
+            let from = Window::containing(now, in_force).map_or(Timestamp::UNIX_EPOCH, Window::end);
+            self.changes.push(WindowChange { from, length });
+        }
+        true
+    }
+}
+
+impl Default for WindowSchedule {
+    fn default() -> Self {
+        WindowSchedule::of(Window::DEFAULT_LENGTH)
+    }
+}
+
+impl From<Duration> for WindowSchedule {
+    fn from(length: Duration) -> Self {
+        WindowSchedule::of(length)
+    }
+}
+
+/// The window schedules of several datasets, with a default for the
+/// ones not named: what places the rows of a writer log, which may
+/// hold several datasets, in their partitions.
+#[derive(Clone, Debug, Default)]
+pub struct Windows {
+    by_dataset: BTreeMap<(TenantId, DatasetName), WindowSchedule>,
+    default: WindowSchedule,
+}
+
+impl Windows {
+    /// Schedules with `default` for every dataset not named.
+    #[must_use]
+    pub fn new(default: WindowSchedule) -> Self {
+        Windows {
+            by_dataset: BTreeMap::new(),
+            default,
+        }
+    }
+
+    /// Names `dataset`'s schedule.
+    pub fn insert(&mut self, tenant: TenantId, dataset: DatasetName, schedule: WindowSchedule) {
+        self.by_dataset.insert((tenant, dataset), schedule);
+    }
+
+    /// The schedule of `dataset`.
+    #[must_use]
+    pub fn schedule_for(&self, tenant: &TenantId, dataset: &DatasetName) -> &WindowSchedule {
+        self.by_dataset
+            .get(&(tenant.clone(), dataset.clone()))
+            .unwrap_or(&self.default)
+    }
+}
+
+impl From<Duration> for Windows {
+    fn from(length: Duration) -> Self {
+        Windows::new(WindowSchedule::of(length))
+    }
+}
+
+impl From<WindowSchedule> for Windows {
+    fn from(schedule: WindowSchedule) -> Self {
+        Windows::new(schedule)
+    }
+}
+
+impl From<&Windows> for Windows {
+    fn from(windows: &Windows) -> Self {
+        windows.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn at(seconds: i64) -> Timestamp {
         Timestamp::from_nanos(seconds * NANOS_PER_SECOND)
+    }
+
+    /// MF-2: a change takes effect at the end of the window in force,
+    /// earlier windows keep their length, and a pending change gives
+    /// way to a newer one.
+    #[test]
+    fn a_schedule_changes_the_window_from_the_next_boundary() {
+        let hour = Duration::from_secs(3_600);
+        let mut schedule = WindowSchedule::default();
+        assert_eq!(schedule.length_at(at(100_000)), Window::DEFAULT_LENGTH);
+        assert!(!schedule.set(Window::DEFAULT_LENGTH, at(100_000)));
+        assert!(schedule.set(hour, at(100_000)));
+        let change = *schedule.changes().last().unwrap();
+        assert_eq!(
+            change.from,
+            at(172_800),
+            "the end of the day containing now"
+        );
+        assert!(
+            !schedule.set(hour, at(100_100)),
+            "asking again changes nothing"
+        );
+        assert_eq!(schedule.length_at(at(172_799)), Window::DEFAULT_LENGTH);
+        assert_eq!(schedule.length_at(at(172_800)), hour);
+        assert_eq!(schedule.latest(), hour);
+        assert_eq!(
+            schedule.containing(at(100_000)),
+            Window::containing(at(100_000), Window::DEFAULT_LENGTH)
+        );
+        assert_eq!(
+            schedule.containing(at(180_000)),
+            Window::containing(at(180_000), hour)
+        );
+        // Changing one's mind before the change took effect replaces it,
+        // and going back to the length in force drops it.
+        let minutes = Duration::from_secs(300);
+        assert!(schedule.set(minutes, at(100_500)));
+        assert_eq!(schedule.changes().last().unwrap().from, at(172_800));
+        assert_eq!(schedule.changes().len(), 2);
+        assert_eq!(schedule.latest(), minutes);
+        assert!(schedule.set(Window::DEFAULT_LENGTH, at(100_600)));
+        assert_eq!(schedule.changes().len(), 1);
+        assert!(schedule.set(minutes, at(100_700)));
+        // Once in effect, a change stays and the next one follows it.
+        assert!(schedule.set(hour, at(172_900)));
+        let later = *schedule.changes().last().unwrap();
+        assert_eq!(later.from, at(173_100), "the end of the five-minute window");
+        assert_eq!(schedule.length_at(at(173_000)), minutes);
+        assert_eq!(schedule.length_at(at(173_100)), hour);
+        let json = serde_json::to_string(&schedule).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WindowSchedule>(&json).unwrap(),
+            schedule
+        );
+    }
+
+    #[test]
+    fn windows_name_each_datasets_schedule_and_default_the_rest() {
+        let hour = Duration::from_secs(3_600);
+        let mut windows = Windows::from(Window::DEFAULT_LENGTH);
+        let prod = DatasetName::new("prod").unwrap();
+        windows.insert(TenantId::DEFAULT, prod.clone(), WindowSchedule::of(hour));
+        assert_eq!(
+            windows.schedule_for(&TenantId::DEFAULT, &prod).latest(),
+            hour
+        );
+        let other = DatasetName::new("other").unwrap();
+        assert_eq!(
+            windows.schedule_for(&TenantId::DEFAULT, &other).latest(),
+            Window::DEFAULT_LENGTH
+        );
     }
 
     #[test]

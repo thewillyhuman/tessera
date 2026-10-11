@@ -167,9 +167,10 @@ impl ObjectStore for FaultyStore {
 }
 
 /// A store that applies every write under one key prefix but reports it
-/// as failed, and whose reads fail while it is blind. This is the worst
-/// case for a writer: a write that landed with no way to find out. For
-/// tests of lost-response handling.
+/// as failed, and whose reads under that prefix fail while it is blind.
+/// This is the worst case for a writer: a write that landed with no way
+/// to find out, while the rest of the store answers. For tests of
+/// lost-response handling.
 pub struct LostResponseStore {
     inner: Arc<dyn ObjectStore>,
     lie_under: Key,
@@ -187,13 +188,19 @@ impl LostResponseStore {
         }
     }
 
-    /// Makes reads fail (`true`) or succeed (`false`).
+    /// Makes reads under the lied-about prefix fail (`true`) or succeed
+    /// (`false`).
     pub fn set_blind(&self, blind: bool) {
         self.blind.store(blind, Ordering::Relaxed);
     }
 
     fn blind(&self) -> bool {
         self.blind.load(Ordering::Relaxed)
+    }
+
+    /// Whether a read of `key` fails right now.
+    fn blind_to(&self, key: &Key) -> bool {
+        self.blind() && key.is_under(&self.lie_under)
     }
 
     fn lost(key: &Key) -> ObjectError {
@@ -225,21 +232,21 @@ impl std::fmt::Debug for LostResponseStore {
 #[async_trait]
 impl ObjectStore for LostResponseStore {
     async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
-        if self.blind() {
+        if self.blind_to(key) {
             return Err(Self::lost(key));
         }
         self.inner.get(key).await
     }
 
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
-        if self.blind() {
+        if self.blind_to(key) {
             return Err(Self::lost(key));
         }
         self.inner.get_range(key, range).await
     }
 
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
-        if self.blind() {
+        if self.blind_to(key) {
             return Err(Self::lost(key));
         }
         self.inner.head(key).await
@@ -256,7 +263,7 @@ impl ObjectStore for LostResponseStore {
     }
 
     fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
-        if self.blind() {
+        if self.blind_to(prefix) || (self.blind() && self.lie_under.is_under(prefix)) {
             let error = Self::lost(prefix);
             return stream::once(async move { Err(error) }).boxed();
         }

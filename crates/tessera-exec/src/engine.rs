@@ -31,7 +31,7 @@ use tessera_kernels::promql::Params;
 use tessera_manifest::{DatasetLogs, ManifestError, Manifests, View, view};
 use tessera_object::{PoolError, Pools};
 use tessera_types::event::{OBSERVED_TIMESTAMP, TRACE_ID};
-use tessera_types::{DatasetName, Env, Kind, TenantId, TimeRange, Timestamp, Window};
+use tessera_types::{DatasetName, Env, Kind, TenantId, TimeRange, Timestamp, WindowSchedule};
 
 use crate::ExecError;
 use crate::batch::Batch;
@@ -179,7 +179,6 @@ pub struct Engine {
     pub(crate) pools: Arc<Pools>,
     pub(crate) format: Arc<dyn FileFormat>,
     pub(crate) cpu: Arc<CpuPool>,
-    pub(crate) partition_window: Duration,
     pub(crate) peers: Option<(Arc<dyn Peers>, Arc<dyn RemoteScan>)>,
     /// Where the `system` tables' rows come from.
     system_tables: Option<Arc<dyn SystemTables>>,
@@ -222,7 +221,6 @@ impl Engine {
             pools,
             format,
             cpu,
-            partition_window: Window::DEFAULT_LENGTH,
             peers: None,
             system_tables: None,
             rollups: None,
@@ -406,11 +404,21 @@ impl Engine {
             tenant,
             dataset,
             kind,
-            self.partition_window,
+            self.window_schedule(tenant, dataset).await?,
             range,
         )
         .await?;
         Ok(view::read_sources(&self.pools, &self.format, found).await?)
+    }
+
+    /// The partition windows of `dataset` over time (MF-2), from its
+    /// dataset log.
+    pub(crate) async fn window_schedule(
+        &self,
+        tenant: &TenantId,
+        dataset: &DatasetName,
+    ) -> Result<WindowSchedule, EngineError> {
+        Ok(self.datasets.open(tenant, dataset).window().await?)
     }
 
     /// The node's default limits on a query.

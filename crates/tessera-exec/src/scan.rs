@@ -220,7 +220,7 @@ pub(crate) async fn split(
         &scan.tenant,
         &scan.dataset,
         scan.kind,
-        engine.partition_window,
+        engine.window_schedule(&scan.tenant, &scan.dataset).await?,
         scan.time_range,
     )
     .await?;

@@ -21,7 +21,8 @@ use std::time::Duration;
 use tessera_manifest::{Manifest, list_partitions};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::{
-    DatasetName, Env, FileId, Kind, Seq, TenantId, TimeRange, Timestamp, WriterId,
+    DatasetName, Env, FileId, Kind, Seq, TenantId, TimeRange, Timestamp, WindowSchedule, Windows,
+    WriterId,
 };
 use tessera_wal::{BlockMeta, EntryBody, reader};
 
@@ -137,10 +138,10 @@ pub async fn collect_log(
     writer: WriterId,
     now: Timestamp,
     grace: Duration,
-    window: Duration,
+    windows: impl Into<Windows>,
     checkpoints: &Checkpoints,
 ) -> Result<LogCollection, CompactError> {
-    let mut positions = Positions::new(Arc::clone(store), env.clone(), window);
+    let mut positions = Positions::new(Arc::clone(store), env.clone(), windows.into());
     let seqs = reader::list(&**store, writer).await?;
     let mut collection = LogCollection::default();
     let mut deletable: Vec<Seq> = Vec::new();
@@ -187,17 +188,17 @@ pub async fn collect_log(
 struct Positions {
     store: Arc<dyn ObjectStore>,
     env: Env,
-    window: Duration,
+    windows: Windows,
     partitions: BTreeMap<(TenantId, DatasetName, Kind), Vec<tessera_types::PartitionId>>,
     by_partition: BTreeMap<tessera_types::PartitionId, BTreeMap<WriterId, Seq>>,
 }
 
 impl Positions {
-    fn new(store: Arc<dyn ObjectStore>, env: Env, window: Duration) -> Self {
+    fn new(store: Arc<dyn ObjectStore>, env: Env, windows: Windows) -> Self {
         Positions {
             store,
             env,
-            window,
+            windows,
             partitions: BTreeMap::new(),
             by_partition: BTreeMap::new(),
         }
@@ -234,7 +235,8 @@ impl Positions {
                 })
                 .cloned()
                 .collect();
-            if !self.covers_every_window(&touched, range) {
+            let schedule = self.windows.schedule_for(&block.tenant, &block.dataset);
+            if !covers_every_window(schedule, &touched, range) {
                 return Ok(false);
             }
             for partition in touched {
@@ -259,32 +261,32 @@ impl Positions {
         }
         Ok(true)
     }
+}
 
-    /// Whether `partitions` include a manifest for every window of
-    /// `range` the block's rows could lie in. Blocks older than the
-    /// event-time bounds field read as the open range and fail this
-    /// test, which keeps them until their log is ended and fully adopted
-    /// by other means.
-    fn covers_every_window(
-        &self,
-        partitions: &[tessera_types::PartitionId],
-        range: TimeRange,
-    ) -> bool {
-        if range.start == Timestamp::MIN || range.end == Timestamp::MAX {
+/// Whether `partitions` include a manifest for every window of `range`
+/// the block's rows could lie in under `schedule`. Blocks older than
+/// the event-time bounds field read as the open range and fail this
+/// test, which keeps them until their log is ended and fully adopted by
+/// other means.
+fn covers_every_window(
+    schedule: &WindowSchedule,
+    partitions: &[tessera_types::PartitionId],
+    range: TimeRange,
+) -> bool {
+    if range.start == Timestamp::MIN || range.end == Timestamp::MAX {
+        return false;
+    }
+    let mut at = range.start;
+    loop {
+        let Some(window) = schedule.containing(at) else {
+            return false;
+        };
+        if !partitions.iter().any(|p| p.window == window) {
             return false;
         }
-        let mut at = range.start;
-        loop {
-            let Some(window) = tessera_types::Window::containing(at, self.window) else {
-                return false;
-            };
-            if !partitions.iter().any(|p| p.window == window) {
-                return false;
-            }
-            if window.end() >= range.end {
-                return true;
-            }
-            at = window.end();
+        if window.end() >= range.end {
+            return true;
         }
+        at = window.end();
     }
 }

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tessera_commit::{Action, CommitError, CommitLog, KvMutation, KvState, UpdateError};
 use tessera_format::{IndexSpec, Layout};
 use tessera_object::{ObjectStore, layout};
-use tessera_types::{DatasetName, Env, Kind, TenantId, Timestamp, Window};
+use tessera_types::{DatasetName, Env, Kind, TenantId, Timestamp, WindowSchedule};
 
 /// The layout of one kind of event in a dataset, as the dataset log
 /// records it.
@@ -135,6 +135,7 @@ impl From<UpdateError<DatasetLogError>> for DatasetLogError {
 /// The log of one dataset.
 pub struct DatasetLog {
     log: CommitLog<KvState>,
+    clock: Arc<dyn tessera_types::Clock>,
 }
 
 fn layout_key(kind: Kind) -> String {
@@ -146,6 +147,7 @@ fn advice_key(kind: Kind) -> String {
 }
 
 const WINDOW_KEY: &str = "window_seconds";
+const WINDOW_SCHEDULE_KEY: &str = "window_schedule";
 
 fn tombstones_key(kind: Kind) -> String {
     format!("tombstones/{kind}")
@@ -186,6 +188,23 @@ fn put<T: Serialize>(key: String, value: &T) -> Action {
     })
 }
 
+/// The window schedule `state` holds: the schedule key, else the one
+/// length an older release wrote, else the default.
+fn window_schedule(state: &KvState) -> WindowSchedule {
+    if let Some(schedule) = state
+        .get(WINDOW_SCHEDULE_KEY)
+        .and_then(|s| serde_json::from_str(s).ok())
+    {
+        return schedule;
+    }
+    state
+        .get(WINDOW_KEY)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or_else(WindowSchedule::default, |secs| {
+            WindowSchedule::of(Duration::from_secs(secs))
+        })
+}
+
 impl DatasetLog {
     /// The log of `dataset` in `store`.
     #[must_use]
@@ -196,6 +215,7 @@ impl DatasetLog {
         env: Env,
     ) -> Self {
         DatasetLog {
+            clock: Arc::clone(&env.clock),
             log: CommitLog::new(store, layout::dataset_log(tenant, dataset), env),
         }
     }
@@ -353,32 +373,38 @@ impl DatasetLog {
         Ok(removed)
     }
 
-    /// The partition window of the dataset (MF-1, AD-14): the one set,
-    /// else the default.
+    /// The partition windows of the dataset over time (MF-1, MF-2,
+    /// AD-14): the schedule set, else one length for all time, the
+    /// one an older release set or the default.
     ///
     /// # Errors
     ///
     /// If the log cannot be read.
-    pub async fn window(&self) -> Result<Duration, DatasetLogError> {
+    pub async fn window(&self) -> Result<WindowSchedule, DatasetLogError> {
         let snapshot = self.log.snapshot().await?;
-        Ok(snapshot
-            .state()
-            .get(WINDOW_KEY)
-            .and_then(|s| s.parse::<u64>().ok())
-            .map_or(Window::DEFAULT_LENGTH, Duration::from_secs))
+        Ok(window_schedule(snapshot.state()))
     }
 
-    /// Sets the partition window for partitions not yet created.
+    /// Schedules `window` for the partitions whose window has not
+    /// started: from the end of the window in force now (MF-2).
+    /// Nothing is written when the schedule already ends in `window`.
     ///
     /// # Errors
     ///
     /// If the log cannot be committed.
     pub async fn set_window(&self, window: Duration) -> Result<(), DatasetLogError> {
+        let now = self.clock.now();
         self.log
-            .update(|_| {
-                Ok::<_, DatasetLogError>(vec![Action::Kv(KvMutation::Put {
-                    key: WINDOW_KEY.to_owned(),
-                    value: window.as_secs().to_string(),
+            .update(|state| {
+                let mut schedule = window_schedule(state);
+                if !schedule.set(window, now) {
+                    return Ok::<_, DatasetLogError>(Vec::new());
+                }
+                let value = serde_json::to_string(&schedule)
+                    .unwrap_or_else(|e| unreachable!("a schedule is JSON: {e}"));
+                Ok(vec![Action::Kv(KvMutation::Put {
+                    key: WINDOW_SCHEDULE_KEY.to_owned(),
+                    value,
                 })])
             })
             .await?;
@@ -495,6 +521,7 @@ impl DatasetLogs {
 
 #[cfg(test)]
 mod tests {
+    use tessera_types::Window;
     #[test]
     fn idle_logs_are_released_and_reopened_on_use() {
         use std::sync::Arc;
@@ -607,9 +634,42 @@ mod tests {
     #[tokio::test]
     async fn the_window_and_the_advice_are_kept() {
         let log = log();
-        assert_eq!(log.window().await.unwrap(), Window::DEFAULT_LENGTH);
+        assert_eq!(log.window().await.unwrap(), WindowSchedule::default());
         log.set_window(Duration::from_secs(3_600)).await.unwrap();
-        assert_eq!(log.window().await.unwrap(), Duration::from_secs(3_600));
+        // MF-2: the change waits for the end of the day in force; a
+        // repeat of it writes nothing.
+        let schedule = log.window().await.unwrap();
+        assert_eq!(schedule.latest(), Duration::from_secs(3_600));
+        assert_eq!(
+            schedule.length_at(Timestamp::UNIX_EPOCH),
+            Window::DEFAULT_LENGTH
+        );
+        assert_eq!(
+            schedule.changes()[1].from,
+            Timestamp::from_nanos(86_400 * 1_000_000_000)
+        );
+        let version = log.log.snapshot().await.unwrap().version();
+        log.set_window(Duration::from_secs(3_600)).await.unwrap();
+        assert_eq!(log.log.snapshot().await.unwrap().version(), version);
+        // A log an older release wrote with one length reads as one.
+        log.log
+            .update(|_| {
+                Ok::<_, DatasetLogError>(vec![
+                    Action::Kv(KvMutation::Delete {
+                        key: WINDOW_SCHEDULE_KEY.to_owned(),
+                    }),
+                    Action::Kv(KvMutation::Put {
+                        key: WINDOW_KEY.to_owned(),
+                        value: "600".to_owned(),
+                    }),
+                ])
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            log.window().await.unwrap(),
+            WindowSchedule::of(Duration::from_secs(600))
+        );
         assert!(log.advice(Kind::Log).await.unwrap().is_none());
         assert!(log.value_score(Kind::Log).await.unwrap().is_none());
         log.set_value_score(Kind::Log, 0.25).await.unwrap();

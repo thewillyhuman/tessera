@@ -29,8 +29,15 @@ ingester with linger, memtable, flush and log rotation; a simulation
 scenario that checks the view invariant (VW-1) under faults, crashes
 and duplicate owners.
 
-Gaps left in M1: the partition window is the default day for every
-dataset, whatever its dataset log says (MF-2); attributes live in the
+A dataset's partition window is a schedule in its dataset log
+(MF-2): the length in force at every instant, which the advisor
+changes for the windows that have not started, from the end of the
+window in force, so that partitions keep the window they were created
+with and a timestamp maps to its partition by the log alone; flushes,
+recovery, the tail of a query and log collection all place rows by
+it.
+
+Gaps left in M1: attributes live in the
 `_overflow` JSON column until column promotion arrives (M8); dead
 writers are detected by a quiet-time heuristic (membership shortens it
 since M6). OTLP over gRPC and authentication arrived with M10.

@@ -16,7 +16,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::array::{BooleanArray, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
@@ -26,7 +25,7 @@ use tessera_object::{Pools, layout};
 use tessera_types::event::TIMESTAMP;
 use tessera_types::{
     DatasetName, Env, FileMeta, Kind, PartitionId, Seq, TenantId, TimeRange, Timestamp, Version,
-    Window, WriterId,
+    Window, WindowSchedule, WriterId,
 };
 use tessera_wal::{EntryBody, reader};
 
@@ -90,7 +89,7 @@ pub struct Sources {
 
 /// Lists the files and reads the tail rows of one dataset and kind for
 /// the partitions whose window overlaps `time_range` (pruning stage 1).
-/// `window` is the dataset's partition window length, used to place
+/// `window` is the dataset's window schedule (MF-2), used to place
 /// tail rows in partitions.
 ///
 /// # Errors
@@ -101,9 +100,10 @@ pub async fn sources(
     tenant: &TenantId,
     dataset: &DatasetName,
     kind: Kind,
-    window: Duration,
+    window: impl Into<WindowSchedule>,
     time_range: TimeRange,
 ) -> Result<Sources, ManifestError> {
+    let window = window.into();
     let root = manifests.store();
     let writers = registry::list(&**root, tenant, dataset).await?;
     let mut sources = ViewSources::default();
@@ -160,7 +160,7 @@ pub async fn sources(
                         .copied()
                         .unwrap_or(Seq::ZERO)
                 };
-                if let Some(rows) = beyond_position(batch.rows(), entry.seq(), window, position)? {
+                if let Some(rows) = beyond_position(batch.rows(), entry.seq(), &window, position)? {
                     tail.push(rows);
                 }
             }
@@ -175,7 +175,7 @@ pub async fn sources(
 }
 
 /// Reads the rows of one dataset and kind. `window` is the dataset's
-/// partition window length, used to place tail rows in partitions.
+/// window schedule (MF-2), used to place tail rows in partitions.
 ///
 /// # Errors
 ///
@@ -187,7 +187,7 @@ pub async fn read(
     tenant: &TenantId,
     dataset: &DatasetName,
     kind: Kind,
-    window: Duration,
+    window: impl Into<WindowSchedule>,
 ) -> Result<View, ManifestError> {
     let manifests = Manifests::new(Arc::clone(pools.root().store()), env.clone(), 1);
     let found = sources(&manifests, tenant, dataset, kind, window, TimeRange::ALL).await?;
@@ -247,7 +247,7 @@ async fn read_file(
 fn beyond_position(
     rows: &RecordBatch,
     seq: Seq,
-    window: Duration,
+    window: &WindowSchedule,
     position: impl Fn(Window) -> Seq,
 ) -> Result<Option<RecordBatch>, ManifestError> {
     let timestamps = rows
@@ -261,7 +261,8 @@ fn beyond_position(
         .values()
         .iter()
         .map(|v| {
-            let adopted = Window::containing(Timestamp::from_nanos(*v), window)
+            let adopted = window
+                .containing(Timestamp::from_nanos(*v))
                 .is_some_and(|w| position(w) >= seq);
             Some(!adopted)
         })
@@ -283,6 +284,7 @@ fn beyond_position(
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, FixedSizeBinaryArray};
+    use std::time::Duration;
     use tessera_format::ParquetFormat;
     use tessera_object::MemoryStore;
     use tessera_types::event::EVENT_ID;

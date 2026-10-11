@@ -16,10 +16,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::TryStreamExt;
-use tessera_types::{DatasetName, Env, EventBatch, Keys, Seq, TenantId, WriterId};
+use tessera_types::{DatasetName, Env, EventBatch, Keys, Seq, TenantId, Windows, WriterId};
 
 use crate::flush::{FlushTarget, write_l1_files};
 use crate::{Entry, EntryBody, WalError, WriterLog, reader};
@@ -55,8 +54,9 @@ pub async fn recover(
     target: &FlushTarget,
     env: &Env,
     writer: WriterId,
-    window: Duration,
+    windows: impl Into<Windows>,
 ) -> Result<Recovery, WalError> {
+    let windows = windows.into();
     let store = &target.store;
     let sealed_at = match seal(store, env, writer).await? {
         Sealed::At(seq) => seq,
@@ -74,7 +74,7 @@ pub async fn recover(
             writer,
             rows.after,
             rows.through,
-            window,
+            &windows,
             rows.batches,
         )
         .await?;
@@ -193,6 +193,7 @@ async fn unflushed(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use tessera_format::ParquetFormat;
     use tessera_object::{MemoryStore, ObjectStore};
     use tessera_types::{DatasetName, LogRow, NodeId, PoolId, Timestamp};

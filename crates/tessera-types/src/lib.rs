@@ -34,7 +34,7 @@ pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
 pub use keys::{KeyError, KeyPolicy, Keyring, Keys, NamedKey, TenantKey};
 pub use kind::Kind;
-pub use partition::{InvalidWindow, PartitionId, Window};
+pub use partition::{InvalidWindow, PartitionId, Window, WindowChange, WindowSchedule, Windows};
 pub use position::{Epoch, Seq, Version};
 pub use random::{ForkedRandom, OsRandom, Random, SeededRandom, SharedRandom, mutated};
 pub use redaction::{Redaction, RedactionAction};

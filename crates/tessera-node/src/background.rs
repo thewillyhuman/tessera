@@ -34,7 +34,7 @@ use tessera_manifest::{
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
     DatasetName, Env, Held, Kind, Level, Meter, PartitionId, PoolId, RetentionPolicy, TenantId,
-    Timestamp, Window, WorkKind, WriterId,
+    Timestamp, Windows, WorkKind, WriterId,
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
@@ -247,8 +247,8 @@ async fn round(
                     pool: background.pool.clone(),
                     format: Arc::clone(&background.format),
                 };
-                let recovered =
-                    recover(&target, &background.env, writer, Window::DEFAULT_LENGTH).await?;
+                let windows = windows_of(background, std::slice::from_ref(tenant)).await?;
+                let recovered = recover(&target, &background.env, writer, windows).await?;
                 backlog.recoveries += 1;
                 tracing::info!(%tenant, %dataset, %writer, ?recovered, "recovery");
             }
@@ -503,11 +503,33 @@ fn held_of(partition: &PartitionId, state: &ManifestState) -> Held {
     }
 }
 
+/// The partition windows of every dataset of `tenants` (MF-2), from
+/// their dataset logs: what places the rows of a writer log in
+/// partitions.
+async fn windows_of(background: &Background, tenants: &[TenantId]) -> Result<Windows, Failure> {
+    let mut windows = Windows::default();
+    for tenant in tenants {
+        for dataset in registry::datasets(&*background.store, tenant).await? {
+            let schedule = background.datasets.open(tenant, &dataset).window().await?;
+            windows.insert(tenant.clone(), dataset, schedule);
+        }
+    }
+    Ok(windows)
+}
+
 /// Collects adopted segments of every writer log in the store that
 /// every rule group has read past (GC-2).
 async fn collect_logs(background: &Background) -> Result<(), Failure> {
     let now = background.env.clock.now();
     let checkpoints = checkpoints(background).await?;
+    let tenants: Vec<TenantId> = background
+        .catalog
+        .cached()
+        .state()
+        .tenants()
+        .map(|t| t.id.clone())
+        .collect();
+    let windows = windows_of(background, &tenants).await?;
     for writer in reader::writers(&*background.store).await? {
         if !background
             .owned
@@ -521,7 +543,7 @@ async fn collect_logs(background: &Background) -> Result<(), Failure> {
             writer,
             now,
             DEFAULT_SEGMENT_GRACE,
-            Window::DEFAULT_LENGTH,
+            &windows,
             &checkpoints,
         )
         .await?;
