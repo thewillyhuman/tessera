@@ -313,8 +313,17 @@ its common name who it is; a client presenting none still connects and
 needs a key or a token. Certificates authenticate the HTTP API; the
 `PostgreSQL` protocol takes keys as passwords (SE-1).
 
+A node given `--keyring`, a file of `name = <64 hex digits>` lines,
+seals the data of every tenant whose `encryption_key` setting names
+one of its keys: writer-log blocks under AES-256-GCM, files with
+Parquet modular encryption, sidecar indexes whole. Each names its
+key, so a tenant moved to a new key keeps reading what the old one
+sealed while that key stays in the keyring, and a tenant naming a key
+the node lacks is refused rather than stored plain (SE-2, SE-3). Key
+material never enters the object store; the catalog holds names only.
+
 Gaps left in M10: no
-row-filter roles (SE-1); no per-tenant encryption keys (SE-2); no Iceberg
+row-filter roles (SE-1); no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a
 cluster, and the binary is not statically linked; membership still comes from the registry alone, not

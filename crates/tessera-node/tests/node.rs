@@ -241,6 +241,122 @@ async fn client_certificates_authenticate_over_mutual_tls() {
     node.stop().await;
 }
 
+/// SE-2: with a keyring, a tenant whose setting names a key has its
+/// writer-log blocks sealed and its files encrypted at rest, any index
+/// sealed, and reads back as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyed_tenants_data_is_sealed_at_rest() {
+    use tessera_types::{Keyring, TenantKey};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.keyring = Keyring::default().with("k2025", TenantKey::from_bytes([5; 32]));
+    let node = Node::start(config, Env::system()).await.unwrap();
+    let base = format!("http://{}", node.http_address());
+    let (status, text) = common::post(
+        format!("{base}/api/v1/tenants"),
+        vec![],
+        serde_json::json!({ "name": "acme", "settings": { "encryption_key": "k2025" } }),
+    )
+    .await;
+    assert_eq!(status, 201, "{text}");
+    let created: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let id = created["id"].as_str().unwrap().to_owned();
+    let as_acme = vec![
+        ("x-scope-orgid".to_owned(), "acme".to_owned()),
+        ("x-tessera-dataset".to_owned(), "prod".to_owned()),
+    ];
+    let now = node.env().clock.now().as_nanos();
+    let values: Vec<serde_json::Value> = (0..20)
+        .map(|i| serde_json::json!([(now + i).to_string(), format!("confidential line {i}")]))
+        .collect();
+    let body = serde_json::json!({
+        "streams": [{ "stream": { "app": "web" }, "values": values }]
+    });
+    let (status, text) =
+        common::post(format!("{base}/loki/api/v1/push"), as_acme.clone(), body).await;
+    assert_eq!(status, 204, "{text}");
+    let query = |sql: &str| {
+        let url = format!("{base}/api/v1/query");
+        let headers = as_acme.clone();
+        let body = serde_json::json!({ "dataset": "prod", "query": sql });
+        async move {
+            let (status, text) = common::post(url, headers, body).await;
+            assert_eq!(status, 200, "{text}");
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        }
+    };
+    let answer = query("SELECT count(*) FROM logs").await;
+    assert_eq!(
+        answer["rows"][0][0], 20.0,
+        "read from the sealed tail: {answer}"
+    );
+    eventually("the rows reach a file", || {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let explain = query("EXPLAIN ANALYZE SELECT count(*) FROM logs").await;
+                !explain["explain"].as_str().unwrap().contains(", 0 read")
+            })
+        })
+    })
+    .await;
+    let answer = query("SELECT count(*) FROM logs WHERE body LIKE '%line 7%'").await;
+    assert_eq!(
+        answer["rows"][0][0], 1.0,
+        "read from encrypted files: {answer}"
+    );
+
+    let mut sealed_entries = 0;
+    let mut encrypted_files = 0;
+    for path in walkdir(dir.path()) {
+        let text = path.to_string_lossy().into_owned();
+        let bytes = std::fs::read(&path).unwrap();
+        let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+        let extension = path.extension().and_then(|e| e.to_str());
+        if text.contains("/_wal/")
+            && has("\"kind\":\"segment\"")
+            && has(&format!("\"tenant\":\"{id}\""))
+        {
+            assert!(
+                has("\"key\":\"k2025\""),
+                "{text}: a block of acme names its key"
+            );
+            assert!(
+                !has("confidential line"),
+                "{text}: a block of acme is sealed"
+            );
+            sealed_entries += 1;
+        }
+        if text.contains(&id) && extension == Some("parquet") {
+            assert!(bytes.ends_with(b"PARE"), "{text}: an encrypted footer");
+            encrypted_files += 1;
+        }
+        if text.contains(&id) && extension == Some("idx") {
+            assert!(bytes.starts_with(b"TSX1"), "{text}: a sealed sidecar");
+        }
+    }
+    assert!(sealed_entries > 0, "acme's segments were found");
+    assert!(encrypted_files > 0, "acme's files were found");
+    node.stop().await;
+}
+
+/// Every file under `root`, recursively.
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_refuses_to_start_beside_one_that_cannot_read_its_format() {
     use std::collections::BTreeSet;

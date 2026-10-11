@@ -21,6 +21,7 @@ mod retention;
 pub mod tls;
 
 pub use tessera_server::oidc::Oidc;
+pub use tessera_types::Keyring;
 pub use tls::Tls;
 
 use std::collections::BTreeSet;
@@ -43,7 +44,7 @@ use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
 use tessera_server::{
     AppState, Auth, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows,
 };
-use tessera_types::{Env, Meter, PoolId};
+use tessera_types::{Env, KeyPolicy, Keys, Meter, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -110,6 +111,11 @@ pub struct Config {
     /// The identity provider bearer tokens that are not API keys are
     /// checked against (SE-1); none refuses such tokens.
     pub oidc: Option<Oidc>,
+    /// The named tenant keys this node holds (SE-2); a tenant's
+    /// `encryption_key` setting names one, and its blocks and files are
+    /// sealed under it. Empty, every tenant is stored plain and one
+    /// naming a key is refused.
+    pub keyring: Keyring,
     /// How often the node writes its load signals to `_system.metrics`
     /// (section 14.7).
     pub metrics: Duration,
@@ -138,6 +144,7 @@ impl Config {
             cluster_secret: None,
             tls: None,
             oidc: None,
+            keyring: Keyring::default(),
             metrics: observe::DEFAULT_INTERVAL,
         }
     }
@@ -212,6 +219,11 @@ impl Node {
     /// If the data directory, the catalog or a listener cannot be opened.
     pub async fn start(config: Config, env: Env) -> Result<Node, RunError> {
         let (store, catalog, pool) = open(&config, &env).await?;
+        if !config.keyring.is_empty() {
+            tracing::info!(keys = ?config.keyring.names().collect::<Vec<_>>(), "keyring loaded");
+        }
+        let policy: Arc<dyn KeyPolicy> = catalog.clone();
+        let env = env.with_keys(Keys::new(config.keyring.clone(), policy));
         let mut loops = vec![tokio::spawn(keep_fresh(Arc::clone(&catalog)))];
 
         let format: Arc<dyn FileFormat> = Arc::new(

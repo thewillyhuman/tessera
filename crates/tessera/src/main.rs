@@ -66,6 +66,12 @@ struct RunArgs {
     /// those routes are open, which suits a private network only.
     #[arg(long, env = "TESSERA_CLUSTER_SECRET")]
     cluster_secret: Option<String>,
+    /// A file of named tenant keys, one `name = <64 hex digits>` per
+    /// line (SE-2). A tenant whose `encryption_key` setting names one
+    /// has its blocks and files sealed under it; keep the file out of
+    /// the data directory and the same on every node.
+    #[arg(long, env = "TESSERA_KEYRING")]
+    keyring: Option<PathBuf>,
     /// The PEM certificate chain the HTTP API and the `PostgreSQL`
     /// protocol serve TLS with (SE-3), with `--tls-key`. Without them
     /// connections are plain.
@@ -107,6 +113,15 @@ struct RunArgs {
     linger_ms: u64,
 }
 
+/// The keyring at `path`; none without a path.
+fn read_keyring(path: Option<&std::path::Path>) -> Result<tessera_node::Keyring, String> {
+    let Some(path) = path else {
+        return Ok(tessera_node::Keyring::default());
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    tessera_node::Keyring::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -120,6 +135,13 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Run(args) => {
+            let keyring = match read_keyring(args.keyring.as_deref()) {
+                Ok(keyring) => keyring,
+                Err(error) => {
+                    tracing::error!(error = %error, "cannot read the keyring");
+                    return ExitCode::FAILURE;
+                }
+            };
             tessera_node::run(tessera_node::Config {
                 listen: args.listen,
                 pg_listen: args.pg_listen,
@@ -149,6 +171,7 @@ async fn main() -> ExitCode {
                     linger: std::time::Duration::from_millis(args.linger_ms),
                     ..tessera_ingest::IngestConfig::default()
                 },
+                keyring,
                 ..tessera_node::Config::single_node(args.data_dir)
             })
             .await
