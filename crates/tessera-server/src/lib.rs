@@ -35,6 +35,7 @@ pub mod rollups;
 pub mod rules;
 pub mod system;
 pub mod tempo;
+mod volume;
 pub mod workload;
 
 use std::sync::Arc;
@@ -55,6 +56,7 @@ pub use metering::IngestMeter;
 pub use params::AckMode;
 pub use rollups::RollupEntries;
 pub use system::SystemTableRows;
+pub use volume::Volumes;
 
 /// What a node in a cluster adds: who else is there, how to reach
 /// them, and the limits every tenant runs under.
@@ -65,8 +67,12 @@ pub struct Cluster {
     pub remote: HttpRemote,
     /// Admission control.
     pub admission: Arc<Admission>,
-    /// How many ingesters a dataset's writes go to (IN-9).
+    /// The most ingesters a dataset's writes go to (IN-9); a dataset
+    /// gets one per sixteen megabytes a second of recent volume.
     pub preferred_ingesters: usize,
+    /// The recent volume of each dataset, which sizes its preferred
+    /// set (IN-9).
+    pub volumes: volume::Volumes,
 }
 
 /// What the handlers share.
@@ -141,10 +147,16 @@ impl AppState {
             .admission
             .admit_ingest(batch.tenant(), batch.rows().get_array_memory_size())?;
         let key = format!("{}/{}", batch.tenant(), batch.dataset());
+        let volume = cluster.volumes.observe(
+            batch.tenant(),
+            batch.dataset(),
+            batch.rows().get_array_memory_size(),
+            self.env.clock.now(),
+        );
         let preferred = cluster.membership.preferred(
             Role::Ingest,
             key.as_bytes(),
-            cluster.preferred_ingesters.max(1),
+            volume.preferred(cluster.preferred_ingesters),
         );
         let mine = preferred.is_empty() || preferred.iter().any(|n| n.node == self.env.node);
         if !mine {
@@ -334,6 +346,7 @@ mod tests {
             remote: HttpRemote::new(),
             admission: Arc::new(Admission::new(limits)),
             preferred_ingesters: 1,
+            volumes: volume::Volumes::default(),
         }));
         state
     }

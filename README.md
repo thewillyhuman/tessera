@@ -123,7 +123,8 @@ hashing over the live compact nodes, renewed, handed over when the
 view changes and taken over when a node's leases expire (sections 5.3
 and 14.2), driving intake, recovery, compaction and collection; dead
 writers recognised by membership; writes forwarded to a dataset's
-preferred ingesters (IN-9); leaf scan tasks assigned to query nodes by
+preferred ingesters, one per sixteen megabytes a second of its recent
+volume up to eight (IN-9); leaf scan tasks assigned to query nodes by
 file id over internal HTTP routes and read locally when a peer fails
 (QE-15, QE-17); per-tenant admission control on concurrent queries,
 queue time and ingest bytes in flight with 429 and 503 answers
@@ -137,8 +138,7 @@ Gaps left in M6: aggregation and the other intermediate stages run on
 the coordinator over the rows the leaf tasks return (QE-14 asks for
 stages on worker nodes); membership is seeded from the root pool only,
 there is no gossip; load signals for an autoscaler (OP-5) and the
-`_system` tenant (14.7) wait for M10; the preferred-ingester set is
-two per dataset rather than sized by volume; there is no object byte
+`_system` tenant (14.7) wait for M10; there is no object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.

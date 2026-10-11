@@ -63,9 +63,9 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 const INGEST_TICK: Duration = Duration::from_millis(50);
 /// The dataset of the `_system` tenant that holds the workload log.
 pub const WORKLOAD_DATASET: &str = "queries";
-/// How many ingesters a dataset's writes are spread over (IN-9). The
-/// spec lets the set grow with the dataset's volume; two is the start.
-const PREFERRED_INGESTERS: usize = 2;
+/// The most ingesters a dataset's writes are spread over (IN-9): the
+/// set grows with the dataset's recent volume up to this.
+const PREFERRED_INGESTERS: usize = 8;
 
 /// What a node needs to start (OP-11).
 #[derive(Clone, Debug)]
@@ -539,6 +539,7 @@ impl Shared {
                 remote,
                 admission: Arc::new(Admission::new(Limits::default())),
                 preferred_ingesters: PREFERRED_INGESTERS,
+                volumes: tessera_server::Volumes::default(),
             })),
             budgets: Arc::new(Ledger::new()),
             auth: Arc::new(
