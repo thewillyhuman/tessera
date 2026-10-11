@@ -30,7 +30,7 @@ Gaps left in M1: OTLP over gRPC (HTTP only); no authentication, so the
 tenant is always `default`; the partition window is the default day for
 every dataset (no dataset log yet); attributes live in the `_overflow`
 JSON column until column promotion arrives (M8); dead writers are
-detected by a quiet-time heuristic until cluster membership arrives (M6).
+detected by a quiet-time heuristic (membership shortens it since M6).
 
 **M2, engine core: done, with gaps listed below.** The plan
 representation every language lowers into; vectorized kernels with
@@ -108,7 +108,35 @@ the `promql(...)` table function in SQL, exemplars, rules and alerts
 suite has not been run; Grafana itself has not been run against the
 API yet.
 
-**M6, distributed execution and cluster: next.**
+**M6, distributed execution and cluster: done, with gaps listed
+below.** Node roles (`ingest`, `query`, `compact`, `eval`), a node
+registry in the root pool with heartbeats and a membership view
+(section 14.1); slot ownership through leases shared by rendezvous
+hashing over the live compact nodes, renewed, handed over when the
+view changes and taken over when a node's leases expire (sections 5.3
+and 14.2), driving intake, recovery, compaction and collection; dead
+writers recognised by membership; writes forwarded to a dataset's
+preferred ingesters (IN-9); leaf scan tasks assigned to query nodes by
+file id over internal HTTP routes and read locally when a peer fails
+(QE-15, QE-17); per-tenant admission control on concurrent queries,
+queue time and ingest bytes in flight with 429 and 503 answers
+(QE-18, IN-11); three caches, local and disposable: open manifests,
+file footers and closed-range query results keyed by plan and manifest
+versions (10.8). The three-node test starts a cluster, scales it up,
+loses a node without a word and scales it down, with zero manual
+steps (OP-4).
+
+Gaps left in M6: aggregation and the other intermediate stages run on
+the coordinator over the rows the leaf tasks return (QE-14 asks for
+stages on worker nodes); membership is seeded from the root pool only,
+there is no gossip; load signals for an autoscaler (OP-5) and the
+`_system` tenant (14.7) wait for M10; the preferred-ingester set is
+two per dataset rather than sized by volume; there is no object byte
+range cache on local disk because the only stores are a local
+directory and memory; the scale envelope of section 17.2 has not been
+run.
+
+**M7, control store, continuous queries and alerting: next.**
 
 ## Layout
 
@@ -123,6 +151,7 @@ crates/
   tessera-manifest  partition manifests, writer registry, intake, consistent view
   tessera-ingest    ingester, ingest service, OTLP decoder
   tessera-compact   compaction jobs, deduplication, garbage collection of files and segments
+  tessera-cluster   node roles, the node registry, membership and admission control
   tessera-ir        plan representation: expressions, plan nodes, typing, function registry, Frontend trait
   tessera-kernels   expression evaluation, variant access, extraction, templates, windows, aggregation
   tessera-opt       binder, rewrite rules, manifest-level and index-level pruning
@@ -154,6 +183,19 @@ cargo run -p tessera -- run --data-dir ./tessera-data \
 The data directory is the root pool; its layout is the object layout of
 spec section 6.2. There is no authentication yet, so both listeners
 bind the loopback interface by default.
+
+A cluster is several nodes on one root pool: a shared directory for
+now. Each node announces itself in the pool's registry and finds the
+others there, so the whole start-up configuration is the root pool,
+the roles, the listen addresses and the address peers reach the node
+at (OP-11):
+
+```
+cargo run -p tessera -- run --data-dir /shared/tessera --roles ingest,query     --listen 0.0.0.0:8080 --advertise http://node-1:8080
+cargo run -p tessera -- run --data-dir /shared/tessera --roles compact     --listen 0.0.0.0:8081 --pg-listen 0.0.0.0:5433 --advertise http://node-2:8081
+```
+
+Adding a node is starting it; removing one is stopping it.
 
 ```
 curl -X POST localhost:8080/api/v1/tenants \
