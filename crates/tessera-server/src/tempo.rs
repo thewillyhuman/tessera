@@ -334,7 +334,14 @@ fn shown_attributes(batch: &RecordBatch, i: usize, shown: &[String]) -> Vec<Valu
                 .find_map(|path| attributes.get(path).cloned()),
         };
         if let Some(value) = value {
-            out.push(json!({ "key": name, "value": any_value_json(&value) }));
+            // Tempo writes an attribute under its own name, scope aside.
+            let key = name
+                .strip_prefix("span.")
+                .or_else(|| name.strip_prefix("resource."))
+                .or_else(|| name.strip_prefix("instrumentation."))
+                .or_else(|| name.strip_prefix('.'))
+                .unwrap_or(name);
+            out.push(json!({ "key": key, "value": any_value_json(&value) }));
         }
     }
     out
@@ -834,6 +841,23 @@ fn tag_names(batches: &[RecordBatch]) -> BTreeMap<&'static str, BTreeSet<String>
 /// name, or an attribute under the `TraceQL` scopes.
 fn tag_values(batches: &[RecordBatch], name: &str) -> BTreeSet<(String, String)> {
     let mut values = BTreeSet::new();
+    // Tempo lists the whole enumeration of a status or kind, whatever
+    // the spans hold.
+    match name {
+        "status" | "span:status" => {
+            return tessera_types::StatusCode::ALL
+                .iter()
+                .map(|s| ("keyword".to_owned(), s.as_str().to_owned()))
+                .collect();
+        }
+        "kind" | "span:kind" => {
+            return tessera_types::SpanKind::ALL
+                .iter()
+                .map(|k| ("keyword".to_owned(), k.as_str().to_owned()))
+                .collect();
+        }
+        _ => {}
+    }
     let paths = paths_of(name);
     for batch in batches {
         let overflow = text(batch, OVERFLOW);
@@ -843,12 +867,6 @@ fn tag_values(batches: &[RecordBatch], name: &str) -> BTreeSet<(String, String)>
             let column = match name {
                 "name" | "span:name" => {
                     cell(text(batch, NAME), i).map(|v| ("string", v.to_owned()))
-                }
-                "status" | "span:status" => {
-                    cell(text(batch, STATUS_CODE), i).map(|v| ("keyword", v.to_owned()))
-                }
-                "kind" | "span:kind" => {
-                    cell(text(batch, SPAN_KIND), i).map(|v| ("keyword", v.to_owned()))
                 }
                 "statusMessage" | "span:statusMessage" => {
                     cell(text(batch, STATUS_MESSAGE), i).map(|v| ("string", v.to_owned()))
@@ -996,14 +1014,18 @@ fn series(batches: &[RecordBatch], labels: &[String]) -> BTreeMap<Vec<Option<Str
     out
 }
 
-fn label_values(labels: &[String], key: &[Option<String>]) -> Vec<Value> {
+/// The labels of a series as Tempo writes them: a missing value is
+/// `nil`, and a series without labels carries the function's name.
+fn label_values(labels: &[String], key: &[Option<String>], function: &str) -> Vec<Value> {
+    if labels.is_empty() {
+        return vec![json!({ "key": "__name__", "value": { "stringValue": function } })];
+    }
     labels
         .iter()
         .zip(key)
-        .filter_map(|(label, value)| {
-            value
-                .as_ref()
-                .map(|v| json!({ "key": label, "value": { "stringValue": v } }))
+        .map(|(label, value)| {
+            let value = value.as_deref().unwrap_or("nil");
+            json!({ "key": label, "value": { "stringValue": value } })
         })
         .collect()
 }
@@ -1036,6 +1058,7 @@ async fn metrics_common(
         ));
     }
     let labels = lowered.labels.clone();
+    let function = lowered.function.clone();
     let batches = run(state, lowered.plan).await?;
     let series = series(&batches, &labels);
     let out: Vec<Value> = if instant {
@@ -1043,7 +1066,7 @@ async fn metrics_common(
             .iter()
             .map(|(key, series)| {
                 json!({
-                    "labels": label_values(&labels, key),
+                    "labels": label_values(&labels, key, &function),
                     "value": series.samples.values().last().copied().unwrap_or(0.0),
                 })
             })
@@ -1064,7 +1087,7 @@ async fn metrics_common(
                         })
                     })
                     .collect();
-                json!({ "labels": label_values(&labels, key), "samples": samples })
+                json!({ "labels": label_values(&labels, key, &function), "samples": samples })
             })
             .collect()
     };
@@ -1352,7 +1375,12 @@ mod tests {
         .await;
         assert_eq!(
             value["tagValues"],
-            json!([{ "type": "keyword", "value": "error" }, { "type": "keyword", "value": "unset" }])
+            json!([
+                { "type": "keyword", "value": "error" },
+                { "type": "keyword", "value": "ok" },
+                { "type": "keyword", "value": "unset" }
+            ]),
+            "the whole enumeration, as Tempo lists it"
         );
         let (_, value) = call(
             &app,
@@ -1411,7 +1439,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{value}");
-        assert_eq!(value["series"][0]["value"], 100_000.0, "{value}");
+        assert_eq!(value["series"][0]["value"], 0.0001, "seconds: {value}");
+        assert_eq!(value["series"][0]["labels"][0]["key"], "__name__");
         let (status, _) = call(
             &app,
             get("/api/metrics/query_range?q=%7B%20%7D&start=1700000000&end=1700000002"),
