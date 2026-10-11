@@ -2382,6 +2382,7 @@ name = "tessera"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "tessera-cluster",
  "tessera-node",
  "tokio",
  "tracing",

@@ -12,6 +12,7 @@ name = "tessera"
 path = "src/main.rs"
 
 [dependencies]
+tessera-cluster.workspace = true
 tessera-node.workspace = true
 
 clap = { version = "4", features = ["derive"] }

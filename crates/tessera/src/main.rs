@@ -2,17 +2,20 @@
 
 //! The `tessera` binary (AR-1): one executable for every role.
 //!
-//! `tessera run` starts every role in one process against a local
-//! directory: the catalog and its administration API, OTLP ingest, the
-//! query engine with SQL over HTTP and the `PostgreSQL` wire protocol.
-//! Roles and the rest of the start-up configuration of OP-11 arrive with
-//! their milestones.
+//! `tessera run` starts a node against a local directory, by default
+//! with every role: the catalog and its administration API, OTLP
+//! ingest, the query engine with SQL over HTTP and the `PostgreSQL` wire
+//! protocol, intake and compaction. The start-up configuration is what
+//! OP-11 allows: the root pool, the roles, the listen addresses and the
+//! address peers reach the node at; the root pool's registry is the
+//! membership seed.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use tessera_cluster::Role;
 
 /// Tessera: a unified observability database.
 #[derive(Parser, Debug)]
@@ -43,6 +46,14 @@ struct RunArgs {
     /// there is no authentication yet.
     #[arg(long, default_value = "127.0.0.1:5432")]
     pg_listen: SocketAddr,
+    /// The roles this node runs, comma-separated: ingest, query, compact,
+    /// eval. Every role by default.
+    #[arg(long, value_delimiter = ',', default_values_t = Role::ALL)]
+    roles: Vec<Role>,
+    /// The base URL peers reach this node's HTTP API at. Needed when the
+    /// listen address is not one they can use, such as 0.0.0.0.
+    #[arg(long)]
+    advertise: Option<String>,
 }
 
 #[tokio::main]
@@ -59,6 +70,8 @@ async fn main() -> ExitCode {
             tessera_node::run(tessera_node::Config {
                 listen: args.listen,
                 pg_listen: args.pg_listen,
+                roles: args.roles.into_iter().collect(),
+                advertise: args.advertise,
                 ..tessera_node::Config::single_node(args.data_dir)
             })
             .await
@@ -84,6 +97,25 @@ mod tests {
         assert_eq!(args.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(args.pg_listen, "127.0.0.1:5432".parse().unwrap());
         assert_eq!(args.data_dir, PathBuf::from("./tessera-data"));
+        assert_eq!(args.roles, Role::ALL);
+        assert_eq!(args.advertise, None);
+    }
+
+    #[test]
+    fn roles_are_a_comma_separated_list() {
+        let cli = Cli::try_parse_from([
+            "tessera",
+            "run",
+            "--roles",
+            "query,compact",
+            "--advertise",
+            "http://node-1:8080",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command;
+        assert_eq!(args.roles, [Role::Query, Role::Compact]);
+        assert_eq!(args.advertise.as_deref(), Some("http://node-1:8080"));
+        assert!(Cli::try_parse_from(["tessera", "run", "--roles", "boss"]).is_err());
     }
 
     #[test]
