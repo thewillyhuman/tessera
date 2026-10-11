@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! Running a compaction job: read the inputs, merge, deduplicate, write
-//! the output in the kind's layout with its indexes, commit the
+//! Running a compaction job: read the inputs, merge, deduplicate,
+//! promote the attribute paths worth a column (section 8.2), write the
+//! output in the dataset's layout with its indexes, commit the
 //! replacement.
 
 use std::collections::HashSet;
@@ -13,10 +14,10 @@ use tessera_format::FileFormat;
 use tessera_manifest::{LayoutRecord, Manifest};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::event::EVENT_ID;
-use tessera_types::{Env, FileId, FileMeta, FileSource};
+use tessera_types::{Env, FileId, FileMeta, FileSource, Kind};
 
-use crate::CompactError;
 use crate::plan::Job;
+use crate::{CompactError, promote};
 
 /// Runs compaction jobs against the pools.
 pub struct Compactor {
@@ -39,6 +40,22 @@ pub enum Outcome {
     },
     /// Some input had already left the manifest; the output was deleted.
     Superseded,
+}
+
+/// Whether a column name is an attribute path.
+fn is_path(column: &str) -> bool {
+    column.starts_with("attr.") || column.starts_with("resource.") || column.starts_with("scope.")
+}
+
+/// `batch` restricted to the kind's own columns, in schema order.
+fn kind_columns(batch: &RecordBatch, kind: Kind) -> Result<RecordBatch, CompactError> {
+    let schema = tessera_types::event::schema(kind);
+    let indices = schema
+        .fields()
+        .iter()
+        .map(|f| batch.schema().index_of(f.name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(batch.project(&indices)?)
 }
 
 impl Compactor {
@@ -64,12 +81,20 @@ impl Compactor {
     ) -> Result<Outcome, CompactError> {
         let mut batches = Vec::new();
         for input in &job.inputs {
-            batches.extend(self.read(input).await?);
+            for batch in self.read(input).await? {
+                // Inputs of different epochs carry different dedicated
+                // columns; the kind's own are the common ground, and
+                // `_overflow` still holds every attribute.
+                batches.push(kind_columns(&batch, job.partition.kind)?);
+            }
         }
         let layout = record.to_layout();
+        let mut wanted: Vec<String> = record.dedicated.clone();
+        wanted.extend(record.sort_key.iter().filter(|c| is_path(c)).cloned());
         let format = Arc::clone(&self.format);
         let (written, duplicates) = tokio::task::spawn_blocking(move || {
             let (rows, duplicates) = deduplicate(&batches)?;
+            let (rows, _) = promote::promote(&rows, &wanted, promote::MAX_DEDICATED)?;
             let written = format.write(&[rows], &layout)?;
             Ok::<_, CompactError>((written, duplicates))
         })

@@ -61,8 +61,9 @@ pub fn prune_files<'a>(
 }
 
 /// The inclusive per-column bounds implied by `predicates` and
-/// `time_range`, one per column. Only comparisons of a dedicated column
-/// with a constant contribute; anything else is left to row filtering.
+/// `time_range`, one per column. Only comparisons of a dedicated column,
+/// or of a path a file may hold as one (AD-4), with a constant
+/// contribute; anything else is left to row filtering.
 #[must_use]
 pub fn bounds(predicates: &[Expr], time_range: TimeRange) -> Vec<Bound> {
     let mut by_column: BTreeMap<String, Bound> = BTreeMap::new();
@@ -104,8 +105,10 @@ pub fn bounds(predicates: &[Expr], time_range: TimeRange) -> Vec<Bound> {
             continue;
         };
         let (op, column, value) = match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(c), Expr::Literal(v)) => (*op, c, v),
-            (Expr::Literal(v), Expr::Column(c)) => (op.flipped(), c, v),
+            (Expr::Column(c) | Expr::Path { path: c, .. }, Expr::Literal(v)) => (*op, c, v),
+            (Expr::Literal(v), Expr::Column(c) | Expr::Path { path: c, .. }) => {
+                (op.flipped(), c, v)
+            }
             _ => continue,
         };
         let Some(value) = scalar(value) else {

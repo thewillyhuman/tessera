@@ -100,11 +100,16 @@ fn row_groups_for(file: &FileMeta, sidecar: &Sidecar, predicate: &Expr) -> Optio
             left,
             right,
         } => {
-            let ((Expr::Column(column), Expr::Literal(Literal::Bytes(bytes)))
-            | (Expr::Literal(Literal::Bytes(bytes)), Expr::Column(column))) =
+            let ((Expr::Column(column) | Expr::Path { path: column, .. }, Expr::Literal(literal))
+            | (Expr::Literal(literal), Expr::Column(column) | Expr::Path { path: column, .. })) =
                 (left.as_ref(), right.as_ref())
             else {
                 return None;
+            };
+            let bytes: &[u8] = match literal {
+                Literal::Bytes(bytes) => bytes,
+                Literal::Text(text) => text.as_bytes(),
+                _ => return None,
             };
             if !file.has_index(IndexKind::Bloom, column) {
                 return None;

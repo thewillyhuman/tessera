@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow::array::{
     Array, Float64Array, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
 };
+use arrow::datatypes::DataType;
 use tessera_exec::{CpuPool, Engine, QueryLimits, QueryOutput};
 use tessera_format::ParquetFormat;
 use tessera_ir::{AggregateExpr, BinaryOp, Expr, NamedExpr, Plan, Registry, Scan, SortKey};
@@ -549,5 +550,60 @@ async fn closed_range_results_are_served_from_the_cache_until_a_manifest_moves()
             .map(RecordBatch::num_rows)
             .sum::<usize>()
             + 2
+    );
+}
+
+#[tokio::test]
+async fn promoted_attribute_columns_serve_paths_and_prune_by_statistics() {
+    let (store, env) = populate().await;
+    compact_all(&store, &env).await;
+    let root: Arc<dyn tessera_object::ObjectStore> = store.clone();
+    for partition in
+        tessera_manifest::list_partitions(&*root, &TenantId::DEFAULT, &dataset(), Kind::Log)
+            .await
+            .unwrap()
+    {
+        let manifest = tessera_manifest::Manifest::open(root.clone(), partition, env.clone());
+        let snapshot = manifest.snapshot().await.unwrap();
+        for file in snapshot.state().files() {
+            assert!(
+                file.columns.iter().any(|c| c.name == "attr.host"),
+                "every row carries the host, so it is promoted"
+            );
+            assert!(file.columns.iter().any(|c| c.name == "attr.n"));
+        }
+    }
+    let engine = engine(&store, &env);
+    let host = Expr::Path {
+        path: "attr.host".into(),
+        data_type: DataType::Utf8,
+    };
+    let plan = Plan::Scan(scan()).filter(host.binary(BinaryOp::Eq, Expr::literal("h1")));
+    let optimized = optimize(plan.clone(), &Registry::builtin()).unwrap();
+    assert!(
+        optimized.to_string().contains("paths=[attr.host]"),
+        "{optimized}"
+    );
+    let output = run(&engine, plan).await;
+    assert_eq!(output.num_rows(), 10, "odd rows in files and in the tail");
+    assert_eq!(
+        output.analysis.scans[0].files_read, 2,
+        "one compacted file per day"
+    );
+
+    // A numeric path with statistics prunes the files that cannot match.
+    let n = Expr::Path {
+        path: "attr.n".into(),
+        data_type: DataType::Int64,
+    };
+    let output = run(
+        &engine,
+        Plan::Scan(scan()).filter(n.binary(BinaryOp::GtEq, Expr::literal(201))),
+    )
+    .await;
+    assert_eq!(output.num_rows(), 2, "only the tail reaches 201");
+    assert_eq!(
+        output.analysis.scans[0].files.after_statistics, 0,
+        "every file's attr.n stays below 201"
     );
 }

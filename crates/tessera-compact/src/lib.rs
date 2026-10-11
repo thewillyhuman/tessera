@@ -17,6 +17,7 @@
 
 pub mod gc;
 pub mod plan;
+pub mod promote;
 pub mod run;
 
 use tessera_format::FormatError;
@@ -26,6 +27,7 @@ use tessera_wal::WalError;
 
 pub use gc::{LogCollection, collect_files, collect_log};
 pub use plan::{Job, Policy, input_bytes, plan};
+pub use promote::promote;
 pub use run::{Compactor, Outcome};
 
 /// Why compaction or collection failed.
@@ -49,6 +51,9 @@ pub enum CompactError {
     /// Arrow rejected an operation.
     #[error("arrow: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+    /// A kernel failed while promoting a column.
+    #[error("kernel: {0}")]
+    Kernel(#[from] tessera_kernels::KernelError),
     /// A CPU task did not complete.
     #[error("compaction task failed: {0}")]
     Task(String),

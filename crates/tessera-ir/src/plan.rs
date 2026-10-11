@@ -129,6 +129,20 @@ pub struct Scan {
     /// Stop after this many rows, read newest first (the time-ordered
     /// top-K scan of section 10.6).
     pub newest_first_limit: Option<usize>,
+    /// Attribute paths the scan outputs as columns of their own (AD-4):
+    /// read from a file's dedicated column where it has one, extracted
+    /// from `_overflow` elsewhere.
+    #[serde(default)]
+    pub paths: Vec<PathColumn>,
+}
+
+/// An attribute path a scan materializes as a column named by the path.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct PathColumn {
+    /// The path, with its scope prefix.
+    pub path: String,
+    /// The type the column is read as.
+    pub data_type: DataType,
 }
 
 impl Scan {
@@ -143,6 +157,7 @@ impl Scan {
             predicates: Vec::new(),
             projection: None,
             newest_first_limit: None,
+            paths: Vec::new(),
         }
     }
 
@@ -154,20 +169,23 @@ impl Scan {
     /// not have.
     pub fn schema(&self) -> Result<SchemaRef, PlanError> {
         let full = event::schema(self.kind);
-        match &self.projection {
-            None => Ok(full),
-            Some(names) => {
-                let fields = names
-                    .iter()
-                    .map(|name| {
-                        full.field_with_name(name)
-                            .cloned()
-                            .map_err(|_| PlanError::UnknownProjection(name.clone()))
-                    })
-                    .collect::<Result<Vec<Field>, _>>()?;
-                Ok(Arc::new(Schema::new(fields)))
+        let mut fields: Vec<Field> = match &self.projection {
+            None => full.fields().iter().map(|f| f.as_ref().clone()).collect(),
+            Some(names) => names
+                .iter()
+                .map(|name| {
+                    full.field_with_name(name)
+                        .cloned()
+                        .map_err(|_| PlanError::UnknownProjection(name.clone()))
+                })
+                .collect::<Result<Vec<Field>, _>>()?,
+        };
+        for path in &self.paths {
+            if fields.iter().all(|f| f.name() != &path.path) {
+                fields.push(Field::new(&path.path, path.data_type.clone(), true));
             }
         }
+        Ok(Arc::new(Schema::new(fields)))
     }
 }
 
@@ -814,6 +832,10 @@ fn fmt_scan(f: &mut fmt::Formatter<'_>, pad: &str, scan: &Scan) -> fmt::Result {
     }
     if let Some(limit) = scan.newest_first_limit {
         write!(f, " newest_first_limit={limit}")?;
+    }
+    if !scan.paths.is_empty() {
+        let shown: Vec<&str> = scan.paths.iter().map(|p| p.path.as_str()).collect();
+        write!(f, " paths=[{}]", shown.join(", "))?;
     }
     writeln!(f)
 }

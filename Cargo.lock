@@ -2458,8 +2458,10 @@ name = "tessera-compact"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "serde_json",
  "tessera-commit",
  "tessera-format",
+ "tessera-kernels",
  "tessera-manifest",
  "tessera-object",
  "tessera-types",

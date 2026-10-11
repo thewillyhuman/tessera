@@ -15,17 +15,17 @@
 
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, RecordBatch, TimestampNanosecondArray};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use futures::stream::{self, StreamExt};
 use tessera_format::{RowPredicate, ScanRequest, ScanStats, Sidecar};
-use tessera_ir::{BinaryOp, Expr, Scan};
-use tessera_kernels::evaluate_predicate;
+use tessera_ir::{BinaryOp, Expr, PathColumn, Scan};
+use tessera_kernels::{evaluate_predicate, variant};
 use tessera_manifest::view;
 use tessera_object::layout;
 use tessera_opt::{Decision, PruneReport, bounds, decide, prune_files};
-use tessera_types::event::TIMESTAMP;
+use tessera_types::event::{OVERFLOW, TIMESTAMP};
 use tessera_types::{FileMeta, Timestamp};
 
 use crate::engine::{Engine, EngineError};
@@ -124,7 +124,7 @@ pub(crate) async fn run(
     let predicate = full_predicate(scan);
     let mut output = Vec::new();
     for rows in found.tail {
-        let rows = apply(&rows, predicate.as_ref(), &schema)?;
+        let rows = apply(&rows, predicate.as_ref(), &schema, &scan.paths)?;
         if rows.num_rows() > 0 {
             analysis.rows_from_tail += rows.num_rows();
             output.push(rows);
@@ -222,9 +222,17 @@ pub(crate) async fn read_files(
 ) -> Result<Vec<RecordBatch>, EngineError> {
     let schema = scan.schema()?;
     let predicate = full_predicate(scan);
+    // The kind's columns are read from every file; a path column only
+    // from the files that have it (AD-4), the rest extract it.
+    let kind_columns: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|name| scan.paths.iter().all(|p| &p.path != name))
+        .collect();
     let request = IndexedRequest {
         request: ScanRequest {
-            projection: Some(schema.fields().iter().map(|f| f.name().clone()).collect()),
+            projection: Some(kind_columns),
             bounds: bounds(&scan.predicates, scan.time_range),
             filter: predicate.as_ref().map(|p| row_predicate(p.clone())),
             row_groups: None,
@@ -232,11 +240,18 @@ pub(crate) async fn read_files(
         predicates_for_indexes: scan.predicates.clone(),
     };
     files.sort_by_key(|f| std::cmp::Reverse(f.max_timestamp));
-    let mut fetches = stream::iter(
-        files
-            .into_iter()
-            .map(|file| fetch(engine, file, request.clone())),
-    )
+    let mut fetches = stream::iter(files.into_iter().map(|file| {
+        let mut request = request.clone();
+        if let Some(projection) = &mut request.request.projection {
+            projection.extend(
+                scan.paths
+                    .iter()
+                    .filter(|p| file.columns.iter().any(|c| c.name == p.path))
+                    .map(|p| p.path.clone()),
+            );
+        }
+        fetch(engine, file, request)
+    }))
     .buffered(FETCH_CONCURRENCY);
     let mut output = Vec::new();
     let mut newest = Newest::new(scan.newest_first_limit);
@@ -250,6 +265,7 @@ pub(crate) async fn read_files(
         analysis.row_groups_skipped_by_index += read.row_groups_skipped;
         analysis.add(read.stats);
         for rows in read.batches {
+            let rows = materialize_paths(&rows, &scan.paths)?;
             let rows = reorder(&rows, &schema)?;
             if rows.num_rows() > 0 {
                 analysis.rows_from_files += rows.num_rows();
@@ -388,6 +404,7 @@ fn apply(
     rows: &RecordBatch,
     predicate: Option<&Expr>,
     schema: &SchemaRef,
+    paths: &[PathColumn],
 ) -> Result<RecordBatch, EngineError> {
     let filtered = match predicate {
         Some(predicate) => {
@@ -396,7 +413,48 @@ fn apply(
         }
         None => rows.clone(),
     };
+    let filtered = materialize_paths(&filtered, paths)?;
     reorder(&filtered, schema)
+}
+
+/// Adds a column per requested path (AD-4): a dedicated column the rows
+/// already have serves as is, cast to the requested type when needed;
+/// otherwise the path is extracted from `_overflow`, null everywhere
+/// when the rows have no variant column either.
+fn materialize_paths(rows: &RecordBatch, paths: &[PathColumn]) -> Result<RecordBatch, EngineError> {
+    if paths.is_empty() {
+        return Ok(rows.clone());
+    }
+    let mut fields: Vec<Field> = rows
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    let mut columns: Vec<ArrayRef> = rows.columns().to_vec();
+    let overflow = rows
+        .column_by_name(OVERFLOW)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned());
+    for path in paths {
+        let column: ArrayRef = match rows.column_by_name(&path.path) {
+            Some(column) if column.data_type() == &path.data_type => Arc::clone(column),
+            Some(column) => arrow::compute::cast(column, &path.data_type)?,
+            None => match &overflow {
+                Some(overflow) => variant::extract(overflow, &path.path, &path.data_type)?,
+                None => arrow::array::new_null_array(&path.data_type, rows.num_rows()),
+            },
+        };
+        if let Some(index) = fields.iter().position(|f| f.name() == &path.path) {
+            columns[index] = column;
+        } else {
+            fields.push(Field::new(&path.path, path.data_type.clone(), true));
+            columns.push(column);
+        }
+    }
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 /// `rows` with the columns of `schema`, in its order.

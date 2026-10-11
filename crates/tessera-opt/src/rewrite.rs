@@ -102,7 +102,7 @@ fn wrap_filter(plan: Plan, predicates: Vec<Expr>) -> Plan {
 }
 
 /// Applies `f` to each input of `plan`, keeping the node itself.
-fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
+pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
     match plan {
         Plan::Scan(_) | Plan::Values { .. } | Plan::SystemTable { .. } => plan,
         Plan::RangeVector {

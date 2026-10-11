@@ -12,6 +12,7 @@
 
 pub mod bind;
 pub mod index;
+pub mod paths;
 pub mod prune;
 pub mod rewrite;
 
@@ -38,7 +39,7 @@ pub enum OptError {
 /// do not type.
 pub fn optimize(plan: Plan, registry: &Registry) -> Result<Plan, OptError> {
     let bound = bind(plan, registry)?;
-    let rewritten = rewrite(bound);
+    let rewritten = paths::promote_paths(rewrite(bound));
     // Rewrites preserve typing; checking once more makes a broken rule a
     // planning error instead of a runtime one.
     rewritten.schema(registry)?;
