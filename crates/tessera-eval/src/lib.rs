@@ -19,7 +19,7 @@ pub mod rule;
 pub mod sink;
 pub mod state;
 
-pub use evaluate::{EvalError, observe};
+pub use evaluate::{EvalError, RuleRun, observe};
 pub use group::{Delivered, Delivery, Evaluated, RuleGroup};
 pub use incremental::{Firing, Shape, shape_of, shape_of_sql};
 pub use lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};

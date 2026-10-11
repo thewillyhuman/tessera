@@ -622,6 +622,7 @@ impl Shared {
             controls: Arc::clone(controls),
             engine,
             owned: leases.owned.clone(),
+            state: state.clone(),
             sink: Arc::new(evaluator::StateSink::new(state.clone())),
             notifier: Arc::new(HttpNotifier::new()),
             interval: config.eval,

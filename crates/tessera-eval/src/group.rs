@@ -21,7 +21,7 @@ use tessera_types::{
     stable_hash,
 };
 
-use crate::evaluate::{EvalError, instance_labels, observe};
+use crate::evaluate::{EvalError, RuleRun, instance_labels, observe};
 use crate::incremental;
 use crate::lifecycle::{Instance, Observation, Status, Transition, fingerprint, step};
 use crate::notify::{Notification, Notifier};
@@ -52,6 +52,9 @@ pub struct Evaluated {
     /// were rebuilt from the files after a log was trimmed past them
     /// (section 11.7).
     pub degraded: Vec<String>,
+    /// What the rules run through the engine asked of their scans, for
+    /// the workload log (AD-1).
+    pub runs: Vec<RuleRun>,
 }
 
 /// The result of one recording rule at one evaluation.
@@ -186,20 +189,20 @@ impl RuleGroup {
                 continue;
             }
             let outcome = match &incremental {
-                Some(shape) => {
-                    self.observe_incrementally(engine, rule, shape, snapshot.state(), now)
-                        .await
-                }
+                Some(shape) => self
+                    .observe_incrementally(engine, rule, shape, snapshot.state(), now)
+                    .await
+                    .map(|(observations, extra, degraded)| (observations, extra, degraded, None)),
                 None => observe(engine, &self.tenant, rule, now)
                     .await
-                    .map(|observations| (observations, Vec::new(), false))
+                    .map(|(observations, run)| (observations, Vec::new(), false, Some(run)))
                     .map_err(|e| e.to_string()),
             };
-            let (observations, extra, degraded) = match outcome {
-                Ok(found) => (Some(found.0), found.1, found.2),
+            let (observations, extra, degraded, run) = match outcome {
+                Ok(found) => (Some(found.0), found.1, found.2, found.3),
                 Err(error) => {
                     tracing::warn!(tenant = %self.tenant, group = %self.name, rule = %rule.name, error = %error, "rule evaluation failed");
-                    (None, Vec::new(), false)
+                    (None, Vec::new(), false, None)
                 }
             };
             // A recording rule's samples are written, not judged: the
@@ -220,6 +223,7 @@ impl RuleGroup {
                 extra,
                 positions_before: snapshot.state().positions.clone(),
                 degraded,
+                run,
             });
         }
         if observed.is_empty() {
@@ -249,6 +253,7 @@ impl RuleGroup {
                 .filter(|o| o.degraded)
                 .map(|o| o.rule.name.clone())
                 .collect(),
+            runs: observed.into_iter().filter_map(|o| o.run).collect(),
         })
     }
 
@@ -783,6 +788,8 @@ struct Observed<'a> {
     positions_before: BTreeMap<String, Seq>,
     /// Whether the rule is degraded after this evaluation (section 11.7).
     degraded: bool,
+    /// What the engine was asked, when the rule ran through it.
+    run: Option<RuleRun>,
 }
 
 /// The actions that bring `state` up to date with what was observed,
@@ -801,6 +808,7 @@ fn decide(
         extra,
         positions_before,
         degraded: _,
+        run: _,
     } in observed
     {
         if !extra.is_empty() && state.positions != *positions_before {

@@ -6,13 +6,13 @@
 //! rule that is not in the incremental subset of CQ-7.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
 };
 use arrow::datatypes::DataType;
-use tessera_exec::{Engine, EngineError, QueryOutput};
+use tessera_exec::{Engine, EngineError, QueryOutput, ScanUse};
 use tessera_ir::{BindContext, Frontend, Statement};
 use tessera_logql::LogqlFrontend;
 use tessera_opt::{OptError, optimize};
@@ -86,6 +86,22 @@ pub const SEVERITY: &str = "severity";
 /// Runs `rule` at `now` and returns what it observed: one entry per
 /// result row or sample.
 ///
+/// What running a rule through the engine asked of its scans (AD-1):
+/// the workload log's view of the rule, for the evaluator to record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuleRun {
+    /// The rule.
+    pub rule: String,
+    /// The rule's language.
+    pub language: Language,
+    /// What each scan read and was asked.
+    pub uses: Vec<ScanUse>,
+    /// The plan's fingerprint (CO-3).
+    pub fingerprint: u64,
+    /// How long the run took.
+    pub latency: Duration,
+}
+
 /// # Errors
 ///
 /// If the expression does not lower in its language, is not a query, or
@@ -95,7 +111,7 @@ pub async fn observe(
     tenant: &TenantId,
     rule: &AlertRule,
     now: Timestamp,
-) -> Result<Vec<Observation>, EvalError> {
+) -> Result<(Vec<Observation>, RuleRun), EvalError> {
     let expression = |message: String| EvalError::Expression {
         rule: rule.name.clone(),
         message,
@@ -159,6 +175,7 @@ pub async fn observe(
         rule: rule.name.clone(),
         source,
     })?;
+    let started = Instant::now();
     let output = engine
         .run(&plan)
         .await
@@ -166,10 +183,18 @@ pub async fn observe(
             rule: rule.name.clone(),
             source,
         })?;
-    Ok(match rule.language {
+    let run = RuleRun {
+        rule: rule.name.clone(),
+        language: rule.language,
+        uses: tessera_exec::workload::uses(&plan, &output.analysis),
+        fingerprint: tessera_exec::cache::fingerprint(&plan),
+        latency: started.elapsed(),
+    };
+    let observations = match rule.language {
         Language::Sql => observe_rows(&output),
         Language::Promql | Language::Logql => observe_samples(&output.batches),
-    })
+    };
+    Ok((observations, run))
 }
 
 /// The labels of an instance: the rule's name and severity, the rule's

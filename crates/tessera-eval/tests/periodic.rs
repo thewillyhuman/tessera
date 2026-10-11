@@ -110,6 +110,11 @@ async fn an_sql_rule_fires_per_group_after_its_hold_and_resolves() {
     let first = group.evaluate(&fx.engine, at(1_010)).await.unwrap();
     assert_eq!(first.rules, ["errors"]);
     assert_eq!(first.transitions.len(), 1, "only checkout has two errors");
+    let [run] = first.runs.as_slice() else {
+        panic!("one run for the workload log: {:?}", first.runs)
+    };
+    assert_eq!((run.rule.as_str(), run.language), ("errors", Language::Sql));
+    assert_eq!(run.uses[0].dataset.as_str(), "prod");
     let pending = &first.transitions[0];
     assert_eq!(
         (pending.from, pending.to),

@@ -7,7 +7,8 @@
 //! write path (CQ-14), notifications to the tenant's routes (CQ-15),
 //! held back by its silences and acknowledgments. The rollups this node
 //! owns are maintained the same way (section 8.7), their output written
-//! through the same path.
+//! through the same path. What a rule run through the engine asked of
+//! its scans goes to the workload log like any query's (AD-1).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -46,6 +47,8 @@ pub struct Evaluator {
     pub engine: Arc<Engine>,
     /// The slots this node owns.
     pub owned: Owned,
+    /// The node's state, whose workload log the rules' runs go to.
+    pub state: AppState,
     /// Where alert events go.
     pub sink: Arc<dyn AlertSink>,
     /// How routes are reached.
@@ -231,18 +234,8 @@ async fn tenant_round(
         let now = evaluator.env.clock.now();
         match group.evaluate(&evaluator.engine, now).await {
             Ok(evaluated) => {
-                if !evaluated.transitions.is_empty() {
-                    tracing::info!(%tenant, group = %name, transitions = evaluated.transitions.len(), "alert transitions");
-                }
-                if !evaluated.degraded.is_empty() {
-                    tracing::warn!(%tenant, group = %name, rules = ?evaluated.degraded, "rules degraded: windows rebuilt from the files");
-                }
                 round.degraded += u64::try_from(evaluated.degraded.len()).unwrap_or(u64::MAX);
-                if !evaluated.recorded.is_empty() {
-                    if let Err(error) = group.record(delivery.sink, &evaluated.recorded).await {
-                        tracing::warn!(%tenant, group = %name, error = %error, "recording rules not written");
-                    }
-                }
+                settle(evaluator, tenant, &name, &group, delivery.sink, evaluated).await;
             }
             Err(error) => {
                 tracing::warn!(%tenant, group = %name, error = %error, "rule group evaluation failed");
@@ -262,6 +255,41 @@ async fn tenant_round(
             .max(group.lag(now).await.unwrap_or(Duration::ZERO));
     }
     Ok(round)
+}
+
+/// What follows one evaluation of `group`: its transitions and
+/// degraded rules logged, its runs sent to the workload log (AD-1),
+/// its recording rules' samples written through `sink`.
+async fn settle(
+    evaluator: &Evaluator,
+    tenant: &TenantId,
+    name: &str,
+    group: &RuleGroup,
+    sink: &dyn AlertSink,
+    evaluated: tessera_eval::Evaluated,
+) {
+    if !evaluated.transitions.is_empty() {
+        tracing::info!(%tenant, group = %name, transitions = evaluated.transitions.len(), "alert transitions");
+    }
+    if !evaluated.degraded.is_empty() {
+        tracing::warn!(%tenant, group = %name, rules = ?evaluated.degraded, "rules degraded: windows rebuilt from the files");
+    }
+    for run in evaluated.runs {
+        tessera_server::workload::record_uses(
+            &evaluator.state,
+            run.uses,
+            run.language.as_str(),
+            "rule",
+            run.latency,
+            run.fingerprint,
+            None,
+        );
+    }
+    if !evaluated.recorded.is_empty() {
+        if let Err(error) = group.record(sink, &evaluated.recorded).await {
+            tracing::warn!(%tenant, group = %name, error = %error, "recording rules not written");
+        }
+    }
 }
 
 /// The rollups of `tenant` this node owns, each brought up to date.
