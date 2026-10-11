@@ -70,6 +70,9 @@ pub struct ScanAnalysis {
     pub rows_from_files: usize,
     /// Rows produced from the tail.
     pub rows_from_tail: usize,
+    /// Bytes of the tail rows before the predicates, what the tail costs
+    /// to scan (CO-3).
+    pub bytes_from_tail: u64,
     /// Files read by other nodes (QE-15).
     pub files_remote: usize,
     /// Leaf tasks sent to other nodes.
@@ -124,6 +127,7 @@ pub(crate) async fn run(
     let predicate = full_predicate(scan);
     let mut output = Vec::new();
     for rows in found.tail {
+        analysis.bytes_from_tail += u64::try_from(rows.get_array_memory_size()).unwrap_or(0);
         let rows = apply(&rows, predicate.as_ref(), &schema, &scan.paths)?;
         if rows.num_rows() > 0 {
             analysis.rows_from_tail += rows.num_rows();

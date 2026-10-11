@@ -45,7 +45,7 @@ pub struct ScanUse {
     pub files_considered: u64,
     /// Files pruned by statistics and indexes before reading.
     pub files_pruned: u64,
-    /// Bytes fetched.
+    /// Bytes fetched from files, plus the bytes of the tail rows scanned.
     pub bytes_scanned: u64,
     /// Object-store requests made.
     pub requests: u64,
@@ -307,7 +307,7 @@ fn use_of(
             Some(s) => (
                 s.files.after_time_range as u64,
                 (s.files.after_time_range.saturating_sub(s.files_read)) as u64,
-                s.bytes_read,
+                s.bytes_read + s.bytes_from_tail,
                 s.rows_scanned,
                 (s.rows_from_files + s.rows_from_tail) as u64,
                 s.requests as u64,
@@ -383,10 +383,12 @@ mod tests {
         scanned.rows_scanned = 1_000;
         scanned.rows_from_files = 200;
         scanned.rows_from_tail = 50;
+        scanned.bytes_from_tail = 1_024;
         analysis.scans.push(scanned);
         let found = uses(&plan, &analysis);
         assert_eq!(found.len(), 1);
         let scan = &found[0];
+        assert_eq!(scan.bytes_scanned, 5_120, "files and tail");
         assert!(scan.columns.contains("severity_number"));
         assert!(scan.columns.contains("attr.host"));
         assert_eq!(

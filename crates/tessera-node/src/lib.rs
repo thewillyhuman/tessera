@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, ControlStores, PoolConfig};
-use tessera_cluster::{Admission, Limits, Membership, Registry, Role, registry};
+use tessera_cluster::{Admission, Ledger, Limits, Membership, Registry, Role, registry};
 use tessera_commit::LeaseManager;
 use tessera_eval::HttpNotifier;
 use tessera_exec::{CpuPool, Engine, QueryLimits};
@@ -465,6 +465,7 @@ impl Shared {
                 admission: Arc::new(Admission::new(Limits::default())),
                 preferred_ingesters: PREFERRED_INGESTERS,
             })),
+            budgets: Arc::new(Ledger::new()),
         };
         (state, engine, controls)
     }

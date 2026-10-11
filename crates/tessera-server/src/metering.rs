@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use tessera_exec::ScanUse;
 use tessera_ingest::IngestHandle;
@@ -121,6 +121,17 @@ pub fn record(state: &AppState, usages: &[Usage]) {
     });
 }
 
+/// The attribute at `path` of every row, as text, when the rows carry
+/// overflow attributes.
+pub(crate) fn column(rows: &RecordBatch, path: &str) -> Option<StringArray> {
+    let overflow = rows
+        .column_by_name(OVERFLOW)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())?;
+    variant::extract(overflow, path, &DataType::Utf8)
+        .ok()
+        .and_then(|a| a.as_any().downcast_ref::<StringArray>().cloned())
+}
+
 /// What a batch of writes amounts to per service and team (CO-1): the
 /// service from `resource.service.name`, the team from the tenant's
 /// team attribute when it has one.
@@ -133,17 +144,10 @@ pub fn ingest_usage(state: &AppState, batch: &EventBatch) -> Vec<Usage> {
         .state()
         .tenant(batch.tenant())
         .and_then(|t| t.settings.team_attribute.clone());
-    let overflow = rows
-        .column_by_name(OVERFLOW)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-    let extract = |path: &str| -> Option<StringArray> {
-        let overflow = overflow?;
-        variant::extract(overflow, path, &DataType::Utf8)
-            .ok()
-            .and_then(|a| a.as_any().downcast_ref::<StringArray>().cloned())
-    };
-    let services = extract(SERVICE);
-    let teams = team_attribute.as_deref().and_then(extract);
+    let services = column(rows, SERVICE);
+    let teams = team_attribute
+        .as_deref()
+        .and_then(|path| column(rows, path));
     let bytes_per_row = rows.get_array_memory_size() as u64 / rows.num_rows().max(1) as u64;
     let mut groups: BTreeMap<(Option<String>, Option<String>), u64> = BTreeMap::new();
     for i in 0..rows.num_rows() {

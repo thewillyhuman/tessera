@@ -12,6 +12,7 @@
 //! rule about tenants or data lives here.
 
 pub mod admin;
+mod budgets;
 mod control;
 pub mod encode;
 mod error;
@@ -32,7 +33,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use tessera_catalog::{Catalog, ControlStores};
-use tessera_cluster::{Admission, Membership, QueryPermit, Role};
+use tessera_cluster::{Admission, Ledger, Membership, QueryPermit, Role};
 use tessera_exec::Engine;
 use tessera_format::FileFormat;
 use tessera_ingest::IngestHandle;
@@ -77,21 +78,32 @@ pub struct AppState {
     /// The cluster, when the node is in one; alone, nothing is forwarded
     /// and nothing is limited.
     pub cluster: Option<Arc<Cluster>>,
+    /// What the tenants and teams have used of their budgets today
+    /// (section 13.4).
+    pub budgets: Arc<Ledger>,
 }
 
 impl AppState {
-    /// Writes `batch`: admitted within the tenant's budget, then here or
+    /// Writes `batch`: as the tenant's and its teams' budgets admit it
+    /// (section 13.4), within the tenant's bytes in flight, then here or
     /// through one of the dataset's preferred ingesters (IN-9), chosen by
     /// rendezvous hashing over the live ones; a preferred ingester that
     /// cannot be reached means writing here.
     ///
     /// # Errors
     ///
-    /// If the tenant is over its budget or the write fails here.
+    /// If a budget refuses the write, the tenant is over its limit of
+    /// bytes in flight, or the write fails here.
     pub async fn write(&self, batch: EventBatch) -> Result<(), ApiError> {
-        if batch.tenant() != &TenantId::SYSTEM {
-            metering::record(self, &metering::ingest_usage(self, &batch));
-        }
+        let batch = if batch.tenant() == &TenantId::SYSTEM {
+            batch
+        } else {
+            let Some(admitted) = budgets::admit_ingest(self, batch)? else {
+                return Ok(());
+            };
+            metering::record(self, &metering::ingest_usage(self, &admitted));
+            admitted
+        };
         let Some(cluster) = &self.cluster else {
             self.ingest.write(batch).await?;
             return Ok(());
@@ -119,13 +131,15 @@ impl AppState {
     }
 
     /// A turn to run a query for `tenant` (QE-18): held until dropped.
-    /// Alone, there is no limit and no permit.
+    /// Alone, there is no limit and no permit. A tenant whose query
+    /// budget is used up and says to reject gets no turn (section 13.4).
     ///
     /// # Errors
     ///
-    /// If the tenant's queries are all busy for longer than the queue
-    /// allows.
+    /// If the tenant's query budget refuses the query, or its queries
+    /// are all busy for longer than the queue allows.
     pub async fn admit_query(&self, tenant: &TenantId) -> Result<Option<QueryPermit>, ApiError> {
+        budgets::admit_query(self, tenant)?;
         match &self.cluster {
             Some(cluster) => Ok(Some(cluster.admission.admit_query(tenant).await?)),
             None => Ok(None),
@@ -210,6 +224,7 @@ impl AppState {
             controls,
             env,
             cluster: None,
+            budgets: Arc::new(Ledger::new()),
         }
     }
 }

@@ -40,7 +40,7 @@ fn time(name: &str) -> Field {
 /// The columns of `system.usage` (CO-4) besides `timestamp` and `phase`:
 /// the column, the attribute of the `_system.usage` event it comes
 /// from, and whether it is a number.
-pub const USAGE_COLUMNS: [(&str, &str, bool); 16] = [
+pub const USAGE_COLUMNS: [(&str, &str, bool); 18] = [
     ("tenant", "attr.tenant", false),
     ("dataset", "attr.dataset", false),
     ("kind", "attr.kind", false),
@@ -57,6 +57,8 @@ pub const USAGE_COLUMNS: [(&str, &str, bool); 16] = [
     ("pattern_id", "attr.pattern_id", true),
     ("pattern", "attr.pattern", false),
     ("name", "attr.name", false),
+    ("action", "attr.action", false),
+    ("limit", "attr.limit", true),
 ];
 
 /// The schema of `system.log_patterns` (section 13.2): each pattern of a

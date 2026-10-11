@@ -59,6 +59,13 @@ pub fn record_uses(
         state,
         &crate::metering::query_usage(&metered, language, source, latency, fingerprint),
     );
+    let mut scanned: BTreeMap<&TenantId, u64> = BTreeMap::new();
+    for scan in &metered {
+        *scanned.entry(&scan.tenant).or_default() += scan.bytes_scanned;
+    }
+    for (tenant, bytes) in scanned {
+        crate::budgets::charge_query(state, tenant, bytes);
+    }
     let mut random = state.env.random.clone();
     let rows: Vec<EventRow> = uses
         .into_iter()
