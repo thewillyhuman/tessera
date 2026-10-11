@@ -51,7 +51,11 @@ blocking operators fail instead of spilling when their memory grant
 runs out; pipelines run one plan node at a time rather than fused
 across stages; a bare attribute reads as text until the advisor
 promotes it (M8); `now()` is the node's clock and there is no result
-cache.
+cache. A query runs under its tenant's limits on bytes scanned, memory
+and wall time (QE-18), the settings `query_max_scan_bytes`,
+`query_max_memory_bytes` and `query_max_seconds`; the node's defaults
+apply where a tenant sets none, and a query past a limit fails with
+the limit named.
 
 **M3, logs complete: done, with gaps listed below.** Compaction of L1
 files into L2 files with deduplication, the default layouts of section

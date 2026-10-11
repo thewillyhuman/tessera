@@ -113,6 +113,9 @@ impl ApiError {
             QueryError::Syntax(diagnostic) => ApiError::bad_request(diagnostic.describe(text)),
             QueryError::Plan(error) => ApiError::bad_request(error.to_string()),
             QueryError::Forbidden { .. } => ApiError::forbidden(error.to_string()),
+            QueryError::Engine(error @ EngineError::Limit(_)) => {
+                ApiError::bad_request(error.to_string())
+            }
             QueryError::Engine(
                 error @ (EngineError::Manifest(_)
                 | EngineError::Format(_)

@@ -737,3 +737,50 @@ async fn a_join_pairs_rows_by_key_and_narrows_the_probe_side() {
         "fewer rows than without it"
     );
 }
+
+/// QE-18: a query stops when its scans read more than allowed or it
+/// runs longer than allowed, and says which limit it hit.
+#[tokio::test]
+async fn limits_stop_a_query_that_reads_or_runs_too_much() {
+    let (store, env) = populate().await;
+    let engine = engine(&store, &env);
+    let plan = optimize(Plan::Scan(scan()), &Registry::builtin()).unwrap();
+    let scanned = engine
+        .run_with(
+            &plan,
+            &QueryLimits {
+                scan_bytes: Some(1),
+                ..QueryLimits::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(scanned.contains("1 bytes a query may read"), "{scanned}");
+    let sorted = optimize(
+        Plan::Scan(scan()).sort(vec![SortKey::descending(Expr::column(TIMESTAMP))]),
+        &Registry::builtin(),
+    )
+    .unwrap();
+    let slow = engine
+        .run_with(
+            &sorted,
+            &QueryLimits {
+                wall_time: Some(std::time::Duration::from_nanos(1)),
+                ..QueryLimits::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(slow.contains("ran longer than"), "{slow}");
+    let generous = QueryLimits {
+        scan_bytes: Some(1 << 30),
+        wall_time: Some(std::time::Duration::from_secs(60)),
+        ..QueryLimits::default()
+    };
+    assert_eq!(
+        engine.run_with(&plan, &generous).await.unwrap().num_rows(),
+        21
+    );
+}

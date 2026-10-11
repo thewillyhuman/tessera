@@ -93,12 +93,39 @@ impl ScanAnalysis {
     }
 }
 
+/// What a query may still read (QE-18): its limit in bytes and what
+/// its earlier scans spent.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanLimit {
+    /// Bytes a query may read in all.
+    pub bytes: u64,
+    /// Bytes the query's earlier scans read.
+    pub spent: u64,
+}
+
+/// Fails once `analysis`, on top of what was spent, exceeds `limit`.
+fn within(analysis: &ScanAnalysis, limit: Option<ScanLimit>) -> Result<(), EngineError> {
+    match limit {
+        Some(limit)
+            if limit.spent + analysis.bytes_read + analysis.bytes_from_tail > limit.bytes =>
+        {
+            Err(EngineError::Limit(format!(
+                "scanned more than the {} bytes a query may read",
+                limit.bytes
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Runs `scan`, returning batches in the scan's schema: the tail from
-/// the segments, and the files from this node and from its peers.
+/// the segments, and the files from this node and from its peers,
+/// within `limit` when there is one.
 pub(crate) async fn run(
     engine: &Engine,
     scan: &Scan,
     analysis: &mut ScanAnalysis,
+    limit: Option<ScanLimit>,
 ) -> Result<Vec<RecordBatch>, EngineError> {
     analysis.source = format!("{}/{}", scan.dataset, scan.kind);
     let scan = &without_deleted(engine, scan).await?;
@@ -129,6 +156,7 @@ pub(crate) async fn run(
     let mut output = Vec::new();
     for rows in found.tail {
         analysis.bytes_from_tail += u64::try_from(rows.get_array_memory_size()).unwrap_or(0);
+        within(analysis, limit)?;
         let rows = apply(&rows, predicate.as_ref(), &schema, &scan.paths)?;
         if rows.num_rows() > 0 {
             analysis.rows_from_tail += rows.num_rows();
@@ -172,7 +200,7 @@ pub(crate) async fn run(
             }
         }
     }
-    let from_files = read_files(engine, scan, local, &output, analysis).await?;
+    let from_files = read_files(engine, scan, local, &output, analysis, limit).await?;
     output.extend(from_files);
     Ok(output)
 }
@@ -239,6 +267,7 @@ pub(crate) async fn read_files(
     mut files: Vec<FileMeta>,
     already: &[RecordBatch],
     analysis: &mut ScanAnalysis,
+    limit: Option<ScanLimit>,
 ) -> Result<Vec<RecordBatch>, EngineError> {
     let schema = scan.schema()?;
     let predicate = full_predicate(scan);
@@ -285,6 +314,7 @@ pub(crate) async fn read_files(
         };
         analysis.row_groups_skipped_by_index += read.row_groups_skipped;
         analysis.add(read.stats);
+        within(analysis, limit)?;
         for rows in read.batches {
             let rows = materialize_paths(&rows, &scan.paths)?;
             let rows = reorder(&rows, &schema)?;

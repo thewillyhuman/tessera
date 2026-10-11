@@ -56,6 +56,9 @@ pub enum EngineError {
     /// An operator failed.
     #[error("{0}")]
     Exec(#[from] ExecError),
+    /// The query used more than its limits allow (QE-18).
+    #[error("query limit: {0}")]
+    Limit(String),
     /// A kernel failed outside an operator.
     #[error("{0}")]
     Kernel(#[from] tessera_kernels::KernelError),
@@ -121,14 +124,27 @@ impl QueryOutput {
 pub struct QueryLimits {
     /// Bytes a query's blocking operators may hold.
     pub memory_bytes: usize,
+    /// Bytes a query may read from files and the tail, or no bound.
+    pub scan_bytes: Option<u64>,
+    /// How long a query may run, or no bound.
+    pub wall_time: Option<Duration>,
 }
 
 impl Default for QueryLimits {
     fn default() -> Self {
         QueryLimits {
             memory_bytes: 1 << 30,
+            scan_bytes: None,
+            wall_time: None,
         }
     }
+}
+
+/// What one query may use while it runs (QE-18): the memory its
+/// blocking operators share and the bytes its scans may read in all.
+struct Grant {
+    memory: Arc<MemoryPool>,
+    scan_bytes: Option<u64>,
 }
 
 /// How long a table's tombstones are kept before they are read again.
@@ -294,7 +310,15 @@ impl Engine {
     /// If a file cannot be read or the predicates cannot be evaluated.
     pub async fn leaf(&self, task: &LeafTask) -> Result<Vec<RecordBatch>, EngineError> {
         let mut analysis = ScanAnalysis::default();
-        scan::read_files(self, &task.scan, task.files.clone(), &[], &mut analysis).await
+        scan::read_files(
+            self,
+            &task.scan,
+            task.files.clone(),
+            &[],
+            &mut analysis,
+            None,
+        )
+        .await
     }
 
     /// The function registry the engine runs.
@@ -303,13 +327,35 @@ impl Engine {
         &self.registry
     }
 
-    /// Runs an optimized `plan`.
+    /// The node's default limits on a query.
+    #[must_use]
+    pub fn limits(&self) -> &QueryLimits {
+        &self.limits
+    }
+
+    /// Runs an optimized `plan` under the node's default limits.
     ///
     /// # Errors
     ///
     /// If the plan is malformed, storage cannot be read, or an operator
     /// fails or exhausts its memory.
     pub async fn run(&self, plan: &Plan) -> Result<QueryOutput, EngineError> {
+        self.run_with(plan, &self.limits).await
+    }
+
+    /// Runs an optimized `plan` under `limits` (QE-18): the memory its
+    /// blocking operators share, the bytes its scans may read and how
+    /// long it may run.
+    ///
+    /// # Errors
+    ///
+    /// If the plan is malformed, storage cannot be read, an operator
+    /// fails, or a limit is exceeded.
+    pub async fn run_with(
+        &self,
+        plan: &Plan,
+        limits: &QueryLimits,
+    ) -> Result<QueryOutput, EngineError> {
         let schema = plan.schema(&self.registry)?;
         let key = if cache::is_closed(plan, self.manifests.env().clock.now()) {
             Some(self.result_key(plan).await?)
@@ -328,9 +374,23 @@ impl Engine {
                 fingerprint: 0,
             });
         }
-        let memory = MemoryPool::new(self.limits.memory_bytes);
+        let grant = Grant {
+            memory: MemoryPool::new(limits.memory_bytes),
+            scan_bytes: limits.scan_bytes,
+        };
         let mut analysis = Analysis::default();
-        let batches = self.execute(plan, &memory, &mut analysis).await?;
+        let execution = self.execute(plan, &grant, &mut analysis);
+        let batches = match limits.wall_time {
+            Some(allowed) => tokio::time::timeout(allowed, execution)
+                .await
+                .map_err(|_| {
+                    EngineError::Limit(format!(
+                        "ran longer than the {} s a query may take",
+                        allowed.as_secs_f64()
+                    ))
+                })??,
+            None => execution.await?,
+        };
         if let Some(key) = key {
             self.results
                 .insert(key, Arc::clone(&schema), batches.clone());
@@ -362,20 +422,16 @@ impl Engine {
         })
     }
 
+    /// Runs `plan` within `grant`.
     fn execute<'a>(
         &'a self,
         plan: &'a Plan,
-        memory: &'a Arc<MemoryPool>,
+        grant: &'a Grant,
         analysis: &'a mut Analysis,
     ) -> futures::future::BoxFuture<'a, Result<Vec<RecordBatch>, EngineError>> {
         Box::pin(async move {
             match plan {
-                Plan::Scan(scan) => {
-                    let mut scanned = ScanAnalysis::default();
-                    let result = scan::run(self, scan, &mut scanned).await;
-                    analysis.scans.push(scanned);
-                    result
-                }
+                Plan::Scan(scan) => self.scan_node(scan, grant, analysis).await,
                 Plan::Values { schema, rows } => Ok(vec![values(schema, rows)?]),
                 Plan::SystemTable { tenant, table } => {
                     let Some(provider) = &self.system_tables else {
@@ -391,7 +447,7 @@ impl Engine {
                 Plan::Union { inputs } => {
                     let mut batches = Vec::new();
                     for input in inputs {
-                        batches.extend(self.execute(input, memory, analysis).await?);
+                        batches.extend(self.execute(input, grant, analysis).await?);
                     }
                     Ok(batches)
                 }
@@ -400,7 +456,7 @@ impl Engine {
                     right,
                     on,
                     kind,
-                } => self.join(left, right, on, *kind, memory, analysis).await,
+                } => self.join(left, right, on, *kind, grant, analysis).await,
                 Plan::TraceGroup {
                     candidates,
                     spans,
@@ -409,9 +465,9 @@ impl Engine {
                     // Two phases (QL-13): the candidates' trace ids, then
                     // every span of those traces.
                     let ids = match candidates {
-                        Some(candidates) => Some(trace_ids(
-                            &self.execute(candidates, memory, analysis).await?,
-                        )),
+                        Some(candidates) => {
+                            Some(trace_ids(&self.execute(candidates, grant, analysis).await?))
+                        }
                         None => None,
                     };
                     let spans = match ids {
@@ -423,8 +479,9 @@ impl Engine {
                         )),
                         None => Cow::Borrowed(spans.as_ref()),
                     };
-                    let batches = self.execute(&spans, memory, analysis).await?;
-                    let operator = Box::new(TraceGroup::new(spanset.clone(), Arc::clone(memory)));
+                    let batches = self.execute(&spans, grant, analysis).await?;
+                    let operator =
+                        Box::new(TraceGroup::new(spanset.clone(), Arc::clone(&grant.memory)));
                     self.pipe(operator, batches).await
                 }
                 Plan::PromQL {
@@ -436,7 +493,7 @@ impl Engine {
                 } => {
                     let mut series = Vec::with_capacity(inputs.len());
                     for input in inputs {
-                        let batches = self.execute(input, memory, analysis).await?;
+                        let batches = self.execute(input, grant, analysis).await?;
                         series.push(promql::series_of(&batches)?);
                     }
                     let params = Params {
@@ -452,12 +509,34 @@ impl Engine {
                 }
                 other => {
                     let input = other.inputs()[0];
-                    let operator = self.operator(other, input, memory)?;
-                    let batches = self.execute(input, memory, analysis).await?;
+                    let operator = self.operator(other, input, &grant.memory)?;
+                    let batches = self.execute(input, grant, analysis).await?;
                     self.pipe(operator, batches).await
                 }
             }
         })
+    }
+
+    /// A scan node: the scan runs within what the query's earlier scans
+    /// left of its bytes, and its analysis joins the query's.
+    async fn scan_node(
+        &self,
+        scan: &tessera_ir::Scan,
+        grant: &Grant,
+        analysis: &mut Analysis,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let limit = grant.scan_bytes.map(|bytes| scan::ScanLimit {
+            bytes,
+            spent: analysis
+                .scans
+                .iter()
+                .map(|s| s.bytes_read + s.bytes_from_tail)
+                .sum(),
+        });
+        let mut scanned = ScanAnalysis::default();
+        let result = scan::run(self, scan, &mut scanned, limit).await;
+        analysis.scans.push(scanned);
+        result
     }
 
     /// The operator that turns `input`'s rows into `plan`'s, for the
@@ -562,12 +641,12 @@ impl Engine {
         right: &JoinSide,
         on: &[(Expr, Expr)],
         kind: JoinKind,
-        memory: &Arc<MemoryPool>,
+        grant: &Grant,
         analysis: &mut Analysis,
     ) -> Result<Vec<RecordBatch>, EngineError> {
         let left_keys: Vec<Expr> = on.iter().map(|(l, _)| l.clone()).collect();
         let right_keys: Vec<Expr> = on.iter().map(|(_, r)| r.clone()).collect();
-        let right_rows = self.execute(&right.plan, memory, analysis).await?;
+        let right_rows = self.execute(&right.plan, grant, analysis).await?;
         let left_plan = match kind {
             JoinKind::Inner => with_runtime_filter(
                 left.plan.as_ref().clone(),
@@ -577,7 +656,7 @@ impl Engine {
             )?,
             JoinKind::Left => left.plan.as_ref().clone(),
         };
-        let left_rows = self.execute(&left_plan, memory, analysis).await?;
+        let left_rows = self.execute(&left_plan, grant, analysis).await?;
         let rows_of =
             |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         let build_left = kind == JoinKind::Inner && rows_of(&left_rows) < rows_of(&right_rows);
@@ -608,7 +687,7 @@ impl Engine {
                 left_input,
             )
         };
-        let pool = Arc::clone(memory);
+        let pool = Arc::clone(&grant.memory);
         let operator = self
             .cpu
             .spawn(move || HashJoin::new(kind, build_side, &build_rows, &build, &probe, pool))

@@ -111,6 +111,7 @@ impl PgServer {
             readable: Some(Arc::new(move |dataset: &DatasetName| {
                 reader.may_read(dataset.as_str())
             })),
+            limits: Some(crate::params::limits(&self.state, &ctx.tenant)),
             ..RunOptions::default()
         };
         let response = query::run_with(&self.state.engine, &SqlFrontend, text, &ctx, options)

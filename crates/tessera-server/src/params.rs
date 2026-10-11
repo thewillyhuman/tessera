@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use tessera_catalog::{Principal, TenantName};
+use tessera_exec::QueryLimits;
 use tessera_types::{DatasetName, TenantId, Timestamp};
 
 use crate::{ApiError, AppState, auth};
@@ -116,6 +117,26 @@ pub(crate) fn tenants(state: &AppState, principal: &Principal) -> BTreeMap<Strin
         .filter(|tenant| principal.may_act_for(&tenant.id))
         .map(|tenant| (tenant.name.to_string(), tenant.id.clone()))
         .collect()
+}
+
+/// The limits a query of `tenant` runs under (QE-18): the node's
+/// defaults, overridden by the tenant's settings.
+pub(crate) fn limits(state: &AppState, tenant: &TenantId) -> QueryLimits {
+    let mut limits = *state.engine.limits();
+    let cached = state.catalog.cached();
+    let Some(settings) = cached.state().tenant(tenant).map(|t| &t.settings) else {
+        return limits;
+    };
+    if let Some(bytes) = settings.query_max_scan_bytes {
+        limits.scan_bytes = Some(bytes);
+    }
+    if let Some(bytes) = settings.query_max_memory_bytes {
+        limits.memory_bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    }
+    if let Some(seconds) = settings.query_max_seconds {
+        limits.wall_time = Some(Duration::from_secs(seconds));
+    }
+    limits
 }
 
 /// Checks that `principal` may do `need` on `dataset`.

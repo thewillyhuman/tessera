@@ -138,6 +138,15 @@ pub struct TenantSettings {
     pub retention_seconds: Option<u64>,
     /// How many queries may run at once.
     pub query_concurrency: Option<u32>,
+    /// The most bytes one query may read from files and the tail
+    /// (QE-18); unlimited by default.
+    pub query_max_scan_bytes: Option<u64>,
+    /// The most bytes one query's blocking operators may hold (QE-18);
+    /// the node's default otherwise.
+    pub query_max_memory_bytes: Option<u64>,
+    /// The longest one query may run, in seconds (QE-18); unlimited by
+    /// default.
+    pub query_max_seconds: Option<u64>,
     /// The attribute path that names the team a row belongs to, for
     /// metering by team (CO-1); none by default.
     pub team_attribute: Option<String>,
@@ -165,6 +174,9 @@ pub enum InvalidSettings {
         /// Why.
         reason: InvalidBudget,
     },
+    /// A limit is zero, which would refuse every query.
+    #[error("{0} must be greater than zero")]
+    Zero(String),
 }
 
 impl TenantSettings {
@@ -178,6 +190,9 @@ impl TenantSettings {
                 .or(self.ingest_rate_bytes_per_second),
             retention_seconds: patch.retention_seconds.or(self.retention_seconds),
             query_concurrency: patch.query_concurrency.or(self.query_concurrency),
+            query_max_scan_bytes: patch.query_max_scan_bytes.or(self.query_max_scan_bytes),
+            query_max_memory_bytes: patch.query_max_memory_bytes.or(self.query_max_memory_bytes),
+            query_max_seconds: patch.query_max_seconds.or(self.query_max_seconds),
             team_attribute: patch
                 .team_attribute
                 .clone()
@@ -219,6 +234,14 @@ impl TenantSettings {
                 team_budget.validate_for_ingest(),
             )?;
         }
+        let limits = [
+            ("query_max_scan_bytes", self.query_max_scan_bytes),
+            ("query_max_memory_bytes", self.query_max_memory_bytes),
+            ("query_max_seconds", self.query_max_seconds),
+        ];
+        if let Some((setting, _)) = limits.iter().find(|(_, value)| *value == Some(0)) {
+            return Err(InvalidSettings::Zero((*setting).to_owned()));
+        }
         Ok(())
     }
 }
@@ -251,6 +274,31 @@ mod tests {
     use tessera_types::BudgetAction;
 
     use super::*;
+
+    #[test]
+    fn query_limits_merge_and_must_be_positive() {
+        let base = TenantSettings {
+            query_max_scan_bytes: Some(1 << 30),
+            ..TenantSettings::default()
+        };
+        let patch = TenantSettings {
+            query_max_seconds: Some(30),
+            ..TenantSettings::default()
+        };
+        let merged = base.merged(&patch);
+        assert_eq!(merged.query_max_scan_bytes, Some(1 << 30));
+        assert_eq!(merged.query_max_seconds, Some(30));
+        assert_eq!(merged.query_max_memory_bytes, None);
+        merged.validate().unwrap();
+        let zero = TenantSettings {
+            query_max_memory_bytes: Some(0),
+            ..TenantSettings::default()
+        };
+        assert_eq!(
+            zero.validate(),
+            Err(InvalidSettings::Zero("query_max_memory_bytes".into()))
+        );
+    }
 
     #[test]
     fn accepts_sql_identifiers_as_names() {

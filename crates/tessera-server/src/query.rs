@@ -128,6 +128,7 @@ async fn run_native(
             readable: Some(Arc::new(move |dataset: &DatasetName| {
                 reader.may_read(dataset.as_str())
             })),
+            limits: Some(crate::params::limits(state, &ctx.tenant)),
         },
     )
     .await
@@ -319,6 +320,46 @@ mod tests {
         assert!(
             !explain.contains("Union"),
             "one kind reads one scan: {explain}"
+        );
+    }
+
+    /// QE-18: a tenant's query limits apply to its queries over HTTP.
+    #[tokio::test]
+    async fn a_tenants_query_limits_apply() {
+        let state = crate::testing::state().await;
+        let app = crate::router(state.clone());
+        let body = serde_json::to_vec(&export(&["first"])).unwrap();
+        let write = Request::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(crate::otlp::DATASET_HEADER, "prod")
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(write).await.unwrap().status(),
+            StatusCode::OK
+        );
+        state
+            .catalog
+            .alter_tenant(
+                &tessera_catalog::TenantName::new("default").unwrap(),
+                tessera_catalog::TenantSettings {
+                    query_max_scan_bytes: Some(1),
+                    ..tessera_catalog::TenantSettings::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (status, value) = post(
+            &app,
+            serde_json::json!({ "dataset": "prod", "query": "SELECT body FROM logs" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(
+            value["error"],
+            "query limit: scanned more than the 1 bytes a query may read"
         );
     }
 

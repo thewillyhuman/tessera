@@ -11,7 +11,7 @@ use tessera_ir::{BindContext, ControlStatement, Diagnostic, Frontend, Plan, Stat
 use tessera_opt::{OptError, optimize};
 use tessera_types::DatasetName;
 
-use crate::engine::{Analysis, Engine, EngineError, QueryOutput};
+use crate::engine::{Analysis, Engine, EngineError, QueryLimits, QueryOutput};
 use crate::workload;
 
 /// Why a query failed, at the stage it failed.
@@ -63,6 +63,9 @@ pub struct RunOptions {
     pub rollups: bool,
     /// The datasets the caller may read (SE-1); every one when absent.
     pub readable: Option<Readable>,
+    /// The limits the query runs under (QE-18); the node's defaults
+    /// when absent.
+    pub limits: Option<QueryLimits>,
 }
 
 impl Default for RunOptions {
@@ -70,6 +73,7 @@ impl Default for RunOptions {
         RunOptions {
             rollups: true,
             readable: None,
+            limits: None,
         }
     }
 }
@@ -103,10 +107,11 @@ pub async fn run_with(
     options: RunOptions,
 ) -> Result<Response, QueryError> {
     let statement = frontend.lower(text, ctx).map_err(QueryError::Syntax)?;
+    let limits = options.limits.unwrap_or(*engine.limits());
     match statement {
         Statement::Query(plan) => {
             let plan = plan_of(engine, plan, ctx, options).await?;
-            let mut output = engine.run(&plan).await?;
+            let mut output = engine.run_with(&plan, &limits).await?;
             output.uses = workload::uses(&plan, &output.analysis);
             output.fingerprint = crate::cache::fingerprint(&plan);
             Ok(Response::Rows(output))
@@ -115,7 +120,7 @@ pub async fn run_with(
         Statement::Explain { plan, analyze } => {
             let plan = plan_of(engine, plan, ctx, options).await?;
             let analysis = if analyze {
-                Some(engine.run(&plan).await?.analysis)
+                Some(engine.run_with(&plan, &limits).await?.analysis)
             } else {
                 None
             };
