@@ -92,6 +92,12 @@ impl TenantKey {
         Ok(TenantKey::from_bytes(bytes))
     }
 
+    /// The key's bytes, for a cipher that takes them whole.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8; KEY_LEN] {
+        &self.0
+    }
+
     fn cipher(&self) -> LessSafeKey {
         LessSafeKey::new(
             UnboundKey::new(&AES_256_GCM, self.0.as_ref())

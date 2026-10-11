@@ -5,7 +5,9 @@
 //! Rows are sorted by the layout's key, written in its row groups (one
 //! batch per row group, so that the sidecar's postings line up with the
 //! file's), and indexed into a sidecar when the layout asks for one.
-//! Pages are compressed with zstd.
+//! Pages are compressed with zstd. Under a tenant key the file uses
+//! Parquet modular encryption, footer included, with the key's name as
+//! the footer key metadata (SE-2).
 
 use arrow::array::{Array, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
@@ -13,6 +15,7 @@ use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, Encoding, ZstdLevel};
+use parquet::encryption::encrypt::FileEncryptionProperties;
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use tessera_types::Timestamp;
@@ -29,12 +32,14 @@ use crate::scan::FileReader;
 use crate::sidecar::Sidecar;
 use crate::stats::column_stats;
 use crate::{FileFormat, FormatError, Written};
-use tessera_types::{IndexKind, IndexRef};
+use tessera_types::{IndexKind, IndexRef, Keys, NamedKey};
 
 /// Parquet with zstd page compression.
 #[derive(Clone, Debug, Default)]
 pub struct ParquetFormat {
     footers: Option<Arc<FooterCache>>,
+    /// The keys encrypted files and sealed sidecars are opened with.
+    keys: Arc<Keys>,
 }
 
 impl ParquetFormat {
@@ -44,7 +49,15 @@ impl ParquetFormat {
     pub fn with_footer_cache(capacity: usize) -> Self {
         ParquetFormat {
             footers: Some(Arc::new(FooterCache::new(capacity))),
+            keys: Arc::new(Keys::none()),
         }
+    }
+
+    /// This format opening encrypted files with `keys` (SE-2).
+    #[must_use]
+    pub fn with_keys(mut self, keys: Arc<Keys>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The footer cache, if this format keeps one.
@@ -59,18 +72,31 @@ impl ParquetFormat {
     /// few bits where a dictionary stores every distinct value whole.
     /// The observed time stays dictionary-encoded: a batch's rows share
     /// it, so it repeats, and it is not in time order within a file.
-    fn properties() -> WriterProperties {
+    /// Under `key`, modular encryption of the footer and every column.
+    fn properties(key: Option<&NamedKey>) -> Result<WriterProperties, FormatError> {
         let path = ColumnPath::from(TIMESTAMP);
-        WriterProperties::builder()
+        let mut builder = WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::default()))
             .set_column_dictionary_enabled(path.clone(), false)
-            .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED)
-            .build()
+            .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
+        if let Some(key) = key {
+            let encryption = FileEncryptionProperties::builder(key.key.bytes().to_vec())
+                .with_footer_key_metadata(key.name.as_bytes().to_vec())
+                .build()
+                .map_err(|e| FormatError::Unreadable(e.to_string()))?;
+            builder = builder.with_file_encryption_properties(encryption);
+        }
+        Ok(builder.build())
     }
 }
 
 impl FileFormat for ParquetFormat {
-    fn write(&self, batches: &[RecordBatch], layout: &Layout) -> Result<Written, FormatError> {
+    fn write(
+        &self,
+        batches: &[RecordBatch],
+        layout: &Layout,
+        key: Option<&NamedKey>,
+    ) -> Result<Written, FormatError> {
         let first = batches.first().ok_or(FormatError::Empty)?;
         let schema = first.schema();
         if batches.iter().any(|b| b.schema() != schema) {
@@ -95,8 +121,9 @@ impl FileFormat for ParquetFormat {
             .map(|offset| sorted.slice(offset, rows_per_group.min(sorted.num_rows() - offset)))
             .collect();
         let mut bytes = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut bytes, schema.clone(), Some(Self::properties()))
-            .map_err(|e| FormatError::Unreadable(e.to_string()))?;
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, schema.clone(), Some(Self::properties(key)?))
+                .map_err(|e| FormatError::Unreadable(e.to_string()))?;
         for group in &groups {
             writer
                 .write(group)
@@ -110,6 +137,10 @@ impl FileFormat for ParquetFormat {
             .map_err(|e| FormatError::Unreadable(e.to_string()))?;
 
         let (sidecar, indexes) = build_sidecar(layout, &groups)?;
+        let sidecar = match (sidecar, key) {
+            (Some(encoded), Some(key)) => Some(Sidecar::seal(&encoded, key)),
+            (sidecar, _) => sidecar,
+        };
         let columns = schema
             .fields()
             .iter()
@@ -130,7 +161,7 @@ impl FileFormat for ParquetFormat {
     }
 
     fn open(&self, store: Arc<dyn ObjectStore>, key: Key, size: u64) -> Box<dyn FileReader> {
-        let reader = ParquetReader::new(store, key, size);
+        let reader = ParquetReader::new(store, key, size).with_keys(Arc::clone(&self.keys));
         Box::new(match &self.footers {
             Some(footers) => reader.with_footers(Arc::clone(footers)),
             None => reader,
@@ -138,10 +169,13 @@ impl FileFormat for ParquetFormat {
     }
 
     fn read(&self, bytes: Bytes) -> Result<Vec<RecordBatch>, FormatError> {
-        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .map_err(|e| FormatError::Unreadable(e.to_string()))?
-            .build()
-            .map_err(|e| FormatError::Unreadable(e.to_string()))?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            bytes,
+            crate::reader::options(&self.keys),
+        )
+        .map_err(|e| FormatError::Unreadable(e.to_string()))?
+        .build()
+        .map_err(|e| FormatError::Unreadable(e.to_string()))?;
         reader
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| FormatError::Unreadable(e.to_string()))
@@ -268,13 +302,83 @@ mod tests {
             .clone()
     }
 
+    /// SE-2: a file written under a key has an encrypted footer and
+    /// pages and a sealed sidecar; the keyring opens them, whole or by
+    /// range, and nothing else does.
+    #[tokio::test]
+    async fn files_of_a_keyed_tenant_open_only_with_the_keyring() {
+        use tessera_object::MemoryStore;
+        use tessera_types::keys::NoKeys;
+        use tessera_types::{Keyring, TenantKey};
+
+        use crate::ScanRequest;
+
+        let named = NamedKey {
+            name: "k".into(),
+            key: TenantKey::from_bytes([9; 32]),
+        };
+        let keys = Arc::new(Keys::new(
+            Keyring::default().with("k", named.key.clone()),
+            Arc::new(NoKeys),
+        ));
+        let rows: Vec<LogRow> = (0..10).map(|i| log(100 + i, "secret body")).collect();
+        let layout = Layout {
+            sort_key: vec![],
+            row_group_rows: 4,
+            indexes: crate::sidecar::IndexSpec {
+                term: vec!["body".into()],
+                trigram: vec![],
+                bloom: vec![],
+            },
+        };
+        let written = ParquetFormat::default()
+            .write(&[batch(&rows)], &layout, Some(&named))
+            .unwrap();
+        assert_eq!(&written.bytes[written.bytes.len() - 4..], b"PARE");
+        assert!(
+            ParquetFormat::default()
+                .read(written.bytes.clone())
+                .is_err(),
+            "no keys, no rows"
+        );
+        let keyed = ParquetFormat::default().with_keys(Arc::clone(&keys));
+        let read = keyed.read(written.bytes.clone()).unwrap();
+        assert_eq!(read.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+
+        let sidecar = written.sidecar.clone().unwrap();
+        assert!(Sidecar::decode(sidecar.clone()).is_err(), "sealed");
+        assert!(matches!(
+            Sidecar::open(sidecar.clone(), &Keys::none()),
+            Err(FormatError::Keys(_))
+        ));
+        assert_eq!(Sidecar::open(sidecar, &keys).unwrap().row_groups(), 3);
+
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let key = Key::new("data/file.parquet").unwrap();
+        store.put(&key, written.bytes.clone()).await.unwrap();
+        let size = written.bytes.len() as u64;
+        let fetched = keyed
+            .open(Arc::clone(&store), key.clone(), size)
+            .fetch(ScanRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(fetched.stats().row_groups, 3);
+        let batches = fetched.decode().unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+        let refused = ParquetFormat::default()
+            .open(store, key, size)
+            .fetch(ScanRequest::default())
+            .await;
+        assert!(refused.is_err(), "no keys, no footer");
+    }
+
     #[test]
     fn the_event_time_is_delta_encoded() {
         use parquet::file::reader::{FileReader, SerializedFileReader};
 
         let rows: Vec<LogRow> = (0..200).map(|i| log(1_000 + i * 7, "x")).collect();
         let written = ParquetFormat::default()
-            .write(&[batch(&rows)], &Layout::l1())
+            .write(&[batch(&rows)], &Layout::l1(), None)
             .unwrap();
         let reader = SerializedFileReader::new(written.bytes.clone()).unwrap();
         let group = &reader.metadata().row_groups()[0];
@@ -309,6 +413,7 @@ mod tests {
             .write(
                 &[batch(&[log(30, "c"), log(10, "a")]), batch(&[log(20, "b")])],
                 &Layout::l1(),
+                None,
             )
             .unwrap();
         assert_eq!(written.row_count, 3);
@@ -337,7 +442,11 @@ mod tests {
     #[test]
     fn statistics_cover_every_column() {
         let written = ParquetFormat::default()
-            .write(&[batch(&[log(5, "zzz"), log(1, "aaa")])], &Layout::l1())
+            .write(
+                &[batch(&[log(5, "zzz"), log(1, "aaa")])],
+                &Layout::l1(),
+                None,
+            )
             .unwrap();
         let body = written.columns.iter().find(|c| c.name == BODY).unwrap();
         assert_eq!(body.min, Some(Scalar::Text("aaa".into())));
@@ -361,7 +470,7 @@ mod tests {
             .collect();
         let raw: usize = batch(&rows).get_array_memory_size();
         let written = ParquetFormat::default()
-            .write(&[batch(&rows)], &Layout::l1())
+            .write(&[batch(&rows)], &Layout::l1(), None)
             .unwrap();
         assert!(
             written.bytes.len() * 4 < raw,
@@ -373,7 +482,7 @@ mod tests {
     #[test]
     fn empty_and_mixed_inputs_are_rejected() {
         assert!(matches!(
-            ParquetFormat::default().write(&[], &Layout::l1()),
+            ParquetFormat::default().write(&[], &Layout::l1(), None),
             Err(FormatError::Empty)
         ));
         let log = batch(&[log(1, "x")]);
@@ -385,11 +494,11 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ParquetFormat::default().write(&[log, other.clone()], &Layout::l1()),
+            ParquetFormat::default().write(&[log, other.clone()], &Layout::l1(), None),
             Err(FormatError::MixedSchemas)
         ));
         assert!(matches!(
-            ParquetFormat::default().write(&[other], &Layout::l1()),
+            ParquetFormat::default().write(&[other], &Layout::l1(), None),
             Err(FormatError::NoTimestamp)
         ));
     }
@@ -427,7 +536,7 @@ mod tests {
             },
         };
         let written = ParquetFormat::default()
-            .write(&[batch(&rows)], &layout)
+            .write(&[batch(&rows)], &layout, None)
             .unwrap();
         assert_eq!(written.sort_key, vec!["severity_number", "timestamp"]);
         assert_eq!(written.row_groups, 3);
@@ -460,7 +569,7 @@ mod tests {
             ..Layout::l1()
         };
         assert!(matches!(
-            ParquetFormat::default().write(&[batch(&[log(1, "a")])], &layout),
+            ParquetFormat::default().write(&[batch(&[log(1, "a")])], &layout, None),
             Err(FormatError::UnknownColumn(c)) if c == "nope"
         ));
     }

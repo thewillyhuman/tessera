@@ -64,9 +64,11 @@ pub async fn write_l1_files(
     let mut files = Vec::new();
     for (partition, rows) in split_by_partition(batches, window)? {
         let format = Arc::clone(&target.format);
-        let written = tokio::task::spawn_blocking(move || format.write(&rows, &Layout::l1()))
-            .await
-            .map_err(|e| WalError::Flush(format!("file encoding task failed: {e}")))??;
+        let key = env.keys.for_tenant(&partition.tenant)?;
+        let written =
+            tokio::task::spawn_blocking(move || format.write(&rows, &Layout::l1(), key.as_ref()))
+                .await
+                .map_err(|e| WalError::Flush(format!("file encoding task failed: {e}")))??;
         let file_id = FileId::random(&mut env.random.clone());
         target
             .store

@@ -56,6 +56,9 @@ pub enum CompactError {
     /// Arrow rejected an operation.
     #[error("arrow: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+    /// A tenant key is missing (SE-2).
+    #[error("tenant keys: {0}")]
+    Keys(#[from] tessera_types::KeyError),
     /// A kernel failed while promoting a column.
     #[error("kernel: {0}")]
     Kernel(#[from] tessera_kernels::KernelError),

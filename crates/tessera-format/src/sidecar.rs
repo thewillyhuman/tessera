@@ -25,12 +25,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, StringArray};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use tessera_types::stable_hash;
+use tessera_types::{Keys, NamedKey, stable_hash};
 
 use crate::FormatError;
 use crate::text::{tokenize, trigrams};
 
 const MAGIC: &[u8; 4] = b"TSC1";
+/// The magic of a sidecar sealed under a tenant key (SE-2): the key's
+/// name and the sealed encoding follow.
+const SEALED_MAGIC: &[u8; 4] = b"TSX1";
+/// What a sealed sidecar is bound to.
+const SEALED_AAD: &[u8] = b"tessera sidecar";
 
 /// The row groups a token or trigram appears in, as a bitmap.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -320,7 +325,33 @@ impl Sidecar {
         out.freeze()
     }
 
-    /// Decodes a sidecar.
+    /// `encoded`, a sidecar's bytes, sealed under `key` (SE-2).
+    #[must_use]
+    pub fn seal(encoded: &[u8], key: &NamedKey) -> Bytes {
+        let mut out = BytesMut::with_capacity(encoded.len() + 64);
+        out.put_slice(SEALED_MAGIC);
+        put_str(&mut out, &key.name);
+        out.put_slice(&key.key.seal(SEALED_AAD, encoded));
+        out.freeze()
+    }
+
+    /// Decodes a sidecar, opening it with `keys` when it is sealed.
+    ///
+    /// # Errors
+    ///
+    /// `Keys` when its key is not held or does not open it;
+    /// `Unreadable` if the bytes are not a sidecar this crate wrote.
+    pub fn open(mut bytes: Bytes, keys: &Keys) -> Result<Self, FormatError> {
+        if bytes.len() < 4 || &bytes[..4] != SEALED_MAGIC {
+            return Self::decode(bytes);
+        }
+        bytes.advance(4);
+        let name = get_str(&mut bytes)?;
+        let plain = keys.open(&name, SEALED_AAD, &bytes)?;
+        Self::decode(Bytes::from(plain))
+    }
+
+    /// Decodes a plain sidecar.
     ///
     /// # Errors
     ///

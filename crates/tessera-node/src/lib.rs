@@ -214,9 +214,10 @@ impl Node {
         let (store, catalog, pool) = open(&config, &env).await?;
         let mut loops = vec![tokio::spawn(keep_fresh(Arc::clone(&catalog)))];
 
-        let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::with_footer_cache(
-            tessera_format::footer::DEFAULT_CAPACITY,
-        ));
+        let format: Arc<dyn FileFormat> = Arc::new(
+            ParquetFormat::with_footer_cache(tessera_format::footer::DEFAULT_CAPACITY)
+                .with_keys(Arc::clone(&env.keys)),
+        );
         let pools = Arc::new(Pools::new(pool.clone(), Arc::clone(&store)));
         let ingester = Ingester::start(
             Arc::clone(&store),

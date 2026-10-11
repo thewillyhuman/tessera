@@ -7,7 +7,9 @@
 //! Files are written whole: L1 files are small by construction (section
 //! 6.9). They are read whole where the caller wants every row, or through
 //! a [`FileReader`] that fetches only the row groups and columns a query
-//! needs ([`scan`]).
+//! needs ([`scan`]). A keyed tenant's files are encrypted under its key
+//! and its sidecars sealed (SE-2); each names its key, and readers open
+//! them with the keyring they were given.
 
 pub mod footer;
 pub mod layout;
@@ -25,7 +27,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use bytes::Bytes;
 use tessera_object::{Key, ObjectStore};
-use tessera_types::{ColumnStats, IndexRef, Timestamp};
+use tessera_types::{ColumnStats, IndexRef, KeyError, NamedKey, Timestamp};
 
 pub use crate::footer::FooterCache;
 pub use crate::layout::{DEFAULT_ROW_GROUP_ROWS, Layout};
@@ -55,6 +57,9 @@ pub enum FormatError {
     /// Arrow failed to build or sort a batch.
     #[error("arrow: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+    /// A tenant key is missing or does not open a sidecar (SE-2).
+    #[error("tenant keys: {0}")]
+    Keys(#[from] KeyError),
 }
 
 /// What a write produced: the bytes and what the manifest records about
@@ -86,18 +91,26 @@ pub struct Written {
 pub trait FileFormat: Send + Sync {
     /// Encodes `batches`, which share one schema, in `layout`: sorted by
     /// its key, split into its row groups, with its indexes in a sidecar.
+    /// Under `key`, the file is encrypted and the sidecar sealed, each
+    /// naming the key (SE-2).
     ///
     /// # Errors
     ///
     /// `Empty`, `MixedSchemas`, `NoTimestamp`, a sort key or index column
     /// the schema lacks, or an encoding failure.
-    fn write(&self, batches: &[RecordBatch], layout: &Layout) -> Result<Written, FormatError>;
+    fn write(
+        &self,
+        batches: &[RecordBatch],
+        layout: &Layout,
+        key: Option<&NamedKey>,
+    ) -> Result<Written, FormatError>;
 
-    /// Decodes a whole file.
+    /// Decodes a whole file, with the format's keys if it is encrypted.
     ///
     /// # Errors
     ///
-    /// `Unreadable` if the bytes are not a file this format wrote.
+    /// `Unreadable` if the bytes are not a file this format wrote or its
+    /// key is not held.
     fn read(&self, bytes: Bytes) -> Result<Vec<RecordBatch>, FormatError>;
 
     /// Opens the `size`-byte file at `key` for partial reads.

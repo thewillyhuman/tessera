@@ -423,7 +423,7 @@ async fn fetch(
             .store()
             .get(&layout::sidecar(&file.partition, file.file_id))
             .await?;
-        let sidecar = Sidecar::decode(bytes)?;
+        let sidecar = Sidecar::open(bytes, &engine.manifests.env().keys)?;
         match decide(&file, &sidecar, &request.predicates_for_indexes) {
             Decision::SkipFile => return Ok((file, None)),
             Decision::RowGroups(Some(groups)) => {

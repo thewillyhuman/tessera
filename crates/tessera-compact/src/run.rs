@@ -178,6 +178,7 @@ impl Compactor {
         let mut wanted: Vec<String> = record.dedicated.clone();
         wanted.extend(record.sort_key.iter().filter(|c| is_path(c)).cloned());
         let format = Arc::clone(&self.format);
+        let keys = Arc::clone(&self.env.keys);
         let partition = job.partition.clone();
         let retain = retain.filter(|_| job.level == Level::L3).cloned();
         let tombstones = tombstones.to_vec();
@@ -206,7 +207,8 @@ impl Compactor {
             } else {
                 (rows, Vec::new())
             };
-            let written = format.write(std::slice::from_ref(&rows), &layout)?;
+            let key = keys.for_tenant(&partition.tenant)?;
+            let written = format.write(std::slice::from_ref(&rows), &layout, key.as_ref())?;
             let stored = stored_usage(&rows, &partition, written.bytes.len() as u64, &templates);
             Ok::<_, CompactError>((written, duplicates, stored))
         })

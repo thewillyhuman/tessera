@@ -9,13 +9,19 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::error::ArrowError;
 use bytes::Bytes;
+use parquet::DecodeResult;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
     RowFilter,
 };
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::encryption::decrypt::{FileDecryptionProperties, KeyRetriever};
+use parquet::errors::ParquetError;
+use parquet::file::metadata::{
+    FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder,
+};
 use tessera_object::{Key, ObjectStore};
+use tessera_types::Keys;
 use tessera_types::event::{OVERFLOW, SCOPES, attributes_column};
 
 use crate::FormatError;
@@ -41,6 +47,38 @@ pub struct ParquetReader {
     key: Key,
     size: u64,
     footers: Option<Arc<FooterCache>>,
+    keys: Arc<Keys>,
+}
+
+/// Reader options opening an encrypted file with `keys`: the file's
+/// footer key metadata names the key (SE-2).
+#[must_use]
+pub(crate) fn options(keys: &Arc<Keys>) -> ArrowReaderOptions {
+    ArrowReaderOptions::new().with_file_decryption_properties(decryption(keys))
+}
+
+fn decryption(keys: &Arc<Keys>) -> Arc<FileDecryptionProperties> {
+    FileDecryptionProperties::with_key_retriever(Arc::new(Retriever(Arc::clone(keys))))
+        .build()
+        .unwrap_or_else(|e| unreachable!("a retriever always builds: {e}"))
+}
+
+/// Finds a file's key in the keyring by the name the file records.
+struct Retriever(Arc<Keys>);
+
+impl KeyRetriever for Retriever {
+    fn retrieve_key(&self, key_metadata: &[u8]) -> parquet::errors::Result<Vec<u8>> {
+        let name = std::str::from_utf8(key_metadata).map_err(|_| {
+            ParquetError::General("the file's key metadata is not a key name".into())
+        })?;
+        self.0
+            .ring()
+            .get(name)
+            .map(|key| key.bytes().to_vec())
+            .ok_or_else(|| {
+                ParquetError::General(format!("key {name} is not in this node's keyring"))
+            })
+    }
 }
 
 impl ParquetReader {
@@ -52,7 +90,15 @@ impl ParquetReader {
             key,
             size,
             footers: None,
+            keys: Arc::new(Keys::none()),
         }
+    }
+
+    /// The reader opening an encrypted file with `keys` (SE-2).
+    #[must_use]
+    pub fn with_keys(mut self, keys: Arc<Keys>) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The reader taking and keeping the footer in `footers`.
@@ -95,14 +141,13 @@ impl ParquetReader {
             return Err(FormatError::Unreadable("file shorter than a footer".into()));
         }
         let tail_start = self.size.saturating_sub(FOOTER_GUESS);
+        let unreadable = |e: ParquetError| FormatError::Unreadable(e.to_string());
         let tail = self.get(tail_start..self.size, stats).await?;
-        let footer = &tail[tail.len() - 8..];
-        if &footer[4..] != b"PAR1" {
-            return Err(FormatError::Unreadable("missing parquet magic".into()));
-        }
-        let length = u64::from(u32::from_le_bytes([
-            footer[0], footer[1], footer[2], footer[3],
-        ]));
+        let footer: [u8; 8] = tail[tail.len() - 8..]
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("eight bytes"));
+        let footer = FooterTail::try_new(&footer).map_err(unreadable)?;
+        let length = footer.metadata_length() as u64;
         let metadata_start = self
             .size
             .checked_sub(FOOTER_SIZE + length)
@@ -115,8 +160,26 @@ impl ParquetReader {
             self.get(metadata_start..self.size - FOOTER_SIZE, stats)
                 .await?
         };
-        ParquetMetaDataReader::decode_metadata(&metadata)
-            .map_err(|e| FormatError::Unreadable(e.to_string()))
+        let mut decoder = ParquetMetaDataPushDecoder::try_new(self.size)
+            .map_err(unreadable)?
+            .with_page_index_policy(PageIndexPolicy::Skip)
+            .with_file_decryption_properties(Some(decryption(&self.keys)));
+        decoder
+            .push_range(
+                self.size - FOOTER_SIZE..self.size,
+                tail.slice(tail.len() - 8..),
+            )
+            .map_err(unreadable)?;
+        decoder
+            .push_range(metadata_start..self.size - FOOTER_SIZE, metadata)
+            .map_err(unreadable)?;
+        match decoder.try_decode().map_err(unreadable)? {
+            DecodeResult::Data(metadata) => Ok(metadata),
+            DecodeResult::NeedsData(ranges) => Err(FormatError::Unreadable(format!(
+                "footer decoding needs more of the file: {ranges:?}"
+            ))),
+            DecodeResult::Finished => Err(FormatError::Unreadable("no footer decoded".into())),
+        }
     }
 }
 
@@ -141,7 +204,7 @@ impl FileReader for ParquetReader {
         let mut stats = ScanStats::default();
         let metadata = self.metadata(&mut stats).await?;
         let arrow_metadata =
-            ArrowReaderMetadata::try_new(Arc::clone(&metadata), ArrowReaderOptions::default())
+            ArrowReaderMetadata::try_new(Arc::clone(&metadata), options(&self.keys))
                 .map_err(|e| FormatError::Unreadable(e.to_string()))?;
         let schema = arrow_metadata.schema();
         let index_of = |name: &str| schema.index_of(name).ok();
