@@ -2353,6 +2353,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-compat-promql"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "prost",
+ "serde_json",
+ "snap",
+ "tessera-ingest",
+ "tessera-server",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "tessera-compat-sql"
 version = "0.1.0"
 dependencies = [
