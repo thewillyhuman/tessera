@@ -23,7 +23,9 @@ use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, in
 use tessera_format::FileFormat;
 use tessera_manifest::{DatasetLogs, Manifest, Registration, intake, list_partitions, registry};
 use tessera_object::{ObjectStore, Pools};
-use tessera_types::{DatasetName, Env, Kind, Level, PoolId, TenantId, Window, WorkKind, WriterId};
+use tessera_types::{
+    DatasetName, Env, Kind, Level, Meter, PoolId, TenantId, Window, WorkKind, WriterId,
+};
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
 use crate::leases::Owned;
@@ -63,6 +65,8 @@ pub struct Background {
     pub interval: Duration,
     /// The dataset logs, for each dataset's layout.
     pub datasets: Arc<DatasetLogs>,
+    /// Where compaction reports what it stores (CO-2).
+    pub meter: Arc<dyn Meter>,
 }
 
 /// Runs the background work forever. Failures are logged and retried on
@@ -72,7 +76,8 @@ pub async fn run(background: Background) {
         Arc::clone(&background.pools),
         Arc::clone(&background.format),
         background.env.clone(),
-    );
+    )
+    .with_meter(Arc::clone(&background.meter));
     let mut ticks = tokio::time::interval(background.interval);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

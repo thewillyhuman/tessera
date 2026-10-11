@@ -17,7 +17,7 @@ use tessera_ir::{
     AggregateExpr, AlertDefinition, BinaryOp, BindContext, ControlStatement, Diagnostic, Expr,
     Literal, NamedExpr, Plan, Registry, Scan, SortKey, Span, Statement,
 };
-use tessera_types::{DatasetName, Kind, Timestamp, event};
+use tessera_types::{DatasetName, Kind, TenantId, Timestamp, event};
 
 use crate::ast;
 
@@ -230,7 +230,9 @@ fn lower_query(
     let Some(from) = &query.from else {
         return lower_constant_query(query, ctx, registry);
     };
-    let (scope, mut plan) = if from.dataset.as_deref() == Some("system") {
+    let (scope, mut plan) = if from.dataset.as_deref() == Some("system") && from.table == "usage" {
+        usage_source(ctx)
+    } else if from.dataset.as_deref() == Some("system") {
         let schema = tessera_ir::system_table_schema(&from.table).ok_or_else(|| {
             Diagnostic::at(
                 from.span,
@@ -282,6 +284,39 @@ fn lower_query(
     } else {
         lowerer.plain_query(query, plan)
     }
+}
+
+/// `system.usage` (CO-4): the `_system.usage` events with their
+/// attributes as columns, read whatever the request's tenant.
+fn usage_source(ctx: &BindContext) -> (Scope, Plan) {
+    let schema = tessera_ir::usage_schema();
+    let dataset = DatasetName::new("usage").unwrap_or_else(|_| ctx.dataset.clone());
+    let scan = Plan::Scan(Scan::all(TenantId::SYSTEM, dataset, Kind::Event));
+    let mut exprs = vec![
+        NamedExpr::new(Expr::column(event::TIMESTAMP), event::TIMESTAMP),
+        NamedExpr::new(Expr::column(event::NAME), "phase"),
+    ];
+    for (name, path, numeric) in tessera_ir::system::USAGE_COLUMNS {
+        exprs.push(NamedExpr::new(
+            Expr::Path {
+                path: path.to_owned(),
+                data_type: if numeric {
+                    DataType::Int64
+                } else {
+                    DataType::Utf8
+                },
+            },
+            name,
+        ));
+    }
+    (
+        Scope {
+            schema,
+            table: Some("usage".into()),
+            kind: None,
+        },
+        scan.project(exprs),
+    )
 }
 
 /// `SELECT 1`, `SELECT now()`: constant rows without a table.

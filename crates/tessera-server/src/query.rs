@@ -115,6 +115,7 @@ async fn run_native(
                 "sql",
                 "ad hoc",
                 started.elapsed(),
+                output.fingerprint,
             );
             let (columns, rows) = rows_json(&output.schema, &output.batches)?;
             QueryResponse::Rows { columns, rows }

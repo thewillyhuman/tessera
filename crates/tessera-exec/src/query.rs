@@ -62,6 +62,7 @@ pub async fn run(
             let plan = optimize(plan, engine.registry())?;
             let mut output = engine.run(&plan).await?;
             output.uses = workload::uses(&plan, &output.analysis);
+            output.fingerprint = crate::cache::fingerprint(&plan);
             Ok(Response::Rows(output))
         }
         Statement::Control(statement) => Ok(Response::Control(statement)),

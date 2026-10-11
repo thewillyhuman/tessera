@@ -47,6 +47,8 @@ pub struct ScanUse {
     pub files_pruned: u64,
     /// Bytes fetched.
     pub bytes_scanned: u64,
+    /// Object-store requests made.
+    pub requests: u64,
     /// Rows in the row groups read, before the predicates.
     pub rows_scanned: u64,
     /// Rows the scan produced.
@@ -300,16 +302,18 @@ fn use_of(
     for predicate in scan.predicates.iter().chain(&context.predicates) {
         predicate_uses(predicate, &mut predicates);
     }
-    let (files_considered, files_pruned, bytes_scanned, rows_scanned, rows_returned) = match stats {
-        Some(s) => (
-            s.files.after_time_range as u64,
-            (s.files.after_time_range.saturating_sub(s.files_read)) as u64,
-            s.bytes_read,
-            s.rows_scanned,
-            (s.rows_from_files + s.rows_from_tail) as u64,
-        ),
-        None => (0, 0, 0, 0, 0),
-    };
+    let (files_considered, files_pruned, bytes_scanned, rows_scanned, rows_returned, requests) =
+        match stats {
+            Some(s) => (
+                s.files.after_time_range as u64,
+                (s.files.after_time_range.saturating_sub(s.files_read)) as u64,
+                s.bytes_read,
+                s.rows_scanned,
+                (s.rows_from_files + s.rows_from_tail) as u64,
+                s.requests as u64,
+            ),
+            None => (0, 0, 0, 0, 0, 0),
+        };
     #[allow(clippy::cast_precision_loss)]
     let selectivity = (rows_scanned > 0).then(|| rows_returned as f64 / rows_scanned as f64);
     ScanUse {
@@ -323,6 +327,7 @@ fn use_of(
         files_considered,
         files_pruned,
         bytes_scanned,
+        requests,
         rows_scanned,
         rows_returned,
         selectivity,

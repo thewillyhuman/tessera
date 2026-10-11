@@ -37,6 +37,37 @@ fn time(name: &str) -> Field {
     Field::new(name, DataType::Timestamp(TimeUnit::Nanosecond, None), true)
 }
 
+/// The columns of `system.usage` (CO-4) besides `timestamp` and `phase`:
+/// the column, the attribute of the `_system.usage` event it comes
+/// from, and whether it is a number.
+pub const USAGE_COLUMNS: [(&str, &str, bool); 15] = [
+    ("tenant", "attr.tenant", false),
+    ("dataset", "attr.dataset", false),
+    ("kind", "attr.kind", false),
+    ("service", "attr.service", false),
+    ("team", "attr.team", false),
+    ("bytes", "attr.bytes", true),
+    ("events", "attr.events", true),
+    ("principal", "attr.principal", false),
+    ("language", "attr.language", false),
+    ("source", "attr.source", false),
+    ("fingerprint", "attr.fingerprint", false),
+    ("cpu_ms", "attr.cpu_ms", true),
+    ("requests", "attr.requests", true),
+    ("pattern_id", "attr.pattern_id", true),
+    ("name", "attr.name", false),
+];
+
+/// The schema of `system.usage`.
+#[must_use]
+pub fn usage_schema() -> SchemaRef {
+    let mut fields = vec![time("timestamp"), text("phase")];
+    for (name, _, numeric) in USAGE_COLUMNS {
+        fields.push(if numeric { int(name) } else { text(name) });
+    }
+    Arc::new(Schema::new(fields))
+}
+
 /// The schema of `system.<table>`, or `None` for an unknown table.
 #[must_use]
 pub fn system_table_schema(table: &str) -> Option<SchemaRef> {

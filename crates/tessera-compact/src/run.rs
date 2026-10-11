@@ -5,16 +5,19 @@
 //! output in the dataset's layout with its indexes, commit the
 //! replacement.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, FixedSizeBinaryArray, RecordBatch};
+use arrow::array::{
+    Array, BooleanArray, FixedSizeBinaryArray, Int64Array, RecordBatch, StringArray,
+};
 use arrow::compute::{concat_batches, filter_record_batch};
 use tessera_format::FileFormat;
+use tessera_format::layout::SERVICE;
 use tessera_manifest::{LayoutRecord, Manifest};
 use tessera_object::{ObjectStore, Pools, layout};
-use tessera_types::event::EVENT_ID;
-use tessera_types::{Env, FileId, FileMeta, FileSource, Kind};
+use tessera_types::event::{EVENT_ID, NAME, PATTERN_ID};
+use tessera_types::{Env, FileId, FileMeta, FileSource, Kind, Meter, PartitionId, Stored};
 
 use crate::plan::Job;
 use crate::{CompactError, promote};
@@ -24,6 +27,7 @@ pub struct Compactor {
     pools: Arc<Pools>,
     format: Arc<dyn FileFormat>,
     env: Env,
+    meter: Option<Arc<dyn Meter>>,
 }
 
 /// What a job did.
@@ -47,6 +51,61 @@ fn is_path(column: &str) -> bool {
     column.starts_with("attr.") || column.starts_with("resource.") || column.starts_with("scope.")
 }
 
+/// A group of stored rows: service, pattern and name.
+type StoredKey = (Option<String>, Option<i64>, Option<String>);
+
+/// What a compacted file stores per service and name (CO-2): the file's
+/// bytes shared out by rows.
+#[must_use]
+pub fn stored_usage(rows: &RecordBatch, partition: &PartitionId, file_bytes: u64) -> Vec<Stored> {
+    let text = |name: &str| {
+        rows.column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned())
+    };
+    let service = text(SERVICE);
+    let name = matches!(
+        partition.kind,
+        Kind::Metric | Kind::Span | Kind::Event | Kind::Alert
+    )
+    .then(|| text(NAME))
+    .flatten();
+    let pattern = rows
+        .column_by_name(PATTERN_ID)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>().cloned());
+    let mut groups: BTreeMap<StoredKey, u64> = BTreeMap::new();
+    for i in 0..rows.num_rows() {
+        let cell = |array: &Option<StringArray>| {
+            array
+                .as_ref()
+                .filter(|a| !a.is_null(i))
+                .map(|a| a.value(i).to_owned())
+        };
+        let key = (
+            cell(&service),
+            pattern
+                .as_ref()
+                .filter(|a| !a.is_null(i))
+                .map(|a| a.value(i)),
+            cell(&name),
+        );
+        *groups.entry(key).or_default() += 1;
+    }
+    let total = rows.num_rows().max(1) as u64;
+    groups
+        .into_iter()
+        .map(|((service, pattern_id, name), count)| Stored {
+            tenant: partition.tenant.clone(),
+            dataset: partition.dataset.clone(),
+            kind: partition.kind,
+            service,
+            pattern_id,
+            name,
+            rows: count,
+            bytes: file_bytes.saturating_mul(count) / total,
+        })
+        .collect()
+}
+
 /// `batch` restricted to the kind's own columns, in schema order.
 fn kind_columns(batch: &RecordBatch, kind: Kind) -> Result<RecordBatch, CompactError> {
     let schema = tessera_types::event::schema(kind);
@@ -62,7 +121,19 @@ impl Compactor {
     /// A compactor writing to `pools` with `format`.
     #[must_use]
     pub fn new(pools: Arc<Pools>, format: Arc<dyn FileFormat>, env: Env) -> Self {
-        Compactor { pools, format, env }
+        Compactor {
+            pools,
+            format,
+            env,
+            meter: None,
+        }
+    }
+
+    /// The compactor reporting what it stores to `meter` (CO-2).
+    #[must_use]
+    pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     /// Runs `job` against `manifest`, which must be the manifest of the
@@ -92,11 +163,13 @@ impl Compactor {
         let mut wanted: Vec<String> = record.dedicated.clone();
         wanted.extend(record.sort_key.iter().filter(|c| is_path(c)).cloned());
         let format = Arc::clone(&self.format);
-        let (written, duplicates) = tokio::task::spawn_blocking(move || {
+        let partition = job.partition.clone();
+        let (written, duplicates, stored) = tokio::task::spawn_blocking(move || {
             let (rows, duplicates) = deduplicate(&batches)?;
             let (rows, _) = promote::promote(&rows, &wanted, promote::MAX_DEDICATED)?;
-            let written = format.write(&[rows], &layout)?;
-            Ok::<_, CompactError>((written, duplicates))
+            let written = format.write(std::slice::from_ref(&rows), &layout)?;
+            let stored = stored_usage(&rows, &partition, written.bytes.len() as u64);
+            Ok::<_, CompactError>((written, duplicates, stored))
         })
         .await
         .map_err(|e| CompactError::Task(e.to_string()))??;
@@ -134,6 +207,9 @@ impl Compactor {
             .replace(&inputs, std::slice::from_ref(&output))
             .await?
         {
+            if let Some(meter) = &self.meter {
+                meter.stored(stored);
+            }
             Ok(Outcome::Replaced {
                 output: file_id,
                 rows: written.row_count,

@@ -28,7 +28,7 @@ use tessera_wal::WalError;
 pub use gc::{LogCollection, collect_files, collect_log};
 pub use plan::{Job, Policy, input_bytes, plan};
 pub use promote::promote;
-pub use run::{Compactor, Outcome};
+pub use run::{Compactor, Outcome, stored_usage};
 
 /// Why compaction or collection failed.
 #[derive(Debug, thiserror::Error)]

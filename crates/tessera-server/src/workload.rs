@@ -35,19 +35,30 @@ pub fn record(
         language,
         source,
         latency,
+        tessera_exec::cache::fingerprint(plan),
     );
 }
 
-/// Records `uses`, one event each, except those of the `_system`
-/// tenant, whose own queries are not logged.
+/// Records `uses`, one event each, and the query's usage (CO-3), except
+/// for the `_system` tenant, whose own queries are not logged.
 pub fn record_uses(
     state: &AppState,
     uses: Vec<ScanUse>,
     language: &str,
     source: &str,
     latency: Duration,
+    fingerprint: u64,
 ) {
     let now = state.env.clock.now();
+    let metered: Vec<ScanUse> = uses
+        .iter()
+        .filter(|u| u.tenant != TenantId::SYSTEM)
+        .cloned()
+        .collect();
+    crate::metering::record(
+        state,
+        &crate::metering::query_usage(&metered, language, source, latency, fingerprint),
+    );
     let mut random = state.env.random.clone();
     let rows: Vec<EventRow> = uses
         .into_iter()

@@ -16,6 +16,7 @@ pub mod partition;
 pub mod position;
 pub mod random;
 pub mod time;
+pub mod usage;
 pub mod work;
 
 pub use env::Env;
@@ -31,4 +32,5 @@ pub use partition::{InvalidWindow, PartitionId, Window};
 pub use position::{Epoch, Seq, Version};
 pub use random::{OsRandom, Random, SeededRandom, SharedRandom};
 pub use time::{Clock, InvalidTimestamp, ManualClock, SystemClock, TimeRange, Timestamp};
+pub use usage::{Meter, Stored};
 pub use work::WorkKind;

@@ -17,6 +17,7 @@ pub mod encode;
 mod error;
 pub mod internal;
 pub mod loki;
+pub mod metering;
 pub mod otlp;
 mod params;
 pub mod pg;
@@ -40,6 +41,7 @@ use tessera_types::{Env, EventBatch, TenantId};
 
 pub use error::ApiError;
 pub use internal::HttpRemote;
+pub use metering::IngestMeter;
 pub use system::SystemTableRows;
 
 /// What a node in a cluster adds: who else is there, how to reach
@@ -87,6 +89,9 @@ impl AppState {
     ///
     /// If the tenant is over its budget or the write fails here.
     pub async fn write(&self, batch: EventBatch) -> Result<(), ApiError> {
+        if batch.tenant() != &TenantId::SYSTEM {
+            metering::record(self, &metering::ingest_usage(self, &batch));
+        }
         let Some(cluster) = &self.cluster else {
             self.ingest.write(batch).await?;
             return Ok(());

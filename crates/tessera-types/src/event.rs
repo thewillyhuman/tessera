@@ -80,6 +80,9 @@ pub const IS_MONOTONIC: &str = "is_monotonic";
 pub const SERIES_ID: &str = "series_id";
 /// Attributes without a dedicated column, as a JSON object.
 pub const OVERFLOW: &str = "_overflow";
+/// The log pattern a compacted log row was assigned (section 13.2), a
+/// dedicated column of compacted log files.
+pub const PATTERN_ID: &str = "pattern_id";
 /// The value column of a metric result (`RangeVector`, section 10.2):
 /// the same name as a stored metric's value.
 pub const VALUE_LABELS: &str = VALUE;

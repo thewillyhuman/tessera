@@ -31,8 +31,8 @@ use tessera_format::{FileFormat, ParquetFormat};
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::DatasetLogs;
 use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
-use tessera_server::{AppState, Cluster, HttpRemote, SystemTableRows};
-use tessera_types::{Env, PoolId};
+use tessera_server::{AppState, Cluster, HttpRemote, IngestMeter, SystemTableRows};
+use tessera_types::{Env, Meter, PoolId};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -206,7 +206,8 @@ impl Node {
             pools,
             membership,
         };
-        let (leases, lease_loop) = shared.own_slots(&config, &mut loops);
+        let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
+        let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
         let (state, engine, controls) = shared.app_state(ingest.clone());
         shared.evaluate_rules(
             &config,
@@ -381,7 +382,12 @@ impl Shared {
     /// Starts the lease loop for the kinds of work the node's roles own
     /// (section 14.2) and, on a compact node, the background work over
     /// the owned slots. Returns the leases and the loop's stop handle.
-    fn own_slots(&self, config: &Config, loops: &mut Vec<JoinHandle<()>>) -> LeaseLoop {
+    fn own_slots(
+        &self,
+        config: &Config,
+        loops: &mut Vec<JoinHandle<()>>,
+        meter: Arc<dyn Meter>,
+    ) -> LeaseLoop {
         let kinds = leases::kinds_of(&config.roles);
         if kinds.is_empty() {
             return (None, None);
@@ -412,6 +418,7 @@ impl Shared {
                 membership: Arc::clone(&self.membership),
                 interval: config.background,
                 datasets: Arc::new(DatasetLogs::new(Arc::clone(&self.store), self.env.clone())),
+                meter,
             })));
         }
         (Some(leases), Some((stop, task)))

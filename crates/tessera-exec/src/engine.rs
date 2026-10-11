@@ -98,6 +98,9 @@ pub struct QueryOutput {
     /// What it asked of each scanned table (AD-1); filled by
     /// [`crate::query::run`], empty straight from the engine.
     pub uses: Vec<ScanUse>,
+    /// The plan's fingerprint (CO-3); filled by [`crate::query::run`],
+    /// zero straight from the engine.
+    pub fingerprint: u64,
 }
 
 impl QueryOutput {
@@ -232,6 +235,7 @@ impl Engine {
                     result_cached: true,
                 },
                 uses: Vec::new(),
+                fingerprint: 0,
             });
         }
         let memory = MemoryPool::new(self.limits.memory_bytes);
@@ -246,6 +250,7 @@ impl Engine {
             batches,
             analysis,
             uses: Vec::new(),
+            fingerprint: 0,
         })
     }
 

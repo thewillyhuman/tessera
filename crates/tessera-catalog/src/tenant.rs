@@ -137,6 +137,9 @@ pub struct TenantSettings {
     pub retention_seconds: Option<u64>,
     /// How many queries may run at once.
     pub query_concurrency: Option<u32>,
+    /// The attribute path that names the team a row belongs to, for
+    /// metering by team (CO-1); none by default.
+    pub team_attribute: Option<String>,
 }
 
 impl TenantSettings {
@@ -150,6 +153,10 @@ impl TenantSettings {
                 .or(self.ingest_rate_bytes_per_second),
             retention_seconds: patch.retention_seconds.or(self.retention_seconds),
             query_concurrency: patch.query_concurrency.or(self.query_concurrency),
+            team_attribute: patch
+                .team_attribute
+                .clone()
+                .or_else(|| self.team_attribute.clone()),
         }
     }
 }
