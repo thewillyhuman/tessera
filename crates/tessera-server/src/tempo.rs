@@ -143,9 +143,12 @@ fn lower(
         .map_err(|e| ApiError::query(QueryError::Syntax(e), text))
 }
 
-async fn run(state: &AppState, plan: Plan) -> Result<Vec<RecordBatch>, ApiError> {
-    let plan = optimize(plan, state.engine.registry())
-        .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
+async fn run(state: &AppState, scope: &Scope, plan: Plan) -> Result<Vec<RecordBatch>, ApiError> {
+    let plan = optimize(
+        crate::params::restricted(state, scope, plan),
+        state.engine.registry(),
+    )
+    .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
     let started = std::time::Instant::now();
     let output = state
         .engine
@@ -285,7 +288,7 @@ async fn search(
             "a search needs a spanset query, not a metrics query",
         ));
     }
-    let batches = run(&state, lowered.plan).await?;
+    let batches = run(&state, &scope, lowered.plan).await?;
     let traces = traces(
         &batches,
         &lowered.shown,
@@ -485,6 +488,7 @@ async fn load_trace(
     spans.predicates = vec![by_id.clone()];
     let span_rows = run(
         state,
+        scope,
         Plan::Scan(spans).sort(vec![SortKey::ascending(Expr::column(TIMESTAMP))]),
     )
     .await?;
@@ -494,7 +498,7 @@ async fn load_trace(
     let mut events = Scan::all(scope.tenant.clone(), scope.dataset.clone(), Kind::Event);
     events.time_range = range;
     events.predicates = vec![by_id];
-    let event_rows = run(state, Plan::Scan(events)).await?;
+    let event_rows = run(state, scope, Plan::Scan(events)).await?;
     let mut events_by_span: BTreeMap<Vec<u8>, Vec<Event>> = BTreeMap::new();
     for batch in &event_rows {
         let (Some(ids), Some(starts)) = (fixed(batch, SPAN_ID), times(batch, TIMESTAMP)) else {
@@ -809,6 +813,7 @@ async fn discovery_rows(
         );
         return run(
             state,
+            &scope,
             Plan::Scan(scan)
                 .sort(vec![SortKey::descending(Expr::column(TIMESTAMP))])
                 .limit(0, Some(DISCOVERY_ROWS)),
@@ -830,7 +835,7 @@ async fn discovery_rows(
             "tag discovery takes a spanset query, not a metrics query",
         ));
     }
-    run(state, lowered.plan).await
+    run(state, &scope, lowered.plan).await
 }
 
 /// The attribute names of `batches` by scope.
@@ -1081,7 +1086,7 @@ async fn metrics_common(
     }
     let labels = lowered.labels.clone();
     let function = lowered.function.clone();
-    let batches = run(state, lowered.plan).await?;
+    let batches = run(state, &scope, lowered.plan).await?;
     let series = series(&batches, &labels);
     let out: Vec<Value> = if instant {
         series

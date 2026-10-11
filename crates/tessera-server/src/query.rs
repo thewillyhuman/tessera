@@ -131,6 +131,7 @@ async fn run_native(
             readable: Some(Arc::new(move |dataset: &DatasetName| {
                 reader.may_read(dataset.as_str())
             })),
+            row_filter: crate::params::row_filter(&principal, &ctx),
             limits: Some(crate::params::limits(state, &ctx.tenant)),
         },
     )

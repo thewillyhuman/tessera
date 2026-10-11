@@ -184,9 +184,12 @@ fn lower(
         })
 }
 
-async fn run(state: &AppState, plan: Plan) -> Result<Vec<RecordBatch>, ApiError> {
-    let plan = optimize(plan, state.engine.registry())
-        .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
+async fn run(state: &AppState, scope: &Scope, plan: Plan) -> Result<Vec<RecordBatch>, ApiError> {
+    let plan = optimize(
+        crate::params::restricted(state, scope, plan),
+        state.engine.registry(),
+    )
+    .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
     let started = std::time::Instant::now();
     let output = state
         .engine
@@ -338,7 +341,7 @@ async fn query_common(
             }
         )));
     }
-    let batches = run(state, lowered.plan.clone()).await?;
+    let batches = run(state, &scope, lowered.plan.clone()).await?;
     Ok(result_data(&lowered, rows(&batches), instant, end))
 }
 
@@ -411,7 +414,7 @@ async fn discovery_rows(
         let plan = selector_plan(&ctx, name.as_deref(), matchers, range, *span)
             .map_err(|e| ApiError::bad_request(e.describe(&text)))?
             .limit(0, Some(DISCOVERY_ROWS));
-        let batches = run(state, plan).await?;
+        let batches = run(state, &scope, plan).await?;
         let series = tessera_exec::promql::series_of(&batches)?;
         sets.extend(series.into_iter().map(|s| s.labels));
     }

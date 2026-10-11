@@ -65,6 +65,11 @@ pub struct Role {
     /// rules, keys and roles.
     #[serde(default)]
     pub admin: bool,
+    /// A SQL condition over the event columns that the role's reads
+    /// pass through (SE-1), such as `attr.service IN ('a', 'b')`; none
+    /// reads every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_filter: Option<String>,
 }
 
 impl Role {
@@ -86,18 +91,21 @@ impl Role {
                 read: every.clone(),
                 write: every,
                 admin: true,
+                row_filter: None,
             }),
             Role::READER => Some(Role {
                 name: name.into(),
                 read: every,
                 write: Vec::new(),
                 admin: false,
+                row_filter: None,
             }),
             Role::WRITER => Some(Role {
                 name: name.into(),
                 read: Vec::new(),
                 write: every,
                 admin: false,
+                row_filter: None,
             }),
             _ => None,
         }
@@ -257,6 +265,19 @@ impl Principal {
         self.roles.iter().any(|r| grants(&r.read, dataset))
     }
 
+    /// The row filters the principal reads `dataset` under (SE-1): the
+    /// conditions of the roles granting the read, of which any may
+    /// pass; `None` when a role grants the dataset whole. Empty when no
+    /// role grants it, which [`Principal::may_read`] refuses first.
+    #[must_use]
+    pub fn row_filters(&self, dataset: &str) -> Option<Vec<&str>> {
+        let mut filters = Vec::new();
+        for role in self.roles.iter().filter(|r| grants(&r.read, dataset)) {
+            filters.push(role.row_filter.as_deref()?);
+        }
+        Some(filters)
+    }
+
     /// Whether the principal may write `dataset` of its tenant.
     #[must_use]
     pub fn may_write(&self, dataset: &str) -> bool {
@@ -286,6 +307,56 @@ mod tests {
     use tessera_types::SeededRandom;
 
     use super::*;
+
+    /// SE-1: a filtered role reads through its condition; a role
+    /// without one reads the dataset whole and lifts the others'.
+    #[test]
+    fn row_filters_follow_the_reading_roles() {
+        let filtered = |name: &str, condition: &str| Role {
+            name: name.into(),
+            read: vec!["prod".into()],
+            write: Vec::new(),
+            admin: false,
+            row_filter: Some(condition.into()),
+        };
+        let a = filtered("a", "attr.team = 'a'");
+        let b = filtered("b", "attr.team = 'b'");
+        let whole = Role {
+            name: "whole".into(),
+            read: vec!["prod".into()],
+            write: Vec::new(),
+            admin: false,
+            row_filter: None,
+        };
+        let names = |roles: &[&str]| roles.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
+        let both = Principal::with_roles(
+            TenantId::DEFAULT,
+            "k".into(),
+            &names(&["a", "b"]),
+            &[a.clone(), b.clone(), whole.clone()],
+        );
+        assert_eq!(
+            both.row_filters("prod"),
+            Some(vec!["attr.team = 'a'", "attr.team = 'b'"])
+        );
+        assert_eq!(
+            both.row_filters("staging"),
+            Some(Vec::new()),
+            "no role reads it"
+        );
+        let lifted = Principal::with_roles(
+            TenantId::DEFAULT,
+            "k".into(),
+            &names(&["a", "whole"]),
+            &[a, b, whole],
+        );
+        assert_eq!(
+            lifted.row_filters("prod"),
+            None,
+            "a whole read lifts the filter"
+        );
+        assert_eq!(Principal::anonymous().row_filters("prod"), None);
+    }
 
     fn tenant() -> TenantName {
         TenantName::new("acme").unwrap()
@@ -341,6 +412,7 @@ mod tests {
             read: vec!["prod".into()],
             write: Vec::new(),
             admin: false,
+            row_filter: None,
         };
         let principal = Principal::of(TenantId::DEFAULT, &key, &[payments]);
         assert!(principal.may_read("prod"));

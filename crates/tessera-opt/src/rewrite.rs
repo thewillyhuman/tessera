@@ -225,6 +225,14 @@ fn unqualified(exprs: Vec<Expr>, side: &str) -> Vec<Expr> {
     exprs.into_iter().map(|e| e.unqualify(side)).collect()
 }
 
+/// `plan` with `f` applied to every scan in it.
+pub fn map_scans(plan: Plan, f: &mut impl FnMut(Scan) -> Scan) -> Plan {
+    match plan {
+        Plan::Scan(scan) => Plan::Scan(f(scan)),
+        other => rebuild_inputs(other, |input| map_scans(input, f)),
+    }
+}
+
 /// Applies `f` to each input of `plan`, keeping the node itself.
 pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
     match plan {

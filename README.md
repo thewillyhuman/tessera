@@ -313,7 +313,10 @@ certificate signed by that CA is a credential too: the subject's
 organization names the tenant, its organizational units the roles and
 its common name who it is; a client presenting none still connects and
 needs a key or a token. Certificates authenticate the HTTP API; the
-`PostgreSQL` protocol takes keys as passwords (SE-1).
+`PostgreSQL` protocol takes keys as passwords (SE-1). A role may carry a
+`row_filter`, a SQL condition such as `attr.team = 'pay'`, and every
+read it grants passes through it, on the SQL, `PostgreSQL`, Loki,
+Prometheus and Tempo paths alike (SE-1).
 
 A node given `--keyring`, a file of `name = <64 hex digits>` lines,
 seals the data of every tenant whose `encryption_key` setting names
@@ -324,8 +327,7 @@ sealed while that key stays in the keyring, and a tenant naming a key
 the node lacks is refused rather than stored plain (SE-2, SE-3). Key
 material never enters the object store; the catalog holds names only.
 
-Gaps left in M10: no
-row-filter roles (SE-1); no Iceberg
+Gaps left in M10: no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a
 cluster, and the binary is not statically linked; membership still comes from the registry alone, not

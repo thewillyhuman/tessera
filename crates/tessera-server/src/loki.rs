@@ -115,6 +115,7 @@ fn time_range(params: &QueryParams, now: Timestamp) -> Result<(Timestamp, Timest
 /// Runs a lowered query, with the log direction and limit applied.
 async fn run(
     state: &AppState,
+    scope: &Scope,
     lowered: Lowered,
     limit: usize,
     backward: bool,
@@ -129,8 +130,11 @@ async fn run(
     } else {
         lowered.plan.clone()
     };
-    let plan = optimize(plan, state.engine.registry())
-        .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
+    let plan = optimize(
+        crate::params::restricted(state, scope, plan),
+        state.engine.registry(),
+    )
+    .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
     let started = std::time::Instant::now();
     let output = state
         .engine
@@ -321,7 +325,7 @@ async fn query_common(
     } else {
         lower(&query, &scope, range, now)?
     };
-    let (lowered, batches) = run(state, lowered, limit, backward).await?;
+    let (lowered, batches) = run(state, &scope, lowered, limit, backward).await?;
     let data = match lowered.kind {
         ResultKind::Streams => streams(rows(&batches), backward),
         ResultKind::Scalar => {
@@ -410,7 +414,7 @@ async fn discovery_rows(
             "a selector is needed here, not a metric query",
         ));
     }
-    let (_, batches) = run(state, lowered, DISCOVERY_ROWS, true).await?;
+    let (_, batches) = run(state, &scope, lowered, DISCOVERY_ROWS, true).await?;
     Ok(rows(&batches))
 }
 
@@ -690,7 +694,9 @@ async fn tail_loop(
             step: Duration::ZERO,
         };
         let batches = match lower(&query, &scope, params, now) {
-            Ok(lowered) => run(&state, lowered, limit, false).await.map(|(_, b)| b),
+            Ok(lowered) => run(&state, &scope, lowered, limit, false)
+                .await
+                .map(|(_, b)| b),
             Err(error) => Err(error),
         };
         match batches {

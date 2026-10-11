@@ -394,6 +394,97 @@ mod tests {
         created["key"].as_str().unwrap().to_owned()
     }
 
+    /// SE-1: a key whose role carries a row filter reads the rows that
+    /// pass it alone, on the SQL and the Loki paths; a filter that is
+    /// no condition is refused when the role is stored.
+    #[tokio::test]
+    async fn row_filter_roles_read_their_rows_alone() {
+        let sql = |text: &str| json!({ "dataset": "default", "query": text });
+        let mut keys = (String::new(), String::new());
+        let state = locked(async |state| {
+            let logs = crate::otlp::testing::export(&["a", "b", "c", "d"]);
+            let (status, body) = call(
+                state,
+                "POST",
+                "/v1/logs",
+                None,
+                &[],
+                Some(serde_json::to_value(&logs).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (status, body) = call(
+                state,
+                "POST",
+                "/api/v1/query",
+                None,
+                &[],
+                Some(sql("INSERT INTO system.roles (name, read, row_filter) \
+                     VALUES ('late', '[\"*\"]', 'attr.n >= 2')")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (status, body) = call(
+                state,
+                "POST",
+                "/api/v1/query",
+                None,
+                &[],
+                Some(sql("INSERT INTO system.roles (name, read, row_filter) \
+                     VALUES ('broken', '[\"*\"]', 'nonsense ((')")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            keys = (
+                issue(state, "default", "all", &["reader"]).await,
+                issue(state, "default", "late", &["late"]).await,
+            );
+        })
+        .await;
+        let (whole, late) = keys;
+        let count = |key: String| {
+            let state = state.clone();
+            async move {
+                let (status, body) = call(
+                    &state,
+                    "POST",
+                    "/api/v1/query",
+                    Some(&key),
+                    &[],
+                    Some(sql("SELECT count(*) FROM logs")),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                body["rows"][0][0].as_f64().unwrap()
+            }
+        };
+        assert!((count(whole.clone()).await - 4.0).abs() < f64::EPSILON);
+        assert!(
+            (count(late.clone()).await - 2.0).abs() < f64::EPSILON,
+            "attr.n 2 and 3"
+        );
+        let (status, body) = call(
+            &state,
+            "GET",
+            "/loki/api/v1/query?query=count_over_time(%7Bn%3D~%22.%2B%22%7D%5B1h%5D)&time=1700000000000000010",
+            Some(&late),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let total: f64 = body["data"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["value"][1].as_str().unwrap().parse::<f64>().unwrap())
+            .sum();
+        assert!(
+            (total - 2.0).abs() < f64::EPSILON,
+            "the Loki path reads through the filter too: {body}"
+        );
+    }
+
     /// CT-9: a cluster administrator names another tenant's table as
     /// `tenant.dataset.table`; a tenant's own credentials cannot.
     #[tokio::test]

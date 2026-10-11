@@ -16,8 +16,13 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
+use std::sync::Arc;
+
 use tessera_catalog::{Features, Principal, TenantName};
 use tessera_exec::QueryLimits;
+use tessera_exec::query::{RowFilter, restrict};
+use tessera_ir::{BindContext, Expr, Frontend, Plan, Statement};
+use tessera_sql::SqlFrontend;
 use tessera_types::{DatasetName, TenantId, Timestamp};
 
 use crate::{ApiError, AppState, auth};
@@ -167,6 +172,63 @@ pub(crate) fn prices(state: &AppState) -> BTreeMap<String, f64> {
             Some(((*setting).to_owned(), value))
         })
         .collect()
+}
+
+/// The condition `principal` reads each dataset under (SE-1): any of
+/// the conditions of the roles granting the read, none where a role
+/// grants the dataset whole; `None` for a principal with no filtered
+/// role at all. A condition that does not lower denies every row
+/// rather than opening them, as does a dataset no role reads.
+pub(crate) fn row_filter(principal: &Principal, ctx: &BindContext) -> Option<RowFilter> {
+    if principal.roles.iter().all(|r| r.row_filter.is_none()) {
+        return None;
+    }
+    let principal = principal.clone();
+    let ctx = ctx.clone();
+    Some(Arc::new(move |dataset: &DatasetName| {
+        let filters = principal.row_filters(dataset.as_str())?;
+        let denied = || Expr::literal(false);
+        Some(
+            filters
+                .iter()
+                .map(|text| condition(text, &ctx).unwrap_or_else(denied))
+                .reduce(Expr::or)
+                .unwrap_or_else(denied),
+        )
+    }))
+}
+
+/// `plan` restricted to the rows `scope`'s principal may read (SE-1).
+pub(crate) fn restricted(state: &AppState, scope: &Scope, plan: Plan) -> Plan {
+    let ctx = BindContext::new(
+        scope.tenant.clone(),
+        scope.dataset.clone(),
+        state.env.clock.now(),
+    );
+    match row_filter(&scope.principal, &ctx) {
+        Some(filter) => restrict(plan, filter.as_ref()),
+        None => plan,
+    }
+}
+
+/// A SQL condition over the unified events table as an expression,
+/// so that it applies to every kind of row; `None` when it does not
+/// lower.
+pub(crate) fn condition(text: &str, ctx: &BindContext) -> Option<Expr> {
+    let Statement::Query(plan) = SqlFrontend
+        .lower(&format!("SELECT 1 FROM events WHERE {text}"), ctx)
+        .ok()?
+    else {
+        return None;
+    };
+    let mut node = &plan;
+    loop {
+        match node {
+            Plan::Filter { predicate, .. } => return Some(predicate.clone()),
+            Plan::Project { input, .. } | Plan::Limit { input, .. } => node = input,
+            _ => return None,
+        }
+    }
 }
 
 /// The feature switches of `tenant` (CT-7); all on for a tenant the

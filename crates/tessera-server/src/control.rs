@@ -17,9 +17,9 @@ use tessera_catalog::{AccessRole, ApiKey, ControlError, ControlStore, Row, Table
 use tessera_eval::{
     Acknowledgment, AlertRule, Inhibition, NotificationRoute, Rollup, Silence, mode_of,
 };
-use tessera_ir::{ControlStatement, Literal};
+use tessera_ir::{BindContext, ControlStatement, Literal};
 use tessera_manifest::{DatasetLog, Tombstone};
-use tessera_types::{DatasetName, Kind, Random, RetentionPolicy, TenantId};
+use tessera_types::{DatasetName, Kind, Random, RetentionPolicy, TenantId, Timestamp};
 
 use crate::AppState;
 use crate::error::ApiError;
@@ -466,7 +466,19 @@ fn validate(table: Table, document: &Value) -> Result<(), ApiError> {
             serde_json::from_value::<ApiKey>(document.clone()).map_err(invalid)?;
         }
         Table::Roles => {
-            serde_json::from_value::<AccessRole>(document.clone()).map_err(invalid)?;
+            let role = serde_json::from_value::<AccessRole>(document.clone()).map_err(invalid)?;
+            if let Some(text) = &role.row_filter {
+                let ctx = BindContext::new(
+                    TenantId::DEFAULT,
+                    DatasetName::new("default").unwrap_or_else(|_| unreachable!("a name")),
+                    Timestamp::from_nanos(0),
+                );
+                if crate::params::condition(text, &ctx).is_none() {
+                    return Err(ApiError::bad_request(format!(
+                        "roles.row_filter is not a condition over the event columns: {text}"
+                    )));
+                }
+            }
         }
         Table::Rollups | Table::RetentionPolicies | Table::LayoutPins | Table::SavedQueries => {}
     }
