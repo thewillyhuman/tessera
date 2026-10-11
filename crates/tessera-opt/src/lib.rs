@@ -21,7 +21,7 @@ use tessera_ir::{Plan, PlanError, Registry};
 
 pub use bind::bind;
 pub use index::{Decision, decide};
-pub use prune::{PruneReport, bounds, prune_files};
+pub use prune::{PruneReport, bounds, prune_files, stores_every_trace};
 pub use rewrite::{map_scans, rewrite};
 pub use rollup::substitute;
 

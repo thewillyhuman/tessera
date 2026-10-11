@@ -283,6 +283,46 @@ impl Spanset {
         leaves.into_iter().reduce(Expr::or)
     }
 
+    /// A predicate every span that any filter matches satisfies where
+    /// the columns a completed trace stores are at hand (QL-14): the
+    /// filters' union, trace-level conditions included, for the scan
+    /// of files that store them. `None` when [`candidates`] already
+    /// serves every file, or when some filter matches every span.
+    ///
+    /// [`candidates`]: Self::candidates
+    #[must_use]
+    pub fn candidates_stored(&self) -> Option<Expr> {
+        if self.candidates().is_some() {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        if !self.collect_all_leaves(&mut leaves) {
+            return None;
+        }
+        leaves.into_iter().reduce(Expr::or)
+    }
+
+    /// Collects every filter into `leaves`, trace-level conditions
+    /// included; false if some filter matches every span.
+    fn collect_all_leaves(&self, leaves: &mut Vec<Expr>) -> bool {
+        match self {
+            Spanset::Filter(None) => false,
+            Spanset::Filter(Some(condition)) => {
+                leaves.push(condition.clone());
+                true
+            }
+            Spanset::And(left, right)
+            | Spanset::Or(left, right)
+            | Spanset::Pipe(left, right)
+            | Spanset::Structural { left, right, .. } => {
+                left.collect_all_leaves(leaves) && right.collect_all_leaves(leaves)
+            }
+            Spanset::AggregateFilter { input, .. }
+            | Spanset::By { input, .. }
+            | Spanset::Coalesce(input) => input.collect_all_leaves(leaves),
+        }
+    }
+
     /// Collects the filters into `leaves`; false if some filter matches
     /// every span.
     fn collect_leaves(&self, leaves: &mut Vec<Expr>) -> bool {
@@ -455,6 +495,23 @@ mod tests {
             Expr::column(NEST_PARENT).binary(BinaryOp::Eq, Expr::literal(-1)),
         ));
         assert_eq!(roots.candidates(), None, "the tree needs every span");
+        // QL-14: where the shape is stored, the trace-level condition
+        // is a candidate predicate like any other.
+        assert_eq!(
+            roots.candidates_stored().unwrap().to_string(),
+            "(nest_parent = -1)"
+        );
+        let mixed = Spanset::Pipe(Box::new(roots.clone()), Box::new(filter(NAME, "b")));
+        assert_eq!(
+            mixed.candidates_stored().unwrap().to_string(),
+            "((nest_parent = -1) OR (name = 'b'))"
+        );
+        assert_eq!(
+            filter(NAME, "a").candidates_stored(),
+            None,
+            "served by the plain candidates"
+        );
+        assert_eq!(all.candidates_stored(), None, "a filter matches everything");
         assert!(!filter(NAME, "a").reads_trace_columns());
         assert_eq!(
             Spanset::Coalesce(Box::new(filter(NAME, "a")))

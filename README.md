@@ -99,10 +99,13 @@ that lies whole within it stored in the file, and a search reads a
 trace's shape from those columns rather than numbering it again
 (QL-14).
 
-Gaps left in M4: a condition on the stored columns, such as a root
-span's name, is still evaluated per trace rather than pushed into the
-scan of the files that store them, so it prunes nothing; Grafana
-itself has not been run against the API yet.
+A condition on those columns, such as a root span's name, narrows
+the candidate scan of the files whose every trace stores its shape
+and prunes them by their statistics; files that store only some
+traces let the others through to be numbered, and files below L3
+and the tail are read whole.
+
+Gaps left in M4: Grafana itself has not been run against the API yet.
 
 **M5, metrics: done, with gaps listed below.** Metric data points
 over OTLP (gauges, sums, histograms, exponential histograms and

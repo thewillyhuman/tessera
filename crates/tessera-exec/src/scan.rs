@@ -20,11 +20,12 @@ use arrow::compute::filter_record_batch;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use futures::stream::{self, StreamExt};
 use tessera_format::{RowPredicate, ScanRequest, ScanStats, Sidecar};
+use tessera_ir::trace::NEST_LEFT;
 use tessera_ir::{BinaryOp, Expr, PathColumn, Scan};
 use tessera_kernels::{evaluate_predicate, variant};
 use tessera_manifest::view;
 use tessera_object::layout;
-use tessera_opt::{Decision, PruneReport, bounds, decide, prune_files};
+use tessera_opt::{Decision, PruneReport, bounds, decide, prune_files, stores_every_trace};
 use tessera_types::event::{TIMESTAMP, logical_path};
 use tessera_types::{FileMeta, Timestamp};
 
@@ -220,6 +221,23 @@ async fn without_deleted(engine: &Engine, scan: &Scan) -> Result<Scan, EngineErr
     Ok(hidden)
 }
 
+/// The stored predicate `file` can answer (QL-14): as it is when every
+/// trace in the file stores its shape, or letting the spans of the
+/// traces that do not store it through, to be numbered; none for a
+/// file without the stored columns.
+fn stored_predicate_for(file: &FileMeta, stored: Option<&Expr>) -> Option<Expr> {
+    let stored = stored?;
+    let numbered = file.columns.iter().find(|c| c.name == NEST_LEFT)?;
+    if stores_every_trace(file) {
+        return Some(stored.clone());
+    }
+    let unnumbered = Expr::IsNull {
+        expr: Box::new(Expr::column(&numbered.name)),
+        negated: false,
+    };
+    Some(stored.clone().or(unnumbered))
+}
+
 /// The scan's predicates with its time range as conjuncts: rows outside
 /// the range are filtered like any predicate, and the range also prunes
 /// partitions, files and row groups above.
@@ -271,6 +289,7 @@ pub(crate) async fn read_files(
 ) -> Result<Vec<RecordBatch>, EngineError> {
     let schema = scan.schema()?;
     let predicate = full_predicate(scan);
+    let stored = Expr::all(scan.stored_predicates.iter().cloned());
     // The kind's columns are read from every file; a path column only
     // from the files that have it (AD-4), the rest extract it.
     let kind_columns: Vec<String> = schema
@@ -292,6 +311,14 @@ pub(crate) async fn read_files(
     files.sort_by_key(|f| std::cmp::Reverse(f.max_timestamp));
     let mut fetches = stream::iter(files.into_iter().map(|file| {
         let mut request = request.clone();
+        if let Some(stored) = stored_predicate_for(&file, stored.as_ref()) {
+            let conjunct = match &predicate {
+                Some(predicate) => predicate.clone().and(stored.clone()),
+                None => stored.clone(),
+            };
+            request.request.filter = Some(row_predicate(conjunct));
+            request.predicates_for_indexes.push(stored);
+        }
         if let Some(projection) = &mut request.request.projection {
             // A file holds a path as one column, or as a sub-column per
             // type class (DM-5): every column of the path is read.

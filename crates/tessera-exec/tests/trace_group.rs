@@ -138,14 +138,23 @@ fn name_is(name: &str) -> Spanset {
 }
 
 /// A trace group whose candidates are the spans the spanset's filters
-/// match.
+/// match, as the `TraceQL` lowering builds it: a trace-level condition
+/// narrows the candidates in the files that store the shape (QL-14).
 fn group(spanset: Spanset) -> Plan {
     let spans = Scan::all(TenantId::DEFAULT, dataset(), Kind::Span);
-    let candidates = spanset.candidates().map(|predicate| {
-        let mut scan = spans.clone();
-        scan.predicates = vec![predicate];
-        Box::new(Plan::Scan(scan))
-    });
+    let candidates = match (spanset.candidates(), spanset.candidates_stored()) {
+        (Some(predicate), _) => {
+            let mut scan = spans.clone();
+            scan.predicates = vec![predicate];
+            Some(Box::new(Plan::Scan(scan)))
+        }
+        (None, Some(stored)) => {
+            let mut scan = spans.clone();
+            scan.stored_predicates = vec![stored];
+            Some(Box::new(Plan::Scan(scan)))
+        }
+        (None, None) => None,
+    };
     Plan::TraceGroup {
         candidates,
         spans: Box::new(Plan::Scan(spans)),
@@ -367,4 +376,45 @@ async fn completed_files_answer_structural_queries_alike() {
         nested(&before),
         "the stored numbers are the computed ones"
     );
+}
+
+/// QL-14: a condition on the stored columns narrows the candidate scan
+/// of the files that store the shape, and the answer is the one the
+/// tree gives.
+#[tokio::test]
+async fn stored_conditions_narrow_the_candidates_of_completed_files() {
+    let (store, env) = populate().await;
+    let roots_named = Spanset::Filter(Some(
+        Expr::column("nest_parent")
+            .binary(BinaryOp::Eq, Expr::literal(-1))
+            .and(Expr::column(NAME).binary(BinaryOp::Eq, Expr::literal("GET /"))),
+    ));
+    let query = || {
+        group(Spanset::Structural {
+            left: Box::new(roots_named.clone()),
+            op: Structural {
+                relation: Relation::Descendant,
+                negated: false,
+                union: false,
+            },
+            right: Box::new(name_is("cache")),
+        })
+    };
+    let before = run(&engine(&store, &env), query()).await;
+    assert_eq!(ids(&before), vec![(1, 3), (2, 3), (3, 3), (4, 3)]);
+    let candidates = &before.analysis.scans[0];
+    assert_eq!(
+        candidates.rows_from_files + candidates.rows_from_tail,
+        12,
+        "nothing stores the shape yet: every span is a candidate"
+    );
+    complete_all(&store, &env).await;
+    let after = run(&engine(&store, &env), query()).await;
+    assert_eq!(ids(&after), ids(&before));
+    let candidates = &after.analysis.scans[0];
+    assert_eq!(
+        candidates.rows_from_files, 6,
+        "the root and the cache span of each of the three completed traces"
+    );
+    assert_eq!(candidates.rows_from_tail, 3, "the tail is read whole");
 }

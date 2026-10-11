@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use tessera_format::Bound;
+use tessera_ir::trace::NEST_LEFT;
 use tessera_ir::{BinaryOp, Expr, Literal, Scan};
 use tessera_types::event::{
     CLASS_BOOL, CLASS_FLOAT, CLASS_INT, CLASS_TEXT, Scalar, TIMESTAMP, sub_column,
@@ -41,6 +42,7 @@ pub fn prune_files<'a>(
     files: impl IntoIterator<Item = &'a FileMeta>,
 ) -> (Vec<&'a FileMeta>, PruneReport) {
     let mut report = PruneReport::default();
+    let stored = bounds(&scan.stored_predicates, TimeRange::ALL);
     let bounds = bounds(&scan.predicates, scan.time_range);
     let mut kept = Vec::new();
     for file in files {
@@ -54,6 +56,11 @@ pub fn prune_files<'a>(
         report.after_time_range += 1;
         report.after_path_presence += 1;
         if !admits(file, &bounds) {
+            continue;
+        }
+        // The stored predicates bound a file only when every trace in it
+        // stores its shape (QL-14): a null there is a trace to number.
+        if stores_every_trace(file) && !admits(file, &stored) {
             continue;
         }
         report.after_statistics += 1;
@@ -161,6 +168,16 @@ fn classes_of(bound: &Bound) -> &'static [&'static str] {
         Some(Scalar::Bool(_)) => &[CLASS_BOOL],
         None => &[],
     }
+}
+
+/// Whether every span of the file carries its trace's stored shape
+/// (QL-14): the file has the nested-set columns and none is null.
+#[must_use]
+pub fn stores_every_trace(file: &FileMeta) -> bool {
+    file.columns
+        .iter()
+        .find(|c| c.name == NEST_LEFT)
+        .is_some_and(|c| c.null_count == 0)
 }
 
 /// Whether the file's statistics admit a row within every bound.
@@ -363,5 +380,54 @@ mod tests {
             kept.is_empty(),
             "text is all the path holds: pruned by its statistics"
         );
+    }
+
+    /// QL-14: a stored predicate prunes by the statistics of the files
+    /// whose every trace stores its shape, and leaves the others alone.
+    #[test]
+    fn stored_predicates_prune_the_files_that_store_every_trace() {
+        let stats = |name: &str, min: &str, max: &str, nulls: u64| ColumnStats {
+            name: name.into(),
+            min: Some(Scalar::Text(min.into())),
+            max: Some(Scalar::Text(max.into())),
+            null_count: nulls,
+            distinct: None,
+        };
+        let numbered = |nulls: u64| ColumnStats {
+            name: NEST_LEFT.into(),
+            min: Some(Scalar::Int(1)),
+            max: Some(Scalar::Int(9)),
+            null_count: nulls,
+            distinct: None,
+        };
+        let mut complete = file(1, 0, 10, (1, 5));
+        complete
+            .columns
+            .push(stats("root_name", "GET /", "GET /", 0));
+        complete.columns.push(numbered(0));
+        let mut partial = file(2, 0, 10, (1, 5));
+        partial
+            .columns
+            .push(stats("root_name", "GET /", "GET /", 2));
+        partial.columns.push(numbered(2));
+        let plain = file(3, 0, 10, (1, 5));
+        let files = vec![complete, partial, plain];
+        let mut scan = Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Span,
+        );
+        scan.stored_predicates =
+            vec![Expr::column("root_name").binary(BinaryOp::Eq, Expr::literal("POST /"))];
+        let (kept, _) = prune_files(&scan, &files);
+        let ids: Vec<FileId> = kept.iter().map(|f| f.file_id).collect();
+        assert_eq!(
+            ids,
+            [FileId::from_u128(2), FileId::from_u128(3)],
+            "the complete file has no such root"
+        );
+        assert!(stores_every_trace(&files[0]));
+        assert!(!stores_every_trace(&files[1]));
+        assert!(!stores_every_trace(&files[2]));
     }
 }

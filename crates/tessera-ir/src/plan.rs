@@ -189,6 +189,12 @@ pub struct Scan {
     /// attributes by path only does without. On until the optimizer
     /// proves otherwise.
     pub overflow_whole: bool,
+    /// Predicates over the columns a completed trace stores (QL-14),
+    /// as a conjunction, that every output row of a file storing them
+    /// satisfies; a file without them, and the tail, are read whole,
+    /// since what they hold must be numbered first.
+    #[serde(default)]
+    pub stored_predicates: Vec<Expr>,
 }
 
 /// An attribute path a scan materializes as a column named by the path.
@@ -214,6 +220,7 @@ impl Scan {
             newest_first_limit: None,
             paths: Vec::new(),
             overflow_whole: true,
+            stored_predicates: Vec::new(),
         }
     }
 
@@ -1025,6 +1032,14 @@ fn fmt_scan(f: &mut fmt::Formatter<'_>, pad: &str, scan: &Scan) -> fmt::Result {
     if !scan.paths.is_empty() {
         let shown: Vec<&str> = scan.paths.iter().map(|p| p.path.as_str()).collect();
         write!(f, " paths=[{}]", shown.join(", "))?;
+    }
+    if !scan.stored_predicates.is_empty() {
+        let shown: Vec<String> = scan
+            .stored_predicates
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        write!(f, " stored_predicates=[{}]", shown.join(", "))?;
     }
     writeln!(f)
 }

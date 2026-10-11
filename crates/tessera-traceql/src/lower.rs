@@ -149,14 +149,22 @@ fn next(t: Timestamp) -> Timestamp {
 /// it narrows anything, every span of the range otherwise.
 fn trace_group(spanset: Spanset, ctx: &BindContext, range: TimeRange, events: &[Expr]) -> Plan {
     let spans = spans_source(ctx, range, events);
-    let candidates = spanset.candidates().map(|predicate| match &spans {
-        Plan::Scan(scan) => {
+    let candidates = match (spanset.candidates(), spanset.candidates_stored(), &spans) {
+        (Some(predicate), _, Plan::Scan(scan)) => {
             let mut scan = scan.clone();
             scan.predicates = vec![predicate];
-            Box::new(Plan::Scan(scan))
+            Some(Box::new(Plan::Scan(scan)))
         }
-        joined => Box::new(joined.clone().filter(predicate)),
-    });
+        (Some(predicate), _, joined) => Some(Box::new(joined.clone().filter(predicate))),
+        // A trace-level condition narrows the candidates in the files
+        // that store the traces' shape (QL-14); the rest read whole.
+        (None, Some(stored), Plan::Scan(scan)) => {
+            let mut scan = scan.clone();
+            scan.stored_predicates = vec![stored];
+            Some(Box::new(Plan::Scan(scan)))
+        }
+        (None, _, _) => None,
+    };
     Plan::TraceGroup {
         candidates,
         spans: Box::new(spans),
@@ -1144,8 +1152,12 @@ mod tests {
             "{text}"
         );
         assert!(
-            !text.contains("predicates=[(nest_parent"),
-            "every span is a candidate: {text}"
+            !text.contains(" predicates=[(nest_parent"),
+            "every span of a file without the shape is a candidate: {text}"
+        );
+        assert!(
+            text.contains("stored_predicates=[((nest_parent = -1) AND (nest_left >= 1))]"),
+            "a file storing the shape answers the condition (QL-14): {text}"
         );
         let metrics = lower(
             &parse("{ nestedSetParent < 0 } | rate()").unwrap(),
