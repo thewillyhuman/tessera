@@ -53,6 +53,14 @@ fn batch(day: i64, from: u8, count: u8) -> EventBatch {
                 attributes: BTreeMap::from([
                     ("attr.n".to_owned(), Scalar::Int(i64::from(i))),
                     ("attr.host".to_owned(), Scalar::Text(format!("h{}", i % 2))),
+                    (
+                        "attr.code".to_owned(),
+                        if i % 2 == 0 {
+                            Scalar::Int(500)
+                        } else {
+                            Scalar::Text("x".into())
+                        },
+                    ),
                 ]),
                 ..LogRow::default()
             }
@@ -179,6 +187,57 @@ async fn a_full_scan_reads_files_and_the_tail() {
     assert_eq!(scanned.rows_from_tail, 3);
     assert_eq!(scanned.segments, 3);
     assert!(scanned.bytes_read > 0);
+}
+
+/// DM-5: `attr.code` is the number 500 on even rows and the text `x`
+/// on odd ones. Asked as a number the path gives its numbers, asked as
+/// text every value in its text form, and a cast converts the text;
+/// the same from `_overflow` before compaction and from the
+/// sub-columns `attr.code#i64` and `attr.code#str` after it.
+#[tokio::test]
+async fn a_path_of_several_types_reads_the_same_in_every_layout() {
+    use arrow::datatypes::DataType;
+
+    let (store, env) = populate().await;
+    let code = |data_type: DataType| Expr::Path {
+        path: "attr.code".into(),
+        data_type,
+    };
+    let cases = || {
+        [
+            (
+                code(DataType::Int64).binary(BinaryOp::Eq, Expr::literal(500)),
+                11,
+            ),
+            (
+                code(DataType::Utf8).binary(BinaryOp::Eq, Expr::literal("x")),
+                10,
+            ),
+            (
+                code(DataType::Utf8).binary(BinaryOp::Eq, Expr::literal("500")),
+                11,
+            ),
+            (
+                Expr::Cast {
+                    expr: Box::new(code(DataType::Utf8)),
+                    to: DataType::Int64,
+                }
+                .binary(BinaryOp::Eq, Expr::literal(500)),
+                11,
+            ),
+        ]
+    };
+    let engine = engine(&store, &env);
+    for (predicate, expected) in cases() {
+        let output = run(&engine, Plan::Scan(scan()).filter(predicate.clone())).await;
+        assert_eq!(output.num_rows(), expected, "{predicate} before compaction");
+    }
+    compact_all(&store, &env).await;
+    let engine = self::engine(&store, &env);
+    for (predicate, expected) in cases() {
+        let output = run(&engine, Plan::Scan(scan()).filter(predicate.clone())).await;
+        assert_eq!(output.num_rows(), expected, "{predicate} after compaction");
+    }
 }
 
 #[tokio::test]

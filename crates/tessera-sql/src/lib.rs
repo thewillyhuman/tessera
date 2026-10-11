@@ -9,8 +9,9 @@
 //! optionally qualified as `dataset.logs`; an unqualified name reads the
 //! dataset of the [`BindContext`]. Attribute paths are written
 //! `attr.http.request.method`, or quoted `attr."http.request.method"`.
-//! A bare attribute reads as text; compared with a number, cast
-//! (`attr.n::int`) or used by a numeric function it reads as that type.
+//! A bare attribute reads as text; compared with a number or used by a
+//! numeric function it reads its numbers, with text left apart (DM-5);
+//! a cast (`attr.n::int`) converts the text.
 //! `search('...')` embeds the search syntax of section 9.6 as a
 //! predicate, and `promql('...', start, end, step)`, `logql('...',
 //! start, end)` and `traceql('...', start, end)` embed the other

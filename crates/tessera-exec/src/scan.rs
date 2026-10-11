@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray, TimestampNanosecondArray};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use futures::stream::{self, StreamExt};
@@ -25,7 +25,7 @@ use tessera_kernels::{evaluate_predicate, variant};
 use tessera_manifest::view;
 use tessera_object::layout;
 use tessera_opt::{Decision, PruneReport, bounds, decide, prune_files};
-use tessera_types::event::{OVERFLOW, TIMESTAMP};
+use tessera_types::event::TIMESTAMP;
 use tessera_types::{FileMeta, Timestamp};
 
 use crate::engine::{Engine, EngineError};
@@ -469,9 +469,11 @@ fn apply(
 }
 
 /// Adds a column per requested path (AD-4): a dedicated column the rows
-/// already have serves as is, cast to the requested type when needed;
-/// otherwise the path is extracted from `_overflow`, null everywhere
-/// when the rows have no variant column either.
+/// already have serves as is, or read as the requested type under the
+/// typed rules of variant access, as do the sub-columns of a path
+/// stored per type class (DM-5); otherwise the path is extracted from
+/// `_overflow`, null everywhere when the rows have no variant column
+/// either.
 fn materialize_paths(rows: &RecordBatch, paths: &[PathColumn]) -> Result<RecordBatch, EngineError> {
     if paths.is_empty() {
         return Ok(rows.clone());
@@ -483,19 +485,11 @@ fn materialize_paths(rows: &RecordBatch, paths: &[PathColumn]) -> Result<RecordB
         .map(|f| f.as_ref().clone())
         .collect();
     let mut columns: Vec<ArrayRef> = rows.columns().to_vec();
-    let overflow = rows
-        .column_by_name(OVERFLOW)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned());
     for path in paths {
-        let column: ArrayRef = match rows.column_by_name(&path.path) {
-            Some(column) if column.data_type() == &path.data_type => Arc::clone(column),
-            Some(column) => arrow::compute::cast(column, &path.data_type)?,
-            None => match &overflow {
-                Some(overflow) => variant::extract(overflow, &path.path, &path.data_type)?,
-                None => arrow::array::new_null_array(&path.data_type, rows.num_rows()),
-            },
-        };
+        let column = variant::path_column(rows, &path.path, &path.data_type)?
+            .unwrap_or_else(|| arrow::array::new_null_array(&path.data_type, rows.num_rows()));
         if let Some(index) = fields.iter().position(|f| f.name() == &path.path) {
+            fields[index] = Field::new(&path.path, path.data_type.clone(), true);
             columns[index] = column;
         } else {
             fields.push(Field::new(&path.path, path.data_type.clone(), true));
@@ -519,4 +513,52 @@ fn reorder(rows: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch, Engine
         .map(|f| rows.schema().index_of(f.name()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows.project(&indices)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::datatypes::DataType;
+
+    use super::*;
+
+    /// DM-5: a path stored per type class reads as the requested type
+    /// from the sub-column of that class; a plain column of another
+    /// type reads under the same rules.
+    #[test]
+    fn paths_read_from_sub_columns_by_type() {
+        let rows = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("attr.code#i64", DataType::Int64, true),
+                Field::new("attr.code#str", DataType::Utf8, true),
+                Field::new("attr.name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(500), None])),
+                Arc::new(StringArray::from(vec![None, Some("500")])),
+                Arc::new(StringArray::from(vec![Some("7"), Some("x")])),
+            ],
+        )
+        .unwrap();
+        let read = |path: &str, data_type: DataType| {
+            let paths = [PathColumn {
+                path: path.into(),
+                data_type,
+            }];
+            let out = materialize_paths(&rows, &paths).unwrap();
+            Arc::clone(out.column_by_name(path).unwrap())
+        };
+        let ints = read("attr.code", DataType::Int64);
+        let ints = ints.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ints.value(0), 500);
+        assert!(ints.is_null(1), "the text 500 is not the number");
+        let texts = read("attr.code", DataType::Utf8);
+        let texts = texts.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(texts.value(0), "500");
+        assert_eq!(texts.value(1), "500");
+        let names = read("attr.name", DataType::Int64);
+        assert_eq!(names.null_count(), 2, "a text column holds no numbers");
+        let absent = read("attr.absent", DataType::Int64);
+        assert_eq!(absent.null_count(), 2);
+    }
 }

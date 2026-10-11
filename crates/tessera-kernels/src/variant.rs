@@ -6,8 +6,17 @@
 //! Until the advisor promotes a path to a dedicated column (M8), every
 //! attribute lives in `_overflow` as a JSON object of path to scalar
 //! (ST-13 fallback). This kernel reads one path out of that column as the
-//! type the query asks for; values that do not fit the type are null, as
-//! a cast of a dynamic value is in SQL.
+//! type the query asks for. The reading is typed (DM-5): asked as a
+//! number, a path gives its numbers, integers and floats alike, and
+//! null where it holds text or a boolean; asked as a boolean, its
+//! booleans; asked as text, every value in its text form, since a bare
+//! attribute reads as text. An explicit `CAST` converts the text.
+//! Labels (QL-19) are text by nature and read leniently: a numeric
+//! label filter parses them.
+//!
+//! A path that compaction stored per type class, as `attr.code#i64` and
+//! `attr.code#str` (DM-5), is read back by [`merge_columns`] under the
+//! same rules.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,7 +27,10 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use serde_json::Value;
-use tessera_types::event::{EXTRACTED, LABEL_SCOPES, OVERFLOW, SEVERITY_TEXT, label_name};
+use tessera_types::event::{
+    CLASS_BOOL, CLASS_FLOAT, CLASS_INT, CLASS_TEXT, EXTRACTED, LABEL_SCOPES, OVERFLOW,
+    SEVERITY_TEXT, label_name, logical_path, sub_class,
+};
 
 use crate::KernelError;
 
@@ -40,7 +52,172 @@ pub fn extract(
             .ok()
             .and_then(|object| object.get(path).cloned())
     });
-    typed(values, data_type, &format!("attribute {path}"))
+    typed(
+        values,
+        data_type,
+        &format!("attribute {path}"),
+        Reading::Typed,
+    )
+}
+
+/// The values of `class` at `path` in each JSON object of `overflow`,
+/// for the sub-column of a path seen with several types (DM-5):
+/// integers, numbers (as floats), text or booleans, each null where the
+/// value is of another class.
+///
+/// # Errors
+///
+/// `Unsupported` for a class that is not one of the four.
+pub fn extract_class(
+    overflow: &StringArray,
+    path: &str,
+    class: &str,
+) -> Result<ArrayRef, KernelError> {
+    let values = (0..overflow.len()).map(|i| {
+        if overflow.is_null(i) {
+            return None;
+        }
+        serde_json::from_str::<Value>(overflow.value(i))
+            .ok()
+            .and_then(|object| object.get(path).cloned())
+    });
+    Ok(match class {
+        CLASS_INT => Arc::new(
+            values
+                .map(|v| v.and_then(|v| v.as_i64()))
+                .collect::<Int64Array>(),
+        ),
+        CLASS_FLOAT => Arc::new(
+            values
+                .map(|v| v.and_then(|v| v.as_f64()))
+                .collect::<Float64Array>(),
+        ),
+        CLASS_TEXT => Arc::new(
+            values
+                .map(|v| match v {
+                    Some(Value::String(s)) => Some(s),
+                    _ => None,
+                })
+                .collect::<StringArray>(),
+        ),
+        CLASS_BOOL => Arc::new(
+            values
+                .map(|v| v.and_then(|v| v.as_bool()))
+                .collect::<BooleanArray>(),
+        ),
+        other => {
+            return Err(KernelError::Unsupported(format!(
+                "no class {other} of attribute values"
+            )));
+        }
+    })
+}
+
+/// `path` of `rows` read as `data_type` (AD-4, DM-5): from its
+/// dedicated column, read under the typed rules when the types differ;
+/// from its sub-columns when it is stored per type class; else from
+/// `_overflow`. None when the rows have none of these.
+///
+/// # Errors
+///
+/// `Unsupported` for a type a path cannot be read as.
+pub fn path_column(
+    rows: &RecordBatch,
+    path: &str,
+    data_type: &DataType,
+) -> Result<Option<ArrayRef>, KernelError> {
+    if let Some(column) = rows.column_by_name(path) {
+        return Ok(Some(if column.data_type() == data_type {
+            Arc::clone(column)
+        } else if let Some(class) = class_of(column.data_type()) {
+            merge_columns(&[(class, Arc::clone(column))], data_type, rows.num_rows())?
+        } else {
+            arrow::compute::cast(column, data_type)?
+        }));
+    }
+    let schema = rows.schema();
+    let stored: Vec<(&str, ArrayRef)> = schema
+        .fields()
+        .iter()
+        .zip(rows.columns())
+        .filter_map(|(field, column)| {
+            sub_class(field.name())
+                .filter(|(stored, _)| *stored == path)
+                .map(|(_, class)| (class, Arc::clone(column)))
+        })
+        .collect();
+    if !stored.is_empty() {
+        return Ok(Some(merge_columns(&stored, data_type, rows.num_rows())?));
+    }
+    rows.column_by_name(OVERFLOW)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .map(|overflow| extract(overflow, path, data_type))
+        .transpose()
+}
+
+/// The class a column of `data_type` holds, if any.
+#[must_use]
+pub fn class_of(data_type: &DataType) -> Option<&'static str> {
+    Some(match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => CLASS_INT,
+        DataType::Float32 | DataType::Float64 => CLASS_FLOAT,
+        DataType::Utf8 => CLASS_TEXT,
+        DataType::Boolean => CLASS_BOOL,
+        _ => return None,
+    })
+}
+
+/// One path read as `data_type` from `columns`, its stored columns by
+/// class (DM-5), under the rules of [`extract`]: numbers from the
+/// integer and float classes, booleans from theirs, text from every
+/// class in its text form, a timestamp from the integers. `rows` is
+/// the length when no class applies.
+///
+/// # Errors
+///
+/// `Unsupported` for a type a path cannot be read as.
+pub fn merge_columns(
+    columns: &[(&str, ArrayRef)],
+    data_type: &DataType,
+    rows: usize,
+) -> Result<ArrayRef, KernelError> {
+    let classes: &[&str] = match data_type {
+        DataType::Utf8 => &[CLASS_TEXT, CLASS_INT, CLASS_FLOAT, CLASS_BOOL],
+        DataType::Int64 | DataType::Float64 => &[CLASS_INT, CLASS_FLOAT],
+        DataType::Boolean => &[CLASS_BOOL],
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => &[CLASS_INT],
+        other => {
+            return Err(KernelError::Unsupported(format!(
+                "cannot read an attribute as {other}"
+            )));
+        }
+    };
+    let mut merged: Option<ArrayRef> = None;
+    for class in classes {
+        let Some((_, column)) = columns.iter().find(|(c, _)| c == class) else {
+            continue;
+        };
+        let column = if column.data_type() == data_type {
+            Arc::clone(column)
+        } else {
+            arrow::compute::cast(column, data_type)?
+        };
+        merged = Some(match merged {
+            None => column,
+            Some(first) => {
+                let present = arrow::compute::is_not_null(&first)?;
+                arrow::compute::kernels::zip::zip(&present, &first, &column)?
+            }
+        });
+    }
+    Ok(merged.unwrap_or_else(|| arrow::array::new_null_array(data_type, rows)))
 }
 
 /// The label `name` of every row (QL-19, QL-20): a label a parser stage
@@ -63,15 +240,24 @@ pub fn label(
     };
     let (overflow, extracted, severity_text) =
         (text(OVERFLOW), text(EXTRACTED), text(SEVERITY_TEXT));
-    // The dedicated column of the attribute under this label, by scope.
+    // The dedicated columns of the attribute under this label, by scope:
+    // one, or one per type class the path was seen with (DM-5).
     let schema = rows.schema();
-    let dedicated: Option<&ArrayRef> = LABEL_SCOPES.iter().find_map(|scope| {
-        schema
-            .fields()
-            .iter()
-            .position(|f| f.name().starts_with(scope) && label_name(f.name()) == name)
-            .map(|i| rows.column(i))
-    });
+    let dedicated: Vec<&ArrayRef> = LABEL_SCOPES
+        .iter()
+        .map(|scope| {
+            schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    f.name().starts_with(scope) && label_name(logical_path(f.name())) == name
+                })
+                .map(|(i, _)| rows.column(i))
+                .collect::<Vec<_>>()
+        })
+        .find(|columns| !columns.is_empty())
+        .unwrap_or_default();
     let values = (0..rows.num_rows()).map(|i| {
         let from_extracted = extracted
             .filter(|e| !e.is_null(i))
@@ -80,7 +266,7 @@ pub fn label(
         if from_extracted.is_some() {
             return from_extracted;
         }
-        if let Some(value) = dedicated.and_then(|column| cell_json(column, i)) {
+        if let Some(value) = dedicated.iter().find_map(|column| cell_json(column, i)) {
             return Some(value);
         }
         let from_attributes = overflow
@@ -102,7 +288,15 @@ pub fn label(
             _ => None,
         })
     });
-    typed(values, data_type, name)
+    typed(values, data_type, name, Reading::Lenient)
+}
+
+/// How a JSON value becomes a number: as it is typed, or parsed from
+/// text as a label filter reads a label.
+#[derive(Clone, Copy)]
+enum Reading {
+    Typed,
+    Lenient,
 }
 
 /// The value at `row` of a dedicated attribute column, as JSON.
@@ -169,13 +363,18 @@ fn typed(
     values: impl Iterator<Item = Option<Value>>,
     data_type: &DataType,
     what: &str,
+    reading: Reading,
 ) -> Result<ArrayRef, KernelError> {
     Ok(match data_type {
         DataType::Utf8 => Arc::new(values.map(|v| v.and_then(as_text)).collect::<StringArray>()),
-        DataType::Int64 => Arc::new(values.map(|v| v.and_then(as_int)).collect::<Int64Array>()),
+        DataType::Int64 => Arc::new(
+            values
+                .map(|v| v.and_then(|v| as_int(v, reading)))
+                .collect::<Int64Array>(),
+        ),
         DataType::Float64 => Arc::new(
             values
-                .map(|v| v.and_then(as_float))
+                .map(|v| v.and_then(|v| as_float(v, reading)))
                 .collect::<Float64Array>(),
         ),
         DataType::Boolean => Arc::new(
@@ -185,7 +384,7 @@ fn typed(
         ),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Arc::new(
             values
-                .map(|v| v.and_then(as_int))
+                .map(|v| v.and_then(|v| as_int(v, reading)))
                 .collect::<TimestampNanosecondArray>(),
         ),
         other => {
@@ -209,19 +408,19 @@ fn truncated(value: f64) -> i64 {
     value as i64
 }
 
-fn as_int(value: Value) -> Option<i64> {
-    match value {
-        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(truncated)),
-        Value::String(s) => s.parse().ok(),
-        Value::Bool(b) => Some(i64::from(b)),
+fn as_int(value: Value, reading: Reading) -> Option<i64> {
+    match (value, reading) {
+        (Value::Number(n), _) => n.as_i64().or_else(|| n.as_f64().map(truncated)),
+        (Value::String(s), Reading::Lenient) => s.parse().ok(),
+        (Value::Bool(b), Reading::Lenient) => Some(i64::from(b)),
         _ => None,
     }
 }
 
-fn as_float(value: Value) -> Option<f64> {
-    match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse().ok(),
+fn as_float(value: Value, reading: Reading) -> Option<f64> {
+    match (value, reading) {
+        (Value::Number(n), _) => n.as_f64(),
+        (Value::String(s), Reading::Lenient) => s.parse().ok(),
         _ => None,
     }
 }
@@ -250,11 +449,14 @@ mod tests {
     }
 
     #[test]
-    fn reads_a_path_as_a_number_with_coercion() {
+    fn reads_a_path_as_a_number_typed() {
         let array = extract(&overflow(), "attr.n", &DataType::Int64).unwrap();
         let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(array.value(0), 2);
-        assert_eq!(array.value(1), 7);
+        assert!(array.is_null(1), "text is not a number (DM-5)");
+        let labels = label(&batch_of(&[(OVERFLOW, overflow())]), "n", &DataType::Int64).unwrap();
+        let labels = labels.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(labels.value(1), 7, "a label filter parses text");
         let floats = extract(&overflow(), "attr.n", &DataType::Float64).unwrap();
         let floats = floats.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!((floats.value(0) - 2.0).abs() < f64::EPSILON);
@@ -388,5 +590,65 @@ mod tests {
         assert_eq!(hosts.value(0), "h1", "the column, not the stored text");
         assert_eq!(hosts.value(1), "h2");
         assert_eq!(hosts.value(2), "r3", "the overflow when the column is null");
+    }
+
+    #[test]
+    fn classes_split_a_path_by_type_and_merge_back_by_request() {
+        let overflow = StringArray::from(vec![
+            Some(r#"{"attr.code":500}"#),
+            Some(r#"{"attr.code":"500"}"#),
+            Some(r#"{"attr.code":true}"#),
+            None,
+        ]);
+        let ints = extract_class(&overflow, "attr.code", CLASS_INT).unwrap();
+        let texts = extract_class(&overflow, "attr.code", CLASS_TEXT).unwrap();
+        let bools = extract_class(&overflow, "attr.code", CLASS_BOOL).unwrap();
+        assert_eq!(ints.null_count(), 3);
+        assert_eq!(texts.null_count(), 3);
+        assert_eq!(bools.null_count(), 3);
+        assert!(extract_class(&overflow, "attr.code", "list").is_err());
+        let stored = [(CLASS_INT, ints), (CLASS_TEXT, texts), (CLASS_BOOL, bools)];
+
+        let as_int = merge_columns(&stored, &DataType::Int64, 4).unwrap();
+        let as_int = as_int.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(as_int.value(0), 500);
+        assert!(as_int.is_null(1), "the text 500 is not the number");
+        assert!(as_int.is_null(2));
+        let as_text = merge_columns(&stored, &DataType::Utf8, 4).unwrap();
+        let as_text = as_text.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(as_text.value(0), "500", "every value has a text form");
+        assert_eq!(as_text.value(1), "500");
+        assert_eq!(as_text.value(2), "true");
+        assert!(as_text.is_null(3));
+        let as_float = merge_columns(&stored, &DataType::Float64, 4).unwrap();
+        let as_float = as_float.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!((as_float.value(0) - 500.0).abs() < f64::EPSILON);
+        let as_bool = merge_columns(&stored, &DataType::Boolean, 4).unwrap();
+        assert_eq!(as_bool.null_count(), 3);
+        let none = merge_columns(&stored[1..2], &DataType::Int64, 4).unwrap();
+        assert_eq!(none.null_count(), 4, "no numbers stored: all null");
+        assert_eq!(class_of(&DataType::Int32), Some(CLASS_INT));
+        assert_eq!(class_of(&DataType::Binary), None);
+    }
+
+    #[test]
+    fn a_label_reads_across_the_sub_columns_of_its_path() {
+        use arrow::datatypes::{Field, Schema};
+
+        let rows = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("attr.code#i64", DataType::Int64, true),
+                Field::new("attr.code#str", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(500), None])),
+                Arc::new(StringArray::from(vec![None, Some("x")])),
+            ],
+        )
+        .unwrap();
+        let codes = label(&rows, "code", &DataType::Utf8).unwrap();
+        let codes = codes.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(codes.value(0), "500");
+        assert_eq!(codes.value(1), "x");
     }
 }

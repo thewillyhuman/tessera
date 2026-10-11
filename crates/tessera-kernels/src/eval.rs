@@ -138,23 +138,9 @@ fn value(expr: &Expr, batch: &RecordBatch) -> Result<Value, KernelError> {
             .column_by_name(name)
             .map(|c| Value::Column(Arc::clone(c)))
             .ok_or_else(|| KernelError::MissingColumn(name.clone())),
-        Expr::Path { path, data_type } => {
-            // A dedicated column of the path (AD-4) serves before the
-            // variant column is opened.
-            if let Some(column) = batch.column_by_name(path) {
-                let value = Value::Column(Arc::clone(column));
-                return if column.data_type() == data_type {
-                    Ok(value)
-                } else {
-                    value.cast(data_type)
-                };
-            }
-            let overflow = batch
-                .column_by_name(OVERFLOW)
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| KernelError::MissingColumn(OVERFLOW.to_owned()))?;
-            Ok(Value::Column(variant::extract(overflow, path, data_type)?))
-        }
+        Expr::Path { path, data_type } => variant::path_column(batch, path, data_type)?
+            .map(Value::Column)
+            .ok_or_else(|| KernelError::MissingColumn(OVERFLOW.to_owned())),
         Expr::Label { name, data_type } => {
             Ok(Value::Column(variant::label(batch, name, data_type)?))
         }

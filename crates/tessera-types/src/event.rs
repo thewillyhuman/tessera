@@ -204,6 +204,45 @@ pub fn label_name(path: &str) -> String {
 /// structured log body (DM-10), which are attributes of the row too.
 pub const SCOPES: [&str; 4] = ["attr.", "resource.", "scope.", "body."];
 
+/// The marker between an attribute path and the type class of one of
+/// its sub-columns (DM-5): a path seen with values of several types is
+/// stored as `attr.code#i64`, `attr.code#str`, one column per class,
+/// each null where the value is of another class.
+pub const SUB_COLUMN: char = '#';
+
+/// The class of a sub-column holding integers.
+pub const CLASS_INT: &str = "i64";
+/// The class of a sub-column holding floats, and the integers of a path
+/// that also has floats, which compare numerically with them.
+pub const CLASS_FLOAT: &str = "f64";
+/// The class of a sub-column holding text.
+pub const CLASS_TEXT: &str = "str";
+/// The class of a sub-column holding booleans.
+pub const CLASS_BOOL: &str = "bool";
+/// Every class a sub-column can hold.
+pub const CLASSES: [&str; 4] = [CLASS_INT, CLASS_FLOAT, CLASS_TEXT, CLASS_BOOL];
+
+/// The sub-column of `path` holding its values of `class`.
+#[must_use]
+pub fn sub_column(path: &str, class: &str) -> String {
+    format!("{path}{SUB_COLUMN}{class}")
+}
+
+/// The path and class of a sub-column; none for a plain column, whose
+/// name ends in no class marker.
+#[must_use]
+pub fn sub_class(column: &str) -> Option<(&str, &str)> {
+    let (path, class) = column.rsplit_once(SUB_COLUMN)?;
+    CLASSES.contains(&class).then_some((path, class))
+}
+
+/// The path a column stores: itself, or the path before the class
+/// marker of a sub-column.
+#[must_use]
+pub fn logical_path(column: &str) -> &str {
+    sub_class(column).map_or(column, |(path, _)| path)
+}
+
 /// The scopes a label name resolves against (QL-20), in order: the
 /// more specific scope wins. Body fields are not labels until a parser
 /// stage makes them so, as in Loki.
@@ -928,7 +967,7 @@ pub fn attributes_column(rows: &RecordBatch) -> Option<StringArray> {
         .iter()
         .zip(rows.columns())
         .filter(|(field, _)| SCOPES.iter().any(|scope| field.name().starts_with(scope)))
-        .map(|(field, column)| (field.name().as_str(), column))
+        .map(|(field, column)| (logical_path(field.name()), column))
         .collect();
     if dedicated.is_empty() {
         return overflow.cloned();
@@ -936,7 +975,9 @@ pub fn attributes_column(rows: &RecordBatch) -> Option<StringArray> {
     // The stored text is already a JSON object: the dedicated values are
     // appended to it as encoded pairs, without parsing it. A path stored
     // both ways, as files from before promotion stripped it are, appears
-    // twice with the same value, and a parser keeps the last.
+    // twice with the same value, and a parser keeps the last. The
+    // sub-columns of one path (DM-5) are null but for one per row, so
+    // the path appears once under its own name.
     let merged: StringArray = (0..rows.num_rows())
         .map(|i| {
             let stored = overflow
@@ -1442,5 +1483,34 @@ mod tests {
             "scope_x",
             "only the leading scope goes"
         );
+    }
+
+    #[test]
+    fn sub_columns_name_a_path_and_a_class() {
+        assert_eq!(sub_column("attr.code", CLASS_INT), "attr.code#i64");
+        assert_eq!(sub_class("attr.code#str"), Some(("attr.code", "str")));
+        assert_eq!(sub_class("attr.code"), None);
+        assert_eq!(sub_class("attr.c#d"), None, "not a class");
+        assert_eq!(logical_path("attr.code#bool"), "attr.code");
+        assert_eq!(logical_path("attr.code"), "attr.code");
+    }
+
+    #[test]
+    fn sub_columns_merge_back_under_their_path() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attr.code#i64", DataType::Int64, true),
+            Field::new("attr.code#str", DataType::Utf8, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(500), None])),
+                Arc::new(StringArray::from(vec![None, Some("500")])),
+            ],
+        )
+        .unwrap();
+        let merged = attributes_column(&rows).unwrap();
+        assert_eq!(merged.value(0), r#"{"attr.code":500}"#);
+        assert_eq!(merged.value(1), r#"{"attr.code":"500"}"#);
     }
 }

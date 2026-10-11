@@ -6,7 +6,10 @@
 //! advisor's hot set and the sort key). At most [`MAX_DEDICATED`] paths
 //! are promoted; the rest stay in `_overflow`, which keeps every
 //! attribute either way so that a reader without the column loses
-//! nothing (AD-3, AD-4).
+//! nothing (AD-3, AD-4). A path seen with values of several types gets
+//! a column per type class, `attr.code#i64` and `attr.code#str`, each
+//! null where the value is of another class (DM-5), so that a number
+//! and its text stay apart.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,7 +18,9 @@ use arrow::array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use serde_json::Value;
 use tessera_kernels::variant;
-use tessera_types::event::{OVERFLOW, SCOPES};
+use tessera_types::event::{
+    CLASS_BOOL, CLASS_FLOAT, CLASS_INT, CLASS_TEXT, OVERFLOW, SCOPES, logical_path, sub_column,
+};
 
 use crate::CompactError;
 
@@ -38,21 +43,26 @@ struct Seen {
 }
 
 impl Seen {
-    /// The column type most of the values fit: integers as `Int64`,
-    /// any float as `Float64`, booleans as `Boolean`, text otherwise.
-    fn data_type(&self) -> DataType {
-        let numbers = self.ints + self.floats;
-        if self.texts == 0 && self.bools == 0 && numbers > 0 {
-            if self.floats == 0 {
-                DataType::Int64
+    /// The type classes the values fall in, each with its column type:
+    /// numbers as `Int64`, or `Float64` when any is a float; text as
+    /// `Utf8`; booleans as `Boolean`. One class makes a plain column,
+    /// several make a sub-column each (DM-5).
+    fn classes(&self) -> Vec<(&'static str, DataType)> {
+        let mut classes = Vec::new();
+        if self.ints + self.floats > 0 {
+            classes.push(if self.floats == 0 {
+                (CLASS_INT, DataType::Int64)
             } else {
-                DataType::Float64
-            }
-        } else if self.texts == 0 && numbers == 0 && self.bools > 0 {
-            DataType::Boolean
-        } else {
-            DataType::Utf8
+                (CLASS_FLOAT, DataType::Float64)
+            });
         }
+        if self.texts > 0 {
+            classes.push((CLASS_TEXT, DataType::Utf8));
+        }
+        if self.bools > 0 {
+            classes.push((CLASS_BOOL, DataType::Boolean));
+        }
+        classes
     }
 }
 
@@ -90,12 +100,18 @@ pub fn promote(
                 Value::Number(n) if n.is_i64() || n.is_u64() => entry.ints += 1,
                 Value::Number(_) => entry.floats += 1,
                 Value::Bool(_) => entry.bools += 1,
+                Value::Null => {}
                 _ => entry.texts += 1,
             }
         }
     }
     let total = rows.num_rows() as f64;
-    let existing = |path: &str| rows.schema().field_with_name(path).is_ok();
+    let existing = |path: &str| {
+        rows.schema()
+            .fields()
+            .iter()
+            .any(|f| logical_path(f.name()) == path)
+    };
     let mut chosen: Vec<String> = wanted.iter().filter(|p| !existing(p)).cloned().collect();
     let mut dense: Vec<(&String, &Seen)> = seen
         .iter()
@@ -119,7 +135,7 @@ pub fn promote(
             rows.schema()
                 .fields()
                 .iter()
-                .map(|f| f.name().clone())
+                .map(|f| logical_path(f.name()).to_owned())
                 .filter(|name| SCOPES.iter().any(|scope| name.starts_with(scope))),
         )
         .filter(|path| seen.contains_key(path))
@@ -135,10 +151,22 @@ pub fn promote(
         .collect();
     let mut columns: Vec<ArrayRef> = rows.columns().to_vec();
     for path in &chosen {
-        let data_type = seen.get(path).map_or(DataType::Utf8, Seen::data_type);
-        let column = variant::extract(overflow, path, &data_type)?;
-        fields.push(Field::new(path, data_type, true));
-        columns.push(column);
+        let classes = seen.get(path).map(Seen::classes).unwrap_or_default();
+        match classes.as_slice() {
+            [] | [_] => {
+                let data_type = classes
+                    .first()
+                    .map_or(DataType::Utf8, |(_, data_type)| data_type.clone());
+                fields.push(Field::new(path, data_type.clone(), true));
+                columns.push(variant::extract(overflow, path, &data_type)?);
+            }
+            several => {
+                for (class, data_type) in several {
+                    fields.push(Field::new(sub_column(path, class), data_type.clone(), true));
+                    columns.push(variant::extract_class(overflow, path, class)?);
+                }
+            }
+        }
     }
     if let Ok(index) = rows.schema().index_of(OVERFLOW) {
         columns[index] = without(overflow, &stripped);
@@ -275,5 +303,70 @@ mod tests {
         let (capped, paths) = promote(&rows(), &[], 1).unwrap();
         assert_eq!(paths, ["attr.host"], "the densest within the cap");
         assert_eq!(capped.num_columns(), rows().num_columns() + 1);
+    }
+
+    /// DM-5: `attr.code` is a number on even rows and text on odd ones.
+    #[test]
+    fn a_path_seen_with_several_types_gets_a_column_per_class() {
+        let logs: Vec<LogRow> = (0..100u8)
+            .map(|i| LogRow {
+                timestamp: Timestamp::from_nanos(i64::from(i)),
+                event_id: [i; 16],
+                attributes: BTreeMap::from([(
+                    "attr.code".to_owned(),
+                    if i % 2 == 0 {
+                        Scalar::Int(500)
+                    } else {
+                        Scalar::Text("x".into())
+                    },
+                )]),
+                ..LogRow::default()
+            })
+            .collect();
+        let rows =
+            EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &logs)
+                .unwrap()
+                .rows()
+                .clone();
+        let (promoted, paths) = promote(&rows, &[], MAX_DEDICATED).unwrap();
+        assert_eq!(paths, ["attr.code"], "the logical path");
+        let schema = promoted.schema();
+        assert!(
+            schema.field_with_name("attr.code").is_err(),
+            "no plain column"
+        );
+        assert_eq!(
+            schema.field_with_name("attr.code#i64").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            schema.field_with_name("attr.code#str").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        let ints = promoted
+            .column_by_name("attr.code#i64")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ints.value(0), 500);
+        assert!(ints.is_null(1), "text rows are null in the number column");
+        assert_eq!(
+            promoted.column_by_name(OVERFLOW).unwrap().null_count(),
+            100,
+            "stored once, in the sub-columns"
+        );
+        let merged = tessera_kernels::attributes_column(&promoted).unwrap();
+        assert_eq!(merged.value(0), r#"{"attr.code":500}"#);
+        assert_eq!(merged.value(1), r#"{"attr.code":"x"}"#);
+        let (again, paths) = promote(&promoted, &[], MAX_DEDICATED).unwrap();
+        assert!(
+            paths.is_empty(),
+            "a path with sub-columns is promoted already"
+        );
+        assert_eq!(
+            again.schema().fields().len(),
+            promoted.schema().fields().len()
+        );
     }
 }

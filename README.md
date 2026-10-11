@@ -55,8 +55,10 @@ sorts and trace groups spill sorted runs to local disk when their
 memory grant runs out and read them back merged, while aggregates,
 joins and top-k still fail past the grant; pipelines run one plan
 node at a time rather than fused
-across stages; a bare attribute reads as text until the advisor
-promotes it (M8); `now()` is the node's clock. A query runs under its
+across stages; a bare attribute reads as text, as a number it gives
+its numbers with text left apart, and compaction stores a path seen
+with several types as a sub-column per type class, `attr.code#i64`
+and `attr.code#str` (DM-5); `now()` is the node's clock. A query runs under its
 tenant's limits on bytes scanned, memory
 and wall time (QE-18), the settings `query_max_scan_bytes`,
 `query_max_memory_bytes` and `query_max_seconds`; the node's defaults

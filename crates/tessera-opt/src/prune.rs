@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 
 use tessera_format::Bound;
 use tessera_ir::{BinaryOp, Expr, Literal, Scan};
-use tessera_types::event::{Scalar, TIMESTAMP};
+use tessera_types::event::{
+    CLASS_BOOL, CLASS_FLOAT, CLASS_INT, CLASS_TEXT, Scalar, TIMESTAMP, sub_column,
+};
 use tessera_types::{FileMeta, TimeRange, Timestamp};
 
 /// How many files each stage let through.
@@ -149,10 +151,45 @@ fn less(a: &Scalar, b: &Scalar) -> bool {
     }
 }
 
+/// The type classes of sub-columns whose values `bound` can match
+/// (DM-5): a number bounds the integer and float classes, text the
+/// text class, a boolean its own.
+fn classes_of(bound: &Bound) -> &'static [&'static str] {
+    match bound.min.as_ref().or(bound.max.as_ref()) {
+        Some(Scalar::Int(_) | Scalar::Float(_)) => &[CLASS_INT, CLASS_FLOAT],
+        Some(Scalar::Text(_)) => &[CLASS_TEXT],
+        Some(Scalar::Bool(_)) => &[CLASS_BOOL],
+        None => &[],
+    }
+}
+
 /// Whether the file's statistics admit a row within every bound.
 fn admits(file: &FileMeta, bounds: &[Bound]) -> bool {
     bounds.iter().all(|bound| {
-        let Some(stats) = file.columns.iter().find(|c| c.name == bound.column) else {
+        let stats = file
+            .columns
+            .iter()
+            .find(|c| c.name == bound.column)
+            .or_else(|| {
+                // A path stored per type class: the statistics of the
+                // sub-column holding the class the bound can match. Read
+                // as text a path gives every class in its text form, so
+                // text statistics bound it only when text is all it holds.
+                let of_class = |class: &str| {
+                    let name = sub_column(&bound.column, class);
+                    file.columns.iter().find(|c| c.name == name)
+                };
+                let classes = classes_of(bound);
+                if classes == [CLASS_TEXT]
+                    && [CLASS_INT, CLASS_FLOAT, CLASS_BOOL]
+                        .iter()
+                        .any(|class| of_class(class).is_some())
+                {
+                    return None;
+                }
+                classes.iter().find_map(|class| of_class(class))
+            });
+        let Some(stats) = stats else {
             return true;
         };
         let below = match (&bound.min, &stats.max) {
@@ -274,5 +311,57 @@ mod tests {
             vec![Expr::column(SEVERITY_NUMBER).binary(BinaryOp::Eq, Expr::literal(99))];
         let (kept, _) = prune_files(&scan, [&bare]);
         assert_eq!(kept.len(), 1);
+    }
+
+    /// DM-5: a file storing `attr.code` per type class has statistics
+    /// under `attr.code#i64`; a numeric bound on the path reads them.
+    #[test]
+    fn sub_column_statistics_prune_a_path_of_several_types() {
+        use arrow::datatypes::DataType;
+
+        let mut typed = file(1, 0, 10, (1, 5));
+        typed.columns.push(ColumnStats {
+            name: "attr.code#i64".into(),
+            min: Some(Scalar::Int(100)),
+            max: Some(Scalar::Int(200)),
+            null_count: 0,
+            distinct: None,
+        });
+        let mut files = vec![typed];
+        let path = |data_type: DataType| Expr::Path {
+            path: "attr.code".into(),
+            data_type,
+        };
+        let mut scan = Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Log,
+        );
+        scan.predicates = vec![path(DataType::Int64).binary(BinaryOp::GtEq, Expr::literal(500))];
+        let (kept, _) = prune_files(&scan, &files);
+        assert!(kept.is_empty(), "no number of the path reaches 500");
+        scan.predicates = vec![path(DataType::Utf8).binary(BinaryOp::Eq, Expr::literal("x"))];
+        let (kept, _) = prune_files(&scan, &files);
+        assert_eq!(kept.len(), 1, "no statistics of the text class: kept");
+        files[0].columns.push(ColumnStats {
+            name: "attr.code#str".into(),
+            min: Some(Scalar::Text("a".into())),
+            max: Some(Scalar::Text("b".into())),
+            null_count: 0,
+            distinct: None,
+        });
+        let (kept, _) = prune_files(&scan, &files);
+        assert_eq!(
+            kept.len(),
+            1,
+            "read as text the numbers count too: text statistics alone do not bound the path"
+        );
+        scan.predicates = vec![path(DataType::Utf8).binary(BinaryOp::Eq, Expr::literal("x"))];
+        files[0].columns.retain(|c| c.name != "attr.code#i64");
+        let (kept, _) = prune_files(&scan, &files);
+        assert!(
+            kept.is_empty(),
+            "text is all the path holds: pruned by its statistics"
+        );
     }
 }

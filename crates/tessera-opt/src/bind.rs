@@ -333,10 +333,16 @@ pub fn bind_expr(expr: Expr) -> Expr {
             args: args.into_iter().map(bind_expr).collect(),
         },
         Expr::Cast { expr, to } => {
-            let inner = retype(bind_expr(*expr), Some(to.clone()));
+            let inner = bind_expr(*expr);
             match inner {
-                // A cast of a path or label is the value read as that type.
-                Expr::Path { .. } | Expr::Label { .. } => inner,
+                // A cast of a label is the label read as that type. A
+                // cast of a path converts the text the path reads as, so
+                // that a number written as text becomes a number: the
+                // explicit CAST of DM-5, where a comparison is typed.
+                Expr::Label { name, .. } => Expr::Label {
+                    name,
+                    data_type: to,
+                },
                 inner => Expr::Cast {
                     expr: Box::new(inner),
                     to,
@@ -443,7 +449,11 @@ mod tests {
             expr: Box::new(path("attr.n")),
             to: DataType::Int64,
         });
-        assert_eq!(typed(&bound), &DataType::Int64);
+        let Expr::Cast { expr, to } = bound else {
+            panic!("a cast of a path converts its text: {bound}")
+        };
+        assert_eq!(to, DataType::Int64);
+        assert_eq!(typed(&expr), &DataType::Utf8);
         let bound = bind_expr(Expr::InList {
             expr: Box::new(path("attr.n")),
             list: vec![Literal::Null, Literal::Int(3)],

@@ -15,9 +15,10 @@
 //! - An attribute compared with a literal of another type: Tessera
 //!   reads the attribute as the literal's type, so `span.attempt = "2"`
 //!   matches an integer attribute whose text is `2` and
-//!   `span.http.status_code = 500.0` matches an integer `500` (DM-5);
-//!   Tempo matches neither. Typed sub-columns arrive with column
-//!   promotion (M8).
+//!   `span.http.status_code = 500.0` matches an integer `500`, since
+//!   integers and floats compare numerically (DM-5); Tempo matches
+//!   neither. A number never matches text: `span.attempt = 2` leaves a
+//!   text attribute `"2"` out, as in Tempo.
 //! - `span.foo = nil` and `span.foo != nil` are accepted as null tests;
 //!   Tempo rejects them.
 //! - An aggregate filter such as `count() > 2` adds its statistic to
