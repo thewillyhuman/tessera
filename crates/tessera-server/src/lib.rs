@@ -173,7 +173,7 @@ impl AppState {
             pool.clone(),
             Arc::new(ParquetFormat),
         );
-        let ingest = tessera_ingest::spawn(ingester, Duration::from_millis(1));
+        let (ingest, _task) = tessera_ingest::spawn(ingester, Duration::from_millis(1));
         let pools = Arc::new(Pools::new(pool, Arc::new(store)));
         let engine = Engine::new(
             Arc::clone(&pools),

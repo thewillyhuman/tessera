@@ -126,6 +126,7 @@ pub struct Node {
     http: SocketAddr,
     pg: SocketAddr,
     ingest: IngestHandle,
+    ingest_task: JoinHandle<()>,
     registry: Arc<Registry>,
     membership: Arc<Membership>,
     leases: Option<Arc<Leases>>,
@@ -154,7 +155,7 @@ impl Node {
             Arc::clone(&format),
         );
         tracing::info!(writer = %ingester.writer_id(), "ingest started");
-        let ingest = tessera_ingest::spawn(ingester, INGEST_TICK);
+        let (ingest, ingest_task) = tessera_ingest::spawn(ingester, INGEST_TICK);
 
         let listener = bind(config.listen).await?;
         let http = listener.local_addr().unwrap_or(config.listen);
@@ -235,6 +236,7 @@ impl Node {
             http,
             pg,
             ingest,
+            ingest_task,
             registry,
             membership,
             leases,
@@ -313,6 +315,7 @@ impl Node {
         for task in self.servers.iter().chain(&self.loops) {
             task.abort();
         }
+        self.ingest_task.abort();
     }
 }
 

@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::{Ack, IngestError, Ingester};
 
@@ -62,12 +63,14 @@ impl std::fmt::Debug for IngestHandle {
     }
 }
 
-/// Spawns the task that owns `ingester`, ticking it every `tick`.
+/// Spawns the task that owns `ingester`, ticking it every `tick`: the
+/// handle to reach it and the task itself, which aborting drops the
+/// ingester as a crash would, with its log open for recovery.
 #[must_use]
-pub fn spawn(ingester: Ingester, tick: Duration) -> IngestHandle {
+pub fn spawn(ingester: Ingester, tick: Duration) -> (IngestHandle, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(1024);
-    tokio::spawn(run(ingester, receiver, tick));
-    IngestHandle { commands: sender }
+    let task = tokio::spawn(run(ingester, receiver, tick));
+    (IngestHandle { commands: sender }, task)
 }
 
 async fn run(mut ingester: Ingester, mut commands: mpsc::Receiver<Command>, tick: Duration) {
@@ -131,7 +134,7 @@ mod tests {
             Arc::new(ParquetFormat),
         );
         let writer = ingester.writer_id();
-        let handle = spawn(ingester, Duration::from_millis(1));
+        let (handle, _task) = spawn(ingester, Duration::from_millis(1));
         assert_eq!(handle.clone().write(batch()).await.unwrap(), Seq::new(1));
         handle.shutdown().await.unwrap();
         assert!(matches!(
