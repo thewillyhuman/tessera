@@ -22,7 +22,7 @@ use arrow::array::{BooleanArray, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
 use futures::TryStreamExt;
 use tessera_format::FileFormat;
-use tessera_object::{ObjectStore, Pools, layout};
+use tessera_object::{Pools, layout};
 use tessera_types::event::TIMESTAMP;
 use tessera_types::{
     DatasetName, Env, FileMeta, Kind, PartitionId, Seq, TenantId, TimeRange, Timestamp, Version,
@@ -30,7 +30,7 @@ use tessera_types::{
 };
 use tessera_wal::{EntryBody, reader};
 
-use crate::{Manifest, ManifestError, list_partitions, registry};
+use crate::{ManifestError, Manifests, list_partitions, registry};
 
 /// What a view read, for `EXPLAIN` and for tests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -89,14 +89,14 @@ pub struct Sources {
 ///
 /// If the registry, a manifest or a segment cannot be read.
 pub async fn sources(
-    root: &Arc<dyn ObjectStore>,
-    env: &Env,
+    manifests: &Manifests,
     tenant: &TenantId,
     dataset: &DatasetName,
     kind: Kind,
     window: Duration,
     time_range: TimeRange,
 ) -> Result<Sources, ManifestError> {
+    let root = manifests.store();
     let writers = registry::list(&**root, tenant, dataset).await?;
     let mut sources = ViewSources::default();
     let partitions = list_partitions(&**root, tenant, dataset, kind).await?;
@@ -108,8 +108,7 @@ pub async fn sources(
             w.start(),
             Timestamp::from_nanos(w.end().as_nanos().saturating_sub(1)),
         );
-        let manifest = Manifest::open(Arc::clone(root), partition.clone(), env.clone());
-        let snapshot = manifest.snapshot().await?;
+        let snapshot = manifests.open(partition).snapshot().await?;
         sources
             .manifests
             .insert(partition.clone(), snapshot.version());
@@ -166,8 +165,8 @@ pub async fn read(
     kind: Kind,
     window: Duration,
 ) -> Result<View, ManifestError> {
-    let root = Arc::clone(pools.root().store());
-    let found = sources(&root, env, tenant, dataset, kind, window, TimeRange::ALL).await?;
+    let manifests = Manifests::new(Arc::clone(pools.root().store()), env.clone(), 1);
+    let found = sources(&manifests, tenant, dataset, kind, window, TimeRange::ALL).await?;
     let mut rows = Vec::new();
     for file in &found.files {
         rows.extend(read_file(pools, format, file).await?);
@@ -527,12 +526,11 @@ mod tests {
         adopt(&store, &log).await;
         log.append_segment(&[batch(1, 30, 1)]).await.unwrap();
 
-        let root: Arc<dyn tessera_object::ObjectStore> = Arc::new(store.clone());
+        let manifests = Manifests::new(Arc::new(store.clone()), env.clone(), 8);
         let day = i64::try_from(WINDOW.as_nanos()).unwrap();
         let second_day = TimeRange::new(Timestamp::from_nanos(day), Timestamp::from_nanos(2 * day));
         let found = sources(
-            &root,
-            &env,
+            &manifests,
             &TenantId::DEFAULT,
             &dataset(),
             Kind::Log,

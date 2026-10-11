@@ -10,9 +10,11 @@
 
 pub mod intake;
 pub mod manifest;
+pub mod manifests;
 pub mod registry;
 pub mod view;
 
 pub use manifest::{Manifest, ManifestError, ManifestState, list_partitions};
+pub use manifests::Manifests;
 pub use registry::Registration;
 pub use view::{Sources, View, ViewSources};

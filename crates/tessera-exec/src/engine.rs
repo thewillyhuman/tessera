@@ -24,7 +24,7 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
 use tessera_ir::{Expr, Literal, Plan, PlanError, Registry};
 use tessera_kernels::promql::Params;
-use tessera_manifest::ManifestError;
+use tessera_manifest::{ManifestError, Manifests};
 use tessera_object::{PoolError, Pools};
 use tessera_types::event::TRACE_ID;
 use tessera_types::{Env, Window};
@@ -119,10 +119,11 @@ impl Default for QueryLimits {
 pub struct Engine {
     pub(crate) pools: Arc<Pools>,
     pub(crate) format: Arc<dyn FileFormat>,
-    pub(crate) env: Env,
     pub(crate) cpu: Arc<CpuPool>,
     pub(crate) partition_window: Duration,
     pub(crate) peers: Option<(Arc<dyn Peers>, Arc<dyn RemoteScan>)>,
+    /// The manifests this node has opened (section 10.8).
+    pub(crate) manifests: Manifests,
     limits: QueryLimits,
     registry: Registry,
 }
@@ -139,13 +140,18 @@ impl Engine {
         cpu: Arc<CpuPool>,
         limits: QueryLimits,
     ) -> Self {
+        let manifests = Manifests::new(
+            Arc::clone(pools.root().store()),
+            env,
+            tessera_manifest::manifests::DEFAULT_CAPACITY,
+        );
         Engine {
             pools,
             format,
-            env,
             cpu,
             partition_window: Window::DEFAULT_LENGTH,
             peers: None,
+            manifests,
             limits,
             registry: Registry::builtin(),
         }

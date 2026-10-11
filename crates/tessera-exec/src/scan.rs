@@ -93,10 +93,8 @@ pub(crate) async fn run(
 ) -> Result<Vec<RecordBatch>, EngineError> {
     analysis.source = format!("{}/{}", scan.dataset, scan.kind);
     let schema = scan.schema()?;
-    let root = Arc::clone(engine.pools.root().store());
     let found = view::sources(
-        &root,
-        &engine.env,
+        &engine.manifests,
         &scan.tenant,
         &scan.dataset,
         scan.kind,
