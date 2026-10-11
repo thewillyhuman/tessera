@@ -272,7 +272,9 @@ async fn ingest_phase(
             "p50 {} ms, p99 {} ms (linger {} ms, {} clients)",
             ack.p50.as_millis(),
             ack.p99.as_millis(),
-            linger.unwrap_or(Duration::from_millis(250)).as_millis(),
+            linger
+                .unwrap_or_else(|| Config::single_node(PathBuf::new()).ingest.linger)
+                .as_millis(),
             args.clients
         ),
     );
