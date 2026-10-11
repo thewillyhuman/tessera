@@ -86,11 +86,19 @@ impl PgServer {
             return Ok(Response::Execution(Tag::new(tag)));
         }
         let ctx = self.context(client)?;
+        let started = std::time::Instant::now();
         let response = query::run(&self.state.engine, &SqlFrontend, text, &ctx)
             .await
             .map_err(|e| query_error(&e, text))?;
         match response {
             tessera_exec::Response::Rows(output) => {
+                crate::workload::record_uses(
+                    &self.state,
+                    output.uses.clone(),
+                    "sql",
+                    "ad hoc",
+                    started.elapsed(),
+                );
                 let fields = Arc::new(fields(&output.schema, format));
                 let rows = encode_rows(&fields, &output.batches)?;
                 Ok(Response::Query(QueryResponse::new(

@@ -10,6 +10,7 @@ use tessera_ir::{BindContext, ControlStatement, Diagnostic, Frontend, Plan, Stat
 use tessera_opt::{OptError, optimize};
 
 use crate::engine::{Analysis, Engine, EngineError, QueryOutput};
+use crate::workload;
 
 /// Why a query failed, at the stage it failed.
 #[derive(Debug, thiserror::Error)]
@@ -59,7 +60,9 @@ pub async fn run(
     match statement {
         Statement::Query(plan) => {
             let plan = optimize(plan, engine.registry())?;
-            Ok(Response::Rows(engine.run(&plan).await?))
+            let mut output = engine.run(&plan).await?;
+            output.uses = workload::uses(&plan, &output.analysis);
+            Ok(Response::Rows(output))
         }
         Statement::Control(statement) => Ok(Response::Control(statement)),
         Statement::Explain { plan, analyze } => {
@@ -118,8 +121,8 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
         );
         let _ = writeln!(
             out,
-            "  rows: {} from files, {} from the tail ({} segments)",
-            scan.rows_from_files, scan.rows_from_tail, scan.segments
+            "  rows: {} from files, {} from the tail ({} segments), {} scanned before predicates",
+            scan.rows_from_files, scan.rows_from_tail, scan.segments, scan.rows_scanned
         );
         if scan.remote_tasks > 0 {
             let _ = writeln!(

@@ -103,11 +103,19 @@ async fn run_native(
         now: state.env.clock.now(),
     };
     let _turn = state.admit_query(&ctx.tenant).await?;
+    let started = std::time::Instant::now();
     let response = query::run(&state.engine, &SqlFrontend, &request.query, &ctx)
         .await
         .map_err(|e| ApiError::query(e, &request.query))?;
     Ok(Json(match response {
         Response::Rows(output) => {
+            crate::workload::record_uses(
+                state,
+                output.uses.clone(),
+                "sql",
+                "ad hoc",
+                started.elapsed(),
+            );
             let (columns, rows) = rows_json(&output.schema, &output.batches)?;
             QueryResponse::Rows { columns, rows }
         }

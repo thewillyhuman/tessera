@@ -130,11 +130,20 @@ async fn run(
     };
     let plan = optimize(plan, state.engine.registry())
         .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
+    let started = std::time::Instant::now();
     let output = state
         .engine
         .run(&plan)
         .await
         .map_err(|e| ApiError::query(QueryError::Engine(e), ""))?;
+    crate::workload::record(
+        state,
+        &plan,
+        &output.analysis,
+        "logql",
+        "api",
+        started.elapsed(),
+    );
     Ok((lowered, output.batches))
 }
 

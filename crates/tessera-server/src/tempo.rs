@@ -148,11 +148,20 @@ fn lower(
 async fn run(state: &AppState, plan: Plan) -> Result<Vec<RecordBatch>, ApiError> {
     let plan = optimize(plan, state.engine.registry())
         .map_err(|e| ApiError::query(QueryError::Plan(e), ""))?;
+    let started = std::time::Instant::now();
     let output = state
         .engine
         .run(&plan)
         .await
         .map_err(|e| ApiError::query(QueryError::Engine(e), ""))?;
+    crate::workload::record(
+        state,
+        &plan,
+        &output.analysis,
+        "traceql",
+        "api",
+        started.elapsed(),
+    );
     Ok(output.batches)
 }
 

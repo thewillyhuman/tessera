@@ -25,6 +25,7 @@ pub mod query;
 pub mod rules;
 pub mod system;
 pub mod tempo;
+pub mod workload;
 
 use std::sync::Arc;
 

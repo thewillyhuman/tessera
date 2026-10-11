@@ -171,6 +171,10 @@ impl FileReader for ParquetReader {
             .filter(|i| may_match(metadata.row_group(*i), &request.bounds, index_of))
             .collect();
         stats.row_groups_read = kept.len();
+        stats.rows_scanned = kept
+            .iter()
+            .map(|i| u64::try_from(metadata.row_group(*i).num_rows()).unwrap_or(0))
+            .sum();
 
         let mut needed: Vec<usize> = projection.iter().chain(&filter_columns).copied().collect();
         needed.sort_unstable();

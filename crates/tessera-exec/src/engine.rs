@@ -43,6 +43,7 @@ use crate::remote::{LeafTask, Peers, RemoteScan};
 use crate::scan::{self, ScanAnalysis};
 use crate::scheduler::{CpuPool, TaskError};
 use crate::system::SystemTables;
+use crate::workload::ScanUse;
 
 /// Why a query failed.
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +95,9 @@ pub struct QueryOutput {
     pub batches: Vec<RecordBatch>,
     /// What the query did.
     pub analysis: Analysis,
+    /// What it asked of each scanned table (AD-1); filled by
+    /// [`crate::query::run`], empty straight from the engine.
+    pub uses: Vec<ScanUse>,
 }
 
 impl QueryOutput {
@@ -227,6 +231,7 @@ impl Engine {
                     scans: Vec::new(),
                     result_cached: true,
                 },
+                uses: Vec::new(),
             });
         }
         let memory = MemoryPool::new(self.limits.memory_bytes);
@@ -240,6 +245,7 @@ impl Engine {
             schema,
             batches,
             analysis,
+            uses: Vec::new(),
         })
     }
 

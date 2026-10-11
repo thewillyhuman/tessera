@@ -78,6 +78,8 @@ pub struct ScanStats {
     pub requests: usize,
     /// Whether the footer came from the cache instead of a request.
     pub footer_cached: bool,
+    /// Rows in the row groups read, before any filter.
+    pub rows_scanned: u64,
 }
 
 /// Fetched bytes ready to decode.

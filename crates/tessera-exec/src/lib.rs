@@ -23,6 +23,7 @@ pub mod remote;
 pub mod scan;
 pub mod scheduler;
 pub mod system;
+pub mod workload;
 
 pub use batch::Batch;
 pub use cache::{ResultCache, ResultKey};
@@ -35,6 +36,7 @@ pub use remote::{LeafTask, Peer, Peers, RemoteError, RemoteScan};
 pub use scan::ScanAnalysis;
 pub use scheduler::{CpuPool, Task, TaskError};
 pub use system::SystemTables;
+pub use workload::{PredicateUse, ScanUse};
 
 /// Why execution failed.
 #[derive(Debug, thiserror::Error)]
