@@ -16,7 +16,7 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 use tessera_types::Timestamp;
-use tessera_types::event::{OBSERVED_TIMESTAMP, TIMESTAMP};
+use tessera_types::event::TIMESTAMP;
 
 use std::sync::Arc;
 
@@ -53,20 +53,19 @@ impl ParquetFormat {
         self.footers.as_ref()
     }
 
-    /// zstd pages, and the two time columns delta-encoded rather than
-    /// dictionary-encoded: timestamps rarely repeat, but within a sort
+    /// zstd pages, and the event time delta-encoded rather than
+    /// dictionary-encoded: event times rarely repeat, but within a sort
     /// run they grow by little, which the delta encoding stores in a
     /// few bits where a dictionary stores every distinct value whole.
+    /// The observed time stays dictionary-encoded: a batch's rows share
+    /// it, so it repeats, and it is not in time order within a file.
     fn properties() -> WriterProperties {
-        let mut builder =
-            WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::default()));
-        for column in [TIMESTAMP, OBSERVED_TIMESTAMP] {
-            let path = ColumnPath::from(column);
-            builder = builder
-                .set_column_dictionary_enabled(path.clone(), false)
-                .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED);
-        }
-        builder.build()
+        let path = ColumnPath::from(TIMESTAMP);
+        WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_column_dictionary_enabled(path.clone(), false)
+            .set_column_encoding(path, Encoding::DELTA_BINARY_PACKED)
+            .build()
     }
 }
 
@@ -243,6 +242,7 @@ mod tests {
     use tessera_types::{DatasetName, EventBatch, LogRow, TenantId};
 
     use super::*;
+    use tessera_types::event::OBSERVED_TIMESTAMP;
 
     fn log(ts: i64, body: &str) -> LogRow {
         LogRow {
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn time_columns_are_delta_encoded() {
+    fn the_event_time_is_delta_encoded() {
         use parquet::file::reader::{FileReader, SerializedFileReader};
 
         let rows: Vec<LogRow> = (0..200).map(|i| log(1_000 + i * 7, "x")).collect();
@@ -292,8 +292,8 @@ mod tests {
             encodings(TIMESTAMP)
         );
         assert!(
-            encodings(OBSERVED_TIMESTAMP).contains(&Encoding::DELTA_BINARY_PACKED),
-            "{:?}",
+            !encodings(OBSERVED_TIMESTAMP).contains(&Encoding::DELTA_BINARY_PACKED),
+            "the observed time repeats and stays dictionary-encoded: {:?}",
             encodings(OBSERVED_TIMESTAMP)
         );
         assert!(
