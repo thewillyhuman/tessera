@@ -849,6 +849,44 @@ mod tests {
         assert_eq!(value["data"]["result"][0]["value"][1], "1");
     }
 
+    /// QL-7: two vectors combine step by step on their labels, and
+    /// `topk` keeps the k largest series at every step.
+    #[tokio::test]
+    async fn vectors_combine_and_rank_per_step() {
+        let app = pushed().await;
+        let range = |query: &str| {
+            let encoded: String = form_urlencoded::byte_serialize(query.as_bytes()).collect();
+            get(&format!(
+                "/loki/api/v1/query_range?query={encoded}&start=1700000000000000000&end=1700000010000000000&step=10s"
+            ))
+        };
+        let counts = r#"sum by (app) (count_over_time({app=~".+"}[20s]))"#;
+        let (status, value) = call(&app, range(&format!("{counts} / {counts}"))).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let result = value["data"]["result"].as_array().unwrap();
+        assert_eq!(result.len(), 2, "{value}");
+        assert!(
+            result
+                .iter()
+                .flat_map(|s| s["values"].as_array().unwrap())
+                .all(|v| v[1] == "1"),
+            "a series divided by itself is one: {value}"
+        );
+        let (status, value) = call(&app, range(&format!("topk(1, {counts})"))).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let result = value["data"]["result"].as_array().unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "one series per step, both steps checkout: {value}"
+        );
+        assert_eq!(result[0]["metric"]["app"], "checkout");
+        assert_eq!(
+            result[0]["values"],
+            json!([[1_700_000_000.0, "1"], [1_700_000_010.0, "2"]])
+        );
+    }
+
     #[tokio::test]
     async fn discovery_endpoints_describe_the_labels() {
         let app = pushed().await;

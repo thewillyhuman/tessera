@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use arrow::datatypes::DataType;
 use tessera_ir::{
-    AggregateExpr, BindContext, Diagnostic, Expr, ExtractStage, Literal, NamedExpr, Plan,
-    RangeFunction, Scan, SeriesGrouping, SortKey, Span, VALUE,
+    AggregateExpr, BindContext, Diagnostic, Expr, ExtractStage, JoinKind, JoinSide, Literal,
+    NamedExpr, Plan, RangeFunction, Scan, SeriesGrouping, SortKey, Span, VALUE,
 };
 use tessera_types::event::{BODY, EXTRACTED, TIMESTAMP};
 use tessera_types::{Kind, TimeRange, Timestamp, event};
@@ -614,6 +614,59 @@ fn ranked_plan(
     })
 }
 
+/// The engine's operator for `op`, and whether it compares.
+fn operator(op: BinaryOp) -> (tessera_ir::BinaryOp, bool) {
+    match op {
+        BinaryOp::Add => (tessera_ir::BinaryOp::Add, false),
+        BinaryOp::Sub => (tessera_ir::BinaryOp::Sub, false),
+        BinaryOp::Mul => (tessera_ir::BinaryOp::Mul, false),
+        BinaryOp::Div => (tessera_ir::BinaryOp::Div, false),
+        BinaryOp::Rem => (tessera_ir::BinaryOp::Rem, false),
+        BinaryOp::Eq => (tessera_ir::BinaryOp::Eq, true),
+        BinaryOp::NotEq => (tessera_ir::BinaryOp::NotEq, true),
+        BinaryOp::Gt => (tessera_ir::BinaryOp::Gt, true),
+        BinaryOp::Gte => (tessera_ir::BinaryOp::GtEq, true),
+        BinaryOp::Lt => (tessera_ir::BinaryOp::Lt, true),
+        BinaryOp::Lte => (tessera_ir::BinaryOp::LtEq, true),
+    }
+}
+
+/// Two vectors matched one to one on their step and their labels, as
+/// `LogQL` matches vectors without `on` or `ignoring`: arithmetic
+/// combines the two values, a comparison keeps the left rows that
+/// pass. A series without a match on the other side drops out.
+fn vector_binary_plan(
+    op: BinaryOp,
+    left: &MetricExpr,
+    right: &MetricExpr,
+    ctx: &BindContext,
+    params: RangeParams,
+) -> Result<Plan, Diagnostic> {
+    let joined = Plan::Join {
+        left: JoinSide::new(metric_plan(left, ctx, params)?, "l"),
+        right: JoinSide::new(metric_plan(right, ctx, params)?, "r"),
+        on: vec![
+            (Expr::column(TIMESTAMP), Expr::column(TIMESTAMP)),
+            (Expr::column(EXTRACTED), Expr::column(EXTRACTED)),
+        ],
+        kind: JoinKind::Inner,
+    };
+    let (l, r) = (Expr::column("l.value"), Expr::column("r.value"));
+    let keep = |value: Expr| {
+        vec![
+            NamedExpr::new(Expr::column("l.timestamp"), TIMESTAMP),
+            NamedExpr::new(Expr::column("l._extracted"), EXTRACTED),
+            NamedExpr::new(value, VALUE),
+        ]
+    };
+    let (ir_op, comparison) = operator(op);
+    Ok(if comparison {
+        joined.filter(l.clone().binary(ir_op, r)).project(keep(l))
+    } else {
+        joined.project(keep(l.binary(ir_op, r)))
+    })
+}
+
 /// A vector against a scalar: arithmetic projects the value, a comparison
 /// filters the rows; two scalars fold.
 fn binary_plan(
@@ -628,12 +681,7 @@ fn binary_plan(
         (Some(l), Some(r)) => return fold_scalars(op, l, r, span),
         (None, Some(s)) => (left, s, false),
         (Some(s), None) => (right, s, true),
-        _ => {
-            return Err(Diagnostic::at(
-                span,
-                "binary operations between two vectors are not supported yet",
-            ));
-        }
+        (None, None) => return vector_binary_plan(op, left, right, ctx, params),
     };
     let input = metric_plan(vector, ctx, params)?;
     let (a, b) = if flipped {
@@ -845,12 +893,28 @@ mod tests {
         assert!(
             matches!(&folded.plan, Plan::Values { rows, .. } if rows[0][0] == Literal::Float(20.0))
         );
-        let e = lower(
-            &parse(r#"rate({a="b"}[1m]) / rate({c="d"}[1m])"#).unwrap(),
-            &ctx(),
-            params(0),
-        )
-        .unwrap_err();
-        assert!(e.message.contains("two vectors"));
+        let ratio = lowered(r#"sum(rate({a="b"}[1m])) / sum(rate({c="d"}[1m]))"#, 30);
+        assert!(
+            ratio.plan.to_string().starts_with(
+                "Project: l.timestamp AS timestamp, l._extracted AS _extracted, (l.value / r.value) AS value
+  \
+                 Join inner: l.timestamp = r.timestamp AND l._extracted = r._extracted
+"
+            ),
+            "{}",
+            ratio.plan
+        );
+        let above = lowered(r#"rate({a="b"}[1m]) > rate({c="d"}[1m])"#, 30);
+        assert!(
+            above.plan.to_string().starts_with(
+                "Project: l.timestamp AS timestamp, l._extracted AS _extracted, l.value AS value
+  \
+                 Filter: (l.value > r.value)
+    \
+                 Join inner:"
+            ),
+            "{}",
+            above.plan
+        );
     }
 }
