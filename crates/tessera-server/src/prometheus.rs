@@ -131,7 +131,7 @@ async fn write(
     let batch = remote_write::to_batch(&request, scope.tenant, scope.dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if let Some(batch) = batch {
-        state.ingest.write(batch).await?;
+        state.write(batch).await?;
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -304,6 +304,7 @@ async fn query_common(
     instant: bool,
 ) -> Result<Value, ApiError> {
     let scope = scope(state, headers)?;
+    let _turn = state.admit_query(&scope.tenant).await?;
     let params = Params::parse(raw);
     let now = state.env.clock.now();
     let query = params.required("query")?;
@@ -376,6 +377,7 @@ async fn discovery_rows(
     params: &Params,
 ) -> Result<Vec<BTreeMap<String, String>>, ApiError> {
     let scope = scope(state, headers)?;
+    let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let end = params.time("end", now, now)?;
     let start = params.time(

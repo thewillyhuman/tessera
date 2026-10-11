@@ -102,6 +102,7 @@ async fn run_native(
         dataset,
         now: state.env.clock.now(),
     };
+    let _turn = state.admit_query(&ctx.tenant).await?;
     let response = query::run(&state.engine, &SqlFrontend, &request.query, &ctx)
         .await
         .map_err(|e| ApiError::query(e, &request.query))?;

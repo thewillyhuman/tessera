@@ -99,7 +99,7 @@ async fn export_logs(
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if let Some(batch) = batch {
-        state.ingest.write(batch).await?;
+        state.write(batch).await?;
     }
     Ok(export_response(
         encoding,
@@ -125,7 +125,7 @@ async fn export_traces(
     let batches = otlp::traces::to_batches(&request, TenantId::DEFAULT, dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for batch in batches {
-        state.ingest.write(batch).await?;
+        state.write(batch).await?;
     }
     Ok(export_response(
         encoding,
@@ -149,7 +149,7 @@ async fn export_metrics(
     let batch = otlp::metrics::to_batch(&request, TenantId::DEFAULT, dataset, now)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if let Some(batch) = batch {
-        state.ingest.write(batch).await?;
+        state.write(batch).await?;
     }
     Ok(export_response(
         encoding,

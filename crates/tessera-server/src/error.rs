@@ -2,9 +2,9 @@
 
 //! The error shape of every endpoint: `{"error": "..."}` with a status
 //! that says whether to retry. 503 means the object store or the ingest
-//! service is unavailable and the request may be retried; 409 is a
-//! conflict with the current state; 404 an unknown name; 400 a malformed
-//! request.
+//! service is unavailable and the request may be retried; 429 that the
+//! tenant is over a limit and may retry later; 409 is a conflict with
+//! the current state; 404 an unknown name; 400 a malformed request.
 
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -66,6 +66,15 @@ impl ApiError {
         }
     }
 
+    /// The tenant is over a limit; the client may retry later.
+    #[must_use]
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
+
     /// A failed query: syntax and planning errors are the client's, with
     /// the position described against `text`; storage failures may be
     /// retried; anything else failed in the engine.
@@ -120,6 +129,23 @@ impl From<CatalogError> for ApiError {
     }
 }
 
+impl From<tessera_cluster::Rejected> for ApiError {
+    fn from(error: tessera_cluster::Rejected) -> Self {
+        match error {
+            tessera_cluster::Rejected::QueriesBusy { .. } => {
+                ApiError::too_many_requests(error.to_string())
+            }
+            tessera_cluster::Rejected::IngestFull { .. } => {
+                ApiError::unavailable(error.to_string())
+            }
+            tessera_cluster::Rejected::TooLarge { .. } => ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
 impl From<IngestError> for ApiError {
     fn from(error: IngestError) -> Self {
         tracing::warn!(error = %error, "write rejected");
@@ -136,7 +162,10 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response();
-        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+        if matches!(
+            self.status,
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
+        ) {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));

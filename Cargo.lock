@@ -2585,6 +2585,7 @@ dependencies = [
  "serde_urlencoded",
  "snap",
  "tessera-catalog",
+ "tessera-cluster",
  "tessera-exec",
  "tessera-format",
  "tessera-ingest",

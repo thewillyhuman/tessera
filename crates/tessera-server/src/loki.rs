@@ -274,6 +274,7 @@ async fn query_common(
     instant: bool,
 ) -> Result<Response, ApiError> {
     let scope = scope(state, headers)?;
+    let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let query = params
         .query
@@ -367,6 +368,7 @@ async fn discovery_rows(
     params: &QueryParams,
 ) -> Result<Vec<Row>, ApiError> {
     let scope = scope(state, headers)?;
+    let _turn = state.admit_query(&scope.tenant).await?;
     let now = state.env.clock.now();
     let (start, end) = time_range(params, now)?;
     let selector = params
@@ -635,7 +637,7 @@ async fn push(
     if !rows.is_empty() {
         let batch = EventBatch::from_logs(scope.tenant, scope.dataset, &rows)
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
-        state.ingest.write(batch).await?;
+        state.write(batch).await?;
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -649,6 +651,7 @@ async fn tail(
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let scope = scope(&state, &headers)?;
+    let _turn = state.admit_query(&scope.tenant).await?;
     let query = params
         .query
         .clone()

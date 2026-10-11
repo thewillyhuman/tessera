@@ -27,13 +27,28 @@ use std::sync::Arc;
 
 use axum::Router;
 use tessera_catalog::Catalog;
+use tessera_cluster::{Admission, Membership, QueryPermit, Role};
 use tessera_exec::Engine;
 use tessera_format::FileFormat;
 use tessera_ingest::IngestHandle;
 use tessera_object::Pools;
-use tessera_types::Env;
+use tessera_types::{Env, EventBatch, TenantId};
 
 pub use error::ApiError;
+pub use internal::HttpRemote;
+
+/// What a node in a cluster adds: who else is there, how to reach
+/// them, and the limits every tenant runs under.
+pub struct Cluster {
+    /// The membership view.
+    pub membership: Arc<Membership>,
+    /// The transport to peers.
+    pub remote: HttpRemote,
+    /// Admission control.
+    pub admission: Arc<Admission>,
+    /// How many ingesters a dataset's writes go to (IN-9).
+    pub preferred_ingesters: usize,
+}
 
 /// What the handlers share.
 #[derive(Clone)]
@@ -50,6 +65,60 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     /// The node's environment.
     pub env: Env,
+    /// The cluster, when the node is in one; alone, nothing is forwarded
+    /// and nothing is limited.
+    pub cluster: Option<Arc<Cluster>>,
+}
+
+impl AppState {
+    /// Writes `batch`: admitted within the tenant's budget, then here or
+    /// through one of the dataset's preferred ingesters (IN-9), chosen by
+    /// rendezvous hashing over the live ones; a preferred ingester that
+    /// cannot be reached means writing here.
+    ///
+    /// # Errors
+    ///
+    /// If the tenant is over its budget or the write fails here.
+    pub async fn write(&self, batch: EventBatch) -> Result<(), ApiError> {
+        let Some(cluster) = &self.cluster else {
+            self.ingest.write(batch).await?;
+            return Ok(());
+        };
+        let _budget = cluster
+            .admission
+            .admit_ingest(batch.tenant(), batch.rows().get_array_memory_size())?;
+        let key = format!("{}/{}", batch.tenant(), batch.dataset());
+        let preferred = cluster.membership.preferred(
+            Role::Ingest,
+            key.as_bytes(),
+            cluster.preferred_ingesters.max(1),
+        );
+        let mine = preferred.is_empty() || preferred.iter().any(|n| n.node == self.env.node);
+        if !mine {
+            match cluster.remote.forward(&preferred[0].http, &batch).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(peer = %preferred[0].node, error = %error, "forwarding failed; writing here");
+                }
+            }
+        }
+        self.ingest.write(batch).await?;
+        Ok(())
+    }
+
+    /// A turn to run a query for `tenant` (QE-18): held until dropped.
+    /// Alone, there is no limit and no permit.
+    ///
+    /// # Errors
+    ///
+    /// If the tenant's queries are all busy for longer than the queue
+    /// allows.
+    pub async fn admit_query(&self, tenant: &TenantId) -> Result<Option<QueryPermit>, ApiError> {
+        match &self.cluster {
+            Some(cluster) => Ok(Some(cluster.admission.admit_query(tenant).await?)),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Every HTTP route of a node.
@@ -120,6 +189,7 @@ impl AppState {
             format: Arc::new(ParquetFormat),
             engine: Arc::new(engine),
             env,
+            cluster: None,
         }
     }
 }
@@ -131,5 +201,175 @@ pub(crate) mod testing {
     /// A single-node state over an in-memory store with a fast ingester.
     pub async fn state() -> AppState {
         AppState::in_memory().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use http_body_util::BodyExt;
+    use tessera_cluster::{Limits, NodeRecord, registry};
+    use tessera_types::{DatasetName, LogRow, Timestamp};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn record(state: &AppState, roles: &[Role], http: &str) -> NodeRecord {
+        let now = state.env.clock.now();
+        NodeRecord {
+            format: registry::FORMAT,
+            node: state.env.node,
+            roles: roles.iter().copied().collect::<BTreeSet<_>>(),
+            http: http.to_owned(),
+            started_at: now,
+            heartbeat_at: now,
+        }
+    }
+
+    /// `state` as a member of a cluster that sees `others` as live.
+    fn clustered(
+        mut state: AppState,
+        roles: &[Role],
+        others: Vec<NodeRecord>,
+        limits: Limits,
+    ) -> AppState {
+        let own = record(&state, roles, "http://self.invalid");
+        let membership = Membership::new(state.env.clone(), own.clone());
+        let mut records = others;
+        records.push(own);
+        membership.replace(records);
+        state.cluster = Some(Arc::new(Cluster {
+            membership: Arc::new(membership),
+            remote: HttpRemote::new(),
+            admission: Arc::new(Admission::new(limits)),
+            preferred_ingesters: 1,
+        }));
+        state
+    }
+
+    fn logs() -> EventBatch {
+        let rows: Vec<LogRow> = (0..3u8)
+            .map(|i| LogRow {
+                timestamp: Timestamp::from_nanos(1_700_000_000_000_000_000 + i64::from(i)),
+                event_id: [i; 16],
+                body: Some(format!("line {i}")),
+                ..LogRow::default()
+            })
+            .collect();
+        EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &rows).unwrap()
+    }
+
+    async fn count_logs(state: &AppState) -> f64 {
+        let query = serde_json::json!({ "dataset": "prod", "query": "SELECT count(*) FROM logs" });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/query")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(query.to_string()))
+            .unwrap();
+        let response = router(state.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["rows"][0][0].as_f64().unwrap()
+    }
+
+    /// Serves `state` on a local port; the base URL to reach it.
+    async fn serve(state: AppState) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn alone_a_node_writes_locally_and_limits_nothing() {
+        let state = AppState::in_memory().await;
+        state.write(logs()).await.unwrap();
+        assert!(
+            state
+                .admit_query(&TenantId::DEFAULT)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!((count_logs(&state).await - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn queries_over_the_tenant_limit_are_told_to_retry() {
+        let limits = Limits {
+            concurrent_queries: 1,
+            queue: Duration::from_millis(10),
+            ..Limits::default()
+        };
+        let state = clustered(AppState::in_memory().await, &[Role::Query], vec![], limits);
+        let _held = state.admit_query(&TenantId::DEFAULT).await.unwrap();
+        let query = serde_json::json!({ "dataset": "prod", "query": "SELECT 1" });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/query")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(query.to_string()))
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn writes_beyond_the_budget_are_rejected_before_memory() {
+        let limits = Limits {
+            ingest_bytes: 1,
+            ..Limits::default()
+        };
+        let state = clustered(AppState::in_memory().await, &[Role::Ingest], vec![], limits);
+        let error = state.write(logs()).await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writes_go_to_the_preferred_ingester() {
+        let ingester = AppState::in_memory().await;
+        let http = serve(ingester.clone()).await;
+        let peer = record(&ingester, &[Role::Ingest], &http);
+        let querier = clustered(
+            AppState::in_memory().await,
+            &[Role::Query],
+            vec![peer],
+            Limits::default(),
+        );
+        querier.write(logs()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            (count_logs(&ingester).await - 3.0).abs() < f64::EPSILON,
+            "the peer has the rows"
+        );
+        assert!(
+            count_logs(&querier).await.abs() < f64::EPSILON,
+            "not written here"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreachable_ingester_means_writing_here() {
+        let gone = AppState::in_memory().await;
+        let peer = record(&gone, &[Role::Ingest], "http://127.0.0.1:1");
+        let state = clustered(
+            AppState::in_memory().await,
+            &[Role::Query],
+            vec![peer],
+            Limits::default(),
+        );
+        state.write(logs()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!((count_logs(&state).await - 3.0).abs() < f64::EPSILON);
     }
 }

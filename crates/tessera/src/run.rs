@@ -137,6 +137,7 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         format,
         engine: Arc::new(engine),
         env,
+        cluster: None,
     };
     let (stop_pg, stopped) = tokio::sync::oneshot::channel::<()>();
     let pg = tokio::spawn(tessera_server::pg::serve(
