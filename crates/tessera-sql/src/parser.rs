@@ -462,7 +462,7 @@ impl Parser<'_> {
     /// After `INSERT`: `INTO table (columns) VALUES (...), ...`.
     fn insert(&mut self) -> Result<Statement, Diagnostic> {
         self.expect_keyword("into")?;
-        let table = self.table_ref()?;
+        let table = self.table_ref(false)?;
         self.expect_symbol("(")?;
         let mut columns = vec![self.identifier()?.0];
         while self.eat_symbol(",") {
@@ -498,7 +498,7 @@ impl Parser<'_> {
 
     /// After `UPDATE`: `table SET column = literal, ... [WHERE ...]`.
     fn update(&mut self) -> Result<Statement, Diagnostic> {
-        let table = self.table_ref()?;
+        let table = self.table_ref(false)?;
         self.expect_keyword("set")?;
         let mut set = vec![self.assignment()?];
         while self.eat_symbol(",") {
@@ -511,7 +511,7 @@ impl Parser<'_> {
     /// After `DELETE`: `FROM table [WHERE ...]`.
     fn delete(&mut self) -> Result<Statement, Diagnostic> {
         self.expect_keyword("from")?;
-        let table = self.table_ref()?;
+        let table = self.table_ref(false)?;
         let (filter, filter_text) = if self.eat_keyword("where") {
             let start = self.span_here().start;
             let filter = self.expr()?;
@@ -556,13 +556,13 @@ impl Parser<'_> {
             items.push(self.select_item()?);
         }
         let from = if self.eat_keyword("from") {
-            Some(self.table_ref()?)
+            Some(self.table_ref(true)?)
         } else {
             None
         };
         let mut joins = Vec::new();
         while let Some(kind) = self.join_kind()? {
-            let table = self.table_ref()?;
+            let table = self.table_ref(true)?;
             self.expect_keyword("on")?;
             let on = self.expr()?;
             joins.push(Join { kind, table, on });
@@ -684,8 +684,9 @@ impl Parser<'_> {
         Ok(None)
     }
 
-    /// `[[tenant.]dataset.]table [[AS] alias]`.
-    fn table_ref(&mut self) -> Result<TableRef, Diagnostic> {
+    /// `[[tenant.]dataset.]table [[AS] alias]`, or where `functions`
+    /// may appear, a table function `name(args) [[AS] alias]` (QL-3).
+    fn table_ref(&mut self, functions: bool) -> Result<TableRef, Diagnostic> {
         let (first, start) = self.identifier()?;
         let mut parts = vec![first];
         let mut end = start;
@@ -693,6 +694,20 @@ impl Parser<'_> {
             let (part, span) = self.identifier()?;
             parts.push(part);
             end = span;
+        }
+        let mut args = None;
+        if functions && parts.len() == 1 && self.eat_symbol("(") {
+            let mut list = Vec::new();
+            if !self.eat_symbol(")") {
+                loop {
+                    list.push(self.expr()?);
+                    if !self.eat_symbol(",") {
+                        end = self.expect_symbol(")")?;
+                        break;
+                    }
+                }
+            }
+            args = Some(list);
         }
         let span = Span::new(start.start, end.end);
         let table = parts.pop().unwrap_or_default();
@@ -710,6 +725,7 @@ impl Parser<'_> {
             dataset,
             table,
             alias,
+            args,
             span,
         })
     }

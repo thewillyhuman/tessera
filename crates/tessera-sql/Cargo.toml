@@ -9,7 +9,10 @@ repository.workspace = true
 
 [dependencies]
 tessera-ir.workspace = true
+tessera-logql.workspace = true
+tessera-promql.workspace = true
 tessera-search.workspace = true
+tessera-traceql.workspace = true
 tessera-types.workspace = true
 
 arrow = { version = "60", default-features = false }

@@ -3434,7 +3434,10 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "tessera-ir",
+ "tessera-logql",
+ "tessera-promql",
  "tessera-search",
+ "tessera-traceql",
  "tessera-types",
 ]
 

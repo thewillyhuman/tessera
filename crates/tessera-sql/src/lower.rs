@@ -252,6 +252,91 @@ fn literals(
         .collect()
 }
 
+/// A language embedded in `FROM` (QL-3): `promql('expr', start, end,
+/// step)`, `logql('query', start, end [, step])` and `traceql('query',
+/// start, end)`, each lowered under the request's tenant and dataset
+/// into the rows its own API would return. The times are literals,
+/// `now()`, or either plus or minus an interval.
+fn table_function(
+    from: &ast::TableRef,
+    args: &[ast::Expr],
+    ctx: &BindContext,
+) -> Result<Plan, Diagnostic> {
+    let name = from.table.as_str();
+    if !matches!(name, "promql" | "logql" | "traceql") {
+        return Err(Diagnostic::at(
+            from.span,
+            format!("{name} is not a table function; promql, logql and traceql are"),
+        ));
+    }
+    let [query, start, end, rest @ ..] = args else {
+        return Err(Diagnostic::at(
+            from.span,
+            format!("{name} takes the query, its start and its end, then a step"),
+        ));
+    };
+    let ast::ExprKind::String(text) = &query.kind else {
+        return Err(Diagnostic::at(query.span, "the query is a string"));
+    };
+    let time = |expr: &ast::Expr| match literal(expr, ctx)? {
+        Literal::Timestamp(at) => Ok(at),
+        _ => Err(Diagnostic::at(expr.span, "expected a timestamp")),
+    };
+    let (start, end) = (time(start)?, time(end)?);
+    let step = match rest {
+        [] => None,
+        [step] => match literal(step, ctx)? {
+            Literal::Duration(step) => Some(step),
+            _ => return Err(Diagnostic::at(step.span, "expected an interval")),
+        },
+        [_, extra, ..] => return Err(Diagnostic::at(extra.span, "too many arguments")),
+    };
+    let located =
+        |d: Diagnostic| Diagnostic::at(query.span, format!("{name}: {}", d.describe(text)));
+    match name {
+        "promql" => {
+            let Some(step) = step else {
+                return Err(Diagnostic::at(from.span, "promql needs a step"));
+            };
+            let params = tessera_promql::RangeParams { start, end, step };
+            let lowered = tessera_promql::PromqlFrontend { params }
+                .lower_query(text, ctx)
+                .map_err(located)?;
+            if lowered.kind == tessera_promql::ResultKind::String {
+                return Err(Diagnostic::at(
+                    query.span,
+                    "a string expression has no rows",
+                ));
+            }
+            Ok(lowered.plan)
+        }
+        "logql" => {
+            // Loki's default step: the range over 250 points, at least a second.
+            let step = step.unwrap_or_else(|| {
+                let span = end.as_nanos().saturating_sub(start.as_nanos()).max(0);
+                Duration::from_nanos(u64::try_from(span / 250).unwrap_or(0))
+                    .max(Duration::from_secs(1))
+            });
+            let params = tessera_logql::RangeParams { start, end, step };
+            Ok(tessera_logql::LogqlFrontend { params }
+                .lower_query(text, ctx)
+                .map_err(located)?
+                .plan)
+        }
+        _ => {
+            let params = tessera_traceql::RangeParams {
+                start,
+                end,
+                step: step.unwrap_or(Duration::ZERO),
+            };
+            Ok(tessera_traceql::TraceqlFrontend { params }
+                .lower_query(text, ctx)
+                .map_err(located)?
+                .plan)
+        }
+    }
+}
+
 /// A literal as written in a control statement; `now()` and `now()`
 /// plus or minus an interval are read at the statement's time.
 fn literal(expr: &ast::Expr, ctx: &BindContext) -> Result<Literal, Diagnostic> {
@@ -466,7 +551,7 @@ fn lower_query(
     let Some(from) = &query.from else {
         return lower_constant_query(query, ctx, registry);
     };
-    let (table, mut plan) = source(from, ctx)?;
+    let (table, mut plan) = source(from, ctx, registry)?;
     let mut scope = Scope::single(table);
     if let [_, second, ..] = query.joins.as_slice() {
         return Err(Diagnostic::at(
@@ -475,7 +560,7 @@ fn lower_query(
         ));
     }
     if let Some(join) = query.joins.first() {
-        let (right, right_plan) = source(&join.table, ctx)?;
+        let (right, right_plan) = source(&join.table, ctx, registry)?;
         if scope.table(&right.name).is_some() {
             return Err(Diagnostic::at(
                 join.table.span,
@@ -529,7 +614,26 @@ fn lower_query(
 
 /// The rows of a table in `FROM` or `JOIN`, and what its columns are
 /// called: the alias when one is written.
-fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan), Diagnostic> {
+fn source(
+    from: &ast::TableRef,
+    ctx: &BindContext,
+    registry: &Registry,
+) -> Result<(TableScope, Plan), Diagnostic> {
+    if let Some(args) = &from.args {
+        let plan = table_function(from, args, ctx)?;
+        let schema = plan
+            .schema(registry)
+            .map_err(|e| Diagnostic::at(from.span, e.to_string()))?;
+        let mut table = TableScope {
+            name: from.table.clone(),
+            schema,
+            kinds: Vec::new(),
+        };
+        if let Some(alias) = &from.alias {
+            table.name.clone_from(alias);
+        }
+        return Ok((table, plan));
+    }
     let derived = matches!(from.table.as_str(), "usage" | "log_patterns");
     if from.tenant.is_some() && from.dataset.as_deref() == Some("system") && derived {
         return Err(Diagnostic::at(
@@ -1571,6 +1675,60 @@ mod tests {
             Statement::Query(plan) => plan,
             other => panic!("not a query: {other:?}"),
         }
+    }
+
+    /// QL-3: a language in `FROM` is a relation named after it, under
+    /// the request's dataset, with the columns its own API returns.
+    #[test]
+    fn table_functions_embed_the_other_languages() {
+        let plan = lowered(
+            "SELECT timestamp, value FROM promql('up', TIMESTAMP '2024-01-01T00:00:00Z', \
+             TIMESTAMP '2024-01-01T01:00:00Z', INTERVAL '1m') WHERE value > 0",
+        );
+        let text = plan.to_string();
+        assert!(text.contains("PromQL"), "{text}");
+        assert!(text.contains("prod/metric"), "{text}");
+        assert!(
+            text.starts_with(
+                "Project: timestamp AS timestamp, value AS value\n  Filter: (value > 0)"
+            ),
+            "{text}"
+        );
+
+        let plan = lowered(
+            r#"SELECT l.body FROM logql('{app="checkout"} |= "timeout"', now() - INTERVAL '1h', now()) l LIMIT 5"#,
+        );
+        let text = plan.to_string();
+        assert!(text.contains("Scan: prod/log"), "{text}");
+        assert!(
+            text.contains("[2023-11-14T21:13:20Z, 2023-11-14T22:13:20.000000001Z)"),
+            "an hour up to now: {text}"
+        );
+
+        let plan = lowered(
+            "SELECT count(*) FROM traceql('{ status = error }', TIMESTAMP '2024-01-01T00:00:00Z', \
+             TIMESTAMP '2024-01-02T00:00:00Z')",
+        );
+        assert!(plan.to_string().contains("TraceGroup"), "{plan}");
+
+        let error = |sql: &str| lower(&parse(sql).unwrap(), &ctx()).unwrap_err().message;
+        assert!(
+            error("SELECT * FROM promql('up', 1, 2, INTERVAL '1m')").contains("timestamp"),
+            "times are literals"
+        );
+        assert!(
+            error("SELECT * FROM promql('up', now(), now())").contains("step"),
+            "PromQL needs a step"
+        );
+        assert!(
+            error("SELECT * FROM promql('rate(up', now(), now(), INTERVAL '1m')")
+                .contains("promql:"),
+            "the inner diagnostic is reported"
+        );
+        assert!(
+            error("SELECT * FROM sqlish('x', now(), now())").contains("table function"),
+            "only the three languages"
+        );
     }
 
     fn control(sql: &str) -> ControlStatement {

@@ -172,6 +172,9 @@ pub struct TableRef {
     pub table: String,
     /// `AS name`, or a bare name after the table.
     pub alias: Option<String>,
+    /// The arguments when the table is a function, such as
+    /// `promql('up', start, end, step)` (QL-3).
+    pub args: Option<Vec<Expr>>,
     /// Where it was written.
     pub span: Span,
 }

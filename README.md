@@ -86,10 +86,8 @@ id (JSON and protobuf), tag names and values, metrics. The TraceQL
 differential suite agrees with Tempo 2.7.1 on every case; the
 deviations found are documented in the `tessera-traceql` crate.
 
-Gaps left in M4: the `traceql(...)` table function in SQL; trace
-completion (QL-14) waits
-for L3 compaction (M9); Grafana itself has not been run against the
-API yet.
+Gaps left in M4: trace completion (QL-14) waits for L3 compaction
+(M9); Grafana itself has not been run against the API yet.
 
 **M5, metrics: done, with gaps listed below.** Metric data points
 over OTLP (gauges, sums, histograms, exponential histograms and
@@ -106,8 +104,7 @@ and remote write. The PromQL differential suite agrees with
 Prometheus 3.15.0 on every case.
 
 Gaps left in M5: native histograms (OTLP histograms are stored but
-not queryable through PromQL), `info`,
-the `promql(...)` table function in SQL, exemplars, rules and alerts
+not queryable through PromQL), `info`, exemplars, rules and alerts
 (M7), metric downsampling and rollups (M9); the PromQL compliance
 suite has not been run; Grafana itself has not been run against the
 API yet.
@@ -485,7 +482,13 @@ curl -X POST localhost:8080/api/v1/query -H 'content-type: application/json' \
      -d '{"dataset":"prod","query":"SELECT timestamp, body, resource.service.name AS service FROM logs WHERE severity_text = '"'"'ERROR'"'"' ORDER BY timestamp DESC LIMIT 10"}'
 psql 'host=127.0.0.1 port=5432 dbname=prod' \
      -c "SELECT time_bucket(INTERVAL '5m', timestamp) AS t, count(*) FROM logs GROUP BY 1 ORDER BY 1"
+psql 'host=127.0.0.1 port=5432 dbname=prod' \
+     -c "SELECT timestamp, value FROM promql('sum(rate(http_requests_total[5m]))', now() - INTERVAL '1h', now(), INTERVAL '1m')"
 ```
+
+The other languages are tables in `FROM`: `promql('expr', start, end,
+step)`, `logql('query', start, end)` and `traceql('query', start,
+end)` return the rows their own APIs would (QL-3).
 
 The database a PostgreSQL client connects to is the dataset. `EXPLAIN`
 shows the plan and `EXPLAIN ANALYZE` what each scan read and pruned.

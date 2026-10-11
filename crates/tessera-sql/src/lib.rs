@@ -12,7 +12,9 @@
 //! A bare attribute reads as text; compared with a number, cast
 //! (`attr.n::int`) or used by a numeric function it reads as that type.
 //! `search('...')` embeds the search syntax of section 9.6 as a
-//! predicate (QL-3).
+//! predicate, and `promql('...', start, end, step)`, `logql('...',
+//! start, end)` and `traceql('...', start, end)` embed the other
+//! languages as tables in `FROM` (QL-3).
 //!
 //! Statements of the control plane (`CREATE ALERT`, `CREATE TENANT` and
 //! the others of section 9.2) arrive with their milestones.

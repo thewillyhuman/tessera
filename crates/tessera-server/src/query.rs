@@ -251,6 +251,18 @@ mod tests {
             explain.contains("rows: 0 from files, 3 from the tail"),
             "{explain}"
         );
+
+        // QL-3: LogQL as a table, over the same rows.
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT count(*) AS n FROM logql('{n=~\"1|2\"} |= \"d\"', TIMESTAMP '2023-11-14T00:00:00Z', TIMESTAMP '2023-11-15T00:00:00Z')",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"][0][0], 2.0, "second and third: {value}");
     }
 
     /// DM-1: `events` holds every kind on one set of columns, and a
