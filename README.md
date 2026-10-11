@@ -204,7 +204,52 @@ promoted column is read from `_overflow` by the tail and by files
 older than its promotion, which is correct but not faster; space-
 filling curves are not planned.
 
-**M9, cost and retention: next.**
+**M9, cost and retention: done, with gaps listed below.** Metering:
+ingest records bytes and events per tenant, dataset, kind, service
+and team, the team from a configurable attribute (CO-1); compaction
+records stored bytes per the same and per log pattern or name (CO-2);
+queries record bytes scanned, time taken, object-store requests,
+principal, language, source and fingerprint (CO-3); all of it is
+written as events of `_system.usage` and read back as `system.usage`
+(CO-4). Log patterns: compaction clusters log bodies into templates
+and gives each row a `pattern_id` that stays stable across files
+(CO-5); `system.log_patterns` lists them with their volumes. Value
+scores per kind, from reads against stored bytes, kept in the dataset
+log. Retention by value: `CREATE RETENTION POLICY ... AS WHEN ...
+THEN SAMPLE r AFTER d, DROP AFTER d, DOWNSAMPLE TO i AFTER d ... ELSE
+...` over `kind`, severity, `value_score` and row columns;
+`EXPLAIN RETENTION` estimates what a policy removes and saves (CO-9);
+policies are applied at compaction, sampling by event or by trace
+with `sample_rate` scaled on the survivors (CO-6, CO-7), downsampling
+metrics to count, sum, min, max and last per series and interval
+(CO-8), and dropping by age alone removes whole partitions; nothing
+is reduced by value without an enabled policy (CO-10). Budgets per
+tenant and team for ingest, and per tenant for queries, as tenant
+settings; once a budget is reached, what arrives beyond it is
+admitted and recorded once a day (the default), sampled at ingest, or
+refused with 429, and a query is refused before it runs (13.4).
+Rollups: `CREATE ROLLUP name [EVERY d] [INTO dataset] AS` a grouped
+aggregation over one tumbling window, maintained by the eval role
+from closed windows into a derived dataset of events, read by the
+planner in place of the raw rows when a query's source, filter, keys,
+aggregates and whole-window time range match, exactly, with
+`"rollups": false` on the native API to turn the rewrite off
+(AD-13); the advisor proposes rollups for the aggregation shapes the
+workload repeats (8.7).
+
+Gaps left in M9: `system.usage` has not been reconciled against
+object-store billing (the exit criterion); unit prices and cost are
+not shown (CO-4); traces with errors are not exempt from sampling and
+histograms and sketches are not merged when downsampling (CO-7,
+CO-8); the budget ledger counts per node, so a tenant served by
+several ingesters gets up to that many budgets; teams have no query
+budget, since queries carry no principal; Prometheus recording rules
+are still refused rather than turned into rollups; a rollup starts at
+its creation and does not backfill; a query whose range is not aligned
+to a rollup's windows or reaches past its progress mark reads the raw
+rows whole; narrow integers come back from a rollup as 64-bit.
+
+**M10, hardening: next.**
 
 ## Layout
 
