@@ -83,9 +83,9 @@ pub fn apply(
         return Ok((rows, applied));
     }
     if let Some(rate) = retain.sample.filter(|r| *r < 1.0) {
-        let (sampled, dropped) = sample(&rows, kind, &matches, rate)?;
-        applied.sampled_out = dropped;
-        rows = sampled;
+        let sampled = sample(&rows, kind, &matches, rate)?;
+        applied.sampled_out = sampled.dropped();
+        rows = sampled.rows;
     }
     if let (Some(interval), Kind::Metric) = (retain.downsample, kind) {
         let matches: BooleanArray = match &retain.predicate {

@@ -16,12 +16,28 @@ use arrow::error::ArrowError;
 use tessera_types::event::{EVENT_ID, SAMPLE_RATE, TRACE_ID};
 use tessera_types::{Kind, stable_hash};
 
+/// What sampling kept.
+#[derive(Clone, Debug)]
+pub struct Sampled {
+    /// The kept rows, with `sample_rate` scaled on the sampled ones.
+    pub rows: RecordBatch,
+    /// Which of the input rows were kept, in input order.
+    pub kept: BooleanArray,
+}
+
+impl Sampled {
+    /// How many rows were dropped.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        u64::try_from(self.kept.false_count()).unwrap_or(0)
+    }
+}
+
 /// Keeps `rate` of the rows `matches` selects, by trace for spans and by
 /// event otherwise, and scales `sample_rate` on the kept matching rows;
-/// the rows `matches` leaves out are kept untouched. Returns the kept
-/// rows and how many were dropped. The same rows and rate always keep
-/// the same rows. The rate is a fraction of a million, which a `u64`
-/// holds whole.
+/// the rows `matches` leaves out are kept untouched. The same rows and
+/// rate always keep the same rows. The rate is a fraction of a million,
+/// which a `u64` holds whole.
 ///
 /// # Errors
 ///
@@ -32,7 +48,7 @@ pub fn sample(
     kind: Kind,
     matches: &BooleanArray,
     rate: f64,
-) -> Result<(RecordBatch, u64), ArrowError> {
+) -> Result<Sampled, ArrowError> {
     let identity = if kind == Kind::Span {
         TRACE_ID
     } else {
@@ -53,7 +69,6 @@ pub fn sample(
             Some(key % 1_000_000 < threshold)
         })
         .collect();
-    let dropped = u64::try_from(rows.num_rows() - keep.true_count()).unwrap_or(0);
     let kept_matches = filter_record_batch(
         &RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("m", DataType::Boolean, false)])),
@@ -69,7 +84,10 @@ pub fn sample(
         .cloned()
         .unwrap_or_else(|| BooleanArray::from(vec![true; kept.num_rows()]));
     let Some(index) = kept.schema().index_of(SAMPLE_RATE).ok() else {
-        return Ok((kept, dropped));
+        return Ok(Sampled {
+            rows: kept,
+            kept: keep,
+        });
     };
     let current = kept
         .column(index)
@@ -93,7 +111,10 @@ pub fn sample(
         .collect();
     let mut columns = kept.columns().to_vec();
     columns[index] = Arc::new(scaled);
-    Ok((RecordBatch::try_new(kept.schema(), columns)?, dropped))
+    Ok(Sampled {
+        rows: RecordBatch::try_new(kept.schema(), columns)?,
+        kept: keep,
+    })
 }
 
 #[cfg(test)]
@@ -132,16 +153,22 @@ mod tests {
     fn keeps_the_same_rows_each_time_and_scales_the_rate() {
         let rows = logs(200);
         let all = BooleanArray::from(vec![true; 200]);
-        let (kept, dropped) = sample(&rows, Kind::Log, &all, 0.25).unwrap();
-        let (again, _) = sample(&rows, Kind::Log, &all, 0.25).unwrap();
-        assert_eq!(kept.num_rows(), again.num_rows());
+        let sampled = sample(&rows, Kind::Log, &all, 0.25).unwrap();
+        let again = sample(&rows, Kind::Log, &all, 0.25).unwrap();
+        let kept = &sampled.rows;
+        assert_eq!(kept.num_rows(), again.rows.num_rows());
         assert!(
             kept.num_rows() > 20 && kept.num_rows() < 80,
             "{}",
             kept.num_rows()
         );
-        assert_eq!(usize::try_from(dropped).unwrap(), 200 - kept.num_rows());
-        let rates = rates(&kept);
+        assert_eq!(
+            usize::try_from(sampled.dropped()).unwrap(),
+            200 - kept.num_rows()
+        );
+        assert_eq!(sampled.kept.len(), 200, "one answer per input row");
+        assert_eq!(sampled.kept.true_count(), kept.num_rows());
+        let rates = rates(kept);
         assert!((0..kept.num_rows()).all(|i| (rates.value(i) - 0.25).abs() < 1e-12));
     }
 
@@ -149,10 +176,10 @@ mod tests {
     fn rows_outside_the_selection_are_kept_untouched() {
         let rows = logs(100);
         let none = BooleanArray::from(vec![false; 100]);
-        let (kept, dropped) = sample(&rows, Kind::Log, &none, 0.1).unwrap();
-        assert_eq!(kept.num_rows(), 100);
-        assert_eq!(dropped, 0);
-        let rates = rates(&kept);
+        let sampled = sample(&rows, Kind::Log, &none, 0.1).unwrap();
+        assert_eq!(sampled.rows.num_rows(), 100);
+        assert_eq!(sampled.dropped(), 0);
+        let rates = rates(&sampled.rows);
         assert!((0..100).all(|i| (rates.value(i) - 1.0).abs() < 1e-12));
     }
 
@@ -174,7 +201,7 @@ mod tests {
                 .rows()
                 .clone();
         let all = BooleanArray::from(vec![true; 100]);
-        let (kept, _) = sample(&rows, Kind::Span, &all, 0.5).unwrap();
+        let kept = sample(&rows, Kind::Span, &all, 0.5).unwrap().rows;
         let traces = kept
             .column_by_name(TRACE_ID)
             .unwrap()
