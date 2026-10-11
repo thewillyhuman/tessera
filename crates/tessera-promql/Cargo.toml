@@ -12,6 +12,7 @@ tessera-ir.workspace = true
 tessera-types.workspace = true
 
 arrow = { version = "60", default-features = false }
+regex = "1"
 
 [lints]
 workspace = true

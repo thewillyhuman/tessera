@@ -2515,6 +2515,7 @@ name = "tessera-promql"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "regex",
  "tessera-ir",
  "tessera-types",
 ]
