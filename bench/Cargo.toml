@@ -1,0 +1,26 @@
+[package]
+name = "tessera-bench"
+description = "Single-node benchmark of Tessera against the performance targets of spec section 17.1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+tessera-manifest.workspace = true
+tessera-node.workspace = true
+tessera-object.workspace = true
+tessera-types.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+parquet = { version = "60", default-features = false }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "logs", "metrics", "trace", "with-serde"] }
+prost = "0.14"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "io-util"] }
+ureq = { version = "3", features = ["json"] }
+
+[lints]
+workspace = true

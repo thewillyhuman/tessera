@@ -2413,6 +2413,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "opentelemetry-proto",
+ "parquet",
+ "prost",
+ "serde_json",
+ "tempfile",
+ "tessera-manifest",
+ "tessera-node",
+ "tessera-object",
+ "tessera-types",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
 name = "tessera-catalog"
 version = "0.1.0"
 dependencies = [
