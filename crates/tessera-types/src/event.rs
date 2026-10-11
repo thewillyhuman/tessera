@@ -902,28 +902,39 @@ pub fn attributes_column(rows: &RecordBatch) -> Option<StringArray> {
     if dedicated.is_empty() {
         return overflow.cloned();
     }
+    // The stored text is already a JSON object: the dedicated values are
+    // appended to it as encoded pairs, without parsing it. A path stored
+    // both ways, as files from before promotion stripped it are, appears
+    // twice with the same value, and a parser keeps the last.
     let merged: StringArray = (0..rows.num_rows())
         .map(|i| {
-            let mut object = match overflow.filter(|o| !o.is_null(i)) {
-                Some(o) => match serde_json::from_str::<Value>(o.value(i)) {
-                    Ok(Value::Object(object)) => object,
-                    _ => serde_json::Map::new(),
-                },
-                None => serde_json::Map::new(),
-            };
+            let stored = overflow
+                .filter(|o| !o.is_null(i))
+                .map(|o| o.value(i).trim())
+                .filter(|text| text.len() >= 2 && text.starts_with('{') && text.ends_with('}'));
+            let mut out = String::new();
+            match stored {
+                Some(text) => out.push_str(&text[..text.len() - 1]),
+                None => out.push('{'),
+            }
+            let mut empty = stored.is_none_or(|text| text.len() == 2);
             for (path, column) in &dedicated {
-                if object.contains_key(*path) {
+                let Some(value) = cell_value(column, i) else {
                     continue;
+                };
+                if !empty {
+                    out.push(',');
                 }
-                if let Some(value) = cell_value(column, i) {
-                    object.insert((*path).to_owned(), value);
-                }
+                empty = false;
+                out.push_str(&Value::String((*path).to_owned()).to_string());
+                out.push(':');
+                out.push_str(&value.to_string());
             }
-            if object.is_empty() {
-                None
-            } else {
-                Some(Value::Object(object).to_string())
+            if empty {
+                return None;
             }
+            out.push('}');
+            Some(out)
         })
         .collect();
     Some(merged)
