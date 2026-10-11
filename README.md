@@ -406,10 +406,20 @@ of their own and its links stay with the span. Metrics go to
 `/v1/metrics`, one row per data point, or over Prometheus remote
 write at `/api/v1/write`. An OpenTelemetry Collector's `otlphttp`
 exporter pointed at `http://localhost:8080` works as is for logs,
-traces and metrics. A write is acknowledged once its rows are durable
-in the object store; `?ack=buffered` on an OTLP endpoint acknowledges
-once the node holds them, before their segment is stored, for callers
-that prefer latency to durability (IN-10).
+traces and metrics. Arbitrary events go to `/api/v1/events` as JSON
+lines, one object per line with a `timestamp` (RFC 3339 or
+nanoseconds), an optional `name`, `trace_id` and `span_id`, and any
+other member stored as an attribute path (IN-4):
+
+```
+curl -X POST localhost:8080/api/v1/events -H 'x-tessera-dataset: prod' \
+     --data-binary $'{"timestamp":"2024-01-01T00:00:00Z","name":"deploy","service":"api","version":"1.2"}\n'
+```
+
+A write is acknowledged once its rows are durable in the object
+store; `?ack=buffered` on an ingest endpoint acknowledges once the
+node holds them, before their segment is stored, for callers that
+prefer latency to durability (IN-10).
 
 Queries are SQL, over HTTP or over the PostgreSQL protocol. A dataset
 is one table, `events`, holding every kind of event on one set of

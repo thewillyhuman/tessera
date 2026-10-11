@@ -18,6 +18,7 @@ mod budgets;
 mod control;
 pub mod encode;
 mod error;
+pub mod events;
 pub mod internal;
 pub mod loki;
 pub mod metering;
@@ -188,6 +189,7 @@ pub fn router(state: AppState) -> Router {
     admin::router(state.clone())
         .merge(internal::router(state.clone()))
         .merge(otlp::router(state.clone()))
+        .merge(events::router(state.clone()))
         .merge(loki::router(state.clone()))
         .merge(tempo::router(state.clone()))
         .merge(prometheus::router(state.clone()))
