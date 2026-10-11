@@ -2503,14 +2503,26 @@ dependencies = [
 name = "tessera-eval"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "futures",
  "serde",
  "serde_json",
  "tessera-catalog",
  "tessera-commit",
+ "tessera-exec",
+ "tessera-format",
+ "tessera-ir",
+ "tessera-logql",
+ "tessera-manifest",
  "tessera-object",
+ "tessera-opt",
+ "tessera-promql",
+ "tessera-sql",
  "tessera-types",
+ "tessera-wal",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

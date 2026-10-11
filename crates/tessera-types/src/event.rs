@@ -377,13 +377,36 @@ impl EventBatch {
         dataset: DatasetName,
         events: &[EventRow],
     ) -> Result<Self, InvalidBatch> {
+        Self::rows_of_kind(Kind::Event, tenant, dataset, events)
+    }
+
+    /// A batch of alert state transitions (DM-3), which have the shape
+    /// of events: a name, the rule's, and attributes.
+    ///
+    /// # Errors
+    ///
+    /// `Empty` if there are no rows; `Arrow` if a column cannot be built.
+    pub fn from_alerts(
+        tenant: TenantId,
+        dataset: DatasetName,
+        alerts: &[EventRow],
+    ) -> Result<Self, InvalidBatch> {
+        Self::rows_of_kind(Kind::Alert, tenant, dataset, alerts)
+    }
+
+    fn rows_of_kind(
+        kind: Kind,
+        tenant: TenantId,
+        dataset: DatasetName,
+        events: &[EventRow],
+    ) -> Result<Self, InvalidBatch> {
         if events.is_empty() {
             return Err(InvalidBatch::Empty);
         }
         let columns: Vec<ArrayRef> = vec![
             timestamps(events.iter().map(|e| e.timestamp)),
             timestamps(events.iter().map(|e| e.observed_timestamp)),
-            Arc::new(StringArray::from(vec![Kind::Event.as_str(); events.len()])),
+            Arc::new(StringArray::from(vec![kind.as_str(); events.len()])),
             fixed(events.iter().map(|e| Some(&e.event_id[..])), 16)?,
             fixed(
                 events.iter().map(|e| e.trace_id.as_ref().map(|id| &id[..])),
@@ -407,11 +430,11 @@ impl EventBatch {
                     .collect::<Vec<_>>(),
             )),
         ];
-        let rows = RecordBatch::try_new(schema(Kind::Event), columns)?;
+        let rows = RecordBatch::try_new(schema(kind), columns)?;
         Ok(EventBatch {
             tenant,
             dataset,
-            kind: Kind::Event,
+            kind,
             rows,
         })
     }
