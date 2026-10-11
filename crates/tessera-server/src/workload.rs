@@ -129,6 +129,9 @@ fn event(
     if let Some(selectivity) = scan.selectivity {
         attributes.insert("attr.selectivity".into(), Scalar::Float(selectivity));
     }
+    if let Some(shape) = &scan.rollup_shape {
+        attributes.insert("attr.shape".into(), text(shape.clone()));
+    }
     attributes.insert(
         "attr.latency_ms".into(),
         int(u64::try_from(latency.as_millis()).unwrap_or(u64::MAX)),

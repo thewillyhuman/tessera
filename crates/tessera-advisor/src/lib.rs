@@ -14,8 +14,11 @@
 //!
 //! A new layout is adopted only when it beats the current one by a
 //! margin on two consecutive runs (AD-7). Pins from the control store
-//! override any choice (AD-12). Everything here is pure; the node reads
-//! the inputs and writes the outcome.
+//! override any choice (AD-12). Repeated aggregation shapes become
+//! rollup proposals ([`rollups`], section 8.7). Everything here is
+//! pure; the node reads the inputs and writes the outcome.
+
+pub mod rollups;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;

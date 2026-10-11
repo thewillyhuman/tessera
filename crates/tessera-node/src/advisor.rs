@@ -8,17 +8,21 @@
 //! `EXPLAIN LAYOUT` (AD-11); a layout it adopts becomes the next epoch
 //! (AD-9) and the partition window is set for partitions to come
 //! (AD-14). Compaction then writes new files in the layout; old files
-//! stay valid until re-clustered.
+//! stay valid until re-clustered. Aggregation shapes the workload
+//! repeats become rollups (section 8.7), one owner per tenant.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
+use tessera_advisor::rollups::{RepeatedShape, propose};
 use tessera_advisor::{FileSummary, Inputs, Observation, Pins, advise};
-use tessera_catalog::{Catalog, ControlStores, Table, TenantStatus};
+use tessera_catalog::{Catalog, ControlError, ControlStores, Table, TenantStatus};
+use tessera_eval::rule::decode_rows;
+use tessera_eval::{Origin, Rollup};
 use tessera_exec::{Engine, Response, query};
-use tessera_ir::BindContext;
+use tessera_ir::{BindContext, RollupDefinition};
 use tessera_manifest::{DatasetLogs, Manifests, list_partitions, registry};
 use tessera_object::ObjectStore;
 use tessera_sql::SqlFrontend;
@@ -32,6 +36,8 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(600);
 const LOOKBACK: Duration = Duration::from_secs(30 * 24 * 3600);
 /// The most workload events read per run.
 const MAX_OBSERVATIONS: usize = 20_000;
+/// How far back repeated aggregation shapes are counted (section 8.7).
+const SHAPE_LOOKBACK: Duration = Duration::from_secs(24 * 3600);
 
 type Failure = Box<dyn std::error::Error + Send + Sync>;
 
@@ -79,6 +85,13 @@ pub async fn run(advisor: Advisor) {
 }
 
 async fn round(advisor: &Advisor, manifests: &Manifests, tenant: &TenantId) -> Result<(), Failure> {
+    let rollups_key = format!("{tenant}/rollups");
+    if advisor
+        .owned
+        .owns(WorkKind::Partition, rollups_key.as_bytes())
+    {
+        propose_rollups(advisor, tenant).await?;
+    }
     for dataset in registry::datasets(&*advisor.store, tenant).await? {
         for kind in Kind::ALL {
             let key = format!("{tenant}/{dataset}/{kind}");
@@ -129,6 +142,100 @@ async fn advise_dataset(
         tracing::info!(%tenant, %dataset, window_seconds = outcome.window.as_secs(), "partition window set");
     }
     Ok(())
+}
+
+/// The aggregation shapes the tenant's workload repeated in the last
+/// day, each made a rollup unless one covers it (section 8.7).
+async fn propose_rollups(advisor: &Advisor, tenant: &TenantId) -> Result<(), Failure> {
+    let shapes = read_shapes(&advisor.engine, tenant, advisor.env.clock.now()).await?;
+    if shapes.is_empty() {
+        return Ok(());
+    }
+    let control = advisor.controls.open(tenant);
+    let (rollups, _) = decode_rows::<Rollup>(&control.rows(Table::Rollups).await?);
+    let existing: Vec<(String, String)> = rollups
+        .iter()
+        .map(|r| (r.dataset.clone(), r.expr.clone()))
+        .collect();
+    for proposal in propose(&shapes, &existing) {
+        let definition = RollupDefinition {
+            name: proposal.name.clone(),
+            every: None,
+            target: None,
+            query: proposal.sql.clone(),
+            dataset: DatasetName::new(&proposal.dataset)?,
+        };
+        let rollup = match Rollup::from_definition(&definition, tenant) {
+            Ok(rollup) => Rollup {
+                origin: Origin::Advisor,
+                ..rollup
+            },
+            Err(reason) => {
+                tracing::debug!(%tenant, sql = %proposal.sql, reason, "shape is not a rollup");
+                continue;
+            }
+        };
+        let document = serde_json::to_value(&rollup)?;
+        control
+            .transact(|txn| {
+                if txn.get(Table::Rollups, &rollup.name)?.is_some() {
+                    return Err(ControlError::Rejected("exists".into()));
+                }
+                txn.put(Table::Rollups, &rollup.name, &document);
+                Ok(())
+            })
+            .await?;
+        tracing::info!(%tenant, rollup = %rollup.name, dataset = %rollup.dataset, sql = %rollup.expr, "rollup proposed");
+    }
+    Ok(())
+}
+
+/// The aggregation shapes of the tenant's queries in the last day, with
+/// how often each ran.
+async fn read_shapes(
+    engine: &Engine,
+    tenant: &TenantId,
+    now: Timestamp,
+) -> Result<Vec<RepeatedShape>, Failure> {
+    let sql = format!(
+        "SELECT attr.dataset AS dataset, attr.shape AS shape, count(*) AS n \
+         FROM events WHERE attr.tenant = '{tenant}' AND attr.shape IS NOT NULL \
+         AND timestamp > now() - INTERVAL '{} seconds' \
+         GROUP BY attr.dataset, attr.shape",
+        SHAPE_LOOKBACK.as_secs()
+    );
+    let ctx = BindContext {
+        tenant: TenantId::SYSTEM,
+        dataset: DatasetName::new(crate::WORKLOAD_DATASET)?,
+        now,
+    };
+    let Response::Rows(output) = query::run(engine, &SqlFrontend, &sql, &ctx).await? else {
+        return Ok(Vec::new());
+    };
+    let mut shapes = Vec::new();
+    for batch in &output.batches {
+        let column = |name: &str| batch.column_by_name(name);
+        let (Some(datasets), Some(texts), Some(counts)) = (
+            column("dataset").and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+            column("shape").and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+            column("n").and_then(|c| c.as_any().downcast_ref::<Float64Array>()),
+        ) else {
+            continue;
+        };
+        for i in 0..batch.num_rows() {
+            if datasets.is_null(i) || texts.is_null(i) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let repeats = counts.value(i).max(0.0).round() as u64;
+            shapes.push(RepeatedShape {
+                dataset: datasets.value(i).to_owned(),
+                sql: texts.value(i).to_owned(),
+                repeats,
+            });
+        }
+    }
+    Ok(shapes)
 }
 
 /// The files of a dataset and kind, as the cost model sees them.
