@@ -29,6 +29,7 @@ use tessera_types::event::TIMESTAMP;
 use tessera_types::{FileMeta, Timestamp};
 
 use crate::engine::{Engine, EngineError};
+use crate::remote::{LeafTask, Peer};
 
 /// Files fetched concurrently per scan.
 const FETCH_CONCURRENCY: usize = 8;
@@ -65,6 +66,12 @@ pub struct ScanAnalysis {
     pub rows_from_files: usize,
     /// Rows produced from the tail.
     pub rows_from_tail: usize,
+    /// Files read by other nodes (QE-15).
+    pub files_remote: usize,
+    /// Leaf tasks sent to other nodes.
+    pub remote_tasks: usize,
+    /// Leaf tasks a peer could not run, read here instead (QE-17).
+    pub remote_failed: usize,
 }
 
 impl ScanAnalysis {
@@ -77,7 +84,8 @@ impl ScanAnalysis {
     }
 }
 
-/// Runs `scan`, returning batches in the scan's schema.
+/// Runs `scan`, returning batches in the scan's schema: the tail from
+/// the segments, and the files from this node and from its peers.
 pub(crate) async fn run(
     engine: &Engine,
     scan: &Scan,
@@ -109,8 +117,61 @@ pub(crate) async fn run(
         .count();
     analysis.segments = found.sources.segments;
 
-    // Rows outside the time range are filtered like any predicate; the
-    // range also prunes partitions, files and row groups above.
+    let predicate = full_predicate(scan);
+    let mut output = Vec::new();
+    for rows in found.tail {
+        let rows = apply(&rows, predicate.as_ref(), &schema)?;
+        if rows.num_rows() > 0 {
+            analysis.rows_from_tail += rows.num_rows();
+            output.push(rows);
+        }
+    }
+
+    let (files, report) = prune_files(scan, &found.files);
+    analysis.files = report;
+    let files: Vec<FileMeta> = files.into_iter().cloned().collect();
+    // A newest-first scan stops early, which only works in one place.
+    let (local, remote) = if scan.newest_first_limit.is_some() {
+        (files, Vec::new())
+    } else {
+        assign(engine, files)
+    };
+    let mut local = local;
+    for (peer, task_files) in remote {
+        let task = LeafTask {
+            scan: scan.clone(),
+            files: task_files,
+        };
+        analysis.remote_tasks += 1;
+        let Some((_, transport)) = &engine.peers else {
+            local.extend(task.files);
+            continue;
+        };
+        match transport.leaf(&peer, &task).await {
+            Ok(batches) => {
+                analysis.files_remote += task.files.len();
+                for rows in batches {
+                    let rows = reorder(&rows, &schema)?;
+                    analysis.rows_from_files += rows.num_rows();
+                    output.push(rows);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(peer = %peer.node, error = %error, "leaf task failed; reading here");
+                analysis.remote_failed += 1;
+                local.extend(task.files);
+            }
+        }
+    }
+    let from_files = read_files(engine, scan, local, &output, analysis).await?;
+    output.extend(from_files);
+    Ok(output)
+}
+
+/// The scan's predicates with its time range as conjuncts: rows outside
+/// the range are filtered like any predicate, and the range also prunes
+/// partitions, files and row groups above.
+fn full_predicate(scan: &Scan) -> Option<Expr> {
     let mut conjuncts = scan.predicates.clone();
     if scan.time_range.start != Timestamp::MIN {
         conjuncts.push(
@@ -121,18 +182,42 @@ pub(crate) async fn run(
         conjuncts
             .push(Expr::column(TIMESTAMP).binary(BinaryOp::Lt, Expr::literal(scan.time_range.end)));
     }
-    let predicate = Expr::all(conjuncts);
-    let mut output = Vec::new();
-    for rows in found.tail {
-        let rows = apply(&rows, predicate.as_ref(), &schema)?;
-        if rows.num_rows() > 0 {
-            analysis.rows_from_tail += rows.num_rows();
-            output.push(rows);
+    Expr::all(conjuncts)
+}
+
+/// Splits `files` into this node's and each peer's, by the owner the
+/// peers assign to each file; everything is local without peers.
+fn assign(engine: &Engine, files: Vec<FileMeta>) -> (Vec<FileMeta>, Vec<(Peer, Vec<FileMeta>)>) {
+    let Some((peers, _)) = &engine.peers else {
+        return (files, Vec::new());
+    };
+    let mut local = Vec::new();
+    let mut by_peer: Vec<(Peer, Vec<FileMeta>)> = Vec::new();
+    for file in files {
+        match peers.owner_of(file.file_id) {
+            None => local.push(file),
+            Some(peer) => match by_peer.iter_mut().find(|(p, _)| *p == peer) {
+                Some((_, group)) => group.push(file),
+                None => by_peer.push((peer, vec![file])),
+            },
         }
     }
+    (local, by_peer)
+}
 
-    let (mut files, report) = prune_files(scan, &found.files);
-    analysis.files = report;
+/// Reads `files` of `scan` on this node, newest first so that a limit
+/// can stop early once `already` (the rows read before, the tail among
+/// them) and the files read hold the newest rows, and returns their
+/// rows in the scan's schema.
+pub(crate) async fn read_files(
+    engine: &Engine,
+    scan: &Scan,
+    mut files: Vec<FileMeta>,
+    already: &[RecordBatch],
+    analysis: &mut ScanAnalysis,
+) -> Result<Vec<RecordBatch>, EngineError> {
+    let schema = scan.schema()?;
+    let predicate = full_predicate(scan);
     let request = IndexedRequest {
         request: ScanRequest {
             projection: Some(schema.fields().iter().map(|f| f.name().clone()).collect()),
@@ -142,17 +227,16 @@ pub(crate) async fn run(
         },
         predicates_for_indexes: scan.predicates.clone(),
     };
-    // Newest first, so that a limit can stop early; otherwise any order.
     files.sort_by_key(|f| std::cmp::Reverse(f.max_timestamp));
-    let owned: Vec<FileMeta> = files.into_iter().cloned().collect();
     let mut fetches = stream::iter(
-        owned
+        files
             .into_iter()
             .map(|file| fetch(engine, file, request.clone())),
     )
     .buffered(FETCH_CONCURRENCY);
+    let mut output = Vec::new();
     let mut newest = Newest::new(scan.newest_first_limit);
-    newest.observe_batches(&output);
+    newest.observe_batches(already);
     while let Some(result) = fetches.next().await {
         let (file, read) = result?;
         let Some(read) = read else {
@@ -161,8 +245,7 @@ pub(crate) async fn run(
         };
         analysis.row_groups_skipped_by_index += read.row_groups_skipped;
         analysis.add(read.stats);
-        let batches = read.batches;
-        for rows in batches {
+        for rows in read.batches {
             let rows = reorder(&rows, &schema)?;
             if rows.num_rows() > 0 {
                 analysis.rows_from_files += rows.num_rows();

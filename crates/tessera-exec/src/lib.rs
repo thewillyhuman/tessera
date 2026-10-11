@@ -18,6 +18,7 @@ pub mod operator;
 pub mod pipeline;
 pub mod promql;
 pub mod query;
+pub mod remote;
 pub mod scan;
 pub mod scheduler;
 
@@ -27,6 +28,7 @@ pub use memory::{MemoryPool, OutOfMemory};
 pub use operator::{CollectSink, Flow, Operator, Sink};
 pub use pipeline::Pipeline;
 pub use query::{QueryError, Response, explain_text};
+pub use remote::{LeafTask, Peer, Peers, RemoteError, RemoteScan};
 pub use scan::ScanAnalysis;
 pub use scheduler::{CpuPool, Task, TaskError};
 

@@ -2418,6 +2418,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "futures",
+ "serde",
  "serde_json",
  "tessera-compact",
  "tessera-format",
@@ -2430,6 +2431,7 @@ dependencies = [
  "tessera-wal",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

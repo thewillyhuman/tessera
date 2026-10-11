@@ -38,6 +38,7 @@ use crate::operator::{
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
+use crate::remote::{LeafTask, Peers, RemoteScan};
 use crate::scan::{self, ScanAnalysis};
 use crate::scheduler::{CpuPool, TaskError};
 
@@ -121,6 +122,7 @@ pub struct Engine {
     pub(crate) env: Env,
     pub(crate) cpu: Arc<CpuPool>,
     pub(crate) partition_window: Duration,
+    pub(crate) peers: Option<(Arc<dyn Peers>, Arc<dyn RemoteScan>)>,
     limits: QueryLimits,
     registry: Registry,
 }
@@ -143,9 +145,29 @@ impl Engine {
             env,
             cpu,
             partition_window: Window::DEFAULT_LENGTH,
+            peers: None,
             limits,
             registry: Registry::builtin(),
         }
+    }
+
+    /// The engine with other nodes to share leaf tasks with (QE-14):
+    /// `peers` says which node reads which file and `remote` reaches it.
+    #[must_use]
+    pub fn with_peers(mut self, peers: Arc<dyn Peers>, remote: Arc<dyn RemoteScan>) -> Self {
+        self.peers = Some((peers, remote));
+        self
+    }
+
+    /// Runs a leaf task sent by another node: reads its files and
+    /// returns the rows in the scan's schema.
+    ///
+    /// # Errors
+    ///
+    /// If a file cannot be read or the predicates cannot be evaluated.
+    pub async fn leaf(&self, task: &LeafTask) -> Result<Vec<RecordBatch>, EngineError> {
+        let mut analysis = ScanAnalysis::default();
+        scan::read_files(self, &task.scan, task.files.clone(), &[], &mut analysis).await
     }
 
     /// The function registry the engine runs.

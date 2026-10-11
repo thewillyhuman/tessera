@@ -114,6 +114,13 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
             "  rows: {} from files, {} from the tail ({} segments)",
             scan.rows_from_files, scan.rows_from_tail, scan.segments
         );
+        if scan.remote_tasks > 0 {
+            let _ = writeln!(
+                out,
+                "  peers: {} files in {} leaf tasks, {} tasks read here after a failure",
+                scan.files_remote, scan.remote_tasks, scan.remote_failed
+            );
+        }
     }
     out
 }
