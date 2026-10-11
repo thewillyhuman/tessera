@@ -3394,6 +3394,7 @@ dependencies = [
  "arrow",
  "getrandom 0.4.3",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "thiserror",

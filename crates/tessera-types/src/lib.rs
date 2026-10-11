@@ -12,6 +12,7 @@ pub mod event;
 pub mod file;
 pub mod hash;
 pub mod id;
+pub mod keys;
 pub mod kind;
 pub mod partition;
 pub mod position;
@@ -31,6 +32,7 @@ pub use event::{
 pub use file::{ColumnStats, FileMeta, FileSource, IndexKind, IndexRef, Level};
 pub use hash::stable_hash;
 pub use id::{DatasetName, FileId, Id128, InvalidId, NodeId, PoolId, TenantId, WriterId};
+pub use keys::{KeyError, KeyPolicy, Keyring, Keys, NamedKey, TenantKey};
 pub use kind::Kind;
 pub use partition::{InvalidWindow, PartitionId, Window};
 pub use position::{Epoch, Seq, Version};

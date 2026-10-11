@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! The injected environment of a node: its identity, clock and random
-//! source (RS-2), bundled so that components take one value instead of
-//! three.
+//! The injected environment of a node: its identity, clock, random
+//! source (RS-2) and tenant keys (SE-2), bundled so that components take
+//! one value instead of four.
 
 use std::sync::Arc;
 
 use crate::{
-    Clock, ManualClock, NodeId, OsRandom, SeededRandom, SharedRandom, SystemClock, Timestamp,
+    Clock, Keys, ManualClock, NodeId, OsRandom, SeededRandom, SharedRandom, SystemClock, Timestamp,
 };
 
 /// What a component needs from the node it runs on.
@@ -22,25 +22,37 @@ pub struct Env {
     pub clock: Arc<dyn Clock>,
     /// The random source every component draws from.
     pub random: SharedRandom,
+    /// The tenant keys data is sealed with and opened by (SE-2); none
+    /// unless [`Env::with_keys`] gave some.
+    pub keys: Arc<Keys>,
 }
 
 impl std::fmt::Debug for Env {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Env")
             .field("node", &self.node)
+            .field("keys", &self.keys)
             .finish_non_exhaustive()
     }
 }
 
 impl Env {
-    /// An environment from explicit parts.
+    /// An environment from explicit parts, without tenant keys.
     #[must_use]
     pub fn new(node: NodeId, clock: Arc<dyn Clock>, random: SharedRandom) -> Self {
         Env {
             node,
             clock,
             random,
+            keys: Arc::new(Keys::none()),
         }
+    }
+
+    /// This environment with `keys` as the tenant keys.
+    #[must_use]
+    pub fn with_keys(mut self, keys: Keys) -> Self {
+        self.keys = Arc::new(keys);
+        self
     }
 
     /// The production environment: a random node id, the system clock and
@@ -77,6 +89,7 @@ impl Env {
             node,
             clock: Arc::clone(&self.clock),
             random: self.random.clone(),
+            keys: Arc::clone(&self.keys),
         }
     }
 }
