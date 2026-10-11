@@ -312,14 +312,14 @@ pub struct MetricsIngested {
 }
 
 /// `series` gauge series of `samples` points each, ten seconds apart,
-/// ending now, in requests of fifty series.
+/// ending now, in requests of ten series.
 pub fn ingest_metrics(base: &str, series: usize, samples: usize) -> MetricsIngested {
     let now = now_nanos();
     let started = Instant::now();
     let url = format!("{base}/v1/metrics");
     let mut random = SeededRandom::new(7);
     let mut sent = 0u64;
-    for chunk in (0..series).collect::<Vec<_>>().chunks(50) {
+    for chunk in (0..series).collect::<Vec<_>>().chunks(10) {
         let metrics: Vec<Metric> = ["cpu_usage", "memory_bytes"]
             .iter()
             .map(|name| Metric {

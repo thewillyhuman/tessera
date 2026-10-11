@@ -73,6 +73,10 @@ struct Args {
     /// How long to wait for compaction to settle, in seconds.
     #[arg(long, default_value_t = 120)]
     settle_secs: u64,
+    /// Seconds to keep the node up after compaction before the queries
+    /// run, for looking at it from outside; zero by default.
+    #[arg(long, default_value_t = 0)]
+    pause_secs: u64,
 }
 
 /// One line of the report.
@@ -116,7 +120,9 @@ fn config(dir: &Path, linger: Option<Duration>) -> Config {
     config.pg_listen = free;
     config.background = Duration::from_secs(1);
     config.eval = Duration::from_millis(250);
-    config.ingest.flush_bytes = 8 << 20;
+    // Small L1 files, so that compaction has inputs to merge within the
+    // run for metrics and traces as well as logs.
+    config.ingest.flush_bytes = 2 << 20;
     if let Some(linger) = linger {
         config.ingest.linger = linger;
     }
@@ -174,6 +180,10 @@ async fn main() {
         traces.wall.as_secs_f64()
     );
     compaction_phase(&node, &args, &ingest, &mut report).await;
+    if args.pause_secs > 0 {
+        println!("pausing {} s at {base}", args.pause_secs);
+        tokio::time::sleep(Duration::from_secs(args.pause_secs)).await;
+    }
 
     let warm = query_phase(&base, &traces.ids, args.runs);
     let alert = if args.alert_probes > 0 {
