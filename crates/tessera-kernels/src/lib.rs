@@ -21,6 +21,7 @@ pub mod extract;
 pub mod group;
 pub mod histogram;
 pub mod ip;
+pub mod links;
 pub mod naming;
 pub mod promql;
 pub mod redact;

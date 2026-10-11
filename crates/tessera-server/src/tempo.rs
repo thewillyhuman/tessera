@@ -1230,6 +1230,47 @@ mod tests {
 
     const RANGE: &str = "start=1699999000&end=1700001000";
 
+    /// QL-15: the `event.` scope matches spans by their events and the
+    /// `link.` scope by their links.
+    #[tokio::test]
+    async fn event_and_link_scopes_search_spans() {
+        let app = pushed().await;
+        let search = |query: &str| {
+            let encoded: String = form_urlencoded::byte_serialize(query.as_bytes()).collect();
+            get(&format!("/api/search?q={encoded}&{RANGE}"))
+        };
+        let (status, value) = call(&app, search(r#"{ event:name = "exception" }"#)).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let traces = value["traces"].as_array().unwrap();
+        assert_eq!(traces.len(), 1, "{value}");
+        assert_eq!(traces[0]["spanSets"][0]["matched"], 1);
+        assert_eq!(
+            traces[0]["spanSets"][0]["spans"][0]["spanID"],
+            "02".repeat(8)
+        );
+        let (status, value) = call(
+            &app,
+            search(r#"{ event.exception.message = "failed" && status = error }"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["traces"].as_array().unwrap().len(), 1, "{value}");
+        let (status, value) = call(&app, search(r#"{ link.rel = "parent" }"#)).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let traces = value["traces"].as_array().unwrap();
+        assert_eq!(traces.len(), 2, "children in both traces: {value}");
+        let matched: u64 = traces
+            .iter()
+            .map(|t| t["spanSets"][0]["matched"].as_u64().unwrap())
+            .sum();
+        assert_eq!(matched, 3);
+        let (status, value) = call(&app, search(r#"{ link:spanID = "0101010101010101" }"#)).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let traces = value["traces"].as_array().unwrap();
+        assert_eq!(traces.len(), 1, "{value}");
+        assert_eq!(traces[0]["spanSets"][0]["matched"], 2);
+    }
+
     #[tokio::test]
     async fn search_returns_traces_newest_first_with_their_spansets() {
         let app = pushed().await;
@@ -1316,7 +1357,7 @@ mod tests {
         assert_eq!(db["status"]["message"], "failed");
         assert_eq!(db["startTimeUnixNano"], "1700000000000010000");
         assert_eq!(db["endTimeUnixNano"], "1700000000000050000");
-        assert_eq!(db["events"][0]["name"], "log");
+        assert_eq!(db["events"][0]["name"], "exception");
         assert_eq!(db["attributes"][0]["key"], "n");
 
         let (status, value) = call(&app, get(&format!("/api/v2/traces/{}", "1".repeat(32)))).await;

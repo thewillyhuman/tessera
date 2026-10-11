@@ -542,6 +542,7 @@ fn call(name: &str, args: &[Expr], batch: &RecordBatch) -> Result<Value, KernelE
             Ok(text.with_array(Arc::new(matched)))
         }
         ("ip_matches", [text, pattern]) => ip_matches(text, pattern),
+        ("links_match", [links, field, value]) => links_match(links, field, value),
         ("coalesce", [first, rest @ ..]) => {
             let mut acc = first.clone();
             for next in rest {
@@ -571,6 +572,24 @@ fn constant_text(value: &Value, function: &str) -> Result<String, KernelError> {
         .ok_or_else(|| {
             KernelError::Unsupported(format!("{function} needs a constant text pattern"))
         })
+}
+
+/// `TraceQL`'s `link.` scope: whether a span's `links` JSON has a link
+/// whose constant `field` equals the constant `value`.
+fn links_match(links: &Value, field: &Value, value: &Value) -> Result<Value, KernelError> {
+    let field = constant_text(field, "links_match")?;
+    let value = constant_text(value, "links_match")?;
+    let links = links.cast(&DataType::Utf8)?;
+    let strings = links
+        .array()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| KernelError::Unsupported("links_match needs text".into()))?;
+    let hits: BooleanArray = strings
+        .iter()
+        .map(|s| Some(s.is_some_and(|s| crate::links::matches(s, &field, &value))))
+        .collect();
+    Ok(links.with_array(Arc::new(hits)))
 }
 
 /// `LogQL`'s `ip()` filter: whether each address in `text` is one that

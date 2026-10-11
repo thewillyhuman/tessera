@@ -168,7 +168,7 @@ pub(crate) mod testing {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
-    use opentelemetry_proto::tonic::trace::v1::span::Event;
+    use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
     /// A span of `service`, in trace `trace` with id `id` and parent
@@ -293,12 +293,37 @@ pub(crate) mod testing {
                                 }),
                                 ..Default::default()
                             }],
+                            // An errored span records an exception event; every
+                            // span logs; a child links to its parent.
                             events: vec![Event {
                                 time_unix_nano: 1_700_000_000_000_000_000 + spec.start + 1,
-                                name: "log".into(),
-                                attributes: Vec::new(),
+                                name: if spec.error { "exception" } else { "log" }.into(),
+                                attributes: if spec.error {
+                                    vec![KeyValue {
+                                        key: "exception.message".into(),
+                                        value: Some(text("failed")),
+                                        ..Default::default()
+                                    }]
+                                } else {
+                                    Vec::new()
+                                },
                                 dropped_attributes_count: 0,
                             }],
+                            links: spec
+                                .parent
+                                .map(|parent| {
+                                    vec![Link {
+                                        trace_id: vec![spec.trace; 16],
+                                        span_id: vec![parent; 8],
+                                        attributes: vec![KeyValue {
+                                            key: "rel".into(),
+                                            value: Some(text("parent")),
+                                            ..Default::default()
+                                        }],
+                                        ..Default::default()
+                                    }]
+                                })
+                                .unwrap_or_default(),
                             status: spec.error.then(|| Status {
                                 code: 2,
                                 message: "failed".into(),

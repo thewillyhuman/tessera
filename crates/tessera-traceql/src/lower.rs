@@ -12,7 +12,14 @@
 //! resource's (QL-21). A metrics query aggregates the matching spans
 //! per step bucket and series label.
 //!
-//! Not supported yet: the `event.` and `link.` scopes (QL-15), the
+//! The `event.` scope (QL-15) reads span events stored as `event` rows:
+//! each event condition becomes a flag column on the spans, set by a
+//! left join against the events that pass it, so the condition composes
+//! with the rest of the filter and with structural operators. The
+//! `link.` scope reads the `links` column through a kernel that tests
+//! any link for equality.
+//!
+//! Not supported yet: the
 //! nested-set intrinsics, `quantile_over_time` and
 //! `histogram_over_time`.
 
@@ -21,10 +28,13 @@ use std::time::Duration;
 use arrow::datatypes::DataType;
 use tessera_ir::trace::{ROOT_NAME, ROOT_SERVICE, TRACE_DURATION_NS};
 use tessera_ir::{
-    AggregateExpr, BinaryOp, BindContext, Diagnostic, Expr, Literal, NamedExpr, Plan, Relation,
-    Scan, SortKey, Span, SpanAggregate, Spanset, Structural, VALUE,
+    AggregateExpr, BinaryOp, BindContext, Diagnostic, Expr, JoinKind, JoinSide, Literal, NamedExpr,
+    Plan, Relation, Scan, SortKey, Span, SpanAggregate, Spanset, Structural, VALUE,
 };
-use tessera_types::event::{DURATION_NS, NAME, SPAN_KIND, STATUS_CODE, STATUS_MESSAGE, TIMESTAMP};
+use tessera_types::event::{
+    self, DURATION_NS, LINKS, NAME, SPAN_ID, SPAN_KIND, STATUS_CODE, STATUS_MESSAGE, TIMESTAMP,
+    TRACE_ID,
+};
 use tessera_types::{Kind, TimeRange, Timestamp};
 
 use crate::ast::{FieldExpr, Metrics, Pipeline, Query, SpansetExpr, Stage, Static};
@@ -39,6 +49,16 @@ pub struct RangeParams {
     /// The distance between steps of a metrics query; zero for one
     /// value over the whole range.
     pub step: Duration,
+}
+
+/// What lowering collects as it walks the query.
+#[derive(Default)]
+struct Context {
+    /// The attributes the query reads or selects, as written.
+    shown: Vec<String>,
+    /// The conditions on span events, each the `_event_<i>` flag of the
+    /// spans (QL-15).
+    events: Vec<Expr>,
 }
 
 /// What a lowered query produces.
@@ -73,13 +93,13 @@ pub struct Lowered {
 /// The first construct the engine cannot run yet, with its position.
 pub fn lower(query: &Query, ctx: &BindContext, params: RangeParams) -> Result<Lowered, Diagnostic> {
     let range = TimeRange::new(params.start, next(params.end));
-    let mut shown = Vec::new();
-    let spanset = pipeline(&query.pipeline, &mut shown)?;
+    let mut cx = Context::default();
+    let spanset = pipeline(&query.pipeline, &mut cx)?;
     match &query.metrics {
         None => Ok(Lowered {
-            plan: trace_group(spanset, ctx, range),
+            plan: trace_group(spanset, ctx, range, &cx.events),
             kind: ResultKind::Spansets,
-            shown,
+            shown: cx.shown,
             labels: Vec::new(),
             function: String::new(),
         }),
@@ -87,21 +107,25 @@ pub fn lower(query: &Query, ctx: &BindContext, params: RangeParams) -> Result<Lo
             let input = match (&query.pipeline.first, query.pipeline.stages.is_empty()) {
                 (SpansetExpr::Filter { .. }, true) => match spanset {
                     Spanset::Filter(condition) => {
-                        let mut scan =
-                            Scan::all(ctx.tenant.clone(), ctx.dataset.clone(), Kind::Span);
-                        scan.time_range = range;
-                        scan.predicates.extend(condition);
-                        Plan::Scan(scan)
+                        let source = spans_source(ctx, range, &cx.events);
+                        match (source, condition) {
+                            (Plan::Scan(mut scan), condition) => {
+                                scan.predicates.extend(condition);
+                                Plan::Scan(scan)
+                            }
+                            (joined, Some(condition)) => joined.filter(condition),
+                            (joined, None) => joined,
+                        }
                     }
-                    other => trace_group(other, ctx, range),
+                    other => trace_group(other, ctx, range, &cx.events),
                 },
-                _ => trace_group(spanset, ctx, range),
+                _ => trace_group(spanset, ctx, range, &cx.events),
             };
-            let (plan, labels) = metrics_plan(metrics, input, params)?;
+            let (plan, labels) = metrics_plan(metrics, input, params, &mut cx)?;
             Ok(Lowered {
                 plan,
                 kind: ResultKind::Metrics,
-                shown,
+                shown: cx.shown,
                 labels,
                 function: metrics.function.clone(),
             })
@@ -116,28 +140,203 @@ fn next(t: Timestamp) -> Timestamp {
 
 /// A trace group over `spanset`: candidates from the filters' union when
 /// it narrows anything, every span of the range otherwise.
-fn trace_group(spanset: Spanset, ctx: &BindContext, range: TimeRange) -> Plan {
-    let mut spans = Scan::all(ctx.tenant.clone(), ctx.dataset.clone(), Kind::Span);
-    spans.time_range = range;
-    let candidates = spanset.candidates().map(|predicate| {
-        let mut scan = spans.clone();
-        scan.predicates = vec![predicate];
-        Box::new(Plan::Scan(scan))
+fn trace_group(spanset: Spanset, ctx: &BindContext, range: TimeRange, events: &[Expr]) -> Plan {
+    let spans = spans_source(ctx, range, events);
+    let candidates = spanset.candidates().map(|predicate| match &spans {
+        Plan::Scan(scan) => {
+            let mut scan = scan.clone();
+            scan.predicates = vec![predicate];
+            Box::new(Plan::Scan(scan))
+        }
+        joined => Box::new(joined.clone().filter(predicate)),
     });
     Plan::TraceGroup {
         candidates,
-        spans: Box::new(Plan::Scan(spans)),
+        spans: Box::new(spans),
         spanset,
     }
 }
 
-fn pipeline(pipeline: &Pipeline, shown: &mut Vec<String>) -> Result<Spanset, Diagnostic> {
-    let mut current = spanset(&pipeline.first, shown)?;
+/// The spans a query reads: the scan, or, with event conditions, the
+/// scan left-joined to the events passing each condition, grouped by
+/// span, so that every span carries a flag per condition (QL-15).
+fn spans_source(ctx: &BindContext, range: TimeRange, events: &[Expr]) -> Plan {
+    let mut spans = Scan::all(ctx.tenant.clone(), ctx.dataset.clone(), Kind::Span);
+    spans.time_range = range;
+    let mut plan = Plan::Scan(spans);
+    let columns: Vec<String> = event::schema(Kind::Span)
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    for (index, condition) in events.iter().enumerate() {
+        let mut scan = Scan::all(ctx.tenant.clone(), ctx.dataset.clone(), Kind::Event);
+        scan.time_range = range;
+        scan.predicates = vec![condition.clone()];
+        let matched = Plan::Aggregate {
+            input: Box::new(Plan::Scan(scan)),
+            group_by: vec![
+                NamedExpr::new(Expr::column(TRACE_ID), TRACE_ID),
+                NamedExpr::new(Expr::column(SPAN_ID), SPAN_ID),
+            ],
+            aggregates: vec![AggregateExpr {
+                function: "count_raw".into(),
+                args: Vec::new(),
+                name: "n".into(),
+            }],
+        };
+        let side = format!("e{index}");
+        let carried: Vec<String> = columns
+            .iter()
+            .cloned()
+            .chain((0..index).map(event_flag))
+            .collect();
+        let mut exprs: Vec<NamedExpr> = carried
+            .iter()
+            .map(|name| NamedExpr::new(Expr::column(format!("s.{name}")), name.as_str()))
+            .collect();
+        exprs.push(NamedExpr::new(
+            Expr::IsNull {
+                expr: Box::new(Expr::column(format!("{side}.n"))),
+                negated: true,
+            },
+            event_flag(index),
+        ));
+        plan = Plan::Join {
+            left: JoinSide::new(plan, "s"),
+            right: JoinSide::new(matched, side),
+            on: vec![
+                (Expr::column(TRACE_ID), Expr::column(TRACE_ID)),
+                (Expr::column(SPAN_ID), Expr::column(SPAN_ID)),
+            ],
+            kind: JoinKind::Left,
+        }
+        .project(exprs);
+    }
+    plan
+}
+
+/// The flag column of event condition `index`.
+fn event_flag(index: usize) -> String {
+    format!("_event_{index}")
+}
+
+/// The scope a field was written with.
+fn scope_of(expr: &FieldExpr) -> Option<&str> {
+    match expr {
+        FieldExpr::Intrinsic { scope, .. } | FieldExpr::Attribute { scope, .. } => scope.as_deref(),
+        _ => None,
+    }
+}
+
+/// `expr` read against an event row: `event:name` is the event's name,
+/// `event.foo` its attribute.
+fn on_event(expr: &FieldExpr, span: Span) -> Result<FieldExpr, Diagnostic> {
+    Ok(match expr {
+        FieldExpr::Intrinsic { name, span, .. } if name == "name" => FieldExpr::Intrinsic {
+            scope: None,
+            name: name.clone(),
+            span: *span,
+        },
+        FieldExpr::Attribute { name, span, .. } => FieldExpr::Attribute {
+            scope: Some("span".into()),
+            name: name.clone(),
+            span: *span,
+        },
+        FieldExpr::Static(_) => expr.clone(),
+        _ => {
+            return Err(Diagnostic::at(
+                span,
+                "an event condition compares event:name or event.<attribute> with a value",
+            ));
+        }
+    })
+}
+
+/// A comparison on the `event.` scope: the condition over event rows is
+/// kept for the spans' source, and the span's flag for it stands in.
+fn event_condition(
+    op: &str,
+    left: &FieldExpr,
+    right: &FieldExpr,
+    span: Span,
+    cx: &mut Context,
+) -> Result<Expr, Diagnostic> {
+    let other_scoped = |side: &FieldExpr| scope_of(side).is_some_and(|s| s != "event");
+    if other_scoped(left) || other_scoped(right) {
+        return Err(Diagnostic::at(
+            span,
+            "an event field compares with a value, not with a span field",
+        ));
+    }
+    let (l, r) = (on_event(left, span)?, on_event(right, span)?);
+    let mut inner = Context::default();
+    let condition = binary(op, &l, &r, span, &mut inner)?;
+    cx.events.push(condition);
+    Ok(Expr::column(event_flag(cx.events.len() - 1)))
+}
+
+/// A comparison on the `link.` scope: any link of the span with the
+/// field equal to the value, or none for `!=`.
+fn link_condition(
+    op: &str,
+    left: &FieldExpr,
+    right: &FieldExpr,
+    span: Span,
+) -> Result<Expr, Diagnostic> {
+    let ((field, FieldExpr::Static(value)) | (FieldExpr::Static(value), field)) = (left, right)
+    else {
+        return Err(Diagnostic::at(
+            span,
+            "a link field compares with a value, not with a span field",
+        ));
+    };
+    let key = match field {
+        FieldExpr::Intrinsic { name, .. } if name == "traceID" => "trace_id".to_owned(),
+        FieldExpr::Intrinsic { name, .. } if name == "spanID" => "span_id".to_owned(),
+        FieldExpr::Attribute { name, .. } => format!("attributes.{name}"),
+        _ => {
+            return Err(Diagnostic::at(
+                span,
+                "link fields are link:traceID, link:spanID and link.<attribute>",
+            ));
+        }
+    };
+    let value = match value {
+        Static::String(s) | Static::Status(s) | Static::Kind(s) => s.clone(),
+        Static::Int(i) => i.to_string(),
+        Static::Float(f) => f.to_string(),
+        Static::Bool(b) => b.to_string(),
+        Static::Nil | Static::Duration(_) => {
+            return Err(Diagnostic::at(
+                span,
+                "a link field compares with text, a number or a boolean",
+            ));
+        }
+    };
+    let matched = Expr::Call {
+        name: "links_match".into(),
+        args: vec![
+            Expr::column(LINKS),
+            Expr::literal(key),
+            Expr::literal(value),
+        ],
+    };
+    match op {
+        "=" => Ok(matched),
+        "!=" => Ok(Expr::Not(Box::new(matched))),
+        other => Err(Diagnostic::at(
+            span,
+            format!("link fields compare with = or !=, not {other}"),
+        )),
+    }
+}
+
+fn pipeline(pipeline: &Pipeline, cx: &mut Context) -> Result<Spanset, Diagnostic> {
+    let mut current = spanset(&pipeline.first, cx)?;
     for stage in &pipeline.stages {
         current = match stage {
-            Stage::Spanset(expr) => {
-                Spanset::Pipe(Box::new(current), Box::new(spanset(expr, shown)?))
-            }
+            Stage::Spanset(expr) => Spanset::Pipe(Box::new(current), Box::new(spanset(expr, cx)?)),
             Stage::Aggregate {
                 function,
                 arg,
@@ -154,7 +353,7 @@ fn pipeline(pipeline: &Pipeline, shown: &mut Vec<String>) -> Result<Spanset, Dia
                     _ => SpanAggregate::Sum,
                 },
                 arg: match arg {
-                    Some(arg) => Some(field(arg, Some(DataType::Float64), shown)?),
+                    Some(arg) => Some(field(arg, Some(DataType::Float64), cx)?),
                     None => None,
                 },
                 op: comparison(op, *span)?,
@@ -162,13 +361,13 @@ fn pipeline(pipeline: &Pipeline, shown: &mut Vec<String>) -> Result<Spanset, Dia
             },
             Stage::Select(fields) => {
                 for field in fields {
-                    note_shown(field, shown);
+                    note_shown(field, &mut cx.shown);
                 }
                 current
             }
             Stage::By(key) => Spanset::By {
                 input: Box::new(current),
-                key: field(key, Some(DataType::Utf8), shown)?,
+                key: field(key, Some(DataType::Utf8), cx)?,
                 label: format!("by({key})"),
             },
             Stage::Coalesce => Spanset::Coalesce(Box::new(current)),
@@ -177,7 +376,7 @@ fn pipeline(pipeline: &Pipeline, shown: &mut Vec<String>) -> Result<Spanset, Dia
     Ok(current)
 }
 
-fn spanset(expr: &SpansetExpr, shown: &mut Vec<String>) -> Result<Spanset, Diagnostic> {
+fn spanset(expr: &SpansetExpr, cx: &mut Context) -> Result<Spanset, Diagnostic> {
     Ok(match expr {
         SpansetExpr::Filter {
             condition: None | Some(FieldExpr::Static(Static::Bool(true))),
@@ -186,17 +385,15 @@ fn spanset(expr: &SpansetExpr, shown: &mut Vec<String>) -> Result<Spanset, Diagn
         SpansetExpr::Filter {
             condition: Some(condition),
             ..
-        } => Spanset::Filter(Some(field(condition, Some(DataType::Boolean), shown)?)),
-        SpansetExpr::And(left, right) => Spanset::And(
-            Box::new(spanset(left, shown)?),
-            Box::new(spanset(right, shown)?),
-        ),
-        SpansetExpr::Or(left, right) => Spanset::Or(
-            Box::new(spanset(left, shown)?),
-            Box::new(spanset(right, shown)?),
-        ),
+        } => Spanset::Filter(Some(field(condition, Some(DataType::Boolean), cx)?)),
+        SpansetExpr::And(left, right) => {
+            Spanset::And(Box::new(spanset(left, cx)?), Box::new(spanset(right, cx)?))
+        }
+        SpansetExpr::Or(left, right) => {
+            Spanset::Or(Box::new(spanset(left, cx)?), Box::new(spanset(right, cx)?))
+        }
         SpansetExpr::Structural { left, op, right } => Spanset::Structural {
-            left: Box::new(spanset(left, shown)?),
+            left: Box::new(spanset(left, cx)?),
             op: Structural {
                 relation: match op.relation {
                     ">>" => Relation::Descendant,
@@ -208,7 +405,7 @@ fn spanset(expr: &SpansetExpr, shown: &mut Vec<String>) -> Result<Spanset, Diagn
                 negated: op.negated,
                 union: op.union,
             },
-            right: Box::new(spanset(right, shown)?),
+            right: Box::new(spanset(right, cx)?),
         },
     })
 }
@@ -352,19 +549,15 @@ fn type_of(expr: &FieldExpr) -> Option<DataType> {
 
 /// Lowers a condition or value; `hint` is the type an attribute is read
 /// as when nothing else decides it.
-fn field(
-    expr: &FieldExpr,
-    hint: Option<DataType>,
-    shown: &mut Vec<String>,
-) -> Result<Expr, Diagnostic> {
+fn field(expr: &FieldExpr, hint: Option<DataType>, cx: &mut Context) -> Result<Expr, Diagnostic> {
     match expr {
         FieldExpr::Static(value) => Ok(Expr::Literal(literal(value))),
         FieldExpr::Intrinsic { scope, name, span } => {
-            note_shown(expr, shown);
+            note_shown(expr, &mut cx.shown);
             intrinsic(scope.as_deref(), name, *span).map(|(e, _)| e)
         }
         FieldExpr::Attribute { scope, name, span } => {
-            note_shown(expr, shown);
+            note_shown(expr, &mut cx.shown);
             attribute(
                 scope.as_deref(),
                 name,
@@ -377,16 +570,16 @@ fn field(
             left,
             right,
             span,
-        } => binary(op, left, right, *span, shown),
+        } => binary(op, left, right, *span, cx),
         FieldExpr::Not(inner) => Ok(Expr::Not(Box::new(field(
             inner,
             Some(DataType::Boolean),
-            shown,
+            cx,
         )?))),
         FieldExpr::Negate(inner) => Ok(Expr::Negate(Box::new(field(
             inner,
             Some(DataType::Float64),
-            shown,
+            cx,
         )?))),
     }
 }
@@ -396,12 +589,21 @@ fn binary(
     left: &FieldExpr,
     right: &FieldExpr,
     span: Span,
-    shown: &mut Vec<String>,
+    cx: &mut Context,
 ) -> Result<Expr, Diagnostic> {
+    if !matches!(op, "&&" | "||") {
+        let scoped = |scope: &str| scope_of(left) == Some(scope) || scope_of(right) == Some(scope);
+        if scoped("event") {
+            return event_condition(op, left, right, span, cx);
+        }
+        if scoped("link") {
+            return link_condition(op, left, right, span);
+        }
+    }
     match op {
         "&&" | "||" => {
-            let l = field(left, Some(DataType::Boolean), shown)?;
-            let r = field(right, Some(DataType::Boolean), shown)?;
+            let l = field(left, Some(DataType::Boolean), cx)?;
+            let r = field(right, Some(DataType::Boolean), cx)?;
             Ok(if op == "&&" { l.and(r) } else { l.or(r) })
         }
         "=~" | "!~" => {
@@ -411,7 +613,7 @@ fn binary(
                     "a regular expression match needs a string on its right",
                 ));
             };
-            let value = field(left, Some(DataType::Utf8), shown)?;
+            let value = field(left, Some(DataType::Utf8), cx)?;
             let matched = Expr::Call {
                 name: "regexp_match".into(),
                 args: vec![value, Expr::literal(format!("^(?:{pattern})$"))],
@@ -432,20 +634,20 @@ fn binary(
                 right
             };
             Ok(Expr::IsNull {
-                expr: Box::new(field(tested, Some(DataType::Utf8), shown)?),
+                expr: Box::new(field(tested, Some(DataType::Utf8), cx)?),
                 negated: op == "!=",
             })
         }
         "=" | "!=" | "<" | "<=" | ">" | ">=" => {
             // An attribute reads as the type of the other side.
             let hint = type_of(right).or_else(|| type_of(left));
-            let l = field(left, hint.clone(), shown)?;
-            let r = field(right, hint, shown)?;
+            let l = field(left, hint.clone(), cx)?;
+            let r = field(right, hint, cx)?;
             Ok(l.binary(comparison(op, span)?, r))
         }
         "+" | "-" | "*" | "/" | "%" => {
-            let l = field(left, Some(DataType::Float64), shown)?;
-            let r = field(right, Some(DataType::Float64), shown)?;
+            let l = field(left, Some(DataType::Float64), cx)?;
+            let r = field(right, Some(DataType::Float64), cx)?;
             let op = match op {
                 "+" => BinaryOp::Add,
                 "-" => BinaryOp::Sub,
@@ -477,6 +679,7 @@ fn metrics_plan(
     metrics: &Metrics,
     input: Plan,
     params: RangeParams,
+    cx: &mut Context,
 ) -> Result<(Plan, Vec<String>), Diagnostic> {
     // One bucket over the whole range for an instant query; the whole
     // range is then also the step `rate` divides by.
@@ -494,19 +697,18 @@ fn metrics_plan(
             params.step,
         )
     };
-    let mut shown = Vec::new();
     let mut group_by = vec![NamedExpr::new(bucket, TIMESTAMP)];
     let mut labels = Vec::new();
     for key in &metrics.by {
         let name = key.to_string();
         group_by.push(NamedExpr::new(
-            field(key, Some(DataType::Utf8), &mut shown)?,
+            field(key, Some(DataType::Utf8), cx)?,
             name.clone(),
         ));
         labels.push(name);
     }
     let value = match &metrics.arg {
-        Some(arg) => Some(field(arg, Some(DataType::Float64), &mut shown)?),
+        Some(arg) => Some(field(arg, Some(DataType::Float64), cx)?),
         None => None,
     };
     let (function, args) = match (metrics.function.as_str(), value) {
@@ -645,6 +847,48 @@ mod tests {
         );
     }
 
+    /// QL-15: an event condition flags the spans through a left join on
+    /// the events that pass it; a link condition reads the links column.
+    #[test]
+    fn event_and_link_scopes_lower() {
+        let lowered =
+            search("{ event:name = \"exception\" && event.level != \"debug\" && span.x = 1 }");
+        let text = lowered.plan.to_string();
+        assert!(
+            text.starts_with(
+                "TraceGroup: { ((_event_0 AND _event_1) AND (attr.x = 1)) }\n  \
+                 candidates:\n    Filter: ((_event_0 AND _event_1) AND (attr.x = 1))\n      Project:"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Join left: s.trace_id = e1.trace_id AND s.span_id = e1.span_id"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Aggregate: group_by=[trace_id AS trace_id, span_id AS span_id] aggregates=[count_raw() AS n]\n")
+                && text.contains("Scan: prod/event"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(name = 'exception')") && text.contains("(attr.level <> 'debug')"),
+            "the conditions read the event rows: {text}"
+        );
+        assert_eq!(
+            lowered.shown,
+            vec!["span.x"],
+            "event fields are not span columns"
+        );
+        let linked = search("{ link.rel = \"parent\" || link:spanID != \"0202\" }");
+        let text = linked.plan.to_string();
+        assert!(
+            text.starts_with(
+                "TraceGroup: { (links_match(links, 'attributes.rel', 'parent') OR NOT links_match(links, 'span_id', '0202')) }"
+            ),
+            "{text}"
+        );
+    }
+
     #[test]
     fn stages_nil_regex_and_durations_lower() {
         let lowered = search(
@@ -726,10 +970,15 @@ mod tests {
 
     #[test]
     fn unsupported_constructs_are_reported_with_positions() {
-        let error =
-            lower(&parse("{ event.name = \"x\" }").unwrap(), &ctx(), params(0)).unwrap_err();
-        assert_eq!(error.span, Some(Span::new(2, 12)));
-        assert!(error.message.contains("event. scope"), "{}", error.message);
+        let error = lower(
+            &parse("{ event.name = span.name }").unwrap(),
+            &ctx(),
+            params(0),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("span field"), "{}", error.message);
+        let error = lower(&parse("{ link.rel > 1 }").unwrap(), &ctx(), params(0)).unwrap_err();
+        assert!(error.message.contains("= or !="), "{}", error.message);
         let error = lower(&parse("{ nestedSetLeft > 0 }").unwrap(), &ctx(), params(0)).unwrap_err();
         assert!(error.message.contains("nestedSetLeft"), "{}", error.message);
         let error = lower(

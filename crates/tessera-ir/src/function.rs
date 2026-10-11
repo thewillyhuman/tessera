@@ -151,6 +151,13 @@ fn text_to_int(args: &[DataType]) -> Option<DataType> {
     }
 }
 
+fn links_predicate(args: &[DataType]) -> Option<DataType> {
+    match args {
+        [DataType::Utf8, DataType::Utf8, DataType::Utf8] => Some(DataType::Boolean),
+        _ => None,
+    }
+}
+
 fn text_predicate(args: &[DataType]) -> Option<DataType> {
     match args {
         [DataType::Utf8, DataType::Utf8] => Some(DataType::Boolean),
@@ -243,6 +250,12 @@ const SCALARS: &[ScalarFunction] = &[
     ScalarFunction {
         name: "ip_matches",
         return_type: text_predicate,
+    },
+    // `TraceQL`'s `link.` scope: whether a span's links JSON has a link
+    // whose field equals a value (QL-15).
+    ScalarFunction {
+        name: "links_match",
+        return_type: links_predicate,
     },
     // Log-line helpers (LogQL section 9.4): strip ANSI colour codes;
     // read a duration (`1.5s`, `250ms`) as seconds; read a byte
