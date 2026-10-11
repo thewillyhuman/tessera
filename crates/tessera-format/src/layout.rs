@@ -5,7 +5,7 @@
 //! recorded per file (P3), so files of different layouts coexist.
 
 use tessera_types::Kind;
-use tessera_types::event::{BODY, SEVERITY_NUMBER, TIMESTAMP, TRACE_ID};
+use tessera_types::event::{BODY, NAME, SEVERITY_NUMBER, TIMESTAMP, TRACE_ID};
 
 use crate::sidecar::IndexSpec;
 
@@ -57,8 +57,10 @@ impl Layout {
                     bloom: vec![TRACE_ID.to_owned()],
                 },
             },
+            // Spans and events sort by name, then time (section 8.5);
+            // the service comes first once attribute columns exist (M8).
             Kind::Span | Kind::Event => Layout {
-                sort_key: vec![TIMESTAMP.to_owned()],
+                sort_key: vec![NAME.to_owned(), TIMESTAMP.to_owned()],
                 row_group_rows: DEFAULT_ROW_GROUP_ROWS,
                 indexes: bloom_on_trace,
             },
@@ -114,6 +116,14 @@ mod tests {
         assert_eq!(
             Layout::default_for(Kind::Span).indexes.bloom,
             vec!["trace_id"]
+        );
+        assert_eq!(
+            Layout::default_for(Kind::Span).sort_key,
+            vec!["name", "timestamp"]
+        );
+        assert_eq!(
+            Layout::default_for(Kind::Event).sort_key,
+            vec!["name", "timestamp"]
         );
     }
 }
