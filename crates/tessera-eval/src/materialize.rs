@@ -124,11 +124,7 @@ pub async fn materialize(
     };
     let dataset = DatasetName::new(&rollup.dataset).map_err(|e| failed(e.to_string()))?;
     let target = DatasetName::new(&rollup.target).map_err(|e| failed(e.to_string()))?;
-    let ctx = BindContext {
-        tenant: tenant.clone(),
-        dataset,
-        now,
-    };
+    let ctx = BindContext::new(tenant.clone(), dataset, now);
     let plan = match SqlFrontend
         .lower(&rollup.expr, &ctx)
         .map_err(|d| failed(d.describe(&rollup.expr)))?

@@ -241,6 +241,64 @@ mod tests {
         created["key"].as_str().unwrap().to_owned()
     }
 
+    /// CT-9: a cluster administrator names another tenant's table as
+    /// `tenant.dataset.table`; a tenant's own credentials cannot.
+    #[tokio::test]
+    async fn cross_tenant_names_need_cluster_grants() {
+        let state = crate::testing::state().await;
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/api/v1/tenants",
+            None,
+            &[],
+            Some(json!({ "name": "acme" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/v1/logs",
+            None,
+            &[("x-scope-orgid", "acme"), ("x-tessera-dataset", "prod")],
+            Some(logs()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let across =
+            json!({ "dataset": "default", "query": "SELECT count(*) AS n FROM acme.prod.logs" });
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/api/v1/query",
+            None,
+            &[],
+            Some(across.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0][0], 1.0);
+        let reader = issue(&state, "default", "r", &["reader"]).await;
+        let (status, body) = call(
+            &state,
+            "POST",
+            "/api/v1/query",
+            Some(&reader),
+            &[],
+            Some(across),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("tenant acme is not known or not readable"),
+            "{body}"
+        );
+    }
+
     #[tokio::test]
     async fn without_credentials_requests_are_refused_once_anonymous_access_is_off() {
         let state = locked(async |_| {}).await;

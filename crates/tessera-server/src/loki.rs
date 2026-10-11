@@ -153,11 +153,7 @@ fn lower(
     params: RangeParams,
     now: Timestamp,
 ) -> Result<Lowered, ApiError> {
-    let ctx = BindContext {
-        tenant: scope.tenant.clone(),
-        dataset: scope.dataset.clone(),
-        now,
-    };
+    let ctx = BindContext::new(scope.tenant.clone(), scope.dataset.clone(), now);
     LogqlFrontend { params }
         .lower_query(text, &ctx)
         .map_err(|e| ApiError::query(QueryError::Syntax(e), text))

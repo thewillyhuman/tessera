@@ -11,6 +11,7 @@
 //! `default` when absent. Reading, writing and administering are then
 //! checked against the principal's roles (SE-1).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use axum::http::HeaderMap;
@@ -102,6 +103,19 @@ pub(crate) fn tenant(
         )));
     }
     Ok(tenant)
+}
+
+/// The tenants `principal` may name in a query as `tenant.dataset.table`
+/// (CT-9), by name: every tenant for a cluster administrator, its own
+/// otherwise.
+pub(crate) fn tenants(state: &AppState, principal: &Principal) -> BTreeMap<String, TenantId> {
+    let cached = state.catalog.cached();
+    cached
+        .state()
+        .tenants()
+        .filter(|tenant| principal.may_act_for(&tenant.id))
+        .map(|tenant| (tenant.name.to_string(), tenant.id.clone()))
+        .collect()
 }
 
 /// Checks that `principal` may do `need` on `dataset`.

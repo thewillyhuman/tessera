@@ -158,9 +158,12 @@ pub enum SelectItem {
     },
 }
 
-/// A table in `FROM`: a kind of event in a dataset.
+/// A table in `FROM`: a kind of event in a dataset, written
+/// `[[tenant.]dataset.]table`.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TableRef {
+    /// The tenant, when another tenant's table is named (CT-9).
+    pub tenant: Option<String>,
     /// The dataset, if qualified.
     pub dataset: Option<String>,
     /// The table name: `logs`, `spans`, ...

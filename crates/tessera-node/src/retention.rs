@@ -170,11 +170,7 @@ fn lower(
         Kind::Event => "events",
         Kind::Alert => "alerts",
     };
-    let ctx = BindContext {
-        tenant: tenant.clone(),
-        dataset: dataset.clone(),
-        now: Timestamp::from_nanos(0),
-    };
+    let ctx = BindContext::new(tenant.clone(), dataset.clone(), Timestamp::from_nanos(0));
     let sql = format!("SELECT 1 FROM {table} WHERE {condition}");
     let Statement::Query(plan) = SqlFrontend.lower(&sql, &ctx).ok()? else {
         return None;

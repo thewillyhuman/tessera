@@ -104,11 +104,7 @@ pub async fn observe(
         rule: rule.name.clone(),
         source,
     })?;
-    let ctx = BindContext {
-        tenant: tenant.clone(),
-        dataset,
-        now,
-    };
+    let ctx = BindContext::new(tenant.clone(), dataset, now);
     let instant = |start: Timestamp| (start, now, Duration::ZERO);
     let plan = match rule.language {
         Language::Sql => match SqlFrontend

@@ -109,11 +109,12 @@ async fn run_native(
         None => DatasetName::new("default").unwrap_or_else(|_| unreachable!("a valid name")),
     };
     let principal = crate::auth::principal(state, headers).await?;
-    let ctx = BindContext {
-        tenant: crate::params::tenant(state, headers, &principal)?,
+    let mut ctx = BindContext::new(
+        crate::params::tenant(state, headers, &principal)?,
         dataset,
-        now: state.env.clock.now(),
-    };
+        state.env.clock.now(),
+    );
+    ctx.tenants = crate::params::tenants(state, &principal);
     let _turn = state.admit_query(&ctx.tenant).await?;
     let started = std::time::Instant::now();
     let reader = principal.clone();

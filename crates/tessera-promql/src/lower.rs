@@ -499,11 +499,11 @@ mod tests {
     use crate::parse;
 
     fn ctx() -> BindContext {
-        BindContext {
-            tenant: TenantId::DEFAULT,
-            dataset: DatasetName::new("prod").unwrap(),
-            now: Timestamp::from_nanos(1_000_000_000_000),
-        }
+        BindContext::new(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Timestamp::from_nanos(1_000_000_000_000),
+        )
     }
 
     const S: i64 = 1_000_000_000;

@@ -175,11 +175,7 @@ fn lower(
     params: RangeParams,
     now: Timestamp,
 ) -> Result<Lowered, ApiError> {
-    let ctx = BindContext {
-        tenant: scope.tenant.clone(),
-        dataset: scope.dataset.clone(),
-        now,
-    };
+    let ctx = BindContext::new(scope.tenant.clone(), scope.dataset.clone(), now);
     PromqlFrontend { params }
         .lower_query(text, &ctx)
         .map_err(|e| {
@@ -390,11 +386,7 @@ async fn discovery_rows(
         start,
         Timestamp::from_nanos(end.as_nanos().saturating_add(1)),
     );
-    let ctx = BindContext {
-        tenant: scope.tenant.clone(),
-        dataset: scope.dataset.clone(),
-        now,
-    };
+    let ctx = BindContext::new(scope.tenant.clone(), scope.dataset.clone(), now);
     let selectors: Vec<String> = if params.matches.is_empty() {
         vec!["{__name__=~\".+\"}".to_owned()]
     } else {

@@ -204,11 +204,11 @@ async fn read_shapes(
          GROUP BY attr.dataset, attr.shape",
         SHAPE_LOOKBACK.as_secs()
     );
-    let ctx = BindContext {
-        tenant: TenantId::SYSTEM,
-        dataset: DatasetName::new(crate::WORKLOAD_DATASET)?,
+    let ctx = BindContext::new(
+        TenantId::SYSTEM,
+        DatasetName::new(crate::WORKLOAD_DATASET)?,
         now,
-    };
+    );
     let Response::Rows(output) = query::run(engine, &SqlFrontend, &sql, &ctx).await? else {
         return Ok(Vec::new());
     };
@@ -297,11 +297,11 @@ async fn read_observations(
          ORDER BY timestamp DESC LIMIT {MAX_OBSERVATIONS}",
         LOOKBACK.as_secs()
     );
-    let ctx = BindContext {
-        tenant: TenantId::SYSTEM,
-        dataset: DatasetName::new(crate::WORKLOAD_DATASET)?,
+    let ctx = BindContext::new(
+        TenantId::SYSTEM,
+        DatasetName::new(crate::WORKLOAD_DATASET)?,
         now,
-    };
+    );
     let Response::Rows(output) = query::run(engine, &SqlFrontend, &sql, &ctx).await? else {
         return Ok(Vec::new());
     };

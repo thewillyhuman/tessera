@@ -272,11 +272,11 @@ mod tests {
     }
 
     fn ctx() -> BindContext {
-        BindContext {
-            tenant: TenantId::DEFAULT,
-            dataset: DatasetName::new("prod").unwrap(),
-            now: Timestamp::UNIX_EPOCH,
-        }
+        BindContext::new(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Timestamp::UNIX_EPOCH,
+        )
     }
 
     #[tokio::test]

@@ -135,6 +135,7 @@ fn lower_delete(
     ctx: &BindContext,
     registry: &Registry,
 ) -> Result<Statement, Diagnostic> {
+    own_tenant(table)?;
     if table.dataset.as_deref() == Some("system") {
         let pairs = match filter {
             Some(filter) => equalities_of(filter)?,
@@ -230,6 +231,7 @@ fn lower_rollup(
 /// The control table a statement writes: only `system.<table>` can be
 /// written through SQL (CS-3).
 fn control_table(table: &ast::TableRef) -> Result<String, Diagnostic> {
+    own_tenant(table)?;
     if table.dataset.as_deref() != Some("system") {
         return Err(Diagnostic::at(
             table.span,
@@ -522,6 +524,13 @@ fn lower_query(
 /// The rows of a table in `FROM` or `JOIN`, and what its columns are
 /// called: the alias when one is written.
 fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan), Diagnostic> {
+    let derived = matches!(from.table.as_str(), "usage" | "log_patterns");
+    if from.tenant.is_some() && from.dataset.as_deref() == Some("system") && derived {
+        return Err(Diagnostic::at(
+            from.span,
+            format!("system.{} is read for the request's tenant", from.table),
+        ));
+    }
     let (mut table, plan) = if from.dataset.as_deref() == Some("system") && from.table == "usage" {
         usage_source(ctx)
     } else if from.dataset.as_deref() == Some("system") && from.table == "log_patterns" {
@@ -544,12 +553,12 @@ fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan),
                 kinds: Vec::new(),
             },
             Plan::SystemTable {
-                tenant: ctx.tenant.clone(),
+                tenant: tenant_of(from, ctx)?,
                 table: from.table.clone(),
             },
         )
     } else if from.table == "events" {
-        events_source(ctx, &dataset_of(from, ctx)?)
+        events_source(&tenant_of(from, ctx)?, &dataset_of(from, ctx)?)
     } else {
         let (dataset, kind) = resolve_table(from, ctx)?;
         (
@@ -558,7 +567,7 @@ fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan),
                 schema: event::schema(kind),
                 kinds: vec![kind],
             },
-            Plan::Scan(Scan::all(ctx.tenant.clone(), dataset, kind)),
+            Plan::Scan(Scan::all(tenant_of(from, ctx)?, dataset, kind)),
         )
     };
     if let Some(alias) = &from.alias {
@@ -572,7 +581,7 @@ fn source(from: &ast::TableRef, ctx: &BindContext) -> Result<(TableScope, Plan),
 /// lacks null. Every branch keeps `_overflow` whole, so an attribute
 /// read above the union finds every attribute; the views read one kind
 /// through its dedicated columns and are the faster path.
-fn events_source(ctx: &BindContext, dataset: &DatasetName) -> (TableScope, Plan) {
+fn events_source(tenant: &TenantId, dataset: &DatasetName) -> (TableScope, Plan) {
     let unified = event::unified_schema();
     let inputs = Kind::ALL
         .iter()
@@ -593,7 +602,7 @@ fn events_source(ctx: &BindContext, dataset: &DatasetName) -> (TableScope, Plan)
                     NamedExpr::new(expr, field.name())
                 })
                 .collect();
-            Plan::Scan(Scan::all(ctx.tenant.clone(), dataset.clone(), *kind)).project(exprs)
+            Plan::Scan(Scan::all(tenant.clone(), dataset.clone(), *kind)).project(exprs)
         })
         .collect();
     (
@@ -752,6 +761,36 @@ fn resolve_table(
         }
     };
     Ok((dataset_of(from, ctx)?, kind))
+}
+
+/// Control statements act on the request's tenant: a tenant qualifier
+/// is refused rather than ignored.
+fn own_tenant(table: &ast::TableRef) -> Result<(), Diagnostic> {
+    match &table.tenant {
+        None => Ok(()),
+        Some(name) => Err(Diagnostic::at(
+            table.span,
+            format!(
+                "{name}.{}: control statements act on the request's tenant",
+                table.table
+            ),
+        )),
+    }
+}
+
+/// The tenant a table reference names (CT-9), or the request's. A
+/// tenant the query may not name reads as unknown, so that names leak
+/// nothing.
+fn tenant_of(from: &ast::TableRef, ctx: &BindContext) -> Result<TenantId, Diagnostic> {
+    match &from.tenant {
+        None => Ok(ctx.tenant.clone()),
+        Some(name) => ctx.tenant_named(name).cloned().ok_or_else(|| {
+            Diagnostic::at(
+                from.span,
+                format!("tenant {name} is not known or not readable with these credentials"),
+            )
+        }),
+    }
 }
 
 /// The dataset a table reference names, or the request's.
@@ -1467,11 +1506,11 @@ mod tests {
     use crate::parser::parse;
 
     fn ctx() -> BindContext {
-        BindContext {
-            tenant: TenantId::DEFAULT,
-            dataset: DatasetName::new("prod").unwrap(),
-            now: Timestamp::from_nanos(1_700_000_000_000_000_000),
-        }
+        BindContext::new(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Timestamp::from_nanos(1_700_000_000_000_000_000),
+        )
     }
 
     fn lowered(sql: &str) -> Plan {
@@ -1512,6 +1551,54 @@ mod tests {
         assert!(
             schema.field_with_name("l.body").is_ok() && schema.field_with_name("s.name").is_ok()
         );
+    }
+
+    #[test]
+    fn three_part_names_read_the_tenants_the_query_may_name() {
+        let mut ctx = ctx();
+        let acme = TenantId::new("0123456789abcdef0123456789abcdef").unwrap();
+        ctx.tenants.insert("acme".into(), acme.clone());
+        let lowered = |sql: &str| match lower(&parse(sql).unwrap(), &ctx) {
+            Ok(Statement::Query(plan)) => Ok(plan),
+            Ok(other) => panic!("not a query: {other:?}"),
+            Err(e) => Err(e.message),
+        };
+        let plan = lowered("SELECT count(*) FROM acme.prod.logs").unwrap();
+        let Plan::Project { input, .. } = &plan else {
+            panic!("{plan}")
+        };
+        let Plan::Aggregate { input, .. } = input.as_ref() else {
+            panic!("{plan}")
+        };
+        let Plan::Scan(scan) = input.as_ref() else {
+            panic!("{plan}")
+        };
+        assert_eq!(scan.tenant, acme);
+        let plan = lowered("SELECT id FROM acme.system.silences").unwrap();
+        assert!(
+            plan.to_string()
+                .contains(&format!("SystemTable: {acme} system.silences")),
+            "{plan}"
+        );
+        let message = lowered("SELECT count(*) FROM other.prod.logs").unwrap_err();
+        assert!(
+            message.contains("tenant other is not known or not readable"),
+            "{message}"
+        );
+        let message = lower(
+            &parse("DELETE FROM acme.prod.logs WHERE severity_number < 9").unwrap(),
+            &ctx,
+        )
+        .unwrap_err()
+        .message;
+        assert!(message.contains("request's tenant"), "{message}");
+        let message = lower(
+            &parse("INSERT INTO acme.system.silences (id) VALUES ('s1')").unwrap(),
+            &ctx,
+        )
+        .unwrap_err()
+        .message;
+        assert!(message.contains("request's tenant"), "{message}");
     }
 
     #[test]

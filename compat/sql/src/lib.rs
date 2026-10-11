@@ -206,11 +206,7 @@ impl Fixture {
         Fixture {
             engine,
             sqlite,
-            ctx: BindContext {
-                tenant: TenantId::DEFAULT,
-                dataset,
-                now: env.clock.now(),
-            },
+            ctx: BindContext::new(TenantId::DEFAULT, dataset, env.clock.now()),
         }
     }
 

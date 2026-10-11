@@ -110,11 +110,7 @@ pub fn shape_of(rule: &AlertRule, tenant: &TenantId) -> Result<Shape, String> {
 /// of mergeable aggregates.
 pub fn shape_of_sql(expr: &str, dataset: &str, tenant: &TenantId) -> Result<Shape, String> {
     let dataset = DatasetName::new(dataset).map_err(|e| e.to_string())?;
-    let ctx = BindContext {
-        tenant: tenant.clone(),
-        dataset,
-        now: Timestamp::from_nanos(0),
-    };
+    let ctx = BindContext::new(tenant.clone(), dataset, Timestamp::from_nanos(0));
     let plan = match SqlFrontend
         .lower(expr, &ctx)
         .map_err(|d| d.describe(expr))?

@@ -449,11 +449,11 @@ mod tests {
     use super::*;
 
     fn lowered(sql: &str) -> Plan {
-        let ctx = BindContext {
-            tenant: TenantId::DEFAULT,
-            dataset: DatasetName::new("prod").unwrap(),
-            now: tessera_types::Timestamp::from_nanos(0),
-        };
+        let ctx = BindContext::new(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            tessera_types::Timestamp::from_nanos(0),
+        );
         let Statement::Query(plan) = SqlFrontend.lower(sql, &ctx).unwrap() else {
             panic!("not a query");
         };

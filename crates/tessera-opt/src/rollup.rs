@@ -249,11 +249,11 @@ mod tests {
     const MINUTE: i64 = 60_000_000_000;
 
     fn lowered(sql: &str) -> Plan {
-        let ctx = BindContext {
-            tenant: TenantId::DEFAULT,
-            dataset: DatasetName::new("prod").unwrap(),
-            now: Timestamp::from_nanos(0),
-        };
+        let ctx = BindContext::new(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Timestamp::from_nanos(0),
+        );
         let Statement::Query(plan) = SqlFrontend.lower(sql, &ctx).unwrap() else {
             panic!("not a query");
         };

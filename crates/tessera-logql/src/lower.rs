@@ -593,11 +593,11 @@ mod tests {
     use crate::parser::parse;
 
     fn ctx() -> BindContext {
-        BindContext {
-            tenant: TenantId::DEFAULT,
-            dataset: DatasetName::new("prod").unwrap(),
-            now: Timestamp::from_nanos(1_000_000_000_000),
-        }
+        BindContext::new(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Timestamp::from_nanos(1_000_000_000_000),
+        )
     }
 
     fn params(step: u64) -> RangeParams {

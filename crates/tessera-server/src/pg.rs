@@ -89,14 +89,9 @@ impl PgServer {
         } else {
             principal.tenant.clone()
         };
-        Ok((
-            BindContext {
-                tenant,
-                dataset,
-                now: self.state.env.clock.now(),
-            },
-            principal,
-        ))
+        let mut ctx = BindContext::new(tenant, dataset, self.state.env.clock.now());
+        ctx.tenants = crate::params::tenants(&self.state, &principal);
+        Ok((ctx, principal))
     }
 
     /// Runs `text` and encodes the result in `format`.

@@ -6,6 +6,7 @@
 //! owns its lexer and parser (QL-2) and reports errors with positions in
 //! the terms of its language.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -101,6 +102,29 @@ pub struct BindContext {
     pub dataset: DatasetName,
     /// The query's notion of now, fixed once per query.
     pub now: Timestamp,
+    /// The tenants the query may name as `tenant.dataset.table` (CT-9),
+    /// by name: the ones its principal has grants in. Empty for a query
+    /// confined to its own tenant.
+    pub tenants: BTreeMap<String, TenantId>,
+}
+
+impl BindContext {
+    /// A context confined to `tenant`.
+    #[must_use]
+    pub fn new(tenant: TenantId, dataset: DatasetName, now: Timestamp) -> Self {
+        BindContext {
+            tenant,
+            dataset,
+            now,
+            tenants: BTreeMap::new(),
+        }
+    }
+
+    /// The tenant a query names, if it may.
+    #[must_use]
+    pub fn tenant_named(&self, name: &str) -> Option<&TenantId> {
+        self.tenants.get(name)
+    }
 }
 
 /// A lowered statement.

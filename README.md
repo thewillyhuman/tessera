@@ -409,7 +409,9 @@ is one table, `events`, holding every kind of event on one set of
 columns, and the views `logs`, `spans`, `metrics` and `alerts` read one
 kind each, faster; span events are `events WHERE kind = 'event'`. A
 table is qualified as `prod.logs` or resolved against the request's
-dataset; attributes are paths such as `resource.service.name` and
+dataset, and a cluster administrator reads across tenants by naming
+one, `acme.prod.logs` (CT-9); other credentials see their own tenant.
+Attributes are paths such as `resource.service.name` and
 `attr.http.method`:
 
 ```

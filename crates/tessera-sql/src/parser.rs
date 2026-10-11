@@ -671,15 +671,20 @@ impl Parser<'_> {
         Ok(None)
     }
 
-    /// `[dataset.]table [[AS] alias]`.
+    /// `[[tenant.]dataset.]table [[AS] alias]`.
     fn table_ref(&mut self) -> Result<TableRef, Diagnostic> {
         let (first, start) = self.identifier()?;
-        let (dataset, table, span) = if self.eat_symbol(".") {
-            let (table, end) = self.identifier()?;
-            (Some(first), table, Span::new(start.start, end.end))
-        } else {
-            (None, first, start)
-        };
+        let mut parts = vec![first];
+        let mut end = start;
+        while parts.len() < 3 && self.eat_symbol(".") {
+            let (part, span) = self.identifier()?;
+            parts.push(part);
+            end = span;
+        }
+        let span = Span::new(start.start, end.end);
+        let table = parts.pop().unwrap_or_default();
+        let dataset = parts.pop();
+        let tenant = parts.pop();
         let keywords: Vec<&str> = CLAUSE_KEYWORDS
             .iter()
             .chain(ALERT_KEYWORDS.iter())
@@ -688,6 +693,7 @@ impl Parser<'_> {
             .collect();
         let alias = self.alias(&keywords)?;
         Ok(TableRef {
+            tenant,
             dataset,
             table,
             alias,
@@ -1197,6 +1203,18 @@ mod tests {
         };
         assert!(filter.is_some());
         assert_eq!(filter_text, "attr.user = 'u1' AND severity_number < 9");
+    }
+
+    #[test]
+    fn parses_three_part_names() {
+        let q = query("SELECT * FROM acme.prod.logs l WHERE true");
+        let from = q.from.unwrap();
+        assert_eq!(from.tenant.as_deref(), Some("acme"));
+        assert_eq!(from.dataset.as_deref(), Some("prod"));
+        assert_eq!(from.table, "logs");
+        assert_eq!(from.alias.as_deref(), Some("l"));
+        let from = query("SELECT * FROM prod.logs").from.unwrap();
+        assert_eq!((from.tenant, from.dataset.as_deref()), (None, Some("prod")));
     }
 
     #[test]

@@ -618,11 +618,7 @@ async fn compacted_logs_carry_stable_pattern_ids() {
     let (store, env) = populate().await;
     compact_all(&store, &env).await;
     let engine = engine(&store, &env);
-    let ctx = tessera_ir::BindContext {
-        tenant: TenantId::DEFAULT,
-        dataset: dataset(),
-        now: env.clock.now(),
-    };
+    let ctx = tessera_ir::BindContext::new(TenantId::DEFAULT, dataset(), env.clock.now());
     let response = tessera_exec::query::run(
         &engine,
         &tessera_sql::SqlFrontend,

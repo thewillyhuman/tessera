@@ -177,11 +177,11 @@ mod tests {
             assert!(response.status().is_success());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let ctx = BindContext {
-            tenant: TenantId::SYSTEM,
-            dataset: DatasetName::new(DATASET).unwrap(),
-            now: state.env.clock.now(),
-        };
+        let ctx = BindContext::new(
+            TenantId::SYSTEM,
+            DatasetName::new(DATASET).unwrap(),
+            state.env.clock.now(),
+        );
         let response = query::run(
             &state.engine,
             &SqlFrontend,
