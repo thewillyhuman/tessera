@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, ControlStores, PoolConfig};
-use tessera_cluster::{Admission, Ledger, Limits, Membership, Registry, Role, registry};
+use tessera_cluster::{Admission, Ledger, Limits, Load, Membership, Registry, Role, registry};
 use tessera_commit::LeaseManager;
 use tessera_eval::HttpNotifier;
 use tessera_exec::{CpuPool, Engine, QueryLimits};
@@ -213,6 +213,7 @@ impl Node {
             pool,
             pools,
             membership,
+            load: Load::new(),
         };
         let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
@@ -384,6 +385,8 @@ struct Shared {
     pool: PoolId,
     pools: Arc<Pools>,
     membership: Arc<Membership>,
+    /// The node's load signals (OP-5), set by every loop.
+    load: Arc<Load>,
 }
 
 impl Shared {
@@ -411,6 +414,7 @@ impl Shared {
             membership: Arc::clone(&self.membership),
             owned: Owned::default(),
             kinds,
+            load: Arc::clone(&self.load),
         });
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(leases::run(Arc::clone(&leases), config.renewal, stopped));
@@ -431,6 +435,7 @@ impl Shared {
                     Arc::clone(&self.store),
                     self.env.clone(),
                 )),
+                load: Arc::clone(&self.load),
             })));
         }
         (Some(leases), Some((stop, task)))
@@ -483,6 +488,7 @@ impl Shared {
             })),
             budgets: Arc::new(Ledger::new()),
             auth: Arc::new(Auth::new(allow_anonymous)),
+            load: Arc::clone(&self.load),
         };
         (state, engine, controls)
     }
@@ -536,6 +542,7 @@ impl Shared {
             sink: Arc::new(evaluator::StateSink::new(state.clone())),
             notifier: Arc::new(HttpNotifier::new()),
             interval: config.eval,
+            load: Arc::clone(&self.load),
         })));
     }
 }

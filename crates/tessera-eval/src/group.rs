@@ -106,6 +106,31 @@ impl RuleGroup {
         Ok(snapshot.state().outbox.values().cloned().collect())
     }
 
+    /// How far the group is behind at `now`: the longest time since one
+    /// of its rules was last evaluated, beyond the rule's interval; zero
+    /// when every rule is on time or none has run yet.
+    ///
+    /// # Errors
+    ///
+    /// If the state log cannot be read.
+    pub async fn lag(&self, now: Timestamp) -> Result<Duration, EvalError> {
+        let snapshot = self
+            .log
+            .snapshot()
+            .await
+            .map_err(|e| EvalError::State(e.to_string()))?;
+        Ok(self
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                let at = snapshot.state().evaluated.get(&rule.name)?;
+                let since = now.duration_since(*at)?;
+                Some(since.saturating_sub(rule.every()))
+            })
+            .max()
+            .unwrap_or(Duration::ZERO))
+    }
+
     /// Evaluates every rule that is due at `now` and commits what
     /// changed. Rules in the incremental subset read their new segments
     /// every time (CQ-1); the others run through the engine at their

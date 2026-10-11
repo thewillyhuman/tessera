@@ -21,6 +21,7 @@ mod error;
 pub mod internal;
 pub mod loki;
 pub mod metering;
+pub mod metrics;
 pub mod otlp;
 mod params;
 pub mod pg;
@@ -36,7 +37,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use tessera_catalog::{Catalog, ControlStores};
-use tessera_cluster::{Admission, Ledger, Membership, QueryPermit, Role};
+use tessera_cluster::{Admission, Ledger, Load, Membership, QueryPermit, Role};
 use tessera_exec::Engine;
 use tessera_format::FileFormat;
 use tessera_ingest::IngestHandle;
@@ -88,6 +89,8 @@ pub struct AppState {
     pub budgets: Arc<Ledger>,
     /// How requests are authenticated (CT-5, SE-1).
     pub auth: Arc<auth::Auth>,
+    /// The node's load signals (OP-5).
+    pub load: Arc<Load>,
 }
 
 impl AppState {
@@ -102,6 +105,7 @@ impl AppState {
     /// If a budget refuses the write, the tenant is over its limit of
     /// bytes in flight, or the write fails here.
     pub async fn write(&self, batch: EventBatch) -> Result<(), ApiError> {
+        let _inflight = self.load.ingest_started();
         let batch = if batch.tenant() == &TenantId::SYSTEM {
             batch
         } else {
@@ -148,7 +152,12 @@ impl AppState {
     pub async fn admit_query(&self, tenant: &TenantId) -> Result<Option<QueryPermit>, ApiError> {
         budgets::admit_query(self, tenant)?;
         match &self.cluster {
-            Some(cluster) => Ok(Some(cluster.admission.admit_query(tenant).await?)),
+            Some(cluster) => {
+                let waited = std::time::Instant::now();
+                let permit = cluster.admission.admit_query(tenant).await;
+                self.load.query_waited(waited.elapsed());
+                Ok(Some(permit?))
+            }
             None => Ok(None),
         }
     }
@@ -163,6 +172,7 @@ pub fn router(state: AppState) -> Router {
         .merge(tempo::router(state.clone()))
         .merge(prometheus::router(state.clone()))
         .merge(rules::router(state.clone()))
+        .merge(metrics::router(state.clone()))
         .merge(query::router(state))
 }
 
@@ -238,6 +248,7 @@ impl AppState {
             cluster: None,
             budgets: Arc::new(Ledger::new()),
             auth: Arc::new(auth::Auth::new(true)),
+            load: Load::new(),
         }
     }
 }

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tessera_catalog::{Catalog, ControlStore, ControlStores, Table, TenantStatus};
+use tessera_cluster::Load;
 use tessera_eval::rule::decode_rows;
 use tessera_eval::{
     Acknowledgment, AlertRule, AlertSink, Delivery, NotificationRoute, Notifier, Rollup, RuleGroup,
@@ -51,6 +52,8 @@ pub struct Evaluator {
     pub notifier: Arc<dyn Notifier>,
     /// How often a round runs.
     pub interval: Duration,
+    /// Where the evaluator's lag is reported (OP-5).
+    pub load: Arc<Load>,
 }
 
 /// The open rule groups, rebuilt when their rules change.
@@ -80,18 +83,25 @@ async fn round(evaluator: &Evaluator, groups: &mut Groups) {
         .filter(|t| t.status == TenantStatus::Active)
         .map(|t| t.id.clone())
         .collect();
+    let mut lag = Duration::ZERO;
     for tenant in tenants {
-        if let Err(error) = tenant_round(evaluator, groups, &tenant).await {
-            tracing::warn!(%tenant, error = %error, "rule evaluation round failed");
+        match tenant_round(evaluator, groups, &tenant).await {
+            Ok(behind) => lag = lag.max(behind),
+            Err(error) => {
+                tracing::warn!(%tenant, error = %error, "rule evaluation round failed");
+            }
         }
     }
+    evaluator.load.set_evaluator_lag(lag);
 }
 
+/// One round for `tenant`; returns how far its slowest owned group is
+/// behind.
 async fn tenant_round(
     evaluator: &Evaluator,
     groups: &mut Groups,
     tenant: &TenantId,
-) -> Result<(), String> {
+) -> Result<Duration, String> {
     let control = evaluator.controls.open(tenant);
     let rows = control
         .rows(Table::AlertRules)
@@ -118,7 +128,7 @@ async fn tenant_round(
         .retain(|(t, g), _| t != tenant || owned.iter().any(|(name, _)| name == g));
     rollups_round(evaluator, tenant, &control).await?;
     if owned.is_empty() {
-        return Ok(());
+        return Ok(Duration::ZERO);
     }
     let (routes, _) = decode_rows::<NotificationRoute>(
         &control
@@ -145,6 +155,7 @@ async fn tenant_round(
         silences: &silences,
         acknowledgments: &acknowledgments,
     };
+    let mut lag = Duration::ZERO;
     for (name, rules) in owned {
         let key = (tenant.clone(), name.clone());
         let group = match groups.open.get(&key) {
@@ -180,8 +191,9 @@ async fn tenant_round(
                 tracing::warn!(%tenant, group = %name, error = %error, "alert delivery failed");
             }
         }
+        lag = lag.max(group.lag(now).await.unwrap_or(Duration::ZERO));
     }
-    Ok(())
+    Ok(lag)
 }
 
 /// The rollups of `tenant` this node owns, each brought up to date.

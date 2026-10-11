@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tessera_catalog::Catalog;
-use tessera_cluster::{Membership, Role};
+use tessera_cluster::{Load, Membership, Role};
 use tessera_commit::{Lease, LeaseManager, Slot, SlotCount};
 use tessera_types::WorkKind;
 use tokio::sync::oneshot;
@@ -128,6 +128,8 @@ pub struct Leases {
     pub owned: Owned,
     /// The kinds this node takes slots of.
     pub kinds: Vec<WorkKind>,
+    /// Where the slots held are reported (OP-5).
+    pub load: Arc<Load>,
 }
 
 impl Leases {
@@ -171,6 +173,8 @@ impl Leases {
                     (None, false) => {}
                 }
             }
+            self.load
+                .set_slots(kind, u64::try_from(next.len()).unwrap_or(u64::MAX));
             self.owned.replace(kind, count, next);
         }
     }
@@ -288,6 +292,7 @@ mod tests {
             membership: Arc::new(membership),
             owned: Owned::default(),
             kinds: COMPACT_KINDS.to_vec(),
+            load: Load::new(),
         }
     }
 

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, ControlStores, Table};
-use tessera_cluster::Membership;
+use tessera_cluster::{Load, Membership};
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan};
 use tessera_format::FileFormat;
@@ -71,6 +71,17 @@ pub struct Background {
     pub meter: Arc<dyn Meter>,
     /// The control stores, for retention policies (section 13.3).
     pub controls: Arc<ControlStores>,
+    /// Where the backlogs are reported (OP-5).
+    pub load: Arc<Load>,
+}
+
+/// What a round left undone or had to repair.
+#[derive(Clone, Copy, Debug, Default)]
+struct Backlog {
+    /// Compaction jobs deferred by the re-clustering budget.
+    deferred: u64,
+    /// Writers whose logs had to be recovered.
+    recoveries: u64,
 }
 
 /// Runs the background work forever. Failures are logged and retried on
@@ -93,11 +104,20 @@ pub async fn run(background: Background) {
             .tenants()
             .map(|t| t.id.clone())
             .collect();
+        let mut backlog = Backlog::default();
         for tenant in tenants {
-            if let Err(error) = round(&background, &compactor, &tenant).await {
-                tracing::warn!(tenant = %tenant, error = %error, "background round failed");
+            match round(&background, &compactor, &tenant).await {
+                Ok(left) => {
+                    backlog.deferred += left.deferred;
+                    backlog.recoveries += left.recoveries;
+                }
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant, error = %error, "background round failed");
+                }
             }
         }
+        background.load.set_compaction_backlog(backlog.deferred);
+        background.load.set_intake_backlog(backlog.recoveries);
         if let Err(error) = collect_logs(&background).await {
             tracing::warn!(error = %error, "segment collection failed");
         }
@@ -108,7 +128,8 @@ async fn round(
     background: &Background,
     compactor: &Compactor,
     tenant: &TenantId,
-) -> Result<(), Failure> {
+) -> Result<Backlog, Failure> {
+    let mut backlog = Backlog::default();
     for dataset in registry::datasets(&*background.store, tenant).await? {
         for registration in registry::list(&*background.store, tenant, &dataset).await? {
             let writer = registration.writer;
@@ -139,13 +160,14 @@ async fn round(
                 };
                 let recovered =
                     recover(&target, &background.env, writer, Window::DEFAULT_LENGTH).await?;
+                backlog.recoveries += 1;
                 tracing::info!(%tenant, %dataset, %writer, ?recovered, "recovery");
             }
         }
         let mut budget = RECLUSTER_BUDGET;
         let policies = policies_of(background, tenant).await;
         for kind in Kind::ALL {
-            compact_and_collect(
+            backlog.deferred += compact_and_collect(
                 background,
                 compactor,
                 tenant,
@@ -157,12 +179,13 @@ async fn round(
             .await?;
         }
     }
-    Ok(())
+    Ok(backlog)
 }
 
 /// Compacts every partition of a dataset and kind that is due, rewrites
 /// files of an older layout epoch within `budget`, recent partitions
-/// first (AD-10), and collects replaced files.
+/// first (AD-10), and collects replaced files. Returns how many jobs
+/// the budget deferred.
 #[allow(clippy::too_many_arguments)]
 async fn compact_and_collect(
     background: &Background,
@@ -172,7 +195,8 @@ async fn compact_and_collect(
     kind: Kind,
     budget: &mut u64,
     policies: &[RetentionPolicy],
-) -> Result<(), Failure> {
+) -> Result<u64, Failure> {
+    let mut deferred = 0;
     let now = background.env.clock.now();
     let log = background.datasets.open(tenant, dataset);
     let record = log.layout(kind).await?;
@@ -225,6 +249,7 @@ async fn compact_and_collect(
             }
             let bytes = input_bytes(job);
             if bytes > *budget {
+                deferred += 1;
                 return false;
             }
             *budget -= bytes;
@@ -254,7 +279,7 @@ async fn compact_and_collect(
             tracing::info!(%tenant, %dataset, %kind, window = %partition.window, collected, "files collected");
         }
     }
-    Ok(())
+    Ok(deferred)
 }
 
 /// The enabled retention policies of `tenant`; a store or a document
