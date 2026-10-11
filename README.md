@@ -372,9 +372,10 @@ the node lacks is refused rather than stored plain (SE-2, SE-3). Key
 material never enters the object store; the catalog holds names only.
 
 Gaps left in M10: no Iceberg
-export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
-load have not been run; neither the image nor the chart has run on a
-cluster.
+export (OP-9); the scale envelope of 17.2 has not been run, and the
+rolling restart under load is a three-node test in `tessera-node`
+rather than a run of a real upgrade; neither the image nor the chart
+has run on a cluster.
 
 ## Layout
 
