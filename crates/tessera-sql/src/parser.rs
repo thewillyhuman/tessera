@@ -353,7 +353,17 @@ impl Parser<'_> {
             };
             self.expect_keyword("after")?;
             let after = self.interval_text()?;
-            return Ok(RetentionActionAst::Sample { rate, after });
+            let except_errors = if self.eat_keyword("except") {
+                self.expect_keyword("errors")?;
+                true
+            } else {
+                false
+            };
+            return Ok(RetentionActionAst::Sample {
+                rate,
+                after,
+                except_errors,
+            });
         }
         if self.eat_keyword("drop") {
             self.expect_keyword("after")?;
@@ -1040,7 +1050,8 @@ const RESERVED: [&str; 22] = [
 
 /// Keywords of `CREATE ALERT` and `CREATE ROLLUP` options and retention
 /// clauses, which end a duration's unit.
-const ALERT_KEYWORDS: [&str; 11] = [
+const ALERT_KEYWORDS: [&str; 12] = [
+    "except",
     "severity",
     "for",
     "every",

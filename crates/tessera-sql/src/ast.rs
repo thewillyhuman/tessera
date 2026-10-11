@@ -429,12 +429,14 @@ pub struct RetentionClauseAst {
 /// One action of a retention clause, durations as written.
 #[derive(Clone, PartialEq, Debug)]
 pub enum RetentionActionAst {
-    /// `SAMPLE rate AFTER duration`.
+    /// `SAMPLE rate AFTER duration [EXCEPT ERRORS]`.
     Sample {
         /// The fraction kept, as written.
         rate: (String, Span),
         /// The age.
         after: (String, Span),
+        /// Whether traces with an error span are kept whole (CO-7).
+        except_errors: bool,
     },
     /// `DROP AFTER duration`.
     Drop {

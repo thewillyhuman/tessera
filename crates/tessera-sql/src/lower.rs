@@ -335,7 +335,11 @@ fn retention_action(action: &ast::RetentionActionAst) -> Result<RetentionAction,
             .ok_or_else(|| Diagnostic::at(*span, format!("invalid duration {text}")))
     };
     Ok(match action {
-        ast::RetentionActionAst::Sample { rate, after } => {
+        ast::RetentionActionAst::Sample {
+            rate,
+            after,
+            except_errors,
+        } => {
             let fraction: f64 = rate
                 .0
                 .parse()
@@ -345,6 +349,7 @@ fn retention_action(action: &ast::RetentionActionAst) -> Result<RetentionAction,
             RetentionAction::Sample {
                 rate: fraction,
                 after_seconds: seconds(after)?,
+                except_errors: *except_errors,
             }
         }
         ast::RetentionActionAst::Drop { after } => RetentionAction::Drop {
@@ -1747,6 +1752,27 @@ mod tests {
     }
 
     #[test]
+    fn sampling_may_keep_errored_traces_whole() {
+        let ControlStatement::CreateRetentionPolicy(policy) = control(
+            "CREATE RETENTION POLICY keep_errors ON prod AS WHEN kind = 'span' THEN SAMPLE 0.1 AFTER 7d EXCEPT ERRORS",
+        ) else {
+            panic!("not a policy")
+        };
+        assert_eq!(
+            policy.clauses[0].actions,
+            [RetentionAction::Sample {
+                rate: 0.1,
+                after_seconds: 7 * 86_400,
+                except_errors: true,
+            }]
+        );
+        assert_eq!(
+            policy.clauses[0].actions[0].to_string(),
+            "SAMPLE 0.1 AFTER 604800s EXCEPT ERRORS"
+        );
+    }
+
+    #[test]
     fn retention_policies_lower_with_their_clauses() {
         let ControlStatement::CreateRetentionPolicy(policy) = control(
             "CREATE RETENTION POLICY trim_noise ON prod AS \
@@ -1770,7 +1796,8 @@ mod tests {
             [
                 RetentionAction::Sample {
                     rate: 0.05,
-                    after_seconds: 3 * 86_400
+                    after_seconds: 3 * 86_400,
+                    except_errors: false,
                 },
                 RetentionAction::Drop {
                     after_seconds: 30 * 86_400

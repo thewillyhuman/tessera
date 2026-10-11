@@ -48,6 +48,9 @@ pub enum RetentionAction {
         rate: f64,
         /// The age in seconds from which it applies.
         after_seconds: u64,
+        /// Whether traces with an error span are kept whole (CO-7).
+        #[serde(default)]
+        except_errors: bool,
     },
     /// Remove the rows after an age; a whole partition at once when the
     /// policy says nothing finer (MF-6).
@@ -83,7 +86,14 @@ impl std::fmt::Display for RetentionAction {
             RetentionAction::Sample {
                 rate,
                 after_seconds,
-            } => write!(f, "SAMPLE {rate} AFTER {after_seconds}s"),
+                except_errors,
+            } => {
+                write!(f, "SAMPLE {rate} AFTER {after_seconds}s")?;
+                if *except_errors {
+                    write!(f, " EXCEPT ERRORS")?;
+                }
+                Ok(())
+            }
             RetentionAction::Drop { after_seconds } => write!(f, "DROP AFTER {after_seconds}s"),
             RetentionAction::Downsample {
                 interval_seconds,

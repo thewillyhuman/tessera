@@ -86,7 +86,14 @@ pub fn decide(
                 after = after.min(Duration::from_secs(action.after_seconds()));
                 match action {
                     RetentionAction::Drop { .. } => retain.remove = true,
-                    RetentionAction::Sample { rate, .. } => retain.sample = Some(*rate),
+                    RetentionAction::Sample {
+                        rate,
+                        except_errors,
+                        ..
+                    } => {
+                        retain.sample = Some(*rate);
+                        retain.except_errors = *except_errors;
+                    }
                     RetentionAction::Downsample {
                         interval_seconds, ..
                     } => retain.downsample = Some(Duration::from_secs(*interval_seconds)),
@@ -218,6 +225,7 @@ mod tests {
                     RetentionAction::Sample {
                         rate: 0.1,
                         after_seconds: 3 * DAY,
+                        except_errors: false,
                     },
                     RetentionAction::Drop {
                         after_seconds: 30 * DAY,

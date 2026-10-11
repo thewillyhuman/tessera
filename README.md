@@ -223,7 +223,8 @@ and gives each row a `pattern_id` that stays stable across files
 (CO-5); `system.log_patterns` lists them with their volumes. Value
 scores per kind, from reads against stored bytes, kept in the dataset
 log. Retention by value: `CREATE RETENTION POLICY ... AS WHEN ...
-THEN SAMPLE r AFTER d, DROP AFTER d, DOWNSAMPLE TO i AFTER d ... ELSE
+THEN SAMPLE r AFTER d [EXCEPT ERRORS], DROP AFTER d, DOWNSAMPLE TO i
+AFTER d ... ELSE
 ...` over `kind`, severity, `value_score` and row columns;
 `EXPLAIN RETENTION` estimates what a policy removes and saves (CO-9);
 policies are applied at compaction, sampling by event or by trace
@@ -246,9 +247,10 @@ workload repeats (8.7).
 
 Gaps left in M9: `system.usage` has not been reconciled against
 object-store billing (the exit criterion); unit prices and cost are
-not shown (CO-4); traces with errors are not exempt from sampling and
-histograms and sketches are not merged when downsampling (CO-7,
-CO-8); the budget ledger counts per node, so a tenant served by
+not shown (CO-4); `EXCEPT ERRORS` sees the error spans of the files
+being compacted only, and traces referenced by alert events are not
+exempt; histograms and sketches are not merged when downsampling
+(CO-7, CO-8); the budget ledger counts per node, so a tenant served by
 several ingesters gets up to that many budgets; teams have no query
 budget, since queries carry no principal; Prometheus recording rules
 are still refused rather than turned into rollups; a rollup starts at

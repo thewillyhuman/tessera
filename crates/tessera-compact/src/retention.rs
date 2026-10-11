@@ -8,12 +8,12 @@
 //! or dropped whole (CO-7). Downsampling keeps one row per series and
 //! interval with count, sum, min, max and last (CO-8).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, RecordBatch,
+    Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, RecordBatch, StringArray,
     TimestampNanosecondArray, UInt32Array,
 };
 use arrow::compute::{concat_batches, filter_record_batch, take};
@@ -22,7 +22,7 @@ use tessera_ir::Expr;
 use tessera_kernels::evaluate_predicate;
 use tessera_kernels::sample::sample;
 use tessera_types::Kind;
-use tessera_types::event::{SERIES_ID, TIMESTAMP, VALUE};
+use tessera_types::event::{SERIES_ID, STATUS_CODE, TIMESTAMP, TRACE_ID, VALUE};
 
 use crate::CompactError;
 
@@ -43,6 +43,9 @@ pub struct Retain {
     pub predicate: Option<Expr>,
     /// The share of matching rows kept, when sampling is due.
     pub sample: Option<f64>,
+    /// Whether spans of a trace with an error span are kept whole
+    /// rather than sampled (CO-7).
+    pub except_errors: bool,
     /// The interval kept per series, when downsampling is due.
     pub downsample: Option<Duration>,
     /// Whether matching rows are removed, when a drop is due.
@@ -83,6 +86,11 @@ pub fn apply(
         return Ok((rows, applied));
     }
     if let Some(rate) = retain.sample.filter(|r| *r < 1.0) {
+        let matches = if retain.except_errors && kind == Kind::Span {
+            without_errored_traces(&rows, &matches)
+        } else {
+            matches.clone()
+        };
         let sampled = sample(&rows, kind, &matches, rate)?;
         applied.sampled_out = sampled.dropped();
         rows = sampled.rows;
@@ -97,6 +105,33 @@ pub fn apply(
         rows = folded;
     }
     Ok((rows, applied))
+}
+
+/// `matches` with the spans of every trace that has an error span
+/// among `rows` taken out (CO-7), so that sampling leaves those traces
+/// whole. A trace whose error span sits in another file is not seen.
+fn without_errored_traces(rows: &RecordBatch, matches: &BooleanArray) -> BooleanArray {
+    let traces = rows
+        .column_by_name(TRACE_ID)
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
+    let statuses = rows
+        .column_by_name(STATUS_CODE)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let (Some(traces), Some(statuses)) = (traces, statuses) else {
+        return matches.clone();
+    };
+    let errored: HashSet<&[u8]> = (0..rows.num_rows())
+        .filter(|&i| !statuses.is_null(i) && statuses.value(i) == "error" && !traces.is_null(i))
+        .map(|i| traces.value(i))
+        .collect();
+    if errored.is_empty() {
+        return matches.clone();
+    }
+    (0..rows.num_rows())
+        .map(|i| {
+            Some(matches.value(i) && (traces.is_null(i) || !errored.contains(traces.value(i))))
+        })
+        .collect()
 }
 
 /// One series in one interval, as it is folded.
@@ -361,6 +396,57 @@ mod tests {
             "a kept trace is whole: {per_trace:?}"
         );
         assert!(per_trace.len() < 20);
+    }
+
+    #[test]
+    fn errored_traces_stay_whole_when_the_policy_says_so() {
+        let spans: Vec<SpanRow> = (0..100u8)
+            .map(|i| SpanRow {
+                timestamp: Timestamp::from_nanos(i64::from(i)),
+                event_id: [i; 16],
+                trace_id: [i / 5; 16],
+                span_id: [i; 8],
+                name: "op".into(),
+                // One span of trace 3 fails; the rest of its spans do not.
+                status_code: if i == 17 {
+                    tessera_types::StatusCode::Error
+                } else {
+                    tessera_types::StatusCode::Ok
+                },
+                ..SpanRow::default()
+            })
+            .collect();
+        let rows =
+            EventBatch::from_spans(TenantId::DEFAULT, DatasetName::new("p").unwrap(), &spans)
+                .unwrap()
+                .rows()
+                .clone();
+        let count_of = |kept: &RecordBatch, trace: u8| {
+            let traces = kept
+                .column_by_name(TRACE_ID)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap()
+                .clone();
+            (0..traces.len())
+                .filter(|&i| traces.value(i) == [trace; 16])
+                .count()
+        };
+        let sampled = Retain {
+            sample: Some(0.000_001),
+            ..Retain::default()
+        };
+        let (kept, _) = apply(&rows, Kind::Span, &sampled).unwrap();
+        assert_eq!(count_of(&kept, 3), 0, "a tiny rate drops the trace");
+        let exempt = Retain {
+            sample: Some(0.000_001),
+            except_errors: true,
+            ..Retain::default()
+        };
+        let (kept, applied) = apply(&rows, Kind::Span, &exempt).unwrap();
+        assert_eq!(count_of(&kept, 3), 5, "the errored trace stays whole");
+        assert_eq!(applied.sampled_out, 95);
     }
 
     #[test]
