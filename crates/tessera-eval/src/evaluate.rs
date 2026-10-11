@@ -44,6 +44,14 @@ pub enum EvalError {
         #[source]
         source: InvalidId,
     },
+    /// A rollup could not be maintained.
+    #[error("rollup {rollup}: {message}")]
+    Rollup {
+        /// The rollup.
+        rollup: String,
+        /// What failed.
+        message: String,
+    },
     /// The plan does not type or bind.
     #[error("rule {rule}: {source}")]
     Plan {

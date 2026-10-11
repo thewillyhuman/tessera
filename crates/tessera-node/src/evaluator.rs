@@ -5,17 +5,20 @@
 //! node owns the slot of (section 11.3, AR-4) is evaluated through the
 //! engine and its outbox delivered: alert events through the node's
 //! write path (CQ-14), notifications to the tenant's routes (CQ-15),
-//! held back by its silences and acknowledgments.
+//! held back by its silences and acknowledgments. The rollups this node
+//! owns are maintained the same way (section 8.7), their output written
+//! through the same path.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use tessera_catalog::{Catalog, ControlStores, Table, TenantStatus};
+use tessera_catalog::{Catalog, ControlStore, ControlStores, Table, TenantStatus};
 use tessera_eval::rule::decode_rows;
 use tessera_eval::{
-    Acknowledgment, AlertRule, AlertSink, Delivery, NotificationRoute, Notifier, RuleGroup, Silence,
+    Acknowledgment, AlertRule, AlertSink, Delivery, NotificationRoute, Notifier, Rollup, RuleGroup,
+    Silence, maintain,
 };
 use tessera_exec::Engine;
 use tessera_object::ObjectStore;
@@ -113,6 +116,7 @@ async fn tenant_round(
     groups
         .open
         .retain(|(t, g), _| t != tenant || owned.iter().any(|(name, _)| name == g));
+    rollups_round(evaluator, tenant, &control).await?;
     if owned.is_empty() {
         return Ok(());
     }
@@ -174,6 +178,49 @@ async fn tenant_round(
             Ok(_) => {}
             Err(error) => {
                 tracing::warn!(%tenant, group = %name, error = %error, "alert delivery failed");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The rollups of `tenant` this node owns, each brought up to date.
+async fn rollups_round(
+    evaluator: &Evaluator,
+    tenant: &TenantId,
+    control: &ControlStore,
+) -> Result<(), String> {
+    let rows = control
+        .rows(Table::Rollups)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (rollups, bad) = decode_rows::<Rollup>(&rows);
+    for problem in bad {
+        tracing::warn!(%tenant, problem, "rollup does not decode");
+    }
+    let now = evaluator.env.clock.now();
+    for rollup in rollups.into_iter().filter(|r| r.enabled) {
+        let slot = format!("{tenant}/rollup-{}", rollup.name);
+        if !evaluator.owned.owns(WorkKind::RuleGroup, slot.as_bytes()) {
+            continue;
+        }
+        match maintain(
+            &evaluator.engine,
+            Arc::clone(&evaluator.store),
+            &evaluator.env,
+            tenant,
+            &rollup,
+            &*evaluator.sink,
+            now,
+        )
+        .await
+        {
+            Ok(maintained) if maintained.rows > 0 => {
+                tracing::info!(%tenant, rollup = %rollup.name, windows = maintained.windows, rows = maintained.rows, "rollup maintained");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%tenant, rollup = %rollup.name, error = %error, "rollup maintenance failed");
             }
         }
     }
