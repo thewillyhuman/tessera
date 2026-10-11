@@ -425,7 +425,9 @@ object has its fields stored under `body.*` next to the text, so
 `json` or `logfmt` stage takes its labels from the stored fields
 rather than parsing the line again (QL-10); the tenant settings
 `parse_json_bodies` (on by default) and `parse_logfmt_bodies` (off)
-choose what is parsed:
+choose what is parsed. The tenant setting `encryption_key` names the
+key, in the nodes' keyring, the tenant's data is sealed under (SE-2,
+CT-7):
 
 ```
 curl -X POST localhost:8080/v1/logs \

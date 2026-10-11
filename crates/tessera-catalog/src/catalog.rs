@@ -15,7 +15,7 @@ use tessera_commit::{
     Action, CommitError, CommitLog, KvMutation, SlotCount, Snapshot, UpdateError,
 };
 use tessera_object::{Key, ObjectStore, PoolState};
-use tessera_types::{Env, PoolId, TenantId, WorkKind};
+use tessera_types::{Env, KeyPolicy, PoolId, TenantId, WorkKind};
 
 use crate::state::{pool_key, put_record, setting_key, slots_key, tenant_key};
 use crate::{
@@ -569,6 +569,17 @@ fn drop_grace(state: &CatalogState) -> Duration {
         .map_or(Catalog::DEFAULT_DROP_GRACE, Duration::from_secs)
 }
 
+/// The tenant's `encryption_key` setting names the key its data is
+/// written under (SE-2, CT-7).
+impl KeyPolicy for Catalog {
+    fn key_name(&self, tenant: &TenantId) -> Option<String> {
+        self.cached()
+            .state()
+            .tenant(tenant)
+            .and_then(|t| t.settings.encryption_key.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -729,6 +740,21 @@ mod tests {
         let altered = catalog.alter_tenant(&name("acme"), patch).await.unwrap();
         assert_eq!(altered.settings.retention_seconds, Some(30));
         assert_eq!(altered.settings.query_concurrency, Some(64));
+    }
+
+    /// SE-2: the catalog answers which key a tenant writes under, from
+    /// its `encryption_key` setting.
+    #[tokio::test]
+    async fn names_the_key_a_tenant_writes_under() {
+        let catalog = Cluster::new().node(1).await;
+        let sealed = TenantSettings {
+            encryption_key: Some("k2025".into()),
+            ..TenantSettings::default()
+        };
+        let acme = catalog.create_tenant(name("acme"), sealed).await.unwrap();
+        assert_eq!(catalog.key_name(&acme.id).as_deref(), Some("k2025"));
+        assert_eq!(catalog.key_name(&TenantId::DEFAULT), None);
+        assert_eq!(catalog.key_name(&TenantId::new("nobody").unwrap()), None);
     }
 
     #[tokio::test]

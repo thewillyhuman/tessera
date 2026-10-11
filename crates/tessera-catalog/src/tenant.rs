@@ -166,6 +166,12 @@ pub struct TenantSettings {
     /// What is dropped, hashed or masked at ingest (SE-4); a patch
     /// with any rules replaces them all.
     pub redactions: Vec<Redaction>,
+    /// The name of the key, in the nodes' keyring, the tenant's blocks
+    /// and files are sealed under (SE-2); none stores them plain. A
+    /// change seals what is written from then on under the new key;
+    /// what the old key sealed is read with it while it stays in the
+    /// keyring.
+    pub encryption_key: Option<String>,
 }
 
 /// Why settings were refused.
@@ -191,6 +197,9 @@ pub enum InvalidSettings {
     /// A limit is zero, which would refuse every query.
     #[error("{0} must be greater than zero")]
     Zero(String),
+    /// A name is empty.
+    #[error("{0} must not be empty")]
+    Empty(String),
 }
 
 impl TenantSettings {
@@ -226,6 +235,10 @@ impl TenantSettings {
             } else {
                 patch.redactions.clone()
             },
+            encryption_key: patch
+                .encryption_key
+                .clone()
+                .or_else(|| self.encryption_key.clone()),
         }
     }
 
@@ -264,6 +277,13 @@ impl TenantSettings {
         ];
         if let Some((setting, _)) = limits.iter().find(|(_, value)| *value == Some(0)) {
             return Err(InvalidSettings::Zero((*setting).to_owned()));
+        }
+        if self
+            .encryption_key
+            .as_deref()
+            .is_some_and(|k| k.trim().is_empty())
+        {
+            return Err(InvalidSettings::Empty("encryption_key".into()));
         }
         Ok(())
     }
@@ -320,6 +340,40 @@ mod tests {
         assert_eq!(
             zero.validate(),
             Err(InvalidSettings::Zero("query_max_memory_bytes".into()))
+        );
+    }
+
+    /// SE-2, CT-7: the key name merges like any setting and cannot be
+    /// blank.
+    #[test]
+    fn the_encryption_key_names_a_key_and_is_kept_until_changed() {
+        let base = TenantSettings {
+            encryption_key: Some("k2025".into()),
+            ..TenantSettings::default()
+        };
+        let unrelated = TenantSettings {
+            query_concurrency: Some(4),
+            ..TenantSettings::default()
+        };
+        assert_eq!(
+            base.merged(&unrelated).encryption_key.as_deref(),
+            Some("k2025")
+        );
+        let rotated = TenantSettings {
+            encryption_key: Some("k2026".into()),
+            ..TenantSettings::default()
+        };
+        assert_eq!(
+            base.merged(&rotated).encryption_key.as_deref(),
+            Some("k2026")
+        );
+        let blank = TenantSettings {
+            encryption_key: Some("  ".into()),
+            ..TenantSettings::default()
+        };
+        assert_eq!(
+            blank.validate(),
+            Err(InvalidSettings::Empty("encryption_key".into()))
         );
     }
 
