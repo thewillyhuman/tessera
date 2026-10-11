@@ -62,6 +62,39 @@ async fn a_node_starts_serves_and_stops() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_node_refuses_to_start_beside_one_that_cannot_read_its_format() {
+    use std::collections::BTreeSet;
+
+    use tessera_cluster::{NodeRecord, registry};
+    use tessera_object::{ObjectStore, layout};
+    use tessera_types::{NodeId, Timestamp};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(LocalStore::open(dir.path()).await.unwrap());
+    let stale = NodeRecord {
+        format: registry::FORMAT,
+        node: NodeId::from_u128(42),
+        roles: BTreeSet::from([Role::Query]),
+        http: "http://old.invalid".into(),
+        started_at: Timestamp::from_system_time(std::time::SystemTime::now()),
+        heartbeat_at: Timestamp::from_system_time(std::time::SystemTime::now()),
+        reads_through: 0,
+    };
+    store
+        .put(
+            &layout::node(stale.node),
+            serde_json::to_vec(&stale).unwrap().into(),
+        )
+        .await
+        .unwrap();
+    let error = Node::start(config(dir.path()), Env::system())
+        .await
+        .err()
+        .expect("a node that cannot read this build's format is live");
+    assert!(error.to_string().contains("cannot read"), "{error}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn nodes_in_one_root_pool_find_each_other() {
     let dir = tempfile::tempdir().unwrap();
     let a = Node::start(config(dir.path()), Env::system())

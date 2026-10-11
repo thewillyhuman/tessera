@@ -128,6 +128,7 @@ mod tests {
         let mut random = SeededRandom::new(seed);
         NodeRecord {
             format: FORMAT,
+            reads_through: crate::registry::READS_THROUGH,
             node: NodeId::random(&mut random),
             roles: roles.iter().copied().collect(),
             http: format!("http://n{seed}"),

@@ -19,6 +19,15 @@ use crate::role::Role;
 
 /// The format of registry entries (OP-7).
 pub const FORMAT: u32 = 1;
+/// The format of the data this build writes: commit objects, writer-log
+/// entries, files, sidecar indexes and checkpoints (OP-7).
+pub const DATA_FORMAT: u32 = 1;
+/// The newest data format this build reads (OP-8).
+pub const READS_THROUGH: u32 = DATA_FORMAT;
+
+fn reads_through_before_the_field() -> u32 {
+    1
+}
 /// How often a node announces itself.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
 /// How old a heartbeat may be before the node counts as gone: three
@@ -40,6 +49,20 @@ pub struct NodeRecord {
     pub started_at: Timestamp,
     /// When it last announced itself, by its clock.
     pub heartbeat_at: Timestamp,
+    /// The newest data format the node reads (OP-7); nodes from before
+    /// the field read the first.
+    #[serde(default = "reads_through_before_the_field")]
+    pub reads_through: u32,
+}
+
+/// The live record with the oldest reader (OP-7): a node must not write
+/// a data format newer than what this node reads.
+#[must_use]
+pub fn oldest_reader(records: &[NodeRecord], now: Timestamp) -> Option<&NodeRecord> {
+    records
+        .iter()
+        .filter(|r| r.is_live_at(now))
+        .min_by_key(|r| r.reads_through)
 }
 
 impl NodeRecord {
@@ -108,6 +131,7 @@ impl Registry {
             http: self.http.clone(),
             started_at: self.started_at,
             heartbeat_at: now,
+            reads_through: READS_THROUGH,
         }
     }
 
@@ -178,6 +202,38 @@ pub async fn list(store: &dyn ObjectStore) -> Result<Vec<NodeRecord>, RegistryEr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_oldest_live_reader_bounds_what_may_be_written() {
+        use super::*;
+
+        let record = |node: u128, reads_through: u32, heartbeat: i64| NodeRecord {
+            format: FORMAT,
+            node: NodeId::from_u128(node),
+            roles: BTreeSet::new(),
+            http: String::new(),
+            started_at: Timestamp::from_nanos(0),
+            heartbeat_at: Timestamp::from_nanos(heartbeat),
+            reads_through,
+        };
+        let now = Timestamp::from_nanos(100_000_000_000);
+        let records = [
+            record(1, 3, now.as_nanos()),
+            record(2, 1, now.as_nanos()),
+            record(3, 0, 0),
+        ];
+        assert_eq!(
+            oldest_reader(&records, now).map(|r| r.node),
+            Some(NodeId::from_u128(2)),
+            "the dead node does not count"
+        );
+        assert!(oldest_reader(&[], now).is_none());
+        let old: NodeRecord = serde_json::from_str(
+            r#"{"format":1,"node":"00000000000000000000000000000001","roles":[],"http":"","started_at":0,"heartbeat_at":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.reads_through, 1, "a record from before the field");
+    }
+
     use tessera_object::MemoryStore;
     use tessera_types::{Clock, ManualClock, SeededRandom, SharedRandom};
 

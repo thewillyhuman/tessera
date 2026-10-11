@@ -284,6 +284,7 @@ mod tests {
         let now = state.env.clock.now();
         NodeRecord {
             format: registry::FORMAT,
+            reads_through: registry::READS_THROUGH,
             node: state.env.node,
             roles: roles.iter().copied().collect::<BTreeSet<_>>(),
             http: http.to_owned(),

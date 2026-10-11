@@ -26,7 +26,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, ControlStores, PoolConfig};
-use tessera_cluster::{Admission, Ledger, Limits, Load, Membership, Registry, Role, registry};
+use tessera_cluster::{
+    Admission, Ledger, Limits, Load, Membership, NodeRecord, Registry, Role, registry,
+};
 use tessera_commit::LeaseManager;
 use tessera_eval::HttpNotifier;
 use tessera_exec::{CpuPool, Engine, QueryLimits};
@@ -139,6 +141,18 @@ pub enum RunError {
     /// The node cannot announce itself.
     #[error("cannot join the cluster: {0}")]
     Registry(#[from] tessera_cluster::RegistryError),
+    /// A live node cannot read what this build writes (OP-7).
+    #[error(
+        "this build writes data format {writes}, which node {node} cannot read (it reads through {reads_through}); upgrade that node first"
+    )]
+    Format {
+        /// The format this build writes.
+        writes: u32,
+        /// The node that cannot read it.
+        node: tessera_types::NodeId,
+        /// The newest format it reads.
+        reads_through: u32,
+    },
     /// A listener cannot be bound or served.
     #[error("cannot serve on {address}: {source}")]
     Serve {
@@ -610,6 +624,23 @@ async fn join(
         advertise.clone(),
     ));
     let own = registry.announce().await?;
+    let now = env.clock.now();
+    let others: Vec<NodeRecord> = registry
+        .list()
+        .await?
+        .into_iter()
+        .filter(|r| r.node != own.node)
+        .collect();
+    if let Some(reader) = tessera_cluster::oldest_reader(&others, now)
+        .filter(|r| r.reads_through < registry::DATA_FORMAT)
+    {
+        registry.withdraw().await?;
+        return Err(RunError::Format {
+            writes: registry::DATA_FORMAT,
+            node: reader.node,
+            reads_through: reader.reads_through,
+        });
+    }
     tracing::info!(?roles, %advertise, "joined the cluster");
     let membership = Arc::new(Membership::new(env.clone(), own));
     loops.push(tokio::spawn(heartbeat::run(

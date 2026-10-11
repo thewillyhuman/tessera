@@ -51,6 +51,7 @@ mod tests {
     fn record(env: &Env, node: NodeId, role: Role) -> NodeRecord {
         NodeRecord {
             format: registry::FORMAT,
+            reads_through: registry::READS_THROUGH,
             node,
             roles: BTreeSet::from([role]),
             http: format!("http://{node}"),
