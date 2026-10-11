@@ -12,8 +12,10 @@
 mod advisor;
 mod background;
 mod evaluator;
+mod health;
 mod heartbeat;
 mod leases;
+pub mod observe;
 mod peers;
 mod retention;
 
@@ -89,6 +91,9 @@ pub struct Config {
     /// administrator (CT-5); on for a single node, off for a cluster
     /// that anyone can reach.
     pub allow_anonymous: bool,
+    /// How often the node writes its load signals to `_system.metrics`
+    /// (section 14.7).
+    pub metrics: Duration,
 }
 
 impl Config {
@@ -111,6 +116,7 @@ impl Config {
             advise: advisor::DEFAULT_INTERVAL,
             ingest: IngestConfig::default(),
             allow_anonymous: true,
+            metrics: observe::DEFAULT_INTERVAL,
         }
     }
 }
@@ -227,6 +233,18 @@ impl Node {
             &mut loops,
         );
         shared.advise_layouts(&config, leases.as_ref(), engine, &controls, &mut loops);
+        loops.push(tokio::spawn(observe::run_metrics(
+            state.clone(),
+            config.metrics,
+        )));
+        if let Some(receiver) = observe::take_logs() {
+            loops.push(tokio::spawn(observe::run_logs(state.clone(), receiver)));
+        }
+        match health::ensure_rules(&controls).await {
+            Ok(added) if added > 0 => tracing::info!(added, "default health rules added"),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(error = %error, "default health rules not added"),
+        }
         let membership = shared.membership;
         let (stop_servers, servers) = serve(state.clone(), listener, pg_listener);
         Ok(Node {

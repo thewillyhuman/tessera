@@ -16,6 +16,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use tessera_cluster::Role;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// Tessera: a unified observability database.
 #[derive(Parser, Debug)]
@@ -68,6 +70,8 @@ async fn main() -> ExitCode {
             tracing_subscriber::EnvFilter::try_from_env("TESSERA_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .finish()
+        .with(tessera_node::observe::install())
         .init();
     let cli = Cli::parse();
     let result = match cli.command {
