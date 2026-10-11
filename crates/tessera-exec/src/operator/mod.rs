@@ -28,7 +28,7 @@ use crate::batch::Batch;
 pub use aggregate::HashAggregate;
 pub use extract::{Extract, Format};
 pub use filter::Filter;
-pub use join::{BuildSide, HashJoin, JoinInput};
+pub use join::{BuildSide, HashJoin, JoinInput, partitioned};
 pub use limit::Limit;
 pub use project::Project;
 pub use range::{RangeVector, Steps};

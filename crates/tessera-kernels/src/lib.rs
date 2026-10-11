@@ -39,7 +39,7 @@ pub use aggregate::{Accumulator, accumulator};
 pub use bodies::{BodyParsing, parse_bodies};
 pub use eval::{evaluate, evaluate_predicate};
 pub use extract::{ERROR_DETAILS_LABEL, ERROR_LABEL, Extracted, extract};
-pub use group::Grouper;
+pub use group::{Grouper, buckets_of};
 pub use tessera_types::event::attributes_column;
 pub use variant::row_labels;
 

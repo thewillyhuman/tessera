@@ -101,15 +101,7 @@ impl Grouper {
     /// groups by bucket and fold each bucket back on its own (QE-11).
     #[must_use]
     pub fn buckets(&self, buckets: u32) -> Vec<u32> {
-        use std::hash::{Hash, Hasher};
-        self.keys
-            .iter()
-            .map(|key| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut hasher);
-                u32::try_from(hasher.finish() % u64::from(buckets.max(1))).unwrap_or(0)
-            })
-            .collect()
+        self.keys.iter().map(|key| bucket(key, buckets)).collect()
     }
 
     /// The key columns of every group, in group id order.
@@ -123,6 +115,33 @@ impl Grouper {
     }
 }
 
+/// The bucket, below `buckets`, of each row of `keys`: a hash of the
+/// row's key values, the same for equal values in any call within a
+/// process, so that the two inputs of a join are split alike (QE-11).
+///
+/// # Errors
+///
+/// If the keys cannot be encoded.
+pub fn buckets_of(keys: &[ArrayRef], buckets: u32) -> Result<Vec<u32>, KernelError> {
+    let converter = RowConverter::new(
+        keys.iter()
+            .map(|k| SortField::new(k.data_type().clone()))
+            .collect(),
+    )?;
+    let rows = converter.convert_columns(keys)?;
+    Ok(rows
+        .iter()
+        .map(|row| bucket(&row.owned(), buckets))
+        .collect())
+}
+
+fn bucket(key: &OwnedRow, buckets: u32) -> u32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    u32::try_from(hasher.finish() % u64::from(buckets.max(1))).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -130,6 +149,26 @@ mod tests {
     use arrow::array::{Array, Int64Array, StringArray};
 
     use super::*;
+
+    /// QE-11: equal keys land in the same bucket whether they come from a
+    /// grouper or from plain columns, so that spilled groups and the
+    /// two sides of a join are split alike.
+    #[test]
+    fn equal_keys_share_a_bucket_across_groupers_and_columns() {
+        let keys: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["a", "b", "a", "c"])),
+            Arc::new(Int64Array::from(vec![1, 2, 1, 3])),
+        ];
+        let mut grouper = Grouper::new(vec![DataType::Utf8, DataType::Int64]).unwrap();
+        let ids = grouper.group_ids(&keys).unwrap();
+        let by_group = grouper.buckets(8);
+        let by_row = buckets_of(&keys, 8).unwrap();
+        for (row, id) in ids.iter().enumerate() {
+            assert_eq!(by_row[row], by_group[*id as usize]);
+        }
+        assert_eq!(by_row[0], by_row[2]);
+        assert!(by_row.iter().all(|b| *b < 8));
+    }
 
     #[test]
     fn a_lookup_finds_seen_keys_and_never_a_null_one() {

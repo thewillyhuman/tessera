@@ -856,3 +856,75 @@ async fn limits_stop_a_query_that_reads_or_runs_too_much() {
         21
     );
 }
+
+/// QE-11: a join whose build side does not fit its grant runs one
+/// bucket of keys at a time through local disk, with the same rows.
+#[tokio::test]
+async fn a_join_past_its_grant_partitions_through_disk() {
+    let (store, env) = populate().await;
+    let dir =
+        std::env::temp_dir().join(format!("tessera-engine-join-spill-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let engine = engine(&store, &env).with_spill_dir(dir.clone());
+    let owners = Plan::Values {
+        schema: Arc::new(Schema::new(vec![
+            Field::new("host", DataType::Utf8, true),
+            Field::new("owner", DataType::Utf8, true),
+        ])),
+        rows: vec![
+            vec![Literal::Text("h0".into()), Literal::Text("ops".into())],
+            vec![Literal::Text("h1".into()), Literal::Text("dev".into())],
+        ],
+    };
+    let host = Expr::Path {
+        path: "attr.host".into(),
+        data_type: DataType::Utf8,
+    };
+    // The scan is the right side of a left join, so it is the side built.
+    let join = Plan::Join {
+        left: JoinSide::new(owners, "o"),
+        right: JoinSide::new(Plan::Scan(scan()), "l"),
+        on: vec![(Expr::column("host"), host)],
+        kind: JoinKind::Left,
+    };
+    let whole = engine.run(&join).await.unwrap();
+    assert_eq!(whole.analysis.spilled_bytes, 0);
+    // The join hashes the build side as one batch and reserves its size
+    // plus a word per row; a grant of exactly the size refuses it.
+    let build = run(&engine, Plan::Scan(scan())).await;
+    let build_bytes = arrow::compute::concat_batches(&build.schema, &build.batches)
+        .unwrap()
+        .get_array_memory_size();
+    let limits = QueryLimits {
+        memory_bytes: build_bytes,
+        ..QueryLimits::default()
+    };
+    let spilled = engine.run_with(&join, &limits).await.unwrap();
+    assert!(
+        spilled.analysis.spilled_bytes > 0,
+        "both sides went through disk"
+    );
+    let rows = |output: &QueryOutput| {
+        let mut rows: Vec<String> = output
+            .batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows()).map(|i| {
+                    b.columns()
+                        .iter()
+                        .map(|c| arrow::util::display::array_value_to_string(c, i).unwrap())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                })
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    assert_eq!(rows(&spilled), rows(&whole));
+    assert!(whole.num_rows() >= 20);
+    assert!(
+        std::fs::read_dir(&dir).unwrap().next().is_none(),
+        "spill files are removed"
+    );
+}

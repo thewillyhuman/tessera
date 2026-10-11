@@ -55,10 +55,12 @@ a scalar subquery; no window
 functions; `$n` parameters bind over the PostgreSQL protocol with
 their types inferred from the columns they meet, but not in `LIMIT`;
 sorts and trace groups spill sorted runs to local disk when their
-memory grant runs out and read them back merged, and an aggregate
+memory grant runs out and read them back merged, an aggregate
 spills its groups' running states by bucket of their key and folds
-each bucket back on its own (QE-11), while
-joins and top-k still fail past the grant; pipelines run one plan
+each bucket back on its own, and a join whose build side does not fit
+splits both sides by bucket of their keys through disk and joins one
+bucket at a time (QE-11), while top-k, whose memory is proportional to
+`k`, still fails past the grant; pipelines run one plan
 node at a time rather than fused
 across stages; a bare attribute reads as text, as a number it gives
 its numbers with text left apart, and compaction stores a path seen

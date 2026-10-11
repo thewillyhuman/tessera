@@ -8,20 +8,30 @@
 //! pairs it finds. Null keys match nothing, as in SQL. The output puts
 //! the left side's columns before the right side's whichever side was
 //! built, under the names the plan's schema gives them.
+//!
+//! A build side the memory grant does not cover goes through
+//! [`partitioned`] instead (QE-11): both sides are split by a hash of
+//! their keys into runs on local disk and each bucket is joined on its
+//! own, the table in memory a bucket's rather than a side's.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
-use arrow::compute::{concat_batches, take};
+use arrow::compute::{concat_batches, take, take_record_batch};
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use tessera_ir::{Expr, JoinKind, qualify};
-use tessera_kernels::{Grouper, evaluate};
+use tessera_kernels::{Grouper, buckets_of, evaluate};
 
 use crate::ExecError;
 use crate::batch::Batch;
 use crate::memory::MemoryPool;
 use crate::operator::sort::emit_flow;
-use crate::operator::{Flow, Operator, Sink};
+use crate::operator::{CollectSink, Flow, Operator, Sink};
+use crate::spill::SpillFile;
+
+/// How many buckets a partitioned join splits its sides into.
+const BUCKETS: u32 = 16;
 
 /// Which input the hash table holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -117,6 +127,96 @@ impl HashJoin {
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
+}
+
+/// Joins `build_rows` and `probe_rows` one bucket of keys at a time
+/// through `dir` on local disk (QE-11): each side is split by a hash of
+/// its keys into one run per bucket, the rows in memory are let go, and
+/// each bucket's build rows are hashed on their own and probed by the
+/// bucket's probe rows. The output is what [`HashJoin`] over the whole
+/// would give, in another order.
+///
+/// # Errors
+///
+/// If a run cannot be written or read, the keys do not evaluate, or a
+/// bucket's build side still does not fit the grant.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two sides and where to spill"
+)]
+pub fn partitioned(
+    kind: JoinKind,
+    build_side: BuildSide,
+    build_rows: Vec<RecordBatch>,
+    build: &JoinInput,
+    probe_rows: Vec<RecordBatch>,
+    probe: &JoinInput,
+    memory: &Arc<MemoryPool>,
+    dir: &Path,
+) -> Result<Vec<RecordBatch>, ExecError> {
+    let build_runs = split_to_disk(build_rows, build, memory, dir)?;
+    let probe_runs = split_to_disk(probe_rows, probe, memory, dir)?;
+    let mut output = Vec::new();
+    for (build_run, probe_run) in build_runs.into_iter().zip(probe_runs) {
+        let Some(probe_run) = probe_run else {
+            // Every output row comes from a probe row.
+            continue;
+        };
+        let hashed: Vec<RecordBatch> = match &build_run {
+            Some(run) => run.read()?.collect::<Result<_, _>>()?,
+            None => Vec::new(),
+        };
+        let mut join = HashJoin::new(kind, build_side, &hashed, build, probe, Arc::clone(memory))?;
+        drop(hashed);
+        let mut sink = CollectSink::new();
+        for rows in probe_run.read()? {
+            join.push(Batch::new(rows?), &mut sink)?;
+        }
+        join.finish(&mut sink)?;
+        output.extend(sink.into_batches());
+    }
+    Ok(output)
+}
+
+/// Writes `rows` to `dir` as one run per bucket of their keys; `None`
+/// for a bucket without rows.
+fn split_to_disk(
+    rows: Vec<RecordBatch>,
+    input: &JoinInput,
+    memory: &Arc<MemoryPool>,
+    dir: &Path,
+) -> Result<Vec<Option<SpillFile>>, ExecError> {
+    let buckets = usize::try_from(BUCKETS).unwrap_or(16);
+    let mut by_bucket: Vec<Vec<RecordBatch>> = vec![Vec::new(); buckets];
+    for batch in rows {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let keys = evaluate_keys(&input.keys, &batch)?;
+        let assigned = buckets_of(&keys, BUCKETS)?;
+        for (bucket, rows) in by_bucket.iter_mut().enumerate() {
+            let indices: UInt32Array = assigned
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| usize::try_from(**b).unwrap_or(0) == bucket)
+                .map(|(row, _)| u32::try_from(row).unwrap_or(u32::MAX))
+                .collect();
+            if !indices.is_empty() {
+                rows.push(take_record_batch(&batch, &indices)?);
+            }
+        }
+    }
+    by_bucket
+        .into_iter()
+        .map(|batches| {
+            if batches.is_empty() {
+                return Ok(None);
+            }
+            let file = SpillFile::write(dir, &input.schema, &batches)?;
+            memory.note_spilled(file.bytes());
+            Ok(Some(file))
+        })
+        .collect()
 }
 
 /// The joined schema: the left columns then the right, qualified; the
@@ -377,5 +477,59 @@ mod tests {
             "nothing matches an empty build side"
         );
         assert_eq!(memory.used(), 0);
+    }
+
+    /// QE-11: joining one bucket at a time through disk gives the rows a
+    /// whole join gives, and leaves no files behind.
+    #[test]
+    fn a_partitioned_join_matches_a_whole_one() {
+        let dir = std::env::temp_dir().join(format!("tessera-join-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (owner_schema, owner_rows) = owners();
+        let logs = JoinInput {
+            schema: schema(),
+            keys: vec![Expr::column("severity_number")],
+            name: "l".into(),
+        };
+        let owners = JoinInput {
+            schema: owner_schema,
+            keys: vec![Expr::column("severity")],
+            name: "o".into(),
+        };
+        for kind in [JoinKind::Inner, JoinKind::Left] {
+            let mut whole = HashJoin::new(
+                kind,
+                BuildSide::Right,
+                &owner_rows,
+                &owners,
+                &logs,
+                MemoryPool::unbounded(),
+            )
+            .unwrap();
+            let expected = run(&mut whole, vec![rows(&[1, 2, 3, 4]), rows(&[5, 6])]);
+            let pool = MemoryPool::unbounded();
+            let got = partitioned(
+                kind,
+                BuildSide::Right,
+                owner_rows.clone(),
+                &owners,
+                vec![rows(&[1, 2, 3, 4]), rows(&[5, 6])],
+                &logs,
+                &pool,
+                &dir,
+            )
+            .unwrap();
+            let mut expected_owners = strings(&expected, "o.owner");
+            let mut got_owners = strings(&got, "o.owner");
+            expected_owners.sort();
+            got_owners.sort();
+            assert_eq!(got_owners, expected_owners, "{kind:?}");
+            assert!(pool.spilled_bytes() > 0);
+            assert_eq!(pool.used(), 0);
+        }
+        assert!(
+            std::fs::read_dir(&dir).unwrap().next().is_none(),
+            "spill files are removed"
+        );
     }
 }

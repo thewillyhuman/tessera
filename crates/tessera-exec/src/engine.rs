@@ -39,7 +39,7 @@ use crate::cache::{self, ResultCache, ResultKey};
 use crate::memory::MemoryPool;
 use crate::operator::{
     BuildSide, CollectSink, Extract, Filter, Format, HashAggregate, HashJoin, JoinInput, Limit,
-    Operator, Project, RangeVector, Sort, Steps, TopK, TraceGroup,
+    Operator, Project, RangeVector, Sort, Steps, TopK, TraceGroup, partitioned,
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
@@ -928,11 +928,29 @@ impl Engine {
             )
         };
         let pool = Arc::clone(&grant.memory);
-        let operator = self
-            .cpu
-            .spawn(move || HashJoin::new(kind, build_side, &build_rows, &build, &probe, pool))
-            .await??;
-        self.pipe(Box::new(operator), probe_rows).await
+        let whole = {
+            let build_rows = build_rows.clone();
+            let (build, probe, pool) = (build.clone(), probe.clone(), Arc::clone(&pool));
+            self.cpu
+                .spawn(move || HashJoin::new(kind, build_side, &build_rows, &build, &probe, pool))
+                .await?
+        };
+        match whole {
+            Ok(operator) => self.pipe(Box::new(operator), probe_rows).await,
+            // Past the grant, one bucket of keys at a time through local
+            // disk (QE-11); without a spill directory the grant stands.
+            Err(ExecError::Memory(failure)) if self.spill_dir.is_some() => {
+                let dir = self.spill_dir.clone().unwrap_or_default();
+                tracing::debug!(%failure, "join past its grant; partitioning through disk");
+                let task = self.cpu.spawn(move || {
+                    partitioned(
+                        kind, build_side, build_rows, &build, probe_rows, &probe, &pool, &dir,
+                    )
+                });
+                Ok(task.await??)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Runs `operator` over `batches` on the CPU pool.
