@@ -90,12 +90,14 @@ async fn compact_nodes_share_the_slots_and_take_over_on_leave() {
     let a = Node::start(config(dir.path()), Env::system())
         .await
         .unwrap();
+    // Thirty-two slots: rendezvous over few slots leaves a node with none
+    // by chance, which is not what the test is about.
     let catalog = &a.state().catalog;
-    for _ in 0..3 {
+    for _ in 0..5 {
         catalog.double_slots(WorkKind::Partition).await.unwrap();
     }
     eventually("a owns every partition slot", || {
-        a.owned().slots(WorkKind::Partition).len() == 8
+        a.owned().slots(WorkKind::Partition).len() == 32
     })
     .await;
     let b = Node::start(config(dir.path()), Env::system())
@@ -106,12 +108,12 @@ async fn compact_nodes_share_the_slots_and_take_over_on_leave() {
             a.owned().slots(WorkKind::Partition),
             b.owned().slots(WorkKind::Partition),
         );
-        !sa.is_empty() && !sb.is_empty() && sa.is_disjoint(&sb) && sa.len() + sb.len() == 8
+        !sa.is_empty() && !sb.is_empty() && sa.is_disjoint(&sb) && sa.len() + sb.len() == 32
     })
     .await;
     b.stop().await;
     eventually("a takes b's slots back", || {
-        a.owned().slots(WorkKind::Partition).len() == 8
+        a.owned().slots(WorkKind::Partition).len() == 32
     })
     .await;
     a.stop().await;
