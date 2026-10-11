@@ -16,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::ApiError;
+use crate::auth::Identity;
 
 /// How long the issuer's keys are kept before they are read again.
 const KEYS_TTL: Duration = Duration::from_secs(600);
@@ -32,17 +33,6 @@ pub struct Oidc {
     pub tenant_claim: String,
     /// The claim listing the roles the token acts with.
     pub roles_claim: String,
-}
-
-/// What a verified token says.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Identity {
-    /// The subject.
-    pub subject: String,
-    /// The tenant named by the tenant claim.
-    pub tenant: String,
-    /// The roles listed by the roles claim.
-    pub roles: Vec<String>,
 }
 
 /// Checks tokens against an issuer.

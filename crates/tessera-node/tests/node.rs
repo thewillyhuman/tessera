@@ -123,6 +123,7 @@ async fn tls_listeners_serve_https() {
         cert: cert.clone(),
         key,
         ca: Some(cert.clone()),
+        client_ca: None,
     });
     let node = Node::start(config, Env::system()).await.unwrap();
     let ca = ureq::tls::Certificate::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
@@ -155,6 +156,88 @@ async fn tls_listeners_serve_https() {
             .all(|n| n.http.starts_with("https://")),
         "the node advertises https"
     );
+    node.stop().await;
+}
+
+/// SE-1: with a client CA, a client certificate it signed acts for
+/// the tenant its subject's organization names, with the roles its
+/// organizational unit names; a client presenting none is refused
+/// where anonymous access is off.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_certificates_authenticate_over_mutual_tls() {
+    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+    use ureq::tls::{Certificate, ClientCert, PrivateKey, RootCerts, TlsConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let server_key = KeyPair::generate().unwrap();
+    let server = CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+        .unwrap()
+        .signed_by(&server_key, &ca, &ca_key)
+        .unwrap();
+    let client_key = KeyPair::generate().unwrap();
+    let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    let mut subject = DistinguishedName::new();
+    subject.push(DnType::OrganizationName, "default");
+    subject.push(DnType::OrganizationalUnitName, "reader");
+    subject.push(DnType::CommonName, "grafana");
+    client_params.distinguished_name = subject;
+    let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+    let ca_path = dir.path().join("ca.pem");
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&ca_path, ca.pem()).unwrap();
+    std::fs::write(&cert, server.pem()).unwrap();
+    std::fs::write(&key, server_key.serialize_pem()).unwrap();
+    let mut config = config(dir.path());
+    config.allow_anonymous = false;
+    config.tls = Some(tessera_node::Tls {
+        cert,
+        key,
+        ca: Some(ca_path.clone()),
+        client_ca: Some(ca_path),
+    });
+    let node = Node::start(config, Env::system()).await.unwrap();
+    let roots = RootCerts::new_with_certs(&[Certificate::from_pem(ca.pem().as_bytes()).unwrap()]);
+    let presented = ClientCert::new_with_certs(
+        &[Certificate::from_pem(client.pem().as_bytes()).unwrap()],
+        PrivateKey::from_pem(client_key.serialize_pem().as_bytes()).unwrap(),
+    );
+    let agent = |client_cert: Option<ClientCert>| -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .tls_config(
+                TlsConfig::builder()
+                    .root_certs(roots.clone())
+                    .client_cert(client_cert)
+                    .build(),
+            )
+            .build()
+            .into()
+    };
+    let url = format!(
+        "https://127.0.0.1:{}/api/v1/query",
+        node.http_address().port()
+    );
+    let ask = |agent: ureq::Agent| {
+        let url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            let query =
+                serde_json::json!({ "dataset": "prod", "query": "SELECT count(*) FROM logs" });
+            let mut response = agent.post(&url).send_json(query).unwrap();
+            (
+                response.status().as_u16(),
+                response.body_mut().read_to_string().unwrap(),
+            )
+        })
+    };
+    let (status, body) = ask(agent(Some(presented))).await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = ask(agent(None)).await.unwrap();
+    assert_eq!(status, 401, "without a certificate or a key: {body}");
     node.stop().await;
 }
 

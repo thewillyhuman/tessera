@@ -3,7 +3,10 @@
 //! Who a request is (CT-5, SE-1). A request presents an API key as
 //! `Authorization: Bearer tsk_<tenant>_<id>_<secret>`; the key's tenant
 //! names the control store that holds it, the secret is checked against
-//! the stored hash, and the key's roles become the principal's. A
+//! the stored hash, and the key's roles become the principal's. Any
+//! other bearer token is an `OpenID` Connect token (`oidc`), and a
+//! request without a header over a connection whose client certificate
+//! the listener verified is who the certificate says (`mtls`). A
 //! request without credentials is anonymous: a cluster administrator
 //! where anonymous access is enabled, which `tessera run` does, and
 //! refused with 401 elsewhere. Principals are kept a few seconds per
@@ -20,11 +23,24 @@ use axum::http::request::Parts;
 use tessera_catalog::auth::{self as keys, ApiKey};
 use tessera_catalog::{AccessRole, Principal, Table, TenantName, TenantStatus};
 
+use crate::mtls::ClientCertificate;
 use crate::oidc::{Oidc, Verifier};
 use crate::{ApiError, AppState};
 
 /// How long a resolved principal is kept.
 pub const TTL: Duration = Duration::from_secs(5);
+
+/// What a credential other than a key asserts (SE-1): a token's claims
+/// or a certificate's subject.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity {
+    /// Who: the token's subject or the certificate's common name.
+    pub subject: String,
+    /// The tenant acted for, by name.
+    pub tenant: String,
+    /// The roles acted with, by name.
+    pub roles: Vec<String>,
+}
 
 /// A node's authentication settings and its kept principals.
 pub struct Auth {
@@ -144,7 +160,10 @@ pub async fn principal(state: &AppState, parts: &Parts) -> Result<Principal, Api
     match bearer(&parts.headers) {
         Some(text) if keys::parse(text).is_some() => with_key(state, text).await,
         Some(text) => with_token(state, text).await,
-        None => anonymous(state),
+        None => match parts.extensions.get::<ClientCertificate>() {
+            Some(certificate) => with_certificate(state, certificate).await,
+            None => anonymous(state),
+        },
     }
 }
 
@@ -170,8 +189,36 @@ pub async fn with_token(state: &AppState, text: &str) -> Result<Principal, ApiEr
     let identity = tokio::task::spawn_blocking(move || verifier.verify(&token))
         .await
         .map_err(|e| ApiError::unavailable(e.to_string()))??;
+    with_identity(state, hashed, identity).await
+}
+
+/// The principal of the client certificate the listener verified
+/// (SE-1): the tenant its organization names, acting with the roles its
+/// organizational units name, kept like a key's principal.
+///
+/// # Errors
+///
+/// 401 for a certificate whose subject names no tenant, or an unknown
+/// one; 403 for a tenant that is not active.
+pub async fn with_certificate(
+    state: &AppState,
+    certificate: &ClientCertificate,
+) -> Result<Principal, ApiError> {
+    let hashed = keys::hash_bytes(certificate.der());
+    if let Some(principal) = state.auth.lookup(&hashed) {
+        return Ok(principal);
+    }
+    with_identity(state, hashed, certificate.identity()?).await
+}
+
+/// The principal `identity` asserts, kept under `hashed`.
+async fn with_identity(
+    state: &AppState,
+    hashed: String,
+    identity: Identity,
+) -> Result<Principal, ApiError> {
     let name = TenantName::new(&identity.tenant)
-        .map_err(|e| ApiError::unauthorized(format!("the token's tenant: {e}")))?;
+        .map_err(|e| ApiError::unauthorized(format!("tenant {}: {e}", identity.tenant)))?;
     let tenant = state
         .catalog
         .cached()
@@ -305,6 +352,10 @@ mod tests {
                 .unwrap(),
             None => request.body(Body::empty()).unwrap(),
         };
+        send(state, request).await
+    }
+
+    async fn send(state: &AppState, request: Request<Body>) -> (StatusCode, Value) {
         let response = crate::router(state.clone()).oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -487,6 +538,61 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    /// SE-1: a client certificate the listener verified acts for the
+    /// tenant its organization names, with the roles its organizational
+    /// unit names; a header still wins.
+    #[tokio::test]
+    async fn client_certificates_act_for_their_organization_with_their_units_roles() {
+        use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
+
+        let certificate = |organization: &str, unit: &str| {
+            let mut subject = DistinguishedName::new();
+            subject.push(DnType::OrganizationName, organization);
+            subject.push(DnType::OrganizationalUnitName, unit);
+            subject.push(DnType::CommonName, "grafana");
+            let mut params = CertificateParams::default();
+            params.distinguished_name = subject;
+            let key = KeyPair::generate().unwrap();
+            ClientCertificate::new(params.self_signed(&key).unwrap().der().to_vec())
+        };
+        let post = |uri: &str, certificate: &ClientCertificate, key: Option<&str>, body: Value| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .extension(certificate.clone())
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(key) = key {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {key}"));
+            }
+            request.body(Body::from(body.to_string())).unwrap()
+        };
+        let state = locked(async |_| {}).await;
+        let reader = certificate("default", "reader");
+        let (status, body) =
+            send(&state, post("/api/v1/query", &reader, None, query("prod"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, _) = send(&state, post("/v1/logs", &reader, None, logs())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a reader may not write");
+        let stranger = certificate("nobody", "admin");
+        let (status, body) = send(
+            &state,
+            post("/api/v1/query", &stranger, None, query("prod")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) = send(
+            &state,
+            post(
+                "/api/v1/query",
+                &reader,
+                Some("tsk_default_x_y"),
+                query("prod"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "the header wins: {body}");
     }
 
     #[tokio::test]

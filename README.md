@@ -306,10 +306,15 @@ bearer tokens from that OpenID Connect issuer: a token's signature,
 issuer, audience and expiry are checked against the issuer's published
 keys, and the claims named by `--oidc-tenant-claim` (`tenant`) and
 `--oidc-roles-claim` (`roles`) say which tenant it acts for and with
-which of the tenant's roles (SE-1).
+which of the tenant's roles (SE-1). With `--tls-client-ca`, a client
+certificate signed by that CA is a credential too: the subject's
+organization names the tenant, its organizational units the roles and
+its common name who it is; a client presenting none still connects and
+needs a key or a token. Certificates authenticate the HTTP API; the
+`PostgreSQL` protocol takes keys as passwords (SE-1).
 
-Gaps left in M10: no mutual TLS (SE-1); no
-row-filter roles; no per-tenant encryption keys (SE-2); no Iceberg
+Gaps left in M10: no
+row-filter roles (SE-1); no per-tenant encryption keys (SE-2); no Iceberg
 export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
 load have not been run; neither the image nor the chart has run on a
 cluster, and the binary is not statically linked; membership still comes from the registry alone, not

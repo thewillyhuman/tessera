@@ -79,6 +79,13 @@ struct RunArgs {
     /// otherwise.
     #[arg(long)]
     tls_ca: Option<std::path::PathBuf>,
+    /// A PEM CA certificate client certificates are checked against
+    /// (SE-1). A client presenting a certificate it signed is the tenant
+    /// the subject's organization (O) names, with the roles its
+    /// organizational units (OU) name; one presenting none still
+    /// connects and needs a key or a token.
+    #[arg(long, requires = "tls_cert")]
+    tls_client_ca: Option<std::path::PathBuf>,
     /// The `OpenID` Connect issuer bearer tokens are checked against
     /// (SE-1), as its tokens name it; its discovery document is read
     /// under it. Without it, only API keys are accepted.
@@ -127,6 +134,7 @@ async fn main() -> ExitCode {
                         cert,
                         key,
                         ca: args.tls_ca,
+                        client_ca: args.tls_client_ca,
                     }),
                 oidc: args
                     .oidc_issuer

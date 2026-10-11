@@ -30,6 +30,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use tessera_ingest::otlp;
 use tonic::{Code, Request, Response, Status};
 
+use crate::mtls::ClientCertificate;
 use crate::params::{Need, Scope, scope};
 use crate::{ApiError, AppState};
 
@@ -54,6 +55,9 @@ impl Exporter {
     async fn scope<T>(&self, request: &Request<T>) -> Result<Scope, Status> {
         let (mut parts, ()) = axum::http::Request::new(()).into_parts();
         parts.headers = request.metadata().clone().into_headers();
+        if let Some(certificate) = request.extensions().get::<ClientCertificate>() {
+            parts.extensions.insert(certificate.clone());
+        }
         scope(&self.state, &parts, Need::Write)
             .await
             .map_err(|e| status_of(&e))

@@ -44,11 +44,13 @@ tokio = { version = "1", features = ["net", "rt", "macros"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server"] }
 tracing = "0.1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+x509-certificate = "0.25"
 
 [dev-dependencies]
 base64 = "0.22"
 http-body-util = "0.1"
 rand = "0.8"
+rcgen = "0.13"
 rsa = { version = "0.9", features = ["pem"] }
 snap = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

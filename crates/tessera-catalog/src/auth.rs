@@ -167,9 +167,16 @@ pub fn parse(text: &str) -> Option<KeyText> {
 /// The SHA-256 of `secret`, in hex.
 #[must_use]
 pub fn hash(secret: &str) -> String {
+    hash_bytes(secret.as_bytes())
+}
+
+/// The SHA-256 of `bytes`, in hex: how a credential of any kind is
+/// keyed when its principal is kept.
+#[must_use]
+pub fn hash_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
 
-    let digest = Sha256::digest(secret.as_bytes());
+    let digest = Sha256::digest(bytes);
     digest
         .iter()
         .fold(String::with_capacity(64), |mut hex, byte| {
