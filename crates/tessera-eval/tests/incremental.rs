@@ -220,6 +220,48 @@ async fn a_hopping_window_counts_rows_in_every_window_they_fall_in() {
     assert_eq!(count_at(1_020), Some(1));
 }
 
+/// CQ-7: a group that goes quiet is observed with an empty window once
+/// the watermark closes one without its rows, so absence fires.
+#[tokio::test]
+async fn absence_fires_once_a_closed_window_has_no_rows() {
+    let mut fx = fixture().await;
+    fx.log
+        .append_segment(&[errors(at(1_000), 3, "checkout", 17)])
+        .await
+        .unwrap();
+    let group = group(
+        &fx,
+        "quiet",
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute') \
+         HAVING count(*) < 1",
+    );
+    let busy = group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert!(
+        busy.transitions.is_empty(),
+        "the window with rows does not fire"
+    );
+    let closed = group.evaluate(&fx.engine, at(1_040)).await.unwrap();
+    assert!(
+        closed.transitions.is_empty(),
+        "the window closed with rows in it"
+    );
+    let quiet = group.evaluate(&fx.engine, at(1_100)).await.unwrap();
+    let starts: Vec<i64> = windows(&fx)
+        .await
+        .values()
+        .map(|w| w.start.as_nanos() / 1_000_000_000)
+        .collect();
+    assert_eq!(
+        quiet.transitions.len(),
+        1,
+        "a whole window passed without rows: windows {starts:?}"
+    );
+    assert_eq!(quiet.transitions[0].to, Status::Firing);
+    assert_eq!(quiet.transitions[0].labels["service"], "checkout");
+    assert!(quiet.transitions[0].value.abs() < f64::EPSILON);
+}
+
 #[tokio::test]
 async fn an_average_condition_waits_for_the_watermark() {
     let mut fx = fixture().await;

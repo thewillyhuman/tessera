@@ -657,8 +657,31 @@ pub fn observe(
             }
         }
     }
+    // Absence (CQ-7): a group whose newest window ended before the last
+    // window the watermark has closed had no rows in that window, so it
+    // is observed with an empty one, and a condition such as
+    // `count(*) < 1` can hold. Only conditions that wait for the
+    // watermark can be made true by an empty window.
+    let mut candidates: Vec<WindowState> = newest.values().map(|w| (*w).clone()).collect();
+    if shape.firing == Firing::Watermark {
+        let hop = shape
+            .hop
+            .map_or(length, |h| i64::try_from(h.as_nanos()).unwrap_or(i64::MAX))
+            .max(1);
+        let last_closed = horizon.as_nanos().saturating_sub(length).div_euclid(hop) * hop;
+        for window in newest.values() {
+            if window.start.as_nanos() < last_closed {
+                candidates.push(WindowState {
+                    rule: rule.name.clone(),
+                    start: Timestamp::from_nanos(last_closed),
+                    keys: window.keys.clone(),
+                    partials: vec![Partial::default(); shape.aggregates.len()],
+                });
+            }
+        }
+    }
     let mut observations = Vec::new();
-    for window in newest.values() {
+    for window in &candidates {
         let values: Vec<f64> = shape
             .aggregates
             .iter()

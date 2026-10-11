@@ -176,9 +176,9 @@ from data files when a partition falls behind the WAL retention cap
 notifications; email; the incremental subset is SQL only and counts
 rows unweighted; the alert latency target is set by the evaluation
 interval (five seconds by default) rather than measured; sliding
-windows, sketches and histograms, and absence detection run
-periodically, while hopping windows, `hop(timestamp, size, step)`,
-are incremental.
+windows, sketches and histograms run periodically, while hopping
+windows, `hop(timestamp, size, step)`, and absence, a condition such
+as `count(*) < 1` on a group that goes quiet, are incremental.
 
 **M8, adaptive design: done, with gaps listed below.** A workload
 log: every query appends to `_system.queries` what it asked of each
