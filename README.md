@@ -249,7 +249,47 @@ its creation and does not backfill; a query whose range is not aligned
 to a rollup's windows or reaches past its progress mark reads the raw
 rows whole; narrow integers come back from a rollup as 64-bit.
 
-**M10, hardening: next.**
+**M10, hardening: done, with gaps listed below.** Authentication by
+API key (CT-5, SE-1): a key belongs to one tenant, is issued once as
+`tsk_<tenant>_<id>_<secret>` and stored as a hash in `system.api_keys`,
+and acts with roles from `system.roles` that grant reading and writing
+datasets and administering the tenant, `admin`, `reader` and `writer`
+built in; `X-Scope-OrgID` selects among the tenants a principal may act
+for, which for the `_system` tenant's admins is every one; a request
+without a key is a cluster administrator only where anonymous access is
+on, which `tessera run` does unless `--no-anonymous` is given, and gets
+401 elsewhere; ingest needs write, every query path needs read on each
+dataset the plan scans, control statements and the ruler APIs need
+admin, the administration API needs a cluster administrator and issues
+and revokes keys, and over the PostgreSQL protocol the key is the
+password. An audit dataset, `_system.audit`, records every
+administrative action and control statement with its principal
+(SE-6). Load signals at `GET /metrics` in the Prometheus text format:
+writes in flight, query queueing, compaction and intake backlog,
+evaluator lag and slots held (OP-5). Self-observability: a node writes
+its load signals to `_system.metrics` and its log events to
+`_system.logs`, and ships default health rules for them in the
+`_system` tenant (14.7). `DELETE FROM <table> WHERE ...` on a dataset
+stores a tombstone that hides the matching rows at once and has
+compaction remove them, one node collecting tombstones once every file
+beyond L1 is clean and thirty days have passed (SE-5). Redaction rules
+as tenant settings drop, hash or mask attributes and log bodies at
+ingest, before anything is written (SE-4). A container image, a Helm
+chart and a CI image build (OP-10). Node records announce the newest
+data format a build reads, and a node refuses to start beside one that
+cannot read what it writes (OP-7).
+
+Gaps left in M10: no OIDC or mutual TLS, and traffic is not encrypted
+in transit, so a cluster must run on a private network; node-to-node
+routes under `/internal` carry no credentials (SE-1, SE-3); no
+row-filter roles; no per-tenant encryption keys (SE-2); no Iceberg
+export (OP-9); the scale envelope of 17.2 and a rolling upgrade under
+load have not been run; neither the image nor the chart has run on a
+cluster, and the binary is not statically linked; writer-log latency
+and the commit conflict rate are not measured, so their health rules
+are not shipped; redaction by a pattern over values is not
+implemented; membership still comes from the registry alone, not
+gossip or DNS.
 
 ## Layout
 
