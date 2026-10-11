@@ -13,7 +13,7 @@
 //! Two vectors combine through a join on the step and the label set,
 //! narrowed by `on` or `ignoring` and widened again by `group_left` or
 //! `group_right`; several matches on one side multiply where Loki
-//! fails the query. The `bool` modifier is not supported yet.
+//! fails the query.
 //!
 //! Deviations from Loki found by the differential suite (QL-4):
 //!

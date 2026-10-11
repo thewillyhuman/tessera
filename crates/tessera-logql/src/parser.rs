@@ -536,6 +536,7 @@ impl Parser {
             }
             let start = self.span_here();
             self.at += 1;
+            let bool_modifier = self.eat_ident("bool");
             let matching = self.vector_matching()?;
             let right = self.metric_expr(precedence + 1)?;
             left = MetricExpr::Binary {
@@ -543,6 +544,7 @@ impl Parser {
                 left: Box::new(left),
                 right: Box::new(right),
                 matching,
+                bool_modifier,
                 span: Span::new(start.start, self.previous_end()),
             };
         }
@@ -902,10 +904,16 @@ mod tests {
                 group: Some((true, vec!["env".into()])),
             })
         );
-        let m = metric(r#"rate({a="b"}[1m]) > ignoring(pod) rate({c="d"}[1m])"#);
-        let MetricExpr::Binary { matching, .. } = m else {
+        let m = metric(r#"rate({a="b"}[1m]) > bool ignoring(pod) rate({c="d"}[1m])"#);
+        let MetricExpr::Binary {
+            matching,
+            bool_modifier,
+            ..
+        } = m
+        else {
             panic!("{m:?}")
         };
+        assert!(bool_modifier, "`bool` comes before the matching");
         assert_eq!(
             matching,
             Some(VectorMatching {
@@ -915,10 +923,16 @@ mod tests {
             })
         );
         let m = metric(r#"rate({a="b"}[1m]) + rate({c="d"}[1m])"#);
-        let MetricExpr::Binary { matching, .. } = m else {
+        let MetricExpr::Binary {
+            matching,
+            bool_modifier,
+            ..
+        } = m
+        else {
             panic!("{m:?}")
         };
         assert_eq!(matching, None);
+        assert!(!bool_modifier);
     }
 
     #[test]

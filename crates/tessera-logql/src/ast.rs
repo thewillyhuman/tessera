@@ -270,6 +270,8 @@ pub enum MetricExpr {
         /// How the two sides' series match; none matches on every
         /// label.
         matching: Option<VectorMatching>,
+        /// `bool`: a comparison yields 0 or 1 instead of filtering.
+        bool_modifier: bool,
         /// Where it was written.
         span: Span,
     },

@@ -433,8 +433,16 @@ fn metric_plan(
             left,
             right,
             matching,
+            bool_modifier,
             span,
-        } => binary_plan(*op, left, right, matching.as_ref(), *span, ctx, params),
+        } => {
+            let operator = Operator {
+                op: *op,
+                matching: matching.as_ref(),
+                bool_result: *bool_modifier,
+            };
+            binary_plan(&operator, left, right, *span, ctx, params)
+        }
     }
 }
 
@@ -655,7 +663,7 @@ fn ranked_plan(
 }
 
 /// The engine's operator for `op`, and whether it compares.
-fn operator(op: BinaryOp) -> (tessera_ir::BinaryOp, bool) {
+fn ir_operator(op: BinaryOp) -> (tessera_ir::BinaryOp, bool) {
     match op {
         BinaryOp::Add => (tessera_ir::BinaryOp::Add, false),
         BinaryOp::Sub => (tessera_ir::BinaryOp::Sub, false),
@@ -672,22 +680,40 @@ fn operator(op: BinaryOp) -> (tessera_ir::BinaryOp, bool) {
 }
 
 /// Two vectors matched one to one on their step and their labels, as
+/// A binary operator with its modifiers.
+struct Operator<'a> {
+    /// The operator.
+    op: BinaryOp,
+    /// `on`, `ignoring` and the group modifiers.
+    matching: Option<&'a VectorMatching>,
+    /// `bool`: a comparison yields 0 or 1 instead of filtering.
+    bool_result: bool,
+}
+
+/// `test` as a value: 1 where it holds, 0 elsewhere.
+fn as_number(test: Expr) -> Expr {
+    Expr::Cast {
+        expr: Box::new(test),
+        to: DataType::Float64,
+    }
+}
+
 /// Two vectors matched at each step on their label sets: every label,
 /// the `on` labels alone, or all but the `ignoring` ones. One to one,
 /// the result carries the labels matched on; under `group_left` or
 /// `group_right` it carries the many side's labels and the included
 /// ones of the other. Arithmetic combines the two values, a comparison
-/// keeps the left rows that pass. A series without a match on the
-/// other side drops out; several on one side multiply rather than fail
-/// as in Loki.
+/// keeps the left rows that pass, or under `bool` yields 1 or 0 for
+/// every pair. A series without a match on the other side drops out;
+/// several on one side multiply rather than fail as in Loki.
 fn vector_binary_plan(
-    op: BinaryOp,
+    operator: &Operator<'_>,
     left: &MetricExpr,
     right: &MetricExpr,
-    matching: Option<&VectorMatching>,
     ctx: &BindContext,
     params: RangeParams,
 ) -> Result<Plan, Diagnostic> {
+    let matching = operator.matching;
     let restricted = |labels: Expr| match matching {
         None => labels,
         Some(m) => call(
@@ -743,30 +769,32 @@ fn vector_binary_plan(
             NamedExpr::new(value, VALUE),
         ]
     };
-    let (ir_op, comparison) = operator(op);
-    Ok(if comparison {
+    let (ir_op, comparison) = ir_operator(operator.op);
+    Ok(if comparison && !operator.bool_result {
         joined.filter(l.clone().binary(ir_op, r)).project(keep(l))
+    } else if comparison {
+        joined.project(keep(as_number(l.binary(ir_op, r))))
     } else {
         joined.project(keep(l.binary(ir_op, r)))
     })
 }
 
 /// A vector against a scalar: arithmetic projects the value, a comparison
-/// filters the rows; two scalars fold.
+/// filters the rows or under `bool` projects 1 or 0; two scalars fold.
 fn binary_plan(
-    op: BinaryOp,
+    operator: &Operator<'_>,
     left: &MetricExpr,
     right: &MetricExpr,
-    matching: Option<&VectorMatching>,
     span: Span,
     ctx: &BindContext,
     params: RangeParams,
 ) -> Result<Plan, Diagnostic> {
+    let op = operator.op;
     let (vector, scalar, flipped) = match (constant(left), constant(right)) {
         (Some(l), Some(r)) => return fold_scalars(op, l, r, span),
         (None, Some(s)) => (left, s, false),
         (Some(s), None) => (right, s, true),
-        (None, None) => return vector_binary_plan(op, left, right, matching, ctx, params),
+        (None, None) => return vector_binary_plan(operator, left, right, ctx, params),
     };
     let input = metric_plan(vector, ctx, params)?;
     let (a, b) = if flipped {
@@ -782,7 +810,20 @@ fn binary_plan(
             NamedExpr::new(a.clone().binary(op, b.clone()), VALUE),
         ],
     };
-    let comparison = |op| input.clone().filter(a.clone().binary(op, b.clone()));
+    let comparison = |op| {
+        if operator.bool_result {
+            Plan::Project {
+                input: Box::new(input.clone()),
+                exprs: vec![
+                    NamedExpr::new(Expr::column(TIMESTAMP), TIMESTAMP),
+                    NamedExpr::new(Expr::column(EXTRACTED), EXTRACTED),
+                    NamedExpr::new(as_number(a.clone().binary(op, b.clone())), VALUE),
+                ],
+            }
+        } else {
+            input.clone().filter(a.clone().binary(op, b.clone()))
+        }
+    };
     Ok(match op {
         BinaryOp::Add => arithmetic(tessera_ir::BinaryOp::Add),
         BinaryOp::Sub => arithmetic(tessera_ir::BinaryOp::Sub),
@@ -925,6 +966,22 @@ mod tests {
         assert!(
             out.plan.to_string().contains("Format: keep=[]"),
             "no grouping drops every label"
+        );
+        let flagged = lowered(r#"sum(count_over_time({a="b"}[1m])) > bool 5"#, 30);
+        assert!(
+            flagged.plan.to_string().starts_with(
+                "Project: timestamp AS timestamp, _extracted AS _extracted, CAST((value > 5.0) AS Float64) AS value\n  Aggregate:"
+            ),
+            "`bool` keeps every row with 1 or 0: {}",
+            flagged.plan
+        );
+        let both = lowered(r#"rate({a="b"}[1m]) > bool rate({c="d"}[1m])"#, 30);
+        assert!(
+            both.plan.to_string().starts_with(
+                "Project: l.timestamp AS timestamp, l._extracted AS _extracted, CAST((l.value > r.value) AS Float64) AS value\n  Join inner:"
+            ),
+            "{}",
+            both.plan
         );
     }
 
