@@ -46,7 +46,9 @@ protocol; a differential suite against SQLite.
 Gaps left in M2: joins are hash joins on equality keys, inner or left,
 one `JOIN` per query, with the build side's keys as a runtime filter on
 the other side but no `ASOF`, merge or lookup variants; a subquery
-is a derived table in `FROM` only, not a predicate; no window
+is a derived table in `FROM` or an `IN (SELECT ...)` condition of
+`WHERE`, lowered to a join on its distinct keys, but not `EXISTS` or
+a scalar subquery; no window
 functions; `$n` parameters bind over the PostgreSQL protocol with
 their types inferred from the columns they meet, but not in `LIMIT`;
 sorts and trace groups spill sorted runs to local disk when their

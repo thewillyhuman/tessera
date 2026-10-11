@@ -15,7 +15,8 @@
 //! predicate, and `promql('...', start, end, step)`, `logql('...',
 //! start, end)` and `traceql('...', start, end)` embed the other
 //! languages as tables in `FROM` (QL-3), where a parenthesised query
-//! is a derived table too. `$1`, `$2`, ... are parameters a client
+//! is a derived table too, and `x IN (SELECT ...)` in `WHERE` keeps the
+//! rows whose value the subquery returns. `$1`, `$2`, ... are parameters a client
 //! binds values to, as the `PostgreSQL` protocol does; [`BoundSql`]
 //! lowers a statement with its values and [`describe`] tells a client
 //! what types they take.

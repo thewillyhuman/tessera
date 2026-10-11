@@ -176,7 +176,7 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::otlp::testing::export;
+    use crate::otlp::testing::{SpanSpec, export, export_spans};
 
     async fn post(app: &axum::Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
         let request = Request::builder()
@@ -452,5 +452,69 @@ mod tests {
         let (status, value) = post(&app, serde_json::json!({ "query": "SELECT 1 AS one" })).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["rows"][0][0], 1);
+    }
+
+    /// Trace 1 has an erroring span, trace 2 none; `IN (SELECT ...)`
+    /// keeps the spans of the traces the subquery names, once each.
+    #[tokio::test]
+    async fn in_subquery_filters_by_the_rows_of_another_query() {
+        let app = crate::router(crate::testing::state().await);
+        let span = |trace, id, name, error| SpanSpec {
+            service: "api",
+            trace,
+            id,
+            parent: None,
+            name,
+            start: 0,
+            duration: 1_000,
+            error,
+        };
+        let spans = export_spans(&[
+            span(1, 1, "root", false),
+            span(1, 2, "db", true),
+            span(1, 3, "db", true),
+            span(2, 4, "root", false),
+        ]);
+        let write = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(crate::otlp::DATASET_HEADER, "prod")
+            .body(Body::from(serde_json::to_vec(&spans).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(write).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let names = |value: &serde_json::Value| -> Vec<String> {
+            value["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT name FROM spans WHERE trace_id IN (SELECT trace_id FROM spans \
+                          WHERE status_code = 'error') AND name = 'root' ORDER BY name",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(names(&value), ["root"], "trace 1's root, once: {value}");
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT name FROM spans WHERE trace_id NOT IN (SELECT trace_id FROM spans \
+                          WHERE status_code = 'error') ORDER BY name",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(names(&value), ["root"], "trace 2's root: {value}");
     }
 }

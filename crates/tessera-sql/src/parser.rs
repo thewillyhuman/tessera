@@ -808,6 +808,19 @@ impl Parser<'_> {
         }
         if self.eat_keyword("in") {
             self.expect_symbol("(")?;
+            if self.is_keyword("select") {
+                let query = self.query()?;
+                let end = self.expect_symbol(")")?;
+                let span = Span::new(left.span.start, end.end);
+                return Ok(Expr {
+                    kind: ExprKind::InSubquery {
+                        expr: Box::new(left),
+                        query: Box::new(query),
+                        negated,
+                    },
+                    span,
+                });
+            }
             let mut list = vec![self.expr()?];
             while self.eat_symbol(",") {
                 list.push(self.expr()?);
@@ -1500,5 +1513,28 @@ mod tests {
             ExprKind::InList { list, .. } if list[0].kind == ExprKind::Parameter(2)
         ));
         assert!(parse("SELECT $ FROM logs").is_err());
+    }
+
+    #[test]
+    fn in_takes_a_subquery() {
+        let q = query(
+            "SELECT body FROM logs WHERE trace_id NOT IN (SELECT trace_id FROM spans WHERE \
+             status_code = 'error') AND n IN (1)",
+        );
+        let filter = q.filter.unwrap();
+        let ExprKind::Binary { left, .. } = &filter.kind else {
+            panic!("{filter:?}")
+        };
+        let ExprKind::InSubquery {
+            query,
+            negated: true,
+            ..
+        } = &left.kind
+        else {
+            panic!("{left:?}")
+        };
+        assert_eq!(query.from.as_ref().unwrap().table, "spans");
+        assert!(query.filter.is_some());
+        assert!(parse("SELECT body FROM logs WHERE n IN (SELECT)").is_err());
     }
 }

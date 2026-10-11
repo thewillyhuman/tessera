@@ -386,6 +386,16 @@ pub enum ExprKind {
         /// `NOT` when true.
         negated: bool,
     },
+    /// `expr [NOT] IN (SELECT ...)`: whether the value is among the rows
+    /// of a one-column query.
+    InSubquery {
+        /// The tested expression.
+        expr: Box<Expr>,
+        /// The query.
+        query: Box<Query>,
+        /// `NOT` when true.
+        negated: bool,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// The tested expression.
