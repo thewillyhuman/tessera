@@ -412,7 +412,10 @@ of their own and its links stay with the span. Metrics go to
 `/v1/metrics`, one row per data point, or over Prometheus remote
 write at `/api/v1/write`. An OpenTelemetry Collector's `otlphttp`
 exporter pointed at `http://localhost:8080` works as is for logs,
-traces and metrics. Arbitrary events go to `/api/v1/events` as JSON
+traces and metrics, and so does its `otlp` (gRPC) exporter with
+`tls: {insecure: true}` on a node without TLS: the three export
+services answer on the same port over HTTP/2 (IN-1). Arbitrary events
+go to `/api/v1/events` as JSON
 lines, one object per line with a `timestamp` (RFC 3339 or
 nanoseconds), an optional `name`, `trace_id` and `span_id`, and any
 other member stored as an attribute path (IN-4):

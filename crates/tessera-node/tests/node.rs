@@ -61,6 +61,50 @@ async fn a_node_starts_serves_and_stops() {
     node.stop().await;
 }
 
+/// IN-1: a collector's gRPC exporter reaches the logs service on the
+/// node's one port, and the rows come back over HTTP.
+#[tokio::test(flavor = "multi_thread")]
+async fn otlp_grpc_exports_on_the_same_port() {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+    use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(config(dir.path()), Env::system())
+        .await
+        .unwrap();
+    let mut client = LogsServiceClient::connect(format!("http://{}", node.http_address()))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("over grpc".into())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    });
+    request
+        .metadata_mut()
+        .insert("x-tessera-dataset", "prod".parse().unwrap());
+    client.export(request).await.unwrap();
+    let url = format!("http://{}/api/v1/query", node.http_address());
+    let body = serde_json::json!({ "dataset": "prod", "query": "SELECT body FROM logs" });
+    let (status, text) = common::post(url, vec![], body).await;
+    assert_eq!(status, 200, "{text}");
+    let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["rows"][0][0], "over grpc", "{answer}");
+    node.stop().await;
+}
+
 /// SE-3: with a certificate and key, the HTTP API serves TLS, the
 /// node advertises itself as https, and a client with the CA reaches
 /// it.

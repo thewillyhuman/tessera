@@ -77,13 +77,15 @@ pub fn acceptor(tls: &Tls) -> Result<TlsAcceptor, TlsError> {
         path: tls.cert.clone(),
         source,
     };
-    let config =
+    let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(config_error)?
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(config_error)?;
+    // gRPC clients negotiate HTTP/2 through ALPN (IN-1).
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
