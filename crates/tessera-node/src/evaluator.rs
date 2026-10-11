@@ -84,15 +84,29 @@ async fn round(evaluator: &Evaluator, groups: &mut Groups) {
         .map(|t| t.id.clone())
         .collect();
     let mut lag = Duration::ZERO;
+    let mut degraded = 0;
     for tenant in tenants {
         match tenant_round(evaluator, groups, &tenant).await {
-            Ok(behind) => lag = lag.max(behind),
+            Ok(round) => {
+                lag = lag.max(round.lag);
+                degraded += round.degraded;
+            }
             Err(error) => {
                 tracing::warn!(%tenant, error = %error, "rule evaluation round failed");
             }
         }
     }
     evaluator.load.set_evaluator_lag(lag);
+    evaluator.load.set_degraded_rules(degraded);
+}
+
+/// What one tenant's round reports (OP-5).
+#[derive(Default)]
+struct Round {
+    /// How far the slowest owned group is behind.
+    lag: Duration,
+    /// Owned rules degraded after the round (section 11.7).
+    degraded: u64,
 }
 
 /// The labels of every alert firing in `tenant` across `groups`, from
@@ -147,13 +161,12 @@ async fn delivery_inputs(
     Ok((routes, silences, acknowledgments, inhibitions))
 }
 
-/// One round for `tenant`; returns how far its slowest owned group is
-/// behind.
+/// One round for `tenant`.
 async fn tenant_round(
     evaluator: &Evaluator,
     groups: &mut Groups,
     tenant: &TenantId,
-) -> Result<Duration, String> {
+) -> Result<Round, String> {
     let control = evaluator.controls.open(tenant);
     let rows = control
         .rows(Table::AlertRules)
@@ -181,7 +194,7 @@ async fn tenant_round(
         .retain(|(t, g), _| t != tenant || owned.iter().any(|(name, _)| name == g));
     rollups_round(evaluator, tenant, &control).await?;
     if owned.is_empty() {
-        return Ok(Duration::ZERO);
+        return Ok(Round::default());
     }
     let (routes, silences, acknowledgments, inhibitions) = delivery_inputs(&control).await?;
     let firing = if inhibitions.is_empty() {
@@ -198,7 +211,7 @@ async fn tenant_round(
         inhibitions: &inhibitions,
         firing: &firing,
     };
-    let mut lag = Duration::ZERO;
+    let mut round = Round::default();
     for (name, rules) in owned {
         let key = (tenant.clone(), name.clone());
         let group = match groups.open.get(&key) {
@@ -221,6 +234,10 @@ async fn tenant_round(
                 if !evaluated.transitions.is_empty() {
                     tracing::info!(%tenant, group = %name, transitions = evaluated.transitions.len(), "alert transitions");
                 }
+                if !evaluated.degraded.is_empty() {
+                    tracing::warn!(%tenant, group = %name, rules = ?evaluated.degraded, "rules degraded: windows rebuilt from the files");
+                }
+                round.degraded += u64::try_from(evaluated.degraded.len()).unwrap_or(u64::MAX);
                 if !evaluated.recorded.is_empty() {
                     if let Err(error) = group.record(delivery.sink, &evaluated.recorded).await {
                         tracing::warn!(%tenant, group = %name, error = %error, "recording rules not written");
@@ -240,9 +257,11 @@ async fn tenant_round(
                 tracing::warn!(%tenant, group = %name, error = %error, "alert delivery failed");
             }
         }
-        lag = lag.max(group.lag(now).await.unwrap_or(Duration::ZERO));
+        round.lag = round
+            .lag
+            .max(group.lag(now).await.unwrap_or(Duration::ZERO));
     }
-    Ok(lag)
+    Ok(round)
 }
 
 /// The rollups of `tenant` this node owns, each brought up to date.

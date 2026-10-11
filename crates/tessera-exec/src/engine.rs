@@ -25,10 +25,10 @@ use tessera_format::{FileFormat, FormatError};
 use tessera_ir::{BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, PlanError, Registry};
 use tessera_kernels::Grouper;
 use tessera_kernels::promql::Params;
-use tessera_manifest::{DatasetLogs, ManifestError, Manifests};
+use tessera_manifest::{DatasetLogs, ManifestError, Manifests, View, view};
 use tessera_object::{PoolError, Pools};
 use tessera_types::event::{OBSERVED_TIMESTAMP, TRACE_ID};
-use tessera_types::{DatasetName, Env, Kind, TenantId, Timestamp, Window};
+use tessera_types::{DatasetName, Env, Kind, TenantId, TimeRange, Timestamp, Window};
 
 use crate::ExecError;
 use crate::batch::Batch;
@@ -325,6 +325,33 @@ impl Engine {
     #[must_use]
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// The consistent view of `dataset` and `kind` within `range`
+    /// (section 6.8), read here: the files of the partitions the range
+    /// overlaps and the tail rows no partition has adopted, as they are,
+    /// with where each writer's log was read to (section 11.7).
+    ///
+    /// # Errors
+    ///
+    /// If the registry, a manifest, a file or a segment cannot be read.
+    pub async fn view(
+        &self,
+        tenant: &TenantId,
+        dataset: &DatasetName,
+        kind: Kind,
+        range: TimeRange,
+    ) -> Result<View, EngineError> {
+        let found = view::sources(
+            &self.manifests,
+            tenant,
+            dataset,
+            kind,
+            self.partition_window,
+            range,
+        )
+        .await?;
+        Ok(view::read_sources(&self.pools, &self.format, found).await?)
     }
 
     /// The node's default limits on a query.

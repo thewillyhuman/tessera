@@ -22,18 +22,18 @@ use arrow::array::{
 };
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tessera_commit::Action;
+use tessera_exec::Engine;
 use tessera_ir::{AggregateExpr, BinaryOp, BindContext, Expr, Frontend, Literal, Plan, Statement};
 use tessera_kernels::{evaluate, evaluate_predicate};
 use tessera_manifest::registry;
-use tessera_object::ObjectStore;
+use tessera_object::{ObjectError, ObjectStore};
 use tessera_opt::optimize;
 use tessera_sql::SqlFrontend;
 use tessera_types::event::TIMESTAMP;
-use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, Timestamp};
-use tessera_wal::{EntryBody, reader};
+use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, TimeRange, Timestamp};
+use tessera_wal::{EntryBody, WalError, reader};
 
 use crate::lifecycle::{Observation, fingerprint};
 use crate::rule::{AlertRule, Language};
@@ -435,19 +435,35 @@ pub struct Ingested {
     pub windows: BTreeMap<String, WindowState>,
     /// Rows older than the allowed lateness, ignored (CQ-11).
     pub late_rows: u64,
+    /// When the windows were rebuilt from the files because a log had
+    /// been trimmed past the position held (section 11.7), if they were.
+    pub rebuilt: Option<Timestamp>,
+}
+
+/// Where a source task reads from.
+pub struct Source<'a> {
+    /// The root store, where the writer logs are.
+    pub store: &'a Arc<dyn ObjectStore>,
+    /// The keys sealed blocks are unlocked with (SE-2).
+    pub keys: &'a Arc<Keys>,
+    /// The engine a rebuild reads the consistent view through.
+    pub engine: &'a Engine,
+    /// The tenant.
+    pub tenant: &'a TenantId,
 }
 
 /// Reads every writer's new segments for `rule` and folds them into
-/// the windows the state remembers.
+/// the windows the state remembers. A log trimmed past the position
+/// held (GC-2) means segments were lost: the windows are then rebuilt
+/// from the consistent view instead (section 11.7) and the positions
+/// move to where the view read, so the live logs resume there.
 ///
 /// # Errors
 ///
-/// If the registry or a segment cannot be read, or an expression
-/// cannot be evaluated.
+/// If the registry, a segment or the view cannot be read, or an
+/// expression cannot be evaluated.
 pub async fn ingest(
-    store: &Arc<dyn ObjectStore>,
-    keys: &Arc<Keys>,
-    tenant: &TenantId,
+    source: &Source<'_>,
     rule: &AlertRule,
     shape: &Shape,
     state: &EvalState,
@@ -459,31 +475,47 @@ pub async fn ingest(
         watermarks: state.watermarks.clone(),
         windows: BTreeMap::new(),
         late_rows: 0,
+        rebuilt: None,
     };
-    let writers = registry::list(&**store, tenant, &shape.dataset)
+    let writers = registry::list(&**source.store, source.tenant, &shape.dataset)
         .await
         .map_err(|e| e.to_string())?;
-    let horizon = Timestamp::from_nanos(
-        watermark(
-            state,
-            &writers
-                .iter()
-                .map(|r| r.writer.to_string())
-                .collect::<Vec<_>>(),
-            now,
-        )
-        .as_nanos(),
+    let horizon = watermark(
+        state,
+        &writers
+            .iter()
+            .map(|r| r.writer.to_string())
+            .collect::<Vec<_>>(),
+        now,
     );
     for registration in writers {
         let writer = registration.writer;
         let name = writer.to_string();
         let from = state.positions.get(&name).copied().unwrap_or(Seq::ZERO);
-        let mut entries = reader::entries(Arc::clone(store), writer, from, Arc::clone(keys));
-        while let Some(entry) = entries.try_next().await.map_err(|e| e.to_string())? {
-            if entry.seq() <= from {
-                continue;
-            }
-            ingested.positions.insert(name.clone(), entry.seq());
+        let new: Vec<Seq> = reader::list(&**source.store, writer)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|seq| *seq > from)
+            .collect();
+        if from != Seq::ZERO && new.first().is_some_and(|first| *first != from.next()) {
+            tracing::warn!(
+                tenant = %source.tenant, rule = %rule.name, %writer, held = %from, first = %new[0],
+                "writer log trimmed past the position held; rebuilding the windows from the files"
+            );
+            rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
+            return Ok(ingested);
+        }
+        for seq in new {
+            // An entry collected between the listing and the read is
+            // found missing next time, as a gap.
+            let mut entry = match reader::read(&**source.store, writer, seq).await {
+                Ok(entry) => entry,
+                Err(WalError::Store(ObjectError::NotFound { .. })) => break,
+                Err(error) => return Err(error.to_string()),
+            };
+            entry.unlock(source.keys).map_err(|e| e.to_string())?;
+            ingested.positions.insert(name.clone(), seq);
             let EntryBody::Segment { blocks } = entry.body() else {
                 continue;
             };
@@ -492,7 +524,7 @@ pub async fn ingest(
                 *seen = (*seen).max(newest);
             }
             for batch in entry
-                .blocks_for(tenant, &shape.dataset, shape.kind)
+                .blocks_for(source.tenant, &shape.dataset, shape.kind)
                 .map_err(|e| e.to_string())?
             {
                 fold_batch(rule, shape, state, &mut ingested, batch.rows(), horizon)?;
@@ -500,6 +532,67 @@ pub async fn ingest(
         }
     }
     Ok(ingested)
+}
+
+/// Rebuilds the windows of `rule` from the consistent view (section
+/// 11.7): every window still open at `horizon` is folded again from
+/// scratch out of the rows the files and the tail hold for it, and the
+/// positions move to where the view read each log to.
+async fn rebuild(
+    source: &Source<'_>,
+    rule: &AlertRule,
+    shape: &Shape,
+    horizon: Timestamp,
+    now: Timestamp,
+    ingested: &mut Ingested,
+) -> Result<(), String> {
+    let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
+    // The oldest open window starts after this; rows before it belong
+    // to closed windows and are not late, just not needed.
+    let floor = Timestamp::from_nanos(horizon.as_nanos().saturating_sub(length));
+    let view = source
+        .engine
+        .view(
+            source.tenant,
+            &shape.dataset,
+            shape.kind,
+            TimeRange::new(floor, TimeRange::ALL.end),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let fresh = EvalState::default();
+    let late_before = ingested.late_rows;
+    ingested.windows.clear();
+    for rows in &view.rows {
+        fold_batch(rule, shape, &fresh, ingested, rows, floor)?;
+    }
+    ingested.late_rows = late_before;
+    for (writer, seq) in view.sources.positions {
+        ingested.positions.insert(writer.to_string(), seq);
+    }
+    ingested.rebuilt = Some(now);
+    Ok(())
+}
+
+/// The degraded mark `rule` carries after this read (section 11.7):
+/// when its windows were last rebuilt, kept until the horizon has
+/// closed every window the rebuild could have touched, a window length
+/// after it.
+#[must_use]
+pub fn degraded_mark(
+    rule: &AlertRule,
+    shape: &Shape,
+    ingested: &Ingested,
+    state: &EvalState,
+    horizon: Timestamp,
+) -> Option<Timestamp> {
+    if let Some(at) = ingested.rebuilt {
+        return Some(at);
+    }
+    let at = *state.degraded.get(&rule.name)?;
+    let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
+    let until = at.as_nanos().saturating_add(length);
+    (horizon.as_nanos() < until).then_some(at)
 }
 
 /// The dataset's watermark (section 11.5): the least of every writer's,
@@ -761,7 +854,8 @@ fn condition_batch(
 
 /// The actions that record what a source task read: positions,
 /// watermarks and windows, with windows older than two lengths before
-/// the horizon forgotten.
+/// the horizon forgotten, every old window after a rebuild, and the
+/// rule's degraded mark set or cleared (section 11.7).
 #[must_use]
 pub fn actions(
     rule: &AlertRule,
@@ -771,6 +865,15 @@ pub fn actions(
     horizon: Timestamp,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
+    match (
+        degraded_mark(rule, shape, ingested, state, horizon),
+        state.degraded.get(&rule.name),
+    ) {
+        (Some(at), Some(was)) if *was == at => {}
+        (Some(at), _) => actions.push(EvalState::put_degraded(&rule.name, at)),
+        (None, Some(_)) => actions.push(EvalState::delete_degraded(&rule.name)),
+        (None, None) => {}
+    }
     for (writer, seq) in &ingested.positions {
         if state.positions.get(writer) != Some(seq) {
             actions.push(EvalState::put_position(writer, *seq));
@@ -788,7 +891,7 @@ pub fn actions(
     let forget_before = horizon.as_nanos().saturating_sub(length.saturating_mul(2));
     for (key, window) in &state.windows {
         if window.rule == rule.name
-            && window.start.as_nanos() < forget_before
+            && (window.start.as_nanos() < forget_before || ingested.rebuilt.is_some())
             && !ingested.windows.contains_key(key)
         {
             actions.push(EvalState::delete_window(key));

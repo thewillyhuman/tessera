@@ -229,6 +229,9 @@ struct Group {
     rules: Vec<AlertRule>,
     instances: Vec<Instance>,
     evaluated: BTreeMap<String, Timestamp>,
+    /// The rules whose windows were rebuilt from the files after a log
+    /// was trimmed past them (section 11.7).
+    degraded: BTreeMap<String, Timestamp>,
 }
 
 /// Every group of `tenant` with its instances and evaluation times.
@@ -257,6 +260,7 @@ async fn groups_of(state: &AppState, tenant: &TenantId) -> Result<Vec<Group>, Ap
             rules,
             instances: snapshot.state().instances.values().cloned().collect(),
             evaluated: snapshot.state().evaluated.clone(),
+            degraded: snapshot.state().degraded.clone(),
         });
     }
     Ok(groups)
@@ -283,17 +287,24 @@ fn alert_json(instance: &Instance, annotations: &BTreeMap<String, String>) -> Va
 
 /// A rule as Prometheus lists it, with its active alerts; a recording
 /// rule in the recording shape.
+/// A rule as Prometheus lists it. Its health is `degraded` while its
+/// windows stand rebuilt from the files (section 11.7), `ok` otherwise.
 fn rule_json(group: &Group, rule: &AlertRule) -> Value {
     let last_evaluation = group
         .evaluated
         .get(&rule.name)
         .map_or_else(String::new, ToString::to_string);
+    let health = if group.degraded.contains_key(&rule.name) {
+        "degraded"
+    } else {
+        "ok"
+    };
     if let Some(record) = &rule.record {
         return json!({
             "name": record,
             "query": rule.expr,
             "labels": rule.labels,
-            "health": "ok",
+            "health": health,
             "evaluationTime": 0.0,
             "lastEvaluation": last_evaluation,
             "type": "recording",
@@ -322,7 +333,7 @@ fn rule_json(group: &Group, rule: &AlertRule) -> Value {
         "labels": labels,
         "annotations": rule.annotations,
         "alerts": active.iter().map(|i| alert_json(i, &rule.annotations)).collect::<Vec<_>>(),
-        "health": "ok",
+        "health": health,
         "evaluationTime": 0.0,
         "lastEvaluation": last_evaluation,
         "type": "alerting",
@@ -591,6 +602,25 @@ mod tests {
         let (_, text) = call(&app, get("/api/v1/rules")).await;
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["data"]["groups"], json!([]));
+    }
+
+    /// Section 11.7: a rule whose windows were rebuilt from the files
+    /// says so in its health.
+    #[test]
+    fn a_degraded_rule_reports_its_health() {
+        let rule = AlertRule::new("ns/g/Errors", Language::Sql, "SELECT 1");
+        let mut group = Group {
+            name: "g".into(),
+            rules: vec![rule.clone()],
+            instances: Vec::new(),
+            evaluated: BTreeMap::new(),
+            degraded: BTreeMap::new(),
+        };
+        assert_eq!(rule_json(&group, &rule)["health"], "ok");
+        group
+            .degraded
+            .insert(rule.name.clone(), Timestamp::from_nanos(1));
+        assert_eq!(rule_json(&group, &rule)["health"], "degraded");
     }
 
     #[tokio::test]

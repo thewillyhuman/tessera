@@ -41,6 +41,9 @@ pub struct ViewSources {
     pub files: usize,
     /// Segments read for tail rows.
     pub segments: usize,
+    /// The last entry read of each writer's log: where a consumer that
+    /// folded this view resumes from the live logs (section 11.7).
+    pub positions: BTreeMap<WriterId, Seq>,
 }
 
 /// The rows of a view and where they came from.
@@ -129,6 +132,7 @@ pub async fn sources(
             Arc::clone(&manifests.env().keys),
         );
         while let Some(entry) = entries.try_next().await? {
+            sources.positions.insert(writer, entry.seq());
             if !matches!(entry.body(), EntryBody::Segment { .. }) {
                 continue;
             }
@@ -172,6 +176,19 @@ pub async fn read(
 ) -> Result<View, ManifestError> {
     let manifests = Manifests::new(Arc::clone(pools.root().store()), env.clone(), 1);
     let found = sources(&manifests, tenant, dataset, kind, window, TimeRange::ALL).await?;
+    read_sources(pools, format, found).await
+}
+
+/// The rows of `found`: its files read with `format`, then its tail.
+///
+/// # Errors
+///
+/// If a file cannot be read.
+pub async fn read_sources(
+    pools: &Pools,
+    format: &Arc<dyn FileFormat>,
+    found: Sources,
+) -> Result<View, ManifestError> {
     let mut rows = Vec::new();
     for file in &found.files {
         rows.extend(read_file(pools, format, file).await?);
@@ -428,6 +445,35 @@ mod tests {
             (files_only.sources.files, files_only.sources.segments),
             (3, 0),
             "no registered writer, no segment read"
+        );
+    }
+
+    /// Section 11.7: a consumer that folded a view resumes the live
+    /// logs after the last entry the view read, flush records included.
+    #[tokio::test]
+    async fn the_view_reports_the_last_entry_read_of_every_log() {
+        let store = MemoryStore::new();
+        let env = env();
+        let mut log = WriterLog::start(Arc::new(store.clone()), env.clone());
+        registry::register(
+            &store,
+            &env,
+            &TenantId::DEFAULT,
+            &dataset(),
+            log.writer_id(),
+        )
+        .await
+        .unwrap();
+        log.append_segment(&[batch(0, 0, 3)]).await.unwrap(); // seq 1
+        flush(&store, &env, &mut log, 0, 1, vec![batch(0, 0, 3)]).await; // seq 2
+        adopt(&store, &log).await;
+        log.append_segment(&[batch(0, 10, 2)]).await.unwrap(); // seq 3
+
+        let view = read_view(&store).await;
+        assert_eq!(ids(&view), vec![0, 1, 2, 10, 11]);
+        assert_eq!(
+            view.sources.positions,
+            BTreeMap::from([(log.writer_id(), Seq::new(3))])
         );
     }
 

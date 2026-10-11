@@ -48,6 +48,10 @@ pub struct Evaluated {
     pub transitions: Vec<Transition>,
     /// What the recording rules produced, to be written as metrics.
     pub recorded: Vec<Recorded>,
+    /// The rules marked degraded after this evaluation: their windows
+    /// were rebuilt from the files after a log was trimmed past them
+    /// (section 11.7).
+    pub degraded: Vec<String>,
 }
 
 /// The result of one recording rule at one evaluation.
@@ -183,19 +187,19 @@ impl RuleGroup {
             }
             let outcome = match &incremental {
                 Some(shape) => {
-                    self.observe_incrementally(rule, shape, snapshot.state(), now)
+                    self.observe_incrementally(engine, rule, shape, snapshot.state(), now)
                         .await
                 }
                 None => observe(engine, &self.tenant, rule, now)
                     .await
-                    .map(|observations| (observations, Vec::new()))
+                    .map(|observations| (observations, Vec::new(), false))
                     .map_err(|e| e.to_string()),
             };
-            let (observations, extra) = match outcome {
-                Ok(found) => (Some(found.0), found.1),
+            let (observations, extra, degraded) = match outcome {
+                Ok(found) => (Some(found.0), found.1, found.2),
                 Err(error) => {
                     tracing::warn!(tenant = %self.tenant, group = %self.name, rule = %rule.name, error = %error, "rule evaluation failed");
-                    (None, Vec::new())
+                    (None, Vec::new(), false)
                 }
             };
             // A recording rule's samples are written, not judged: the
@@ -215,6 +219,7 @@ impl RuleGroup {
                 observations,
                 extra,
                 positions_before: snapshot.state().positions.clone(),
+                degraded,
             });
         }
         if observed.is_empty() {
@@ -239,6 +244,11 @@ impl RuleGroup {
                 .into_inner()
                 .unwrap_or_else(PoisonError::into_inner),
             recorded,
+            degraded: observed
+                .iter()
+                .filter(|o| o.degraded)
+                .map(|o| o.rule.name.clone())
+                .collect(),
         })
     }
 
@@ -278,23 +288,24 @@ impl RuleGroup {
     /// The incremental path (CQ-1): read the new segments into the
     /// windows, then read the windows; the actions that record the
     /// read come back with the observations.
+    /// The incremental path of one rule: its new segments folded into
+    /// its windows, what they say, the actions that record it, and
+    /// whether the rule is degraded after them (section 11.7).
     async fn observe_incrementally(
         &self,
+        engine: &Engine,
         rule: &AlertRule,
         shape: &incremental::Shape,
         state: &EvalState,
         now: Timestamp,
-    ) -> Result<(Vec<Observation>, Vec<Action>), String> {
-        let ingested = incremental::ingest(
-            &self.store,
-            &self.keys,
-            &self.tenant,
-            rule,
-            shape,
-            state,
-            now,
-        )
-        .await?;
+    ) -> Result<(Vec<Observation>, Vec<Action>, bool), String> {
+        let source = incremental::Source {
+            store: &self.store,
+            keys: &self.keys,
+            engine,
+            tenant: &self.tenant,
+        };
+        let ingested = incremental::ingest(&source, rule, shape, state, now).await?;
         if ingested.late_rows > 0 {
             tracing::info!(tenant = %self.tenant, rule = %rule.name, late_rows = ingested.late_rows, "late rows ignored");
         }
@@ -302,11 +313,15 @@ impl RuleGroup {
         let mut after = state.clone();
         after.positions.clone_from(&ingested.positions);
         after.watermarks.clone_from(&ingested.watermarks);
+        if ingested.rebuilt.is_some() {
+            after.windows.retain(|_, w| w.rule != rule.name);
+        }
         after.windows.extend(ingested.windows.clone());
         let horizon = incremental::watermark(&after, &writers, now);
         let observations = incremental::observe(rule, shape, &after.windows, horizon)?;
         let actions = incremental::actions(rule, shape, &ingested, state, horizon);
-        Ok((observations, actions))
+        let degraded = incremental::degraded_mark(rule, shape, &ingested, state, horizon).is_some();
+        Ok((observations, actions, degraded))
     }
 
     /// Delivers the outbox (CQ-15). Every pending transition is written
@@ -766,6 +781,8 @@ struct Observed<'a> {
     /// moved past them belongs to another owner (AR-6) and the
     /// evaluation is dropped rather than counted twice.
     positions_before: BTreeMap<String, Seq>,
+    /// Whether the rule is degraded after this evaluation (section 11.7).
+    degraded: bool,
 }
 
 /// The actions that bring `state` up to date with what was observed,
@@ -783,6 +800,7 @@ fn decide(
         observations,
         extra,
         positions_before,
+        degraded: _,
     } in observed
     {
         if !extra.is_empty() && state.positions != *positions_before {

@@ -85,6 +85,11 @@ pub fn metric_rows(
             snapshot.evaluator_lag.as_secs_f64(),
             None,
         ),
+        (
+            "tessera_rules_degraded".into(),
+            snapshot.degraded_rules as f64,
+            None,
+        ),
     ];
     for (kind, held) in &snapshot.slots {
         points.push((
@@ -308,10 +313,11 @@ mod tests {
             compaction_backlog: 1,
             intake_backlog: 0,
             evaluator_lag: Duration::from_secs(3),
+            degraded_rules: 0,
             slots: BTreeMap::from([(WorkKind::Partition, 4), (WorkKind::Intake, 1)]),
         };
         let rows = metric_rows(&snapshot, 3, NodeId::from_u128(7), Timestamp::from_nanos(1));
-        assert_eq!(rows.len(), 9);
+        assert_eq!(rows.len(), 10);
         let conflicts = rows
             .iter()
             .find(|r| r.name == "tessera_commit_conflicts_total")

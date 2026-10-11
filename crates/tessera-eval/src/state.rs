@@ -42,6 +42,12 @@ pub struct EvalState {
     /// (section 11.9).
     #[serde(default)]
     pub group_sent: BTreeMap<String, Timestamp>,
+    /// The rules whose window state was rebuilt from the files after
+    /// falling behind the writer logs (section 11.7), with when; a
+    /// rule stays marked until the horizon has closed the windows the
+    /// rebuild could have touched.
+    #[serde(default)]
+    pub degraded: BTreeMap<String, Timestamp>,
 }
 
 const INSTANCE: &str = "instance/";
@@ -51,6 +57,7 @@ const EVALUATED: &str = "evaluated/";
 const WATERMARK: &str = "watermark/";
 const WINDOW: &str = "window/";
 const GROUP_SENT: &str = "group_sent/";
+const DEGRADED: &str = "degraded/";
 
 impl EvalState {
     /// Records an instance.
@@ -113,6 +120,18 @@ impl EvalState {
         put(format!("{GROUP_SENT}{key}"), &at)
     }
 
+    /// Marks `rule` degraded since `at` (section 11.7).
+    #[must_use]
+    pub fn put_degraded(rule: &str, at: Timestamp) -> Action {
+        put(format!("{DEGRADED}{rule}"), &at)
+    }
+
+    /// Clears the degraded mark of `rule`.
+    #[must_use]
+    pub fn delete_degraded(rule: &str) -> Action {
+        delete(format!("{DEGRADED}{rule}"))
+    }
+
     /// The outbox in transition order.
     #[must_use]
     pub fn pending_transitions(&self) -> Vec<&Transition> {
@@ -166,6 +185,8 @@ impl State for EvalState {
                     self.windows.insert(rest.to_owned(), decode(key, value)?);
                 } else if let Some(rest) = key.strip_prefix(GROUP_SENT) {
                     self.group_sent.insert(rest.to_owned(), decode(key, value)?);
+                } else if let Some(rest) = key.strip_prefix(DEGRADED) {
+                    self.degraded.insert(rest.to_owned(), decode(key, value)?);
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }
@@ -185,6 +206,8 @@ impl State for EvalState {
                     self.windows.remove(rest);
                 } else if let Some(rest) = key.strip_prefix(GROUP_SENT) {
                     self.group_sent.remove(rest);
+                } else if let Some(rest) = key.strip_prefix(DEGRADED) {
+                    self.degraded.remove(rest);
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }
@@ -279,6 +302,12 @@ mod tests {
         state.apply(&EvalState::delete_instance("r", "a")).unwrap();
         assert_eq!(state.outbox.len(), 1);
         assert!(state.instances.is_empty());
+        state
+            .apply(&EvalState::put_degraded("r", Timestamp::from_nanos(5)))
+            .unwrap();
+        assert_eq!(state.degraded["r"], Timestamp::from_nanos(5));
+        state.apply(&EvalState::delete_degraded("r")).unwrap();
+        assert!(state.degraded.is_empty());
         assert!(
             state
                 .apply(&Action::Kv(KvMutation::Put {

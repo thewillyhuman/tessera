@@ -11,11 +11,13 @@ use std::sync::Arc;
 use tessera_eval::{AlertRule, Language, RuleGroup, Status, state};
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::ParquetFormat;
-use tessera_manifest::registry;
-use tessera_object::{MemoryStore, ObjectStore, Pools};
+use tessera_manifest::{intake, registry};
+use tessera_object::{MemoryStore, ObjectStore, Pools, layout};
 use tessera_types::event::Scalar;
-use tessera_types::{DatasetName, Env, EventBatch, LogRow, PoolId, TenantId, Timestamp};
-use tessera_wal::WriterLog;
+use tessera_types::{
+    DatasetName, Env, EventBatch, LogRow, PoolId, Seq, TenantId, Timestamp, Window,
+};
+use tessera_wal::{EntryBody, FlushTarget, WriterLog, write_l1_files};
 
 const SECOND: i64 = 1_000_000_000;
 
@@ -313,4 +315,118 @@ async fn an_average_condition_waits_for_the_watermark() {
         "the watermark passed the window"
     );
     assert!((closed.transitions[0].value - 17.0).abs() < f64::EPSILON);
+}
+
+/// Flushes `batches`, segments `(after, through]`, to files and adopts
+/// them, as the ingester and the intake do.
+async fn flush_and_adopt(fx: &mut Fixture, after: Seq, through: Seq, batches: Vec<EventBatch>) {
+    let target = FlushTarget {
+        store: fx.store.clone(),
+        pool: PoolId::new("root").unwrap(),
+        format: Arc::new(ParquetFormat::default()),
+    };
+    let files = write_l1_files(
+        &target,
+        &fx.env,
+        fx.log.writer_id(),
+        after,
+        through,
+        Window::DEFAULT_LENGTH,
+        batches,
+    )
+    .await
+    .unwrap();
+    fx.log
+        .append(EntryBody::Flush {
+            tenant: TenantId::DEFAULT,
+            dataset: dataset(),
+            after,
+            through,
+            files,
+        })
+        .await
+        .unwrap();
+    intake::run(
+        fx.store.clone(),
+        &fx.env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        fx.log.writer_id(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Section 11.7: a log trimmed past the position a rule holds means
+/// segments it never read are gone; the rule rebuilds its open windows
+/// from the files and the live tail, resumes from the live log, and
+/// stays degraded until the horizon has closed the rebuilt windows.
+#[tokio::test]
+async fn a_rule_behind_a_trimmed_log_rebuilds_from_the_files() {
+    let mut fx = fixture().await;
+    let first = errors(at(1_000), 3, "checkout", 17);
+    let seq1 = fx
+        .log
+        .append_segment(std::slice::from_ref(&first))
+        .await
+        .unwrap();
+    let group = group(
+        &fx,
+        "errors",
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         WHERE severity_text = 'ERROR' \
+         GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute') \
+         HAVING count(*) >= 5",
+    );
+    let early = group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert!(early.transitions.is_empty(), "three errors are not five");
+    assert!(early.degraded.is_empty());
+
+    // The segment goes to a file and is adopted; then garbage collection
+    // removes it and its flush record before the rule reads again, and
+    // a new segment lands on the live log.
+    flush_and_adopt(&mut fx, Seq::ZERO, seq1, vec![first]).await;
+    let writer = fx.log.writer_id();
+    fx.store
+        .delete(&layout::writer_log_entry(writer, Seq::new(1)))
+        .await
+        .unwrap();
+    fx.store
+        .delete(&layout::writer_log_entry(writer, Seq::new(2)))
+        .await
+        .unwrap();
+    fx.log
+        .append_segment(&[errors(at(1_010), 2, "checkout", 17)])
+        .await
+        .unwrap();
+
+    let rebuilt = group.evaluate(&fx.engine, at(1_015)).await.unwrap();
+    assert_eq!(rebuilt.degraded, ["errors"], "the rule is marked degraded");
+    assert_eq!(
+        rebuilt.transitions.len(),
+        1,
+        "the file's three and the tail's two make five"
+    );
+    assert_eq!(rebuilt.transitions[0].to, Status::Firing);
+    assert!((rebuilt.transitions[0].value - 5.0).abs() < f64::EPSILON);
+    let seen = windows(&fx).await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen.values().next().unwrap().partials[0].count, 5);
+
+    // The live log resumes after what the view read: one more row in
+    // the same window is counted once, on top, and the mark holds while
+    // the window is open.
+    fx.log
+        .append_segment(&[errors(at(1_015), 1, "checkout", 17)])
+        .await
+        .unwrap();
+    let resumed = group.evaluate(&fx.engine, at(1_025)).await.unwrap();
+    assert_eq!(resumed.degraded, ["errors"]);
+    let seen = windows(&fx).await;
+    assert_eq!(seen.values().next().unwrap().partials[0].count, 6);
+
+    // A window length after the rebuild the horizon has closed every
+    // window it could have touched, and the mark clears.
+    let later = group.evaluate(&fx.engine, at(1_100)).await.unwrap();
+    assert!(later.degraded.is_empty(), "{:?}", later.degraded);
 }

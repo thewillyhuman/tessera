@@ -31,6 +31,7 @@ pub struct Load {
     compaction_backlog: AtomicU64,
     intake_backlog: AtomicU64,
     evaluator_lag_nanos: AtomicU64,
+    degraded_rules: AtomicU64,
     slots: Mutex<BTreeMap<WorkKind, u64>>,
 }
 
@@ -59,6 +60,9 @@ pub struct Snapshot {
     pub intake_backlog: u64,
     /// How far the slowest owned rule group is behind.
     pub evaluator_lag: Duration,
+    /// Owned rules whose window state was rebuilt from the files after
+    /// falling behind the writer logs (section 11.7).
+    pub degraded_rules: u64,
     /// Slots held per kind of work.
     pub slots: BTreeMap<WorkKind, u64>,
 }
@@ -117,6 +121,11 @@ impl Load {
         );
     }
 
+    /// Sets how many owned rules are degraded (section 11.7).
+    pub fn set_degraded_rules(&self, rules: u64) {
+        self.degraded_rules.store(rules, Ordering::Relaxed);
+    }
+
     /// Sets the slots held of `kind`.
     pub fn set_slots(&self, kind: WorkKind, held: u64) {
         self.slots
@@ -135,6 +144,7 @@ impl Load {
             compaction_backlog: self.compaction_backlog.load(Ordering::Relaxed),
             intake_backlog: self.intake_backlog.load(Ordering::Relaxed),
             evaluator_lag: Duration::from_nanos(self.evaluator_lag_nanos.load(Ordering::Relaxed)),
+            degraded_rules: self.degraded_rules.load(Ordering::Relaxed),
             slots: self
                 .slots
                 .lock()
@@ -183,6 +193,11 @@ impl Snapshot {
             "tessera_evaluator_lag_seconds",
             "How far the slowest owned rule group is behind.",
             format!("{:.3}", self.evaluator_lag.as_secs_f64()),
+        );
+        gauge(
+            "tessera_rules_degraded",
+            "Owned rules whose windows were rebuilt from the files after falling behind the writer logs.",
+            self.degraded_rules.to_string(),
         );
         let _ = writeln!(
             out,
@@ -248,7 +263,9 @@ mod tests {
         load.set_slots(WorkKind::Partition, 3);
         load.set_compaction_backlog(2);
         load.set_evaluator_lag(Duration::from_millis(1_500));
+        load.set_degraded_rules(1);
         let text = load.snapshot().prometheus_text();
+        assert!(text.contains("tessera_rules_degraded 1\n"), "{text}");
         assert!(text.contains("tessera_ingest_queue_depth 0\n"), "{text}");
         assert!(text.contains("tessera_compaction_backlog 2\n"), "{text}");
         assert!(
