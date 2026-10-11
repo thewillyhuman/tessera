@@ -14,7 +14,7 @@
 //! relations are checked pair by pair between the two sides' spans,
 //! walking the parent chain for descendant and ancestor.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -22,7 +22,7 @@ use arrow::array::{
     TimestampNanosecondArray, UInt32Array, new_null_array,
 };
 use arrow::compute::{cast, concat_batches, take};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
 use tessera_ir::trace::{
     MATCHED, NEST_LEFT, NEST_PARENT, NEST_RIGHT, ROOT_NAME, ROOT_SERVICE, SPANSET, SPANSET_LABELS,
     TRACE_DURATION_NS, TRACE_START,
@@ -31,8 +31,8 @@ use tessera_ir::{
     BinaryOp, Expr, Literal, Relation, SortKey, SpanAggregate, Spanset, Structural,
     trace_group_schema,
 };
-use tessera_kernels::{evaluate, evaluate_predicate};
-use tessera_types::event::{DURATION_NS, NAME, PARENT_SPAN_ID, SPAN_ID, TIMESTAMP, TRACE_ID};
+use tessera_kernels::{evaluate, evaluate_predicate, trace};
+use tessera_types::event::{TIMESTAMP, TRACE_ID};
 
 use crate::ExecError;
 use crate::batch::Batch;
@@ -155,6 +155,7 @@ fn fixed<'a>(rows: &'a RecordBatch, name: &str) -> Result<&'a FixedSizeBinaryArr
         .ok_or_else(|| ExecError::Unsupported(format!("trace group input has no {name}")))
 }
 
+#[cfg(test)]
 fn text<'a>(rows: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
     rows.column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
@@ -180,65 +181,16 @@ struct Trace {
 
 impl Trace {
     fn new(spans: &RecordBatch) -> Result<Self, ExecError> {
-        let n = spans.num_rows();
-        let ids = fixed(spans, SPAN_ID)?;
-        let parents = fixed(spans, PARENT_SPAN_ID)?;
-        let by_id: HashMap<&[u8], usize> = (0..n).map(|i| (ids.value(i), i)).collect();
-        let parent: Vec<Option<usize>> = (0..n)
-            .map(|i| {
-                if parents.is_null(i) {
-                    None
-                } else {
-                    by_id.get(parents.value(i)).copied()
-                }
-            })
-            .collect();
-        let timestamps = spans
-            .column_by_name(TIMESTAMP)
-            .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>())
-            .ok_or_else(|| ExecError::Unsupported("trace group input has no timestamp".into()))?;
-        let durations = spans
-            .column_by_name(DURATION_NS)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-        let start = timestamps.values().iter().copied().min().unwrap_or(0);
-        let end = (0..n)
-            .map(|i| {
-                let duration = durations
-                    .filter(|d| !d.is_null(i))
-                    .map_or(0, |d| d.value(i));
-                timestamps.value(i).saturating_add(duration)
-            })
-            .max()
-            .unwrap_or(start);
-        let root = (0..n).find(|&i| parents.is_null(i));
-        let names = text(spans, NAME);
-        let merged = tessera_kernels::attributes_column(spans);
-        let overflow = merged.as_ref();
-        let root_name = root.and_then(|r| {
-            names
-                .filter(|a| !a.is_null(r))
-                .map(|a| a.value(r).to_owned())
-        });
-        let root_service = root
-            .and_then(|r| overflow.filter(|a| !a.is_null(r)).map(|a| a.value(r)))
-            .and_then(service_name);
-        let nested = nested_set(&parent);
-        let rows = with_trace_columns(
-            spans,
-            start,
-            end.saturating_sub(start),
-            root_name.as_deref(),
-            root_service.as_deref(),
-            &nested,
-        )?;
+        let shape = trace::shape(spans)?;
+        let rows = trace::with_trace_columns(spans, &shape)?;
         Ok(Trace {
             rows,
-            parent,
-            nested,
-            start,
-            duration: end.saturating_sub(start),
-            root_name,
-            root_service,
+            parent: shape.parent,
+            nested: shape.nested,
+            start: shape.start,
+            duration: shape.duration,
+            root_name: shape.root_name,
+            root_service: shape.root_service,
         })
     }
 
@@ -270,107 +222,6 @@ impl Trace {
             Relation::Parent => self.parent[left] == Some(right),
         }
     }
-}
-
-/// The nested-set numbers of every span (QL-14): a depth-first walk
-/// from each root, children in start order, gives a span the number
-/// it is entered with and the one it is left with, from one; a span's
-/// parent number is its parent's left, -1 for a root. A span no root
-/// reaches, in a cycle, starts a walk of its own.
-fn nested_set(parent: &[Option<usize>]) -> Vec<(i64, i64, i64)> {
-    let n = parent.len();
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (span, p) in parent.iter().enumerate() {
-        if let Some(p) = p {
-            children[*p].push(span);
-        }
-    }
-    let mut numbers = vec![(0i64, 0i64, -1i64); n];
-    let mut next = 1i64;
-    let roots = (0..n).filter(|&span| parent[span].is_none());
-    let unreached = (0..n).filter(|&span| parent[span].is_some());
-    for root in roots.chain(unreached) {
-        if numbers[root].0 != 0 {
-            continue;
-        }
-        numbers[root].0 = next;
-        next += 1;
-        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
-        while let Some((span, child)) = stack.last_mut() {
-            let span = *span;
-            let Some(&next_child) = children[span].get(*child) else {
-                numbers[span].1 = next;
-                next += 1;
-                stack.pop();
-                continue;
-            };
-            *child += 1;
-            if numbers[next_child].0 == 0 {
-                numbers[next_child].0 = next;
-                numbers[next_child].2 = numbers[span].0;
-                next += 1;
-                stack.push((next_child, 0));
-            }
-        }
-    }
-    numbers
-}
-
-/// `resource.service.name` from an `_overflow` value.
-fn service_name(overflow: &str) -> Option<String> {
-    let object: serde_json::Value = serde_json::from_str(overflow).ok()?;
-    match object.get("resource.service.name")? {
-        serde_json::Value::String(s) => Some(s.clone()),
-        other => Some(other.to_string()),
-    }
-}
-
-/// `spans` with the trace-level columns appended, one value for every
-/// row.
-fn with_trace_columns(
-    spans: &RecordBatch,
-    start: i64,
-    duration: i64,
-    root_name: Option<&str>,
-    root_service: Option<&str>,
-    nested: &[(i64, i64, i64)],
-) -> Result<RecordBatch, ExecError> {
-    let n = spans.num_rows();
-    let mut fields: Vec<Field> = spans
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect();
-    let mut columns: Vec<ArrayRef> = spans.columns().to_vec();
-    fields.push(Field::new(
-        TRACE_START,
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        false,
-    ));
-    columns.push(Arc::new(TimestampNanosecondArray::from(vec![start; n])));
-    fields.push(Field::new(TRACE_DURATION_NS, DataType::Int64, false));
-    columns.push(Arc::new(Int64Array::from(vec![duration; n])));
-    fields.push(Field::new(ROOT_NAME, DataType::Utf8, true));
-    columns.push(Arc::new(StringArray::from(vec![root_name; n])));
-    fields.push(Field::new(ROOT_SERVICE, DataType::Utf8, true));
-    columns.push(Arc::new(StringArray::from(vec![root_service; n])));
-    for (name, pick) in [
-        (NEST_LEFT, 0usize),
-        (NEST_RIGHT, 1usize),
-        (NEST_PARENT, 2usize),
-    ] {
-        fields.push(Field::new(name, DataType::Int64, false));
-        let values: Vec<i64> = nested
-            .iter()
-            .map(|(left, right, parent)| [*left, *right, *parent][pick])
-            .collect();
-        columns.push(Arc::new(Int64Array::from(values)));
-    }
-    Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(fields)),
-        columns,
-    )?)
 }
 
 /// One spanset of a trace: the spans, as indices among the trace's
@@ -704,7 +555,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use tessera_ir::trace_group_schema;
-    use tessera_types::event::{STATUS_CODE, Scalar};
+    use tessera_types::event::{DURATION_NS, NAME, SPAN_ID, STATUS_CODE, Scalar};
     use tessera_types::{
         DatasetName, EventBatch, SpanKind, SpanRow, StatusCode, TenantId, Timestamp,
     };
@@ -896,11 +747,6 @@ mod tests {
                 (5, 1, 4, -1), // GET / of trace 2
                 (6, 2, 3, 1),  // db under it
             ]
-        );
-        assert_eq!(
-            nested_set(&[Some(1), Some(0)]),
-            vec![(1, 4, -1), (2, 3, 1)],
-            "a cycle is walked from its first span"
         );
     }
 

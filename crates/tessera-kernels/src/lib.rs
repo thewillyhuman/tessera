@@ -28,6 +28,7 @@ pub mod redact;
 pub mod sample;
 pub mod template;
 pub mod time;
+pub mod trace;
 pub mod units;
 pub mod variant;
 pub mod window;
