@@ -221,6 +221,18 @@ pub struct NotificationRoute {
     /// firing; four hours by default, as Alertmanager.
     #[serde(default = "default_repeat")]
     pub repeat_seconds: u64,
+    /// The labels alerts are grouped by for this route (section 11.9);
+    /// none puts every alert of the route in one group.
+    #[serde(default)]
+    pub group_by: Vec<String>,
+    /// How long a new group collects alerts before its first
+    /// notification; zero sends at once.
+    #[serde(default)]
+    pub group_wait_seconds: u64,
+    /// The least time between notifications of one group after the
+    /// first; zero sends as alerts arrive.
+    #[serde(default)]
+    pub group_interval_seconds: u64,
 }
 
 fn default_repeat() -> u64 {
@@ -235,6 +247,29 @@ impl NotificationRoute {
     #[must_use]
     pub fn repeat(&self) -> Duration {
         Duration::from_secs(self.repeat_seconds)
+    }
+
+    /// How long a new group waits before its first notification.
+    #[must_use]
+    pub fn group_wait(&self) -> Duration {
+        Duration::from_secs(self.group_wait_seconds)
+    }
+
+    /// The least time between notifications of one group.
+    #[must_use]
+    pub fn group_interval(&self) -> Duration {
+        Duration::from_secs(self.group_interval_seconds)
+    }
+
+    /// The group alerts with `labels` fall in on this route: the values
+    /// of the `group_by` labels, in order.
+    #[must_use]
+    pub fn group_of(&self, labels: &BTreeMap<String, String>) -> String {
+        self.group_by
+            .iter()
+            .map(|name| format!("{name}={}", labels.get(name).map_or("", String::as_str)))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -378,6 +413,31 @@ mod tests {
             .collect()
     }
 
+    /// Section 11.9: a route's group is the values of its `group_by`
+    /// labels; without any, one group takes every alert.
+    #[test]
+    fn a_routes_group_is_the_values_of_its_group_by_labels() {
+        let mut route = NotificationRoute {
+            name: "ops".into(),
+            kind: RouteKind::Webhook,
+            url: "http://ops".into(),
+            routing_key: None,
+            repeat_seconds: 60,
+            group_by: vec!["service".into(), "severity".into()],
+            group_wait_seconds: 30,
+            group_interval_seconds: 300,
+        };
+        let alert = labels(&[("service", "web"), ("severity", "page"), ("host", "h1")]);
+        assert_eq!(route.group_of(&alert), "service=web,severity=page");
+        assert_eq!(
+            route.group_of(&labels(&[("service", "web")])),
+            "service=web,severity="
+        );
+        route.group_by.clear();
+        assert_eq!(route.group_of(&alert), "");
+        assert_eq!(route.group_wait(), Duration::from_secs(30));
+    }
+
     /// Section 11.8: a target is held back while a source fires and
     /// agrees on the equal labels; an alert never inhibits itself.
     #[test]
@@ -485,6 +545,9 @@ mod tests {
             url: "http://x".into(),
             routing_key: None,
             repeat_seconds: 60,
+            group_by: vec![],
+            group_wait_seconds: 0,
+            group_interval_seconds: 0,
         };
         assert_eq!(route.repeat(), Duration::from_secs(60));
     }

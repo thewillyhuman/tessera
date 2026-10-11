@@ -162,9 +162,10 @@ rule, with `EXPLAIN ALERT` saying which applies and why (CQ-8); every
 transition written as an `alert` event with a deterministic id
 (CQ-14); notifications from an outbox, at least once with an
 idempotency key, to webhook, Slack-compatible, PagerDuty-compatible
-and Alertmanager-compatible sinks, held back by silences,
-acknowledgments and inhibition rules and repeated at the route's
-interval (CQ-15, 11.8, 11.9);
+and Alertmanager-compatible sinks, grouped per route by its
+`group_by` labels after `group_wait` and then every `group_interval`,
+held back by silences, acknowledgments and inhibition rules and
+repeated at the route's interval (CQ-15, 11.8, 11.9);
 the `eval` role running the rule groups it owns by slot;
 `system.alert_instances`, `GET /api/v1/rules` and `GET /api/v1/alerts`
 over the state logs.
@@ -173,8 +174,7 @@ Gaps left in M7: rollups and recording rules (M9); one state
 partition per rule group, so the group count rather than the key
 space bounds a group's parallelism (CQ-6); rebuilding window state
 from data files when a partition falls behind the WAL retention cap
-(section 11.7); Alertmanager-style grouping of
-notifications; email; the incremental subset is SQL only and counts
+(section 11.7); email; the incremental subset is SQL only and counts
 rows unweighted; the alert latency target is set by the evaluation
 interval (five seconds by default) rather than measured; sketches
 and histograms run periodically, while hopping windows,

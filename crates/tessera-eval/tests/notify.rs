@@ -30,6 +30,9 @@ fn route(name: &str, repeat_seconds: u64) -> NotificationRoute {
         url: format!("http://{name}"),
         routing_key: None,
         repeat_seconds,
+        group_by: vec![],
+        group_wait_seconds: 0,
+        group_interval_seconds: 0,
     }
 }
 
@@ -173,6 +176,51 @@ async fn silences_and_acknowledgments_hold_notifications_back() {
     let acknowledged = again.deliver(&delivery, at(1_001)).await.unwrap();
     assert_eq!(acknowledged.suppressed, 1);
     assert!(notifier.sent().is_empty());
+}
+
+/// Section 11.9: a route with a group wait collects the alerts of a
+/// group and sends them together in one request once the wait is over.
+#[tokio::test]
+async fn a_route_groups_alerts_and_sends_the_group_in_one_request() {
+    let fx = fixture();
+    let rule = |name: &str| {
+        let mut rule = AlertRule::new(name, Language::Promql, "vector(1)");
+        rule.notify = vec!["ops".into()];
+        rule
+    };
+    let group = RuleGroup::open(
+        fx.store.clone(),
+        TenantId::DEFAULT,
+        "g",
+        vec![rule("a"), rule("b")],
+        fx.env.clone(),
+    );
+    let sink = MemorySink::default();
+    let notifier = MemoryNotifier::default();
+    let mut ops = route("ops", 3_600);
+    ops.group_wait_seconds = 10;
+    ops.group_interval_seconds = 60;
+    let routes = [ops];
+    let delivery = Delivery {
+        sink: &sink,
+        notifier: &notifier,
+        routes: &routes,
+        silences: &[],
+        acknowledgments: &[],
+        inhibitions: &[],
+        firing: &[],
+    };
+    group.evaluate(&fx.engine, at(1_000)).await.unwrap();
+    let held = group.deliver(&delivery, at(1_001)).await.unwrap();
+    assert_eq!((held.events, held.notified, held.waiting), (2, 0, 2));
+    assert!(notifier.sent().is_empty(), "the group is still collecting");
+    assert_eq!(group.outbox().await.unwrap().len(), 2, "still pending");
+    let sent = group.deliver(&delivery, at(1_011)).await.unwrap();
+    assert_eq!((sent.notified, sent.waiting, sent.failed), (2, 0, 0));
+    let requests = notifier.sent();
+    assert_eq!(requests.len(), 1, "one request for the group");
+    assert_eq!(requests[0].1.len(), 2);
+    assert!(group.outbox().await.unwrap().is_empty());
 }
 
 /// Section 11.8: an inhibition rule holds a target back while an alert

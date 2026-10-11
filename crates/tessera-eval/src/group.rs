@@ -8,7 +8,7 @@
 //! events are written (CQ-14), the routes notified (CQ-15) and the
 //! transitions marked done.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -310,13 +310,16 @@ impl RuleGroup {
     }
 
     /// Delivers the outbox (CQ-15). Every pending transition is written
-    /// as an alert event of its rule's dataset (CQ-14); then the firing
-    /// and resolved ones go to their rule's routes unless a silence or
-    /// an acknowledgment covers the instance or an inhibition rule holds
-    /// it back behind a firing alert (section 11.8); then each
-    /// is marked done, except one whose route could not be reached,
-    /// which stays for the next delivery. Instances that keep firing
-    /// are notified again after their route's repeat interval.
+    /// as an alert event of its rule's dataset (CQ-14). The firing and
+    /// resolved ones then go to their rule's routes, grouped as each
+    /// route asks (section 11.9): a group waits `group_wait` after its
+    /// first alert and `group_interval` after its last notification, and
+    /// goes out in one request. A transition is done once every route
+    /// of its rule has it; one held back by a silence, an acknowledgment
+    /// or an inhibition rule is done at once (section 11.8); one whose
+    /// route could not be reached stays for the next delivery. Instances
+    /// that keep firing are notified again after their route's repeat
+    /// interval.
     ///
     /// # Errors
     ///
@@ -338,30 +341,151 @@ impl RuleGroup {
         delivered.events = pending.len();
 
         let mut done: Vec<&Transition> = Vec::new();
-        let mut notified: BTreeMap<String, Instance> = BTreeMap::new();
+        let mut candidates: Vec<(&Transition, &AlertRule)> = Vec::new();
         for transition in &pending {
-            let instance = state
-                .instances
-                .get(&format!("{}/{}", transition.rule, transition.fingerprint));
-            let outcome = self
-                .notify(delivery, transition, instance, false, now)
-                .await;
-            match outcome {
-                Outcome::Sent(instance) => {
-                    delivered.notified += 1;
-                    if let Some(instance) = instance {
-                        notified.insert(instance.key(), instance);
-                    }
-                    done.push(transition);
-                }
-                Outcome::Suppressed => {
+            match self.classify(delivery, transition, now) {
+                Classified::NotNotifiable => done.push(transition),
+                Classified::Suppressed => {
                     delivered.suppressed += 1;
                     done.push(transition);
                 }
-                Outcome::NotNotifiable => done.push(transition),
-                Outcome::Failed => delivered.failed += 1,
+                Classified::Notify(rule) => candidates.push((transition, rule)),
             }
         }
+        let sent = self.send_groups(delivery, state, &candidates, now).await;
+        let mut notified: BTreeMap<String, Instance> = BTreeMap::new();
+        for (i, (transition, _)) in candidates.iter().enumerate() {
+            if !sent.sendable[i] {
+                delivered.waiting += 1;
+                continue;
+            }
+            if sent.failed.contains(&i) {
+                delivered.failed += 1;
+                continue;
+            }
+            delivered.notified += 1;
+            done.push(transition);
+            if let Some(instance) = state
+                .instances
+                .get(&format!("{}/{}", transition.rule, transition.fingerprint))
+            {
+                notified.insert(
+                    instance.key(),
+                    Instance {
+                        notified_at: Some(now),
+                        ..instance.clone()
+                    },
+                );
+            }
+        }
+        self.repeat_firing(delivery, state, &mut notified, &mut delivered, now)
+            .await;
+        let mut actions: Vec<Action> = done.iter().map(|t| EvalState::delete_outbox(t)).collect();
+        actions.extend(notified.values().map(EvalState::put_instance));
+        actions.extend(
+            sent.groups
+                .iter()
+                .map(|key| EvalState::put_group_sent(key, now)),
+        );
+        if !actions.is_empty() {
+            self.log
+                .update(|state| {
+                    Ok::<_, ApplyError>(
+                        actions
+                            .iter()
+                            .filter(|action| applies(state, action))
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .await
+                .map_err(|e: UpdateError<ApplyError>| EvalError::State(e.to_string()))?;
+        }
+        Ok(delivered)
+    }
+
+    /// Sends the due groups of `candidates` (section 11.9): a group is
+    /// due `group_wait` after its first alert, or `group_interval` after
+    /// its last notification, and a candidate goes once every one of
+    /// its routes' groups is due.
+    async fn send_groups(
+        &self,
+        delivery: &Delivery<'_>,
+        state: &EvalState,
+        candidates: &[(&Transition, &AlertRule)],
+        now: Timestamp,
+    ) -> Sent {
+        let groups = group_candidates(delivery, candidates);
+        let due: BTreeSet<&str> = groups
+            .iter()
+            .filter(|(key, (route, members))| {
+                let first = members
+                    .iter()
+                    .map(|i| candidates[*i].0.at)
+                    .min()
+                    .unwrap_or(now);
+                let (anchor, wait) = match state.group_sent.get(key.as_str()) {
+                    Some(last) => (*last, route.group_interval()),
+                    None => (first, route.group_wait()),
+                };
+                now.duration_since(anchor)
+                    .is_some_and(|since| since >= wait)
+            })
+            .map(|(key, _)| key.as_str())
+            .collect();
+        let sendable: Vec<bool> = candidates
+            .iter()
+            .map(|(transition, rule)| {
+                routes_of(delivery, rule)
+                    .all(|route| due.contains(group_key(route, transition).as_str()))
+            })
+            .collect();
+        let mut sent = Sent {
+            sendable,
+            failed: BTreeSet::new(),
+            groups: Vec::new(),
+        };
+        for (key, (route, members)) in &groups {
+            if !due.contains(key.as_str()) {
+                continue;
+            }
+            let members: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|i| sent.sendable[*i])
+                .collect();
+            let notifications: Vec<Notification> = members
+                .iter()
+                .map(|i| Notification {
+                    transition: candidates[*i].0.clone(),
+                    annotations: candidates[*i].1.annotations.clone(),
+                    repeat: false,
+                })
+                .collect();
+            if notifications.is_empty() {
+                continue;
+            }
+            match delivery.notifier.send(route, &notifications).await {
+                Ok(()) => sent.groups.push(key.clone()),
+                Err(error) => {
+                    tracing::warn!(tenant = %self.tenant, route = %route.name, group = %key, error = %error, "notification failed");
+                    sent.failed.extend(members);
+                }
+            }
+        }
+        sent
+    }
+
+    /// Notifies the instances that keep firing again once their route's
+    /// repeat interval has passed since they were last notified.
+    async fn repeat_firing(
+        &self,
+        delivery: &Delivery<'_>,
+        state: &EvalState,
+        notified: &mut BTreeMap<String, Instance>,
+        delivered: &mut Delivered,
+        now: Timestamp,
+    ) {
         for instance in state.instances.values() {
             if instance.status != Status::Firing || notified.contains_key(&instance.key()) {
                 continue;
@@ -385,10 +509,7 @@ impl RuleGroup {
                 labels: instance.labels.clone(),
                 value: instance.value,
             };
-            match self
-                .notify(delivery, &again, Some(instance), true, now)
-                .await
-            {
+            match self.notify(delivery, &again, Some(instance), now).await {
                 Outcome::Sent(Some(instance)) => {
                     delivered.repeated += 1;
                     notified.insert(instance.key(), instance);
@@ -397,23 +518,6 @@ impl RuleGroup {
                 Outcome::Failed => delivered.failed += 1,
             }
         }
-        let mut actions: Vec<Action> = done.iter().map(|t| EvalState::delete_outbox(t)).collect();
-        actions.extend(notified.values().map(EvalState::put_instance));
-        if !actions.is_empty() {
-            self.log
-                .update(|state| {
-                    Ok::<_, ApplyError>(
-                        actions
-                            .iter()
-                            .filter(|action| applies(state, action))
-                            .cloned()
-                            .collect(),
-                    )
-                })
-                .await
-                .map_err(|e: UpdateError<ApplyError>| EvalError::State(e.to_string()))?;
-        }
-        Ok(delivered)
     }
 
     /// Writes `pending` as alert events, one batch per dataset.
@@ -442,24 +546,23 @@ impl RuleGroup {
         Ok(())
     }
 
-    /// Tells the rule's routes about `transition`, unless it is not one
-    /// to notify or the instance is silenced, acknowledged or inhibited.
-    async fn notify(
-        &self,
+    /// Whether `transition` is one to notify, and if so of which rule;
+    /// held back when a silence or an acknowledgment covers the instance
+    /// or an inhibition rule holds it behind a firing alert.
+    fn classify<'r>(
+        &'r self,
         delivery: &Delivery<'_>,
         transition: &Transition,
-        instance: Option<&Instance>,
-        repeat: bool,
         now: Timestamp,
-    ) -> Outcome {
+    ) -> Classified<'r> {
         if !matches!(transition.to, Status::Firing | Status::Resolved) {
-            return Outcome::NotNotifiable;
+            return Classified::NotNotifiable;
         }
         let Some(rule) = self.rule(&transition.rule) else {
-            return Outcome::NotNotifiable;
+            return Classified::NotNotifiable;
         };
         if rule.notify.is_empty() {
-            return Outcome::NotNotifiable;
+            return Classified::NotNotifiable;
         }
         let silenced = delivery
             .silences
@@ -474,25 +577,43 @@ impl RuleGroup {
             .iter()
             .any(|i| i.inhibits(&transition.labels, delivery.firing));
         if silenced || acknowledged || inhibited {
-            return Outcome::Suppressed;
+            return Classified::Suppressed;
         }
+        for name in &rule.notify {
+            if !delivery.routes.iter().any(|r| &r.name == name) {
+                tracing::warn!(tenant = %self.tenant, rule = %rule.name, route = %name, "unknown notification route");
+            }
+        }
+        Classified::Notify(rule)
+    }
+
+    /// Tells the rule's routes about `transition` again, on its own
+    /// and at once: how a still-firing instance is repeated.
+    async fn notify(
+        &self,
+        delivery: &Delivery<'_>,
+        transition: &Transition,
+        instance: Option<&Instance>,
+        now: Timestamp,
+    ) -> Outcome {
+        let rule = match self.classify(delivery, transition, now) {
+            Classified::NotNotifiable => return Outcome::NotNotifiable,
+            Classified::Suppressed => return Outcome::Suppressed,
+            Classified::Notify(rule) => rule,
+        };
         let notification = Notification {
             transition: transition.clone(),
             annotations: rule.annotations.clone(),
-            repeat,
+            repeat: true,
         };
         let mut failed = false;
-        for name in &rule.notify {
-            let Some(route) = delivery.routes.iter().find(|r| &r.name == name) else {
-                tracing::warn!(tenant = %self.tenant, rule = %rule.name, route = %name, "unknown notification route");
-                continue;
-            };
+        for route in routes_of(delivery, rule) {
             if let Err(error) = delivery
                 .notifier
                 .send(route, std::slice::from_ref(&notification))
                 .await
             {
-                tracing::warn!(tenant = %self.tenant, rule = %rule.name, route = %name, error = %error, "notification failed");
+                tracing::warn!(tenant = %self.tenant, rule = %rule.name, route = %route.name, error = %error, "notification failed");
                 failed = true;
             }
         }
@@ -552,6 +673,9 @@ pub struct Delivered {
     pub suppressed: usize,
     /// Still-firing instances notified again.
     pub repeated: usize,
+    /// Transitions held for their group's wait or interval (section
+    /// 11.9).
+    pub waiting: usize,
     /// Notifications that failed and stay pending.
     pub failed: usize,
 }
@@ -563,17 +687,71 @@ enum Outcome {
     Failed,
 }
 
+/// What sending the due groups did.
+struct Sent {
+    /// Per candidate, whether every one of its routes' groups was due.
+    sendable: Vec<bool>,
+    /// Candidates whose route could not be reached.
+    failed: BTreeSet<usize>,
+    /// The groups notified, by key.
+    groups: Vec<String>,
+}
+
+/// What a pending transition is to delivery.
+enum Classified<'r> {
+    Notify(&'r AlertRule),
+    Suppressed,
+    NotNotifiable,
+}
+
+/// The routes `rule` notifies, among those the tenant has.
+fn routes_of<'a>(
+    delivery: &'a Delivery<'_>,
+    rule: &'a AlertRule,
+) -> impl Iterator<Item = &'a NotificationRoute> + 'a {
+    rule.notify
+        .iter()
+        .filter_map(move |name| delivery.routes.iter().find(|r| &r.name == name))
+}
+
+/// The key of the group `transition` falls in on `route`: how the
+/// state remembers when the group was last notified.
+fn group_key(route: &NotificationRoute, transition: &Transition) -> String {
+    format!("{}/{}", route.name, route.group_of(&transition.labels))
+}
+
+/// The candidates by route and group, each group with its route.
+fn group_candidates<'a>(
+    delivery: &'a Delivery<'_>,
+    candidates: &[(&Transition, &'a AlertRule)],
+) -> BTreeMap<String, (&'a NotificationRoute, Vec<usize>)> {
+    let mut groups: BTreeMap<String, (&NotificationRoute, Vec<usize>)> = BTreeMap::new();
+    for (index, (transition, rule)) in candidates.iter().enumerate() {
+        for route in routes_of(delivery, rule) {
+            groups
+                .entry(group_key(route, transition))
+                .or_insert_with(|| (route, Vec::new()))
+                .1
+                .push(index);
+        }
+    }
+    groups
+}
+
 /// Whether a delivery action still makes sense on `state`: a deletion
-/// of an outbox entry that is there, or an instance update of an
-/// instance that is still remembered.
+/// of an outbox entry that is there, an instance update of an instance
+/// that is still remembered, or a group's notification time.
 fn applies(state: &EvalState, action: &Action) -> bool {
     match action {
         Action::Kv(KvMutation::Delete { key }) => key
             .strip_prefix("outbox/")
             .is_some_and(|k| state.outbox.contains_key(k)),
-        Action::Kv(KvMutation::Put { key, .. }) => key
-            .strip_prefix("instance/")
-            .is_some_and(|k| state.instances.contains_key(k)),
+        Action::Kv(KvMutation::Put { key, .. }) => {
+            key.starts_with("group_sent/")
+                || key
+                    .strip_prefix("instance/")
+                    .is_some_and(|k| state.instances.contains_key(k))
+        }
         _ => false,
     }
 }

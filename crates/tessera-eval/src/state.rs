@@ -38,6 +38,10 @@ pub struct EvalState {
     /// The windows of the incremental rules, by `rule/start/fingerprint`.
     #[serde(default)]
     pub windows: BTreeMap<String, WindowState>,
+    /// When each notification group last went out, by route and group
+    /// (section 11.9).
+    #[serde(default)]
+    pub group_sent: BTreeMap<String, Timestamp>,
 }
 
 const INSTANCE: &str = "instance/";
@@ -46,6 +50,7 @@ const OUTBOX: &str = "outbox/";
 const EVALUATED: &str = "evaluated/";
 const WATERMARK: &str = "watermark/";
 const WINDOW: &str = "window/";
+const GROUP_SENT: &str = "group_sent/";
 
 impl EvalState {
     /// Records an instance.
@@ -102,6 +107,12 @@ impl EvalState {
         delete(format!("{WINDOW}{key}"))
     }
 
+    /// Records that the group `key` of a route was notified at `at`.
+    #[must_use]
+    pub fn put_group_sent(key: &str, at: Timestamp) -> Action {
+        put(format!("{GROUP_SENT}{key}"), &at)
+    }
+
     /// The outbox in transition order.
     #[must_use]
     pub fn pending_transitions(&self) -> Vec<&Transition> {
@@ -153,6 +164,8 @@ impl State for EvalState {
                     self.watermarks.insert(rest.to_owned(), decode(key, value)?);
                 } else if let Some(rest) = key.strip_prefix(WINDOW) {
                     self.windows.insert(rest.to_owned(), decode(key, value)?);
+                } else if let Some(rest) = key.strip_prefix(GROUP_SENT) {
+                    self.group_sent.insert(rest.to_owned(), decode(key, value)?);
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }
@@ -170,6 +183,8 @@ impl State for EvalState {
                     self.watermarks.remove(rest);
                 } else if let Some(rest) = key.strip_prefix(WINDOW) {
                     self.windows.remove(rest);
+                } else if let Some(rest) = key.strip_prefix(GROUP_SENT) {
+                    self.group_sent.remove(rest);
                 } else {
                     return Err(ApplyError::new(format!("unknown rule state key {key}")));
                 }

@@ -164,6 +164,9 @@ pub fn system_table_schema(table: &str) -> Option<SchemaRef> {
             text("url"),
             text("routing_key"),
             int("repeat_seconds"),
+            text("group_by"),
+            int("group_wait_seconds"),
+            int("group_interval_seconds"),
         ],
         "retention_policies" | "layout_pins" | "saved_queries" => {
             vec![text("key"), text("document")]

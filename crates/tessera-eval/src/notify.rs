@@ -324,6 +324,9 @@ mod tests {
             url: "http://sink".into(),
             routing_key: Some("key".into()),
             repeat_seconds: 60,
+            group_by: vec![],
+            group_wait_seconds: 0,
+            group_interval_seconds: 0,
         }
     }
 
