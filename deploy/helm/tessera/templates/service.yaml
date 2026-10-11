@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tessera.fullname" . }}
+  labels:
+    {{- include "tessera.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "tessera.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    tessera.dev/serves: "true"
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: 8080
+    - name: pg
+      port: {{ .Values.service.pgPort }}
+      targetPort: 5432

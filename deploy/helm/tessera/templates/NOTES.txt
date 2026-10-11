@@ -1,0 +1,13 @@
+Tessera is starting. The HTTP API and the PostgreSQL protocol are on the
+service {{ include "tessera.fullname" . }} (ports {{ .Values.service.httpPort }} and {{ .Values.service.pgPort }}).
+
+{{- if .Values.allowAnonymous }}
+Anonymous access is on: every request without a key is a cluster
+administrator. Issue a _system admin key, then set allowAnonymous to
+false and upgrade the release.
+{{- else }}
+Requests need an API key. If none exists yet, install once with
+allowAnonymous=true, issue one with
+  curl -X POST http://.../api/v1/tenants/_system/keys -d '{"name":"ops","roles":["admin"]}'
+and upgrade with allowAnonymous=false.
+{{- end }}

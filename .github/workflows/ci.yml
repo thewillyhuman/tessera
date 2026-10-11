@@ -32,6 +32,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --release -p tessera-sim -- --seeds 1000 --nodes 5 --steps 40 --fail-before 0.15 --fail-after 0.15
 
+  image:
+    name: container image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t tessera:ci .
+      - run: docker run --rm tessera:ci --help
+
   licenses:
     name: dependency licenses
     runs-on: ubuntu-latest

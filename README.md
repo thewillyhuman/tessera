@@ -280,6 +280,8 @@ crates/
   tessera-node      one node: wires the roles, the background work and the APIs of a process
   tessera           the binary: the command line over tessera-node
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
+deploy/helm/tessera/ Helm chart: node groups by role over one shared root pool
+Dockerfile          the container image
 compat/sql/         SQL differential tests against SQLite
 compat/logql/       LogQL differential tests against a Loki instance
 compat/traceql/     TraceQL differential tests against a Tempo instance
@@ -296,8 +298,24 @@ cargo run -p tessera -- run --data-dir ./tessera-data \
 ```
 
 The data directory is the root pool; its layout is the object layout of
-spec section 6.2. There is no authentication yet, so both listeners
-bind the loopback interface by default.
+spec section 6.2. A request without an API key acts as a cluster
+administrator unless `--no-anonymous` is given, so both listeners bind
+the loopback interface by default. To require keys, issue one for the
+`_system` tenant while anonymous access is on, then restart with
+`--no-anonymous`:
+
+```
+curl -X POST localhost:8080/api/v1/tenants/_system/keys \
+     -H 'content-type: application/json' -d '{"name":"ops","roles":["admin"]}'
+# {"key":"tsk__system_...","id":"...","name":"ops","roles":["admin"],...}
+curl -H 'authorization: Bearer tsk__system_...' localhost:8080/api/v1/tenants
+```
+
+A key belongs to one tenant and acts with its roles: `admin`, `reader`
+and `writer` are built in, and `INSERT INTO system.roles` defines
+others with the datasets they may read and write. Over the PostgreSQL
+protocol the key is the password. `GET /metrics` and `GET /healthz`
+need no key.
 
 A cluster is several nodes on one root pool: a shared directory for
 now. Each node announces itself in the pool's registry and finds the
@@ -311,6 +329,12 @@ cargo run -p tessera -- run --data-dir /shared/tessera --roles compact     --lis
 ```
 
 Adding a node is starting it; removing one is stopping it.
+
+The same binary runs in a container built from the `Dockerfile`, and the
+Helm chart in `deploy/helm/tessera` runs node groups by role over one
+`ReadWriteMany` volume as the root pool, since the binary reads a local
+directory. Neither has been exercised on a cluster yet; the CI builds
+the image.
 
 ```
 curl -X POST localhost:8080/api/v1/tenants \

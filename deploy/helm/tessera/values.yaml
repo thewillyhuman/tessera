@@ -1,0 +1,37 @@
+# Tessera on Kubernetes. Every node is the same image with different
+# roles (OP-11); nodes find each other through the root pool, which is
+# a ReadWriteMany volume here since the binary reads a local directory.
+# An object-store root pool replaces the volume once the binary takes one.
+
+image:
+  repository: ghcr.io/thewillyhuman/tessera
+  tag: ""        # the chart's appVersion when empty
+  pullPolicy: IfNotPresent
+
+# Node groups: each is a Deployment of nodes running the listed roles.
+groups:
+  front:
+    replicas: 2
+    roles: [ingest, query]
+  back:
+    replicas: 1
+    roles: [compact, eval]
+
+# Requests without an API key are refused unless this is true. Issue
+# keys with POST /api/v1/tenants/{name}/keys from a _system admin key;
+# bootstrap the first one with anonymous access on, then turn it off.
+allowAnonymous: false
+
+rootPool:
+  storageClassName: ""      # must support ReadWriteMany
+  size: 100Gi
+
+service:
+  type: ClusterIP
+  httpPort: 8080
+  pgPort: 5432
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

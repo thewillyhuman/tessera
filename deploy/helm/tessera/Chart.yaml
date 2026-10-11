@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tessera
+description: Tessera, the observability database, on one shared root pool (OP-10).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

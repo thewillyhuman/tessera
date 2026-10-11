@@ -1,0 +1,81 @@
+{{- $root := . -}}
+{{- range $name, $group := .Values.groups }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tessera.fullname" $root }}-{{ $name }}
+  labels:
+    {{- include "tessera.labels" $root | nindent 4 }}
+    tessera.dev/group: {{ $name | quote }}
+spec:
+  replicas: {{ $group.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tessera.name" $root }}
+      app.kubernetes.io/instance: {{ $root.Release.Name }}
+      tessera.dev/group: {{ $name | quote }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "tessera.name" $root }}
+        app.kubernetes.io/instance: {{ $root.Release.Name }}
+        tessera.dev/group: {{ $name | quote }}
+        {{- if or (has "query" $group.roles) (has "ingest" $group.roles) }}
+        tessera.dev/serves: "true"
+        {{- end }}
+    spec:
+      containers:
+        - name: tessera
+          image: {{ include "tessera.image" $root }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          args:
+            - run
+            - --data-dir=/var/lib/tessera
+            - --listen=0.0.0.0:8080
+            - --pg-listen=0.0.0.0:5432
+            - --roles={{ join "," $group.roles }}
+            - --advertise=http://$(POD_IP):8080
+            {{- if not $root.Values.allowAnonymous }}
+            - --no-anonymous
+            {{- end }}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: pg
+              containerPort: 5432
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: root-pool
+              mountPath: /var/lib/tessera
+          resources:
+            {{- toYaml $root.Values.resources | nindent 12 }}
+      volumes:
+        - name: root-pool
+          persistentVolumeClaim:
+            claimName: {{ include "tessera.fullname" $root }}-root-pool
+      {{- with $root.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
