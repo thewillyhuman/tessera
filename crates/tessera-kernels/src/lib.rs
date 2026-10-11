@@ -20,6 +20,7 @@ pub mod extract;
 pub mod group;
 pub mod naming;
 pub mod promql;
+pub mod sample;
 pub mod template;
 pub mod time;
 pub mod units;

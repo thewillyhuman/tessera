@@ -20,8 +20,9 @@ use arrow::compute::{concat_batches, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use tessera_ir::Expr;
 use tessera_kernels::evaluate_predicate;
-use tessera_types::event::{EVENT_ID, SAMPLE_RATE, SERIES_ID, TIMESTAMP, TRACE_ID, VALUE};
-use tessera_types::{Kind, stable_hash};
+use tessera_kernels::sample::sample;
+use tessera_types::Kind;
+use tessera_types::event::{SERIES_ID, TIMESTAMP, VALUE};
 
 use crate::CompactError;
 
@@ -96,79 +97,6 @@ pub fn apply(
         rows = folded;
     }
     Ok((rows, applied))
-}
-
-/// Keeps `rate` of the matching rows, by trace for spans and by event
-/// otherwise, and scales `sample_rate` on the survivors (CO-6, CO-7).
-/// The rate is a fraction of a million, which a `u64` holds whole.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn sample(
-    rows: &RecordBatch,
-    kind: Kind,
-    matches: &BooleanArray,
-    rate: f64,
-) -> Result<(RecordBatch, u64), CompactError> {
-    let identity = if kind == Kind::Span {
-        TRACE_ID
-    } else {
-        EVENT_ID
-    };
-    let ids = rows
-        .column_by_name(identity)
-        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
-    let threshold = (rate * 1_000_000.0) as u64;
-    let keep: BooleanArray = (0..rows.num_rows())
-        .map(|i| {
-            if !matches.value(i) {
-                return Some(true);
-            }
-            let key = ids
-                .filter(|a| !a.is_null(i))
-                .map_or(i as u64, |a| stable_hash(a.value(i)));
-            Some(key % 1_000_000 < threshold)
-        })
-        .collect();
-    let dropped = u64::try_from(rows.num_rows() - keep.true_count()).unwrap_or(0);
-    let kept_matches = filter_record_batch(
-        &RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("m", DataType::Boolean, false)])),
-            vec![Arc::new(matches.clone()) as ArrayRef],
-        )?,
-        &keep,
-    )?;
-    let kept = filter_record_batch(rows, &keep)?;
-    let kept_matches = kept_matches
-        .column(0)
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .cloned()
-        .unwrap_or_else(|| BooleanArray::from(vec![true; kept.num_rows()]));
-    let Some(index) = kept.schema().index_of(SAMPLE_RATE).ok() else {
-        return Ok((kept, dropped));
-    };
-    let current = kept
-        .column(index)
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .cloned()
-        .unwrap_or_else(|| Float64Array::from(vec![1.0; kept.num_rows()]));
-    let scaled: Float64Array = (0..kept.num_rows())
-        .map(|i| {
-            let was = if current.is_null(i) {
-                1.0
-            } else {
-                current.value(i)
-            };
-            Some(if kept_matches.value(i) {
-                was * rate
-            } else {
-                was
-            })
-        })
-        .collect();
-    let mut columns = kept.columns().to_vec();
-    columns[index] = Arc::new(scaled);
-    Ok((RecordBatch::try_new(kept.schema(), columns)?, dropped))
 }
 
 /// One series in one interval, as it is folded.
@@ -319,7 +247,7 @@ pub fn joined(batches: &[RecordBatch]) -> Option<RecordBatch> {
 #[cfg(test)]
 mod tests {
     use tessera_ir::BinaryOp;
-    use tessera_types::event::{MetricType, SEVERITY_NUMBER, Scalar};
+    use tessera_types::event::{MetricType, SAMPLE_RATE, SEVERITY_NUMBER, Scalar, TRACE_ID};
     use tessera_types::{DatasetName, EventBatch, LogRow, MetricRow, SpanRow, TenantId, Timestamp};
 
     use super::*;
