@@ -6,11 +6,12 @@
 //!
 //! The input is every span of the candidate traces. Each trace's spans
 //! are sorted by start time and given the trace-level columns
-//! (`trace_start`, `trace_duration_ns`, `root_name`, `root_service`) so
-//! that conditions can read them; the tree is the `parent_span_id`
-//! links among the trace's own spans. Structural relations are checked
-//! pair by pair between the two sides' spans, walking the parent chain
-//! for descendant and ancestor.
+//! (`trace_start`, `trace_duration_ns`, `root_name`, `root_service`)
+//! and their nested-set numbers (`nest_left`, `nest_right`,
+//! `nest_parent`) so that conditions can read them; the tree is the
+//! `parent_span_id` links among the trace's own spans. Structural
+//! relations are checked pair by pair between the two sides' spans,
+//! walking the parent chain for descendant and ancestor.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -24,7 +25,8 @@ use arrow::compute::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use tessera_ir::trace::{
-    MATCHED, ROOT_NAME, ROOT_SERVICE, SPANSET, SPANSET_LABELS, TRACE_DURATION_NS, TRACE_START,
+    MATCHED, NEST_LEFT, NEST_PARENT, NEST_RIGHT, ROOT_NAME, ROOT_SERVICE, SPANSET, SPANSET_LABELS,
+    TRACE_DURATION_NS, TRACE_START,
 };
 use tessera_ir::{
     BinaryOp, Expr, Literal, Relation, SpanAggregate, Spanset, Structural, trace_group_schema,
@@ -143,6 +145,8 @@ struct Trace {
     rows: RecordBatch,
     /// The index of each span's parent among the trace's spans.
     parent: Vec<Option<usize>>,
+    /// Each span's nested-set numbers: left, right and parent.
+    nested: Vec<(i64, i64, i64)>,
     /// The trace's start.
     start: i64,
     /// The trace's duration in nanoseconds.
@@ -197,16 +201,19 @@ impl Trace {
         let root_service = root
             .and_then(|r| overflow.filter(|a| !a.is_null(r)).map(|a| a.value(r)))
             .and_then(service_name);
+        let nested = nested_set(&parent);
         let rows = with_trace_columns(
             spans,
             start,
             end.saturating_sub(start),
             root_name.as_deref(),
             root_service.as_deref(),
+            &nested,
         )?;
         Ok(Trace {
             rows,
             parent,
+            nested,
             start,
             duration: end.saturating_sub(start),
             root_name,
@@ -244,6 +251,50 @@ impl Trace {
     }
 }
 
+/// The nested-set numbers of every span (QL-14): a depth-first walk
+/// from each root, children in start order, gives a span the number
+/// it is entered with and the one it is left with, from one; a span's
+/// parent number is its parent's left, -1 for a root. A span no root
+/// reaches, in a cycle, starts a walk of its own.
+fn nested_set(parent: &[Option<usize>]) -> Vec<(i64, i64, i64)> {
+    let n = parent.len();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (span, p) in parent.iter().enumerate() {
+        if let Some(p) = p {
+            children[*p].push(span);
+        }
+    }
+    let mut numbers = vec![(0i64, 0i64, -1i64); n];
+    let mut next = 1i64;
+    let roots = (0..n).filter(|&span| parent[span].is_none());
+    let unreached = (0..n).filter(|&span| parent[span].is_some());
+    for root in roots.chain(unreached) {
+        if numbers[root].0 != 0 {
+            continue;
+        }
+        numbers[root].0 = next;
+        next += 1;
+        let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+        while let Some((span, child)) = stack.last_mut() {
+            let span = *span;
+            let Some(&next_child) = children[span].get(*child) else {
+                numbers[span].1 = next;
+                next += 1;
+                stack.pop();
+                continue;
+            };
+            *child += 1;
+            if numbers[next_child].0 == 0 {
+                numbers[next_child].0 = next;
+                numbers[next_child].2 = numbers[span].0;
+                next += 1;
+                stack.push((next_child, 0));
+            }
+        }
+    }
+    numbers
+}
+
 /// `resource.service.name` from an `_overflow` value.
 fn service_name(overflow: &str) -> Option<String> {
     let object: serde_json::Value = serde_json::from_str(overflow).ok()?;
@@ -261,6 +312,7 @@ fn with_trace_columns(
     duration: i64,
     root_name: Option<&str>,
     root_service: Option<&str>,
+    nested: &[(i64, i64, i64)],
 ) -> Result<RecordBatch, ExecError> {
     let n = spans.num_rows();
     let mut fields: Vec<Field> = spans
@@ -282,6 +334,18 @@ fn with_trace_columns(
     columns.push(Arc::new(StringArray::from(vec![root_name; n])));
     fields.push(Field::new(ROOT_SERVICE, DataType::Utf8, true));
     columns.push(Arc::new(StringArray::from(vec![root_service; n])));
+    for (name, pick) in [
+        (NEST_LEFT, 0usize),
+        (NEST_RIGHT, 1usize),
+        (NEST_PARENT, 2usize),
+    ] {
+        fields.push(Field::new(name, DataType::Int64, false));
+        let values: Vec<i64> = nested
+            .iter()
+            .map(|(left, right, parent)| [*left, *right, *parent][pick])
+            .collect();
+        columns.push(Arc::new(Int64Array::from(values)));
+    }
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new(fields)),
         columns,
@@ -547,6 +611,7 @@ struct Output {
     trace_duration: Vec<i64>,
     root_name: Vec<Option<String>>,
     root_service: Vec<Option<String>>,
+    nested: Vec<(i64, i64, i64)>,
     spanset: Vec<i64>,
     labels: Vec<Option<String>>,
     matched: Vec<i64>,
@@ -565,6 +630,7 @@ impl Output {
             self.trace_duration.push(trace.duration);
             self.root_name.push(trace.root_name.clone());
             self.root_service.push(trace.root_service.clone());
+            self.nested.push(trace.nested[span]);
             self.spanset.push(i64::try_from(index).unwrap_or(i64::MAX));
             self.labels.push(labels.clone());
             self.matched
@@ -589,6 +655,15 @@ impl Output {
                     TRACE_DURATION_NS => Arc::new(Int64Array::from(self.trace_duration.clone())),
                     ROOT_NAME => Arc::new(StringArray::from(self.root_name.clone())),
                     ROOT_SERVICE => Arc::new(StringArray::from(self.root_service.clone())),
+                    NEST_LEFT => Arc::new(Int64Array::from_iter_values(
+                        self.nested.iter().map(|n| n.0),
+                    )),
+                    NEST_RIGHT => Arc::new(Int64Array::from_iter_values(
+                        self.nested.iter().map(|n| n.1),
+                    )),
+                    NEST_PARENT => Arc::new(Int64Array::from_iter_values(
+                        self.nested.iter().map(|n| n.2),
+                    )),
                     SPANSET => Arc::new(Int64Array::from(self.spanset.clone())),
                     SPANSET_LABELS => Arc::new(StringArray::from(self.labels.clone())),
                     MATCHED => Arc::new(Int64Array::from(self.matched.clone())),
@@ -709,6 +784,47 @@ mod tests {
             }
         }
         rows
+    }
+
+    /// QL-14: the numbers of a depth-first walk, children in start
+    /// order, restarting at one for every trace.
+    #[test]
+    fn nested_set_numbers_follow_a_depth_first_walk_of_each_trace() {
+        let mut operator = TraceGroup::new(Spanset::Filter(None), MemoryPool::unbounded());
+        let out = run(&mut operator, vec![spans()]);
+        let batch = concat_batches(&trace_group_schema(), &out).unwrap();
+        let ids = fixed(&batch, SPAN_ID).unwrap();
+        let longs = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let (left, right, parent) = (longs(NEST_LEFT), longs(NEST_RIGHT), longs(NEST_PARENT));
+        let mut numbered: Vec<(u8, i64, i64, i64)> = (0..batch.num_rows())
+            .map(|i| (ids.value(i)[0], left[i], right[i], parent[i]))
+            .collect();
+        numbered.sort_unstable();
+        assert_eq!(
+            numbered,
+            vec![
+                (1, 1, 8, -1), // GET / of trace 1: the root
+                (2, 2, 5, 1),  // db, its first child, holding cache
+                (3, 3, 4, 2),  // cache, a leaf under db
+                (4, 6, 7, 1),  // auth, the second child
+                (5, 1, 4, -1), // GET / of trace 2
+                (6, 2, 3, 1),  // db under it
+            ]
+        );
+        assert_eq!(
+            nested_set(&[Some(1), Some(0)]),
+            vec![(1, 4, -1), (2, 3, 1)],
+            "a cycle is walked from its first span"
+        );
     }
 
     #[test]

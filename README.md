@@ -88,8 +88,8 @@ id (JSON and protobuf), tag names and values, metrics. The TraceQL
 differential suite agrees with Tempo 2.7.1 on every case; the
 deviations found are documented in the `tessera-traceql` crate.
 
-Gaps left in M4: the nested-set intrinsics and the `traceql(...)`
-table function in SQL; trace completion (QL-14) waits
+Gaps left in M4: the `traceql(...)` table function in SQL; trace
+completion (QL-14) waits
 for L3 compaction (M9); Grafana itself has not been run against the
 API yet.
 

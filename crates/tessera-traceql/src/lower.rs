@@ -22,12 +22,15 @@
 //! `quantile_over_time` is exact, one union branch per quantile with
 //! the quantile as the `p` label; `histogram_over_time` counts spans
 //! per power-of-two bucket of the value, the bucket as the `__bucket`
-//! label (QL-12). Not supported yet: the nested-set intrinsics.
+//! label (QL-12). The nested-set intrinsics read the numbers the trace
+//! group assigns each span (QL-14).
 
 use std::time::Duration;
 
 use arrow::datatypes::DataType;
-use tessera_ir::trace::{ROOT_NAME, ROOT_SERVICE, TRACE_DURATION_NS};
+use tessera_ir::trace::{
+    NEST_LEFT, NEST_PARENT, NEST_RIGHT, ROOT_NAME, ROOT_SERVICE, TRACE_DURATION_NS,
+};
 use tessera_ir::{
     AggregateExpr, BinaryOp, BindContext, Diagnostic, Expr, JoinKind, JoinSide, Literal, NamedExpr,
     Plan, Relation, Scan, SortKey, Span, SpanAggregate, Spanset, Structural, VALUE,
@@ -105,7 +108,10 @@ pub fn lower(query: &Query, ctx: &BindContext, params: RangeParams) -> Result<Lo
             function: String::new(),
         }),
         Some(metrics) => {
-            let input = match (&query.pipeline.first, query.pipeline.stages.is_empty()) {
+            // A plain filter scans the spans directly, unless it reads
+            // what only the whole trace provides.
+            let direct = query.pipeline.stages.is_empty() && !spanset.reads_trace_columns();
+            let input = match (&query.pipeline.first, direct) {
                 (SpansetExpr::Filter { .. }, true) => match spanset {
                     Spanset::Filter(condition) => {
                         let source = spans_source(ctx, range, &cx.events);
@@ -473,6 +479,9 @@ fn intrinsic(scope: Option<&str>, name: &str, span: Span) -> Result<(Expr, DataT
         (None, "traceDuration") | (Some("trace"), "duration") => {
             column(TRACE_DURATION_NS, DataType::Int64)
         }
+        (None | Some("span"), "nestedSetLeft") => column(NEST_LEFT, DataType::Int64),
+        (None | Some("span"), "nestedSetRight") => column(NEST_RIGHT, DataType::Int64),
+        (None | Some("span"), "nestedSetParent") => column(NEST_PARENT, DataType::Int64),
         (Some("instrumentation"), "name") => {
             Ok((path("scope.name", DataType::Utf8), DataType::Utf8))
         }
@@ -1123,6 +1132,32 @@ mod tests {
         );
     }
 
+    /// The nested-set intrinsics are the trace group's columns, so a
+    /// search on them reads every span and a metrics query over them
+    /// goes through the group rather than a direct scan.
+    #[test]
+    fn nested_set_intrinsics_read_the_trace_groups_numbers() {
+        let roots = search("{ nestedSetParent = -1 && nestedSetLeft >= 1 }");
+        let text = roots.plan.to_string();
+        assert!(
+            text.contains("TraceGroup: { ((nest_parent = -1) AND (nest_left >= 1)) }"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("predicates=[(nest_parent"),
+            "every span is a candidate: {text}"
+        );
+        let metrics = lower(
+            &parse("{ nestedSetParent < 0 } | rate()").unwrap(),
+            &ctx(),
+            params(1_000),
+        )
+        .unwrap();
+        let text = metrics.plan.to_string();
+        assert!(text.contains("TraceGroup"), "{text}");
+        assert!(text.contains("nest_parent < 0"), "{text}");
+    }
+
     #[test]
     fn unsupported_constructs_are_reported_with_positions() {
         let error = lower(
@@ -1134,8 +1169,8 @@ mod tests {
         assert!(error.message.contains("span field"), "{}", error.message);
         let error = lower(&parse("{ link.rel > 1 }").unwrap(), &ctx(), params(0)).unwrap_err();
         assert!(error.message.contains("= or !="), "{}", error.message);
-        let error = lower(&parse("{ nestedSetLeft > 0 }").unwrap(), &ctx(), params(0)).unwrap_err();
-        assert!(error.message.contains("nestedSetLeft"), "{}", error.message);
+        let error = lower(&parse("{ childCount > 0 }").unwrap(), &ctx(), params(0)).unwrap_err();
+        assert!(error.message.contains("childCount"), "{}", error.message);
         let error = lower(
             &parse("{ } | quantile_over_time(duration)").unwrap(),
             &ctx(),

@@ -12,8 +12,9 @@
 //! A trace with no spanset left does not match.
 //!
 //! Conditions are plain expressions over the span columns plus the
-//! trace-level columns the operator derives ([`ROOT_NAME`],
-//! [`ROOT_SERVICE`], [`TRACE_START`], [`TRACE_DURATION_NS`]).
+//! columns the operator derives per trace ([`ROOT_NAME`],
+//! [`ROOT_SERVICE`], [`TRACE_START`], [`TRACE_DURATION_NS`]) and per
+//! span from the tree ([`NEST_LEFT`], [`NEST_RIGHT`], [`NEST_PARENT`]).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -36,6 +37,13 @@ pub const TRACE_DURATION_NS: &str = "trace_duration_ns";
 pub const ROOT_NAME: &str = "root_name";
 /// The `resource.service.name` of the root span (`rootServiceName`).
 pub const ROOT_SERVICE: &str = "root_service";
+/// The number a depth-first walk of the trace's tree enters the span
+/// with, from one (`nestedSetLeft`; stored by trace completion, QL-14).
+pub const NEST_LEFT: &str = "nest_left";
+/// The number the walk leaves the span with (`nestedSetRight`).
+pub const NEST_RIGHT: &str = "nest_right";
+/// The parent's `nest_left`, or -1 for a root (`nestedSetParent`).
+pub const NEST_PARENT: &str = "nest_parent";
 /// The index of the spanset within its trace, from zero.
 pub const SPANSET: &str = "spanset";
 /// The labels of the spanset, as a JSON object of `by(key)` to value;
@@ -44,8 +52,17 @@ pub const SPANSET_LABELS: &str = "spanset_labels";
 /// The number of spans in the spanset.
 pub const MATCHED: &str = "matched";
 
-/// The columns derived per trace, which conditions may read.
-pub const TRACE_COLUMNS: [&str; 4] = [TRACE_START, TRACE_DURATION_NS, ROOT_NAME, ROOT_SERVICE];
+/// The columns derived from the whole trace, which conditions may read;
+/// a filter on one makes every span a candidate.
+pub const TRACE_COLUMNS: [&str; 7] = [
+    TRACE_START,
+    TRACE_DURATION_NS,
+    ROOT_NAME,
+    ROOT_SERVICE,
+    NEST_LEFT,
+    NEST_RIGHT,
+    NEST_PARENT,
+];
 
 /// The span columns a trace group carries through.
 pub const SPAN_COLUMNS: [&str; 10] = [
@@ -77,6 +94,9 @@ pub fn trace_group_schema() -> SchemaRef {
         Field::new(MATCHED, DataType::Int64, false),
         Field::new(SPAN_ID, DataType::FixedSizeBinary(8), false),
         Field::new(PARENT_SPAN_ID, DataType::FixedSizeBinary(8), true),
+        Field::new(NEST_LEFT, DataType::Int64, false),
+        Field::new(NEST_RIGHT, DataType::Int64, false),
+        Field::new(NEST_PARENT, DataType::Int64, false),
         Field::new(TIMESTAMP, ns, false),
         Field::new(DURATION_NS, DataType::Int64, true),
         Field::new(NAME, DataType::Utf8, true),
@@ -228,6 +248,14 @@ impl Spanset {
         let mut columns = BTreeSet::new();
         self.visit(&mut |expr| columns.extend(expr.references()));
         columns
+    }
+
+    /// Whether some filter reads a column only the trace provides
+    /// ([`TRACE_COLUMNS`]), so the spans must be read whole.
+    #[must_use]
+    pub fn reads_trace_columns(&self) -> bool {
+        let references = self.references();
+        TRACE_COLUMNS.iter().any(|c| references.contains(*c))
     }
 
     /// A predicate every span that any filter matches satisfies, for
@@ -410,6 +438,12 @@ mod tests {
             Expr::column(ROOT_NAME).binary(BinaryOp::Eq, Expr::literal("a")),
         ));
         assert_eq!(trace_level.candidates(), None);
+        assert!(trace_level.reads_trace_columns());
+        let roots = Spanset::Filter(Some(
+            Expr::column(NEST_PARENT).binary(BinaryOp::Eq, Expr::literal(-1)),
+        ));
+        assert_eq!(roots.candidates(), None, "the tree needs every span");
+        assert!(!filter(NAME, "a").reads_trace_columns());
         assert_eq!(
             Spanset::Coalesce(Box::new(filter(NAME, "a")))
                 .candidates()
@@ -491,6 +525,9 @@ mod tests {
             ]
         );
         for column in SPAN_COLUMNS {
+            assert!(schema.column_with_name(column).is_some(), "{column}");
+        }
+        for column in [NEST_LEFT, NEST_RIGHT, NEST_PARENT] {
             assert!(schema.column_with_name(column).is_some(), "{column}");
         }
         assert!(schema.column_with_name(OVERFLOW).is_some());

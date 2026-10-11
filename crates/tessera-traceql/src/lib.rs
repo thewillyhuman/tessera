@@ -8,8 +8,7 @@
 //! traces (QL-13); a metrics query aggregates the matching spans per
 //! step and series label.
 //!
-//! Not supported yet: the nested-set intrinsics and the `traceql(...)`
-//! table function in SQL (QL-3).
+//! Not supported yet: the `traceql(...)` table function in SQL (QL-3).
 //!
 //! Deviations from Tempo 2.7 found by the differential suite (QL-4):
 //!
@@ -27,6 +26,10 @@
 //! - `quantile_over_time` is exact and `histogram_over_time` counts
 //!   spans per power-of-two bucket of the value; Tempo estimates its
 //!   quantiles from such buckets, so the two differ on the same spans.
+//! - The nested-set numbers behind `nestedSetLeft`, `nestedSetRight`
+//!   and `nestedSetParent` are assigned on every search, children in
+//!   start order; Tempo assigns them when it writes a block, so a
+//!   trace still in its ingester has none there.
 //! - Tag discovery lists no `event` scope, since span events are rows
 //!   of their own (DM-8), and lists only the intrinsics Tessera
 //!   evaluates.
