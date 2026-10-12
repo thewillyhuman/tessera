@@ -35,7 +35,7 @@ pub mod window;
 
 use arrow::error::ArrowError;
 
-pub use aggregate::{Accumulator, accumulator};
+pub use aggregate::{Accumulator, accumulator, row_weight};
 pub use bodies::{BodyParsing, parse_bodies};
 pub use eval::{evaluate, evaluate_predicate};
 pub use extract::{ERROR_DETAILS_LABEL, ERROR_LABEL, Extracted, extract};

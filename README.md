@@ -248,7 +248,8 @@ re-splits the state through a checkpoint partition 0 writes.
 Gaps left in M7: a partition reads every writer log and runs every
 query, so partitions divide the state but not the reading; the
 incremental subset is SQL
-only and counts rows unweighted; the alert latency target is set by the evaluation
+only, counting and summing rows with the weight `1 / sample_rate` as
+the batch aggregates do (QE-13); the alert latency target is set by the evaluation
 interval (five seconds by default) rather than measured; sketches
 and histograms run periodically, while hopping windows,
 `hop(timestamp, size, step)`, sliding windows, `slide(timestamp,

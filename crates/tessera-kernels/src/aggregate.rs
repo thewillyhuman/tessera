@@ -177,9 +177,12 @@ fn whole(value: f64) -> i64 {
     value.round() as i64
 }
 
-/// The weight of row `i`: `1 / sample_rate`, or 1 when unweighted or the
-/// rate is missing or not positive.
-fn weight(sample_rates: Option<&Float64Array>, i: usize) -> f64 {
+/// The weight of row `i` (QE-13): `1 / sample_rate`, or 1 when
+/// unweighted or the rate is missing or not positive. The incremental
+/// runtime weighs its rows by it too, so that a continuous query
+/// equals the batch one (QE-20).
+#[must_use]
+pub fn row_weight(sample_rates: Option<&Float64Array>, i: usize) -> f64 {
     match sample_rates {
         Some(rates) if !rates.is_null(i) && rates.value(i) > 0.0 => 1.0 / rates.value(i),
         _ => 1.0,
@@ -253,7 +256,7 @@ impl Accumulator for Count {
                 continue;
             }
             let w = if self.weighted {
-                weight(sample_rates, i)
+                row_weight(sample_rates, i)
             } else {
                 1.0
             };
@@ -315,7 +318,7 @@ impl Accumulator for Sum {
                 continue;
             }
             let w = if self.weighted {
-                weight(sample_rates, i)
+                row_weight(sample_rates, i)
             } else {
                 1.0
             };
@@ -402,7 +405,7 @@ impl Accumulator for Variance {
                 continue;
             }
             let w = if self.weighted {
-                weight(sample_rates, i)
+                row_weight(sample_rates, i)
             } else {
                 1.0
             };
@@ -479,7 +482,7 @@ impl Accumulator for Avg {
                 continue;
             }
             let w = if self.weighted {
-                weight(sample_rates, i)
+                row_weight(sample_rates, i)
             } else {
                 1.0
             };

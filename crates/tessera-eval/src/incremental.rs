@@ -26,12 +26,12 @@ use serde::{Deserialize, Serialize};
 use tessera_commit::Action;
 use tessera_exec::Engine;
 use tessera_ir::{AggregateExpr, BinaryOp, BindContext, Expr, Frontend, Literal, Plan, Statement};
-use tessera_kernels::{evaluate, evaluate_predicate};
+use tessera_kernels::{evaluate, evaluate_predicate, row_weight};
 use tessera_manifest::registry;
 use tessera_object::{ObjectError, ObjectStore};
 use tessera_opt::optimize;
 use tessera_sql::SqlFrontend;
-use tessera_types::event::TIMESTAMP;
+use tessera_types::event::{SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, TimeRange, Timestamp, WriterId};
 use tessera_wal::{EntryBody, WalError, reader};
 
@@ -348,13 +348,22 @@ fn monotone(having: &Expr, aggregates: &[AggregateExpr]) -> bool {
     }
 }
 
-/// A mergeable partial aggregate.
+/// A mergeable partial aggregate. Rows count and sum with the weight
+/// `1 / sample_rate` (QE-13), as the batch aggregates do, and as they
+/// are for the raw forms.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Partial {
-    /// Rows counted.
+    /// Rows counted, as they are.
     pub count: u64,
-    /// Sum of the argument.
+    /// The rows' weights added; none in a state written before weights
+    /// were kept, which counted every row as one.
+    #[serde(default)]
+    pub weight: Option<f64>,
+    /// Sum of the argument, each row weighted.
     pub sum: f64,
+    /// Sum of the argument, rows as they are.
+    #[serde(default)]
+    pub sum_raw: f64,
     /// Smallest argument.
     pub min: f64,
     /// Largest argument.
@@ -362,7 +371,8 @@ pub struct Partial {
 }
 
 impl Partial {
-    fn fold(&mut self, value: Option<f64>) {
+    fn fold(&mut self, value: Option<f64>, weight: f64) {
+        self.weight = Some(self.weighted_count() + weight);
         self.count += 1;
         if let Some(v) = value {
             if self.sum == 0.0 && self.min == 0.0 && self.max == 0.0 && self.count == 1 {
@@ -372,23 +382,29 @@ impl Partial {
                 self.min = self.min.min(v);
                 self.max = self.max.max(v);
             }
-            self.sum += v;
+            self.sum += v * weight;
+            self.sum_raw += v;
         }
+    }
+
+    /// The rows' weights added: the row count where none were kept.
+    fn weighted_count(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        self.weight.unwrap_or(self.count as f64)
     }
 
     fn value(&self, function: &str) -> f64 {
         #[allow(clippy::cast_precision_loss)]
         let count = self.count as f64;
+        let weighted = self.weighted_count();
+        let average = |sum: f64, count: f64| if count == 0.0 { f64::NAN } else { sum / count };
         match function {
-            "count" | "count_raw" => count,
-            "sum" | "sum_raw" => self.sum,
-            "avg" | "avg_raw" => {
-                if self.count == 0 {
-                    f64::NAN
-                } else {
-                    self.sum / count
-                }
-            }
+            "count" => weighted,
+            "count_raw" => count,
+            "sum" => self.sum,
+            "sum_raw" => self.sum_raw,
+            "avg" => average(self.sum, weighted),
+            "avg_raw" => average(self.sum_raw, count),
             "min" => self.min,
             "max" => self.max,
             _ => f64::NAN,
@@ -754,12 +770,16 @@ fn fold_batch(
                 .transpose()
         })
         .collect::<Result<_, _>>()?;
+    let sample_rates = rows
+        .column_by_name(SAMPLE_RATE)
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
     let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
     let hop = shape
         .hop
         .map(|h| i64::try_from(h.as_nanos()).unwrap_or(i64::MAX));
     for row in 0..rows.num_rows() {
         let at = times.value(row);
+        let weight = row_weight(sample_rates, row);
         if Timestamp::from_nanos(at) < horizon {
             ingested.late_rows += 1;
             continue;
@@ -786,7 +806,7 @@ fn fold_batch(
                     })
             });
             for (partial, arg) in window.partials.iter_mut().zip(&args) {
-                partial.fold(arg.as_ref().and_then(|a| number(a, row)));
+                partial.fold(arg.as_ref().and_then(|a| number(a, row)), weight);
             }
         }
     }
@@ -1013,4 +1033,82 @@ pub fn actions(
         }
     }
     actions
+}
+
+#[cfg(test)]
+mod tests {
+    use tessera_types::{DatasetName, EventBatch, LogRow};
+
+    use super::*;
+    use crate::rule::Language;
+
+    /// QE-13 in the incremental subset: a row counts and sums with the
+    /// weight `1 / sample_rate` as a batch aggregate does, so that a
+    /// continuous query equals the batch one (QE-20), while the raw
+    /// forms take the rows as they are.
+    #[test]
+    fn rows_fold_weighted_by_their_sample_rate() {
+        let sql = "SELECT count(*) AS n, count_raw(*) AS raw, sum(severity_number) AS s, \
+                   sum_raw(severity_number) AS s_raw, avg(severity_number) AS a FROM logs \
+                   GROUP BY tumble(timestamp, INTERVAL '1 minute') HAVING count(*) >= 1";
+        let shape = shape_of_sql(sql, "prod", &TenantId::DEFAULT, None).unwrap();
+        let at = Timestamp::from_nanos(1_700_000_000_000_000_000);
+        let rows: Vec<LogRow> = [(1u8, 2), (2, 4), (3, 6)]
+            .into_iter()
+            .map(|(i, severity)| LogRow {
+                timestamp: at,
+                observed_timestamp: at,
+                event_id: [i; 16],
+                severity_number: Some(severity),
+                ..LogRow::default()
+            })
+            .collect();
+        let batch =
+            EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &rows)
+                .unwrap();
+        let rows = batch.rows();
+        let index = rows.schema().index_of(SAMPLE_RATE).unwrap();
+        let mut columns = rows.columns().to_vec();
+        columns[index] = Arc::new(Float64Array::from(vec![0.5, 0.25, 1.0]));
+        let rows = RecordBatch::try_new(rows.schema(), columns).unwrap();
+        let rule = AlertRule::new("weighted", Language::Sql, sql);
+        let mut ingested = Ingested::default();
+        fold_batch(
+            &rule,
+            &shape,
+            &EvalState::default(),
+            &mut ingested,
+            &rows,
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        let window = ingested.windows.values().next().unwrap();
+        let value = |i: usize| window.partials[i].value(&shape.aggregates[i].function);
+        assert!((value(0) - 7.0).abs() < f64::EPSILON, "count: 2 + 4 + 1");
+        assert!(
+            (value(1) - 3.0).abs() < f64::EPSILON,
+            "count_raw: three rows"
+        );
+        assert!(
+            (value(2) - 26.0).abs() < f64::EPSILON,
+            "sum: 2*2 + 4*4 + 6*1"
+        );
+        assert!((value(3) - 12.0).abs() < f64::EPSILON, "sum_raw: 2 + 4 + 6");
+        assert!((value(4) - 26.0 / 7.0).abs() < 1e-9, "avg over the weights");
+        let old = Partial {
+            count: 3,
+            weight: None,
+            sum: 12.0,
+            sum_raw: 0.0,
+            min: 2.0,
+            max: 6.0,
+        };
+        assert!(
+            (old.value("count") - 3.0).abs() < f64::EPSILON,
+            "an old state counts rows"
+        );
+        let mut grown = old;
+        grown.fold(Some(1.0), 4.0);
+        assert!((grown.value("count") - 7.0).abs() < f64::EPSILON);
+    }
 }
