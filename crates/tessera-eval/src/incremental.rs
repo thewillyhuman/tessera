@@ -12,7 +12,7 @@
 //! data (CQ-9), else once the watermark passes their end (CQ-10); rows
 //! older than the allowed lateness are counted and ignored (CQ-11).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ use tessera_object::{ObjectError, ObjectStore};
 use tessera_opt::optimize;
 use tessera_sql::SqlFrontend;
 use tessera_types::event::TIMESTAMP;
-use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, TimeRange, Timestamp};
+use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, TimeRange, Timestamp, WriterId};
 use tessera_wal::{EntryBody, WalError, reader};
 
 use crate::lifecycle::{Observation, fingerprint};
@@ -427,8 +427,11 @@ pub struct Ingested {
     /// The positions the task started from, so a commit against a
     /// state that moved past them is refused.
     pub positions_before: BTreeMap<String, Seq>,
-    /// The last entry read per writer.
+    /// The last entry read per writer; a writer gone with its log is
+    /// left out, so that its position is forgotten.
     pub positions: BTreeMap<String, Seq>,
+    /// The writers whose logs were read to their end.
+    pub ended: BTreeSet<String>,
     /// The newest observed time per writer, from this and earlier reads.
     pub watermarks: BTreeMap<String, Timestamp>,
     /// The windows touched, updated.
@@ -454,9 +457,12 @@ pub struct Source<'a> {
 
 /// Reads every writer's new segments for `rule` and folds them into
 /// the windows the state remembers. A log trimmed past the position
-/// held (GC-2) means segments were lost: the windows are then rebuilt
-/// from the consistent view instead (section 11.7) and the positions
-/// move to where the view read, so the live logs resume there.
+/// held (GC-2) means segments were lost, and so does the log of a
+/// writer that left the registry gone whole before it was read to its
+/// end: the windows are then rebuilt from the consistent view instead
+/// (section 11.7) and the positions move to where the view read, so
+/// the live logs resume there. A log read to its end is forgotten
+/// once its writer has left the registry.
 ///
 /// # Errors
 ///
@@ -472,6 +478,7 @@ pub async fn ingest(
     let mut ingested = Ingested {
         positions_before: state.positions.clone(),
         positions: state.positions.clone(),
+        ended: state.ended.clone(),
         watermarks: state.watermarks.clone(),
         windows: BTreeMap::new(),
         late_rows: 0,
@@ -496,50 +503,131 @@ pub async fn ingest(
         rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
         return Ok(ingested);
     }
+    let reading = Reading {
+        source,
+        rule,
+        shape,
+        state,
+        horizon,
+    };
+    let registered: BTreeSet<String> = writers.iter().map(|r| r.writer.to_string()).collect();
     for registration in writers {
         let writer = registration.writer;
-        let name = writer.to_string();
-        let from = state.positions.get(&name).copied().unwrap_or(Seq::ZERO);
-        let new: Vec<Seq> = reader::list(&**source.store, writer)
+        let entries = reader::list(&**source.store, writer)
             .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter(|seq| *seq > from)
-            .collect();
-        if from != Seq::ZERO && new.first().is_some_and(|first| *first != from.next()) {
-            tracing::warn!(
-                tenant = %source.tenant, rule = %rule.name, %writer, held = %from, first = %new[0],
-                "writer log trimmed past the position held; rebuilding the windows from the files"
-            );
+            .map_err(|e| e.to_string())?;
+        if read_log(&reading, &mut ingested, writer, entries).await? == Read::Gap {
             rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
             return Ok(ingested);
         }
-        for seq in new {
-            // An entry collected between the listing and the read is
-            // found missing next time, as a gap.
-            let mut entry = match reader::read(&**source.store, writer, seq).await {
-                Ok(entry) => entry,
-                Err(WalError::Store(ObjectError::NotFound { .. })) => break,
-                Err(error) => return Err(error.to_string()),
-            };
-            entry.unlock(source.keys).map_err(|e| e.to_string())?;
-            ingested.positions.insert(name.clone(), seq);
-            let EntryBody::Segment { blocks } = entry.body() else {
-                continue;
-            };
-            if let Some(newest) = blocks.iter().map(|b| b.max_observed).max() {
-                let seen = ingested.watermarks.entry(name.clone()).or_insert(newest);
-                *seen = (*seen).max(newest);
-            }
-            for batch in entry
-                .blocks_for(source.tenant, &shape.dataset, shape.kind)
-                .map_err(|e| e.to_string())?
-            {
-                fold_batch(rule, shape, state, &mut ingested, batch.rows(), horizon)?;
-            }
+    }
+    // A writer that left the registry wrote its log to the end: read
+    // to it, the log is forgotten; gone before that, it is a gap.
+    for name in state.positions.keys().filter(|n| !registered.contains(*n)) {
+        if state.ended.contains(name) {
+            ingested.positions.remove(name);
+            ingested.watermarks.remove(name);
+            ingested.ended.remove(name);
+            continue;
+        }
+        let Ok(writer) = name.parse::<WriterId>() else {
+            continue;
+        };
+        let entries = reader::list(&**source.store, writer)
+            .await
+            .map_err(|e| e.to_string())?;
+        if entries.is_empty() {
+            tracing::warn!(
+                tenant = %source.tenant, rule = %rule.name, %writer,
+                "writer log gone whole before its end was read; rebuilding the windows from the files"
+            );
+            ingested.positions.remove(name);
+            ingested.watermarks.remove(name);
+            rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
+            return Ok(ingested);
+        }
+        if read_log(&reading, &mut ingested, writer, entries).await? == Read::Gap {
+            rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
+            return Ok(ingested);
         }
     }
     Ok(ingested)
+}
+
+/// What a source task reads for: the rule and its shape, the state it
+/// starts from and the horizon late rows are judged against.
+struct Reading<'a> {
+    source: &'a Source<'a>,
+    rule: &'a AlertRule,
+    shape: &'a Shape,
+    state: &'a EvalState,
+    horizon: Timestamp,
+}
+
+/// What reading a writer's log found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Read {
+    /// Everything new, or nothing new.
+    Caught,
+    /// Entries past the position held are gone (GC-2).
+    Gap,
+}
+
+/// Reads the `entries` of `writer` past the position held, folding
+/// their segments into the windows and remembering the log's end.
+async fn read_log(
+    reading: &Reading<'_>,
+    ingested: &mut Ingested,
+    writer: WriterId,
+    entries: Vec<Seq>,
+) -> Result<Read, String> {
+    let Reading {
+        source,
+        rule,
+        shape,
+        state,
+        horizon,
+    } = *reading;
+    let name = writer.to_string();
+    let from = state.positions.get(&name).copied().unwrap_or(Seq::ZERO);
+    let new: Vec<Seq> = entries.into_iter().filter(|seq| *seq > from).collect();
+    if from != Seq::ZERO && new.first().is_some_and(|first| *first != from.next()) {
+        tracing::warn!(
+            tenant = %source.tenant, rule = %rule.name, %writer, held = %from, first = %new[0],
+            "writer log trimmed past the position held; rebuilding the windows from the files"
+        );
+        return Ok(Read::Gap);
+    }
+    for seq in new {
+        // An entry collected between the listing and the read is
+        // found missing next time, as a gap.
+        let mut entry = match reader::read(&**source.store, writer, seq).await {
+            Ok(entry) => entry,
+            Err(WalError::Store(ObjectError::NotFound { .. })) => break,
+            Err(error) => return Err(error.to_string()),
+        };
+        entry.unlock(source.keys).map_err(|e| e.to_string())?;
+        ingested.positions.insert(name.clone(), seq);
+        let blocks = match entry.body() {
+            EntryBody::Segment { blocks } => blocks,
+            EntryBody::End => {
+                ingested.ended.insert(name.clone());
+                continue;
+            }
+            EntryBody::Flush { .. } | EntryBody::Seal { .. } => continue,
+        };
+        if let Some(newest) = blocks.iter().map(|b| b.max_observed).max() {
+            let seen = ingested.watermarks.entry(name.clone()).or_insert(newest);
+            *seen = (*seen).max(newest);
+        }
+        for batch in entry
+            .blocks_for(source.tenant, &shape.dataset, shape.kind)
+            .map_err(|e| e.to_string())?
+        {
+            fold_batch(rule, shape, state, ingested, batch.rows(), horizon)?;
+        }
+    }
+    Ok(Read::Caught)
 }
 
 /// Rebuilds the windows of `rule` from the consistent view (section
@@ -894,6 +982,22 @@ pub fn actions(
         if state.watermarks.get(writer) != Some(seen) {
             actions.push(EvalState::put_watermark(writer, *seen));
         }
+    }
+    for writer in state.positions.keys() {
+        if !ingested.positions.contains_key(writer) {
+            actions.push(EvalState::delete_position(writer));
+        }
+    }
+    for writer in state.watermarks.keys() {
+        if !ingested.watermarks.contains_key(writer) {
+            actions.push(EvalState::delete_watermark(writer));
+        }
+    }
+    for writer in ingested.ended.difference(&state.ended) {
+        actions.push(EvalState::put_ended(writer));
+    }
+    for writer in state.ended.difference(&ingested.ended) {
+        actions.push(EvalState::delete_ended(writer));
     }
     for window in ingested.windows.values() {
         actions.push(EvalState::put_window(window));

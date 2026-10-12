@@ -31,8 +31,8 @@ pub fn partition_of(fingerprint: &str, parts: u32) -> u32 {
 }
 
 /// The keys of `whole` that partition `part` of `parts` owns, with
-/// what every partition shares: positions, watermarks, evaluation
-/// times, notification group times and degraded marks. The windows of
+/// what every partition shares: positions, ended logs, watermarks,
+/// evaluation times, notification group times and degraded marks. The windows of
 /// the partition's keys come along as they were; a re-split asks for
 /// their rebuild.
 #[must_use]
@@ -65,6 +65,7 @@ pub fn split(whole: &EvalState, part: u32, parts: u32) -> EvalState {
         parts,
         split: None,
         rebuild: BTreeSet::new(),
+        ended: whole.ended.clone(),
     }
 }
 

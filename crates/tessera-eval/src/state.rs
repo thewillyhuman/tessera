@@ -61,6 +61,10 @@ pub struct EvalState {
     /// as after a re-split (CQ-6).
     #[serde(default)]
     pub rebuild: BTreeSet<String>,
+    /// The writers whose logs were read to their end, so that such a
+    /// log gone whole afterwards is no gap (section 11.7).
+    #[serde(default)]
+    pub ended: BTreeSet<String>,
 }
 
 const fn one_partition() -> u32 {
@@ -82,6 +86,7 @@ impl Default for EvalState {
             parts: one_partition(),
             split: None,
             rebuild: BTreeSet::new(),
+            ended: BTreeSet::new(),
         }
     }
 }
@@ -97,6 +102,7 @@ const WATERMARK: &str = "watermark/";
 const WINDOW: &str = "window/";
 const GROUP_SENT: &str = "group_sent/";
 const DEGRADED: &str = "degraded/";
+const ENDED: &str = "ended/";
 
 impl EvalState {
     /// Records an instance.
@@ -195,6 +201,30 @@ impl EvalState {
         delete(format!("{REBUILD}{rule}"))
     }
 
+    /// Forgets the position held in a writer's log, once it is gone.
+    #[must_use]
+    pub fn delete_position(writer: &str) -> Action {
+        delete(format!("{POSITION}{writer}"))
+    }
+
+    /// Forgets a writer's watermark, once its log is gone.
+    #[must_use]
+    pub fn delete_watermark(writer: &str) -> Action {
+        delete(format!("{WATERMARK}{writer}"))
+    }
+
+    /// Records that a writer's log was read to its end.
+    #[must_use]
+    pub fn put_ended(writer: &str) -> Action {
+        put(format!("{ENDED}{writer}"), &())
+    }
+
+    /// Forgets that a writer's log ended, with the writer.
+    #[must_use]
+    pub fn delete_ended(writer: &str) -> Action {
+        delete(format!("{ENDED}{writer}"))
+    }
+
     /// The actions that turn this state into `next`, every key
     /// included: how a partition takes the keys of a re-split (CQ-6).
     #[must_use]
@@ -233,6 +263,7 @@ impl EvalState {
                 .map(|k| delete(format!("{DEGRADED}{k}"))),
         );
         actions.extend(self.rebuild.iter().map(|k| delete(format!("{REBUILD}{k}"))));
+        actions.extend(self.ended.iter().map(|k| delete(format!("{ENDED}{k}"))));
         actions.extend(next.instances.values().map(EvalState::put_instance));
         actions.extend(
             next.positions
@@ -262,6 +293,7 @@ impl EvalState {
                 .map(|(r, at)| EvalState::put_degraded(r, *at)),
         );
         actions.extend(next.rebuild.iter().map(|r| EvalState::put_rebuild(r)));
+        actions.extend(next.ended.iter().map(|w| EvalState::put_ended(w)));
         actions.extend(EvalState::put_parts(next.parts, next.split.as_deref()));
         actions
     }
@@ -323,6 +355,8 @@ impl State for EvalState {
                     self.degraded.insert(rest.to_owned(), decode(key, value)?);
                 } else if let Some(rest) = key.strip_prefix(REBUILD) {
                     self.rebuild.insert(rest.to_owned());
+                } else if let Some(rest) = key.strip_prefix(ENDED) {
+                    self.ended.insert(rest.to_owned());
                 } else if key == PARTS {
                     self.parts = decode(key, value)?;
                 } else if key == SPLIT {
@@ -350,6 +384,8 @@ impl State for EvalState {
                     self.degraded.remove(rest);
                 } else if let Some(rest) = key.strip_prefix(REBUILD) {
                     self.rebuild.remove(rest);
+                } else if let Some(rest) = key.strip_prefix(ENDED) {
+                    self.ended.remove(rest);
                 } else if key == SPLIT {
                     self.split = None;
                 } else {

@@ -237,9 +237,8 @@ instances whose fingerprint hashes to it, and a change of the count
 re-splits the state through a checkpoint partition 0 writes.
 
 Gaps left in M7: a partition reads every writer log and runs every
-query, so partitions divide the state but not the reading; a writer log removed whole
-after its writer ended is not detected as a gap by a rule still to
-read its last entries (section 11.7); the incremental subset is SQL
+query, so partitions divide the state but not the reading; the
+incremental subset is SQL
 only and counts rows unweighted; the alert latency target is set by the evaluation
 interval (five seconds by default) rather than measured; sketches
 and histograms run periodically, while hopping windows,

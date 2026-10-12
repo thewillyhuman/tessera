@@ -98,10 +98,44 @@ fn group(fx: &Fixture, name: &str, expr: &str) -> RuleGroup {
     )
 }
 
-async fn windows(fx: &Fixture) -> BTreeMap<String, tessera_eval::incremental::WindowState> {
+async fn eval_state(fx: &Fixture) -> state::EvalState {
     let store: Arc<dyn ObjectStore> = fx.store.clone();
     let log = state::open(store, &TenantId::DEFAULT, "inc", 0, fx.env.clone());
-    log.snapshot().await.unwrap().state().windows.clone()
+    log.snapshot().await.unwrap().state().clone()
+}
+
+async fn windows(fx: &Fixture) -> BTreeMap<String, tessera_eval::incremental::WindowState> {
+    eval_state(fx).await.windows
+}
+
+/// Ends the writer's log, lets intake adopt it and leave the registry,
+/// and removes every entry of the log, as garbage collection would.
+async fn end_and_collect(fx: &mut Fixture) {
+    let last = fx.log.end().await.unwrap();
+    intake::run(
+        fx.store.clone(),
+        &fx.env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        fx.log.writer_id(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        registry::list(&*fx.store, &TenantId::DEFAULT, &dataset())
+            .await
+            .unwrap()
+            .is_empty(),
+        "an ended, adopted log leaves the registry"
+    );
+    let mut seq = Seq::new(1);
+    while seq <= last {
+        fx.store
+            .delete(&layout::writer_log_entry(fx.log.writer_id(), seq))
+            .await
+            .unwrap();
+        seq = seq.next();
+    }
 }
 
 #[tokio::test]
@@ -355,6 +389,115 @@ async fn flush_and_adopt(fx: &mut Fixture, after: Seq, through: Seq, batches: Ve
     )
     .await
     .unwrap();
+}
+
+/// Section 11.7: the log of a writer that ended and left the registry
+/// was removed whole before the rule read its last entries; the rule
+/// rebuilds its windows from the files rather than lose them.
+#[tokio::test]
+async fn a_log_gone_whole_before_its_end_was_read_rebuilds_from_the_files() {
+    let mut fx = fixture().await;
+    let first = errors(at(1_000), 3, "checkout", 17);
+    fx.log
+        .append_segment(std::slice::from_ref(&first))
+        .await
+        .unwrap();
+    let group = group(
+        &fx,
+        "errors",
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         WHERE severity_text = 'ERROR' \
+         GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute') \
+         HAVING count(*) >= 5",
+    );
+    let early = group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert!(early.transitions.is_empty(), "three errors are not five");
+
+    // Two more errors the rule never reads before the log is flushed,
+    // ended, adopted and collected whole.
+    let second = errors(at(1_010), 2, "checkout", 17);
+    let seq2 = fx
+        .log
+        .append_segment(std::slice::from_ref(&second))
+        .await
+        .unwrap();
+    flush_and_adopt(&mut fx, Seq::ZERO, seq2, vec![first, second]).await;
+    end_and_collect(&mut fx).await;
+
+    let rebuilt = group.evaluate(&fx.engine, at(1_015)).await.unwrap();
+    assert_eq!(rebuilt.degraded, ["errors"], "the rule is marked degraded");
+    assert_eq!(rebuilt.transitions.len(), 1, "the files hold all five");
+    assert_eq!(rebuilt.transitions[0].to, Status::Firing);
+    assert!((rebuilt.transitions[0].value - 5.0).abs() < f64::EPSILON);
+    let state = eval_state(&fx).await;
+    assert!(
+        !state
+            .positions
+            .contains_key(&fx.log.writer_id().to_string()),
+        "the gone log is forgotten: {:?}",
+        state.positions
+    );
+}
+
+/// Section 11.7: a log read to its end is no gap once gone, and the
+/// position and watermark held in it are forgotten with its writer.
+#[tokio::test]
+async fn a_log_read_to_its_end_is_forgotten_once_gone() {
+    let mut fx = fixture().await;
+    let rows = errors(at(1_000), 3, "checkout", 17);
+    let seq1 = fx
+        .log
+        .append_segment(std::slice::from_ref(&rows))
+        .await
+        .unwrap();
+    let group = group(
+        &fx,
+        "errors",
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         WHERE severity_text = 'ERROR' \
+         GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute') \
+         HAVING count(*) >= 2",
+    );
+    let fired = group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert_eq!(fired.transitions.len(), 1);
+    flush_and_adopt(&mut fx, Seq::ZERO, seq1, vec![rows]).await;
+    let last = fx.log.end().await.unwrap();
+    intake::run(
+        fx.store.clone(),
+        &fx.env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        fx.log.writer_id(),
+    )
+    .await
+    .unwrap();
+
+    // The writer left the registry; its log is still read, to its end.
+    let drained = group.evaluate(&fx.engine, at(1_010)).await.unwrap();
+    assert!(drained.degraded.is_empty());
+    let writer = fx.log.writer_id().to_string();
+    let state = eval_state(&fx).await;
+    assert_eq!(state.positions.get(&writer), Some(&last));
+    assert!(state.ended.contains(&writer));
+
+    // Gone whole afterwards, the log is no gap: nothing is rebuilt and
+    // the writer is forgotten.
+    let mut seq = Seq::new(1);
+    while seq <= last {
+        fx.store
+            .delete(&layout::writer_log_entry(fx.log.writer_id(), seq))
+            .await
+            .unwrap();
+        seq = seq.next();
+    }
+    let after = group.evaluate(&fx.engine, at(1_015)).await.unwrap();
+    assert!(after.degraded.is_empty(), "{:?}", after.degraded);
+    let state = eval_state(&fx).await;
+    assert!(!state.positions.contains_key(&writer));
+    assert!(!state.watermarks.contains_key(&writer));
+    assert!(!state.ended.contains(&writer));
+    let seen = windows(&fx).await;
+    assert_eq!(seen.values().next().unwrap().partials[0].count, 3);
 }
 
 /// Section 11.7: a log trimmed past the position a rule holds means
