@@ -16,7 +16,8 @@
 //! fetched from every producer, so that no node holds every partial
 //! output. A join whose two sides are scans runs the same way, each
 //! side an exchange split by its join keys and each worker joining
-//! one partition of both. The other stages fold on the coordinator.
+//! one partition of both, and so does a trace group, its spans split
+//! by trace id. The other stages fold on the coordinator.
 //!
 //! Pipelines are not yet fused across nodes nor split into morsels
 //! across stages.
@@ -121,7 +122,8 @@ pub struct Analysis {
 /// (QE-14), for `EXPLAIN ANALYZE`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StageAnalysis {
-    /// What was split: `aggregate`, `join`, `top-k` or `limit`.
+    /// What was split: `aggregate`, `join`, `trace-group`, `top-k` or
+    /// `limit`.
     pub kind: &'static str,
     /// Partial stages sent to peers.
     pub remote: usize,
@@ -462,6 +464,11 @@ impl Engine {
                     grant,
                 )
                 .await
+            }
+            Plan::TraceGroup { spanset, .. } => {
+                let operator =
+                    Box::new(TraceGroup::new(spanset.clone(), Arc::clone(&grant.memory)));
+                self.pipe(operator, rows.next().unwrap_or_default()).await
             }
             other => {
                 let Some(input) = other.inputs().into_iter().next() else {
@@ -805,13 +812,22 @@ impl Engine {
         let Some((_, transport)) = &self.peers else {
             return Ok(None);
         };
-        if let Plan::Join {
-            left, right, on, ..
-        } = plan
-        {
-            return self
-                .join_staged(plan, left, right, on, grant, analysis)
-                .await;
+        match plan {
+            Plan::Join {
+                left, right, on, ..
+            } => {
+                return self
+                    .join_staged(plan, left, right, on, grant, analysis)
+                    .await;
+            }
+            Plan::TraceGroup {
+                candidates, spans, ..
+            } => {
+                return self
+                    .trace_staged(plan, candidates.as_deref(), spans, grant, analysis)
+                    .await;
+            }
+            _ => {}
         }
         let Some(stage) = stage_of(plan, &self.registry) else {
             return Ok(None);
@@ -840,41 +856,16 @@ impl Engine {
             kind: stage.kind,
             ..StageAnalysis::default()
         };
-        let mut local = split.local;
-        let mut batches = Vec::new();
-        let mut producers: Vec<(Peer, Vec<FileMeta>)> = Vec::new();
-        for (peer, files) in split.remote {
-            let task = StageTask {
-                plan: partial.clone(),
-                files,
-                exchange: exchange.clone(),
-            };
-            report.remote += 1;
-            scanned.remote_tasks += 1;
-            match transport.stage(&peer, &task).await {
-                Ok(rows) => {
-                    scanned.files_remote += task.files.len();
-                    if exchange.is_some() {
-                        producers.push((peer, task.files));
-                    } else {
-                        batches.extend(rows);
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(peer = %peer.node, error = %error, "stage failed; running here");
-                    report.failed += 1;
-                    scanned.remote_failed += 1;
-                    local.extend(task.files);
-                }
-            }
-        }
-        let share = Share {
-            files: local,
-            tail: split.tail,
-            analysis: scanned,
-        };
-        let mine = self
-            .execute_in(&partial, grant, analysis, Some(&share))
+        let (mut batches, producers, mine) = self
+            .partial_stages(
+                &partial,
+                split,
+                scanned,
+                exchange.as_ref(),
+                grant,
+                analysis,
+                &mut report,
+            )
             .await?;
         let output = match exchange {
             Some(exchange) if !producers.is_empty() => {
@@ -903,6 +894,64 @@ impl Engine {
         };
         analysis.stages.push(report);
         Ok(Some(output))
+    }
+
+    /// Runs a stage's partial half over `split`: on each peer over its
+    /// share, kept under `exchange` when there is one, and here over
+    /// this node's share and the tail; a peer that fails has its share
+    /// run here. Returns the rows the peers returned, the peers that
+    /// kept their output with their files, and this node's own rows.
+    #[allow(clippy::too_many_arguments)]
+    async fn partial_stages(
+        &self,
+        partial: &Plan,
+        split: scan::Split,
+        mut scanned: ScanAnalysis,
+        exchange: Option<&Exchange>,
+        grant: &Grant,
+        analysis: &mut Analysis,
+        report: &mut StageAnalysis,
+    ) -> Result<PartialOutputs, EngineError> {
+        let Some((_, transport)) = &self.peers else {
+            return Err(unsupported("a partial stage needs peers"));
+        };
+        let mut local = split.local;
+        let mut batches = Vec::new();
+        let mut producers: Vec<(Peer, Vec<FileMeta>)> = Vec::new();
+        for (peer, files) in split.remote {
+            let task = StageTask {
+                plan: partial.clone(),
+                files,
+                exchange: exchange.cloned(),
+            };
+            report.remote += 1;
+            scanned.remote_tasks += 1;
+            match transport.stage(&peer, &task).await {
+                Ok(rows) => {
+                    scanned.files_remote += task.files.len();
+                    if exchange.is_some() {
+                        producers.push((peer, task.files));
+                    } else {
+                        batches.extend(rows);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(peer = %peer.node, error = %error, "stage failed; running here");
+                    report.failed += 1;
+                    scanned.remote_failed += 1;
+                    local.extend(task.files);
+                }
+            }
+        }
+        let share = Share {
+            files: local,
+            tail: split.tail,
+            analysis: scanned,
+        };
+        let mine = self
+            .execute_in(partial, grant, analysis, Some(&share))
+            .await?;
+        Ok((batches, producers, mine))
     }
 
     /// A join whose two sides are fragments over scans runs on the
@@ -958,7 +1007,7 @@ impl Engine {
             (right, right_split, right_scanned, "r", 1),
         ];
         let mut inputs = Vec::new();
-        for (side, split, mut scanned, suffix, which) in sides {
+        for (side, split, scanned, suffix, which) in sides {
             let partial = with_scan(&side.plan, &split.scan);
             let exchange = Exchange {
                 id: format!("{id}-{suffix}"),
@@ -974,36 +1023,16 @@ impl Engine {
                     })
                     .collect(),
             };
-            let mut local = split.local;
-            let mut producers: Vec<(Peer, Vec<FileMeta>)> = Vec::new();
-            for (peer, files) in split.remote {
-                let task = StageTask {
-                    plan: partial.clone(),
-                    files,
-                    exchange: Some(exchange.clone()),
-                };
-                report.remote += 1;
-                scanned.remote_tasks += 1;
-                match transport.stage(&peer, &task).await {
-                    Ok(_) => {
-                        scanned.files_remote += task.files.len();
-                        producers.push((peer, task.files));
-                    }
-                    Err(error) => {
-                        tracing::warn!(peer = %peer.node, error = %error, "stage failed; running here");
-                        report.failed += 1;
-                        scanned.remote_failed += 1;
-                        local.extend(task.files);
-                    }
-                }
-            }
-            let share = Share {
-                files: local,
-                tail: split.tail,
-                analysis: scanned,
-            };
-            let mine = self
-                .execute_in(&partial, grant, analysis, Some(&share))
+            let (_, producers, mine) = self
+                .partial_stages(
+                    &partial,
+                    split,
+                    scanned,
+                    Some(&exchange),
+                    grant,
+                    analysis,
+                    &mut report,
+                )
                 .await?;
             inputs.push(ExchangeInput {
                 exchange,
@@ -1015,6 +1044,86 @@ impl Engine {
         let output = self
             .exchanged(plan, inputs, workers, grant, analysis, &mut report)
             .await?;
+        analysis.stages.push(report);
+        Ok(Some(output))
+    }
+
+    /// A trace group whose span plan is a fragment over a scan runs on
+    /// the workers (QE-14): the candidates' trace ids are read here,
+    /// every span of those traces is read on the nodes that own the
+    /// files and kept as an exchange split by trace id, so that a trace
+    /// stays whole, and every producer groups one partition. `None`
+    /// when the transport has no exchange or the span plan is not a
+    /// fragment; when no peer owns a file of it, the group runs here
+    /// over the candidates already read.
+    async fn trace_staged(
+        &self,
+        plan: &Plan,
+        candidates: Option<&Plan>,
+        spans: &Plan,
+        grant: &Grant,
+        analysis: &mut Analysis,
+    ) -> Result<Option<Vec<RecordBatch>>, EngineError> {
+        let Some((_, transport)) = &self.peers else {
+            return Ok(None);
+        };
+        if !transport.supports_exchange() || fragment_scan_of(spans).is_none() {
+            return Ok(None);
+        }
+        let ids = match candidates {
+            Some(candidates) => Some(trace_ids(
+                &self.execute_in(candidates, grant, analysis, None).await?,
+            )),
+            None => None,
+        };
+        let spans = match ids {
+            Some(ids) if ids.is_empty() => return Ok(Some(Vec::new())),
+            Some(ids) => with_in_list(spans.clone(), Expr::column(TRACE_ID), ids),
+            None => spans.clone(),
+        };
+        let Some(scan) = fragment_scan_of(&spans) else {
+            return Ok(None);
+        };
+        let limit = scan_limit(grant, analysis);
+        let mut scanned = ScanAnalysis::default();
+        let split = scan::split(self, scan, &mut scanned, limit).await?;
+        let partial = with_scan(&spans, &split.scan);
+        let exchange = Exchange {
+            id: self.exchange_id(),
+            partitions: u32::try_from(split.remote.len() + 1).unwrap_or(u32::MAX),
+            keys: vec![Expr::column(TRACE_ID)],
+        };
+        let mut report = StageAnalysis {
+            kind: "trace-group",
+            ..StageAnalysis::default()
+        };
+        let (_, producers, mine) = self
+            .partial_stages(
+                &partial,
+                split,
+                scanned,
+                Some(&exchange),
+                grant,
+                analysis,
+                &mut report,
+            )
+            .await?;
+        let output = if producers.is_empty() {
+            self.fold(plan, vec![mine], grant).await?
+        } else {
+            let workers: Vec<Peer> = producers.iter().map(|(p, _)| p.clone()).collect();
+            let input = ExchangeInput {
+                exchange: Exchange {
+                    partitions: u32::try_from(workers.len() + 1).unwrap_or(u32::MAX),
+                    ..exchange
+                },
+                partial,
+                producers,
+                mine,
+            };
+            self.exchanged(plan, vec![input], workers, grant, analysis, &mut report)
+                .await?
+        };
         analysis.stages.push(report);
         Ok(Some(output))
     }
@@ -1480,6 +1589,15 @@ struct Stage {
     /// keys.
     keys: Option<Vec<Expr>>,
 }
+
+/// What a stage's partial half yields: the rows the peers returned,
+/// the peers that kept their output with their files, and this node's
+/// own rows.
+type PartialOutputs = (
+    Vec<RecordBatch>,
+    Vec<(Peer, Vec<FileMeta>)>,
+    Vec<RecordBatch>,
+);
 
 /// One input of a final stage run over an exchange: what its partial
 /// stages kept, the coordinator's own rows of it, and how to recompute

@@ -221,13 +221,15 @@ A join whose two sides are scans folds on the workers the same way,
 each side an exchange split by its join keys and each worker joining
 one partition of both sides; the runtime filter an inner join's left
 side gets from the right side's keys on one node is not applied
-there.
+there. A trace group's span phase does too: the candidates' trace ids
+are read on the coordinator, every span of those traces is kept by
+the nodes that own the files as an exchange split by trace id, and
+each worker groups the traces of its partition.
 
-Gaps left in M6: trace grouping, sorts without a limit, PromQL
-evaluation and joins over other inputs still run on the coordinator
-over the rows the leaf tasks return, and the outputs of top-k, limit
-and keyless aggregate stages go through the coordinator; there is no
-object byte
+Gaps left in M6: sorts without a limit, PromQL evaluation and joins
+over other inputs still run on the coordinator over the rows the leaf
+tasks return, and the outputs of top-k, limit and keyless aggregate
+stages go through the coordinator; there is no object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.

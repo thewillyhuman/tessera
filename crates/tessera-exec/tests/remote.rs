@@ -2,9 +2,10 @@
 
 //! Leaf tasks shared with peers: files assigned to another node are read
 //! there (QE-15), a peer that fails is read around (QE-17), and the rows
-//! are the same either way. A grouped aggregate folds on the workers
-//! over an exchange of their partial outputs (QE-14), and folds here
-//! when a worker or a kept output is lost.
+//! are the same either way. A grouped aggregate, a join of two scans
+//! and a trace group fold on the workers over an exchange of their
+//! partial outputs (QE-14), and fold here when a worker or a kept
+//! output is lost.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -18,14 +19,15 @@ use tessera_exec::{
 };
 use tessera_format::ParquetFormat;
 use tessera_ir::{
-    AggregateExpr, Expr, JoinKind, JoinSide, NamedExpr, Plan, Registry, Scan, SortKey,
+    AggregateExpr, BinaryOp, Expr, JoinKind, JoinSide, NamedExpr, Plan, Registry, Relation, Scan,
+    SortKey, Spanset, Structural,
 };
 use tessera_manifest::{intake, registry};
 use tessera_object::{MemoryStore, Pools};
 use tessera_opt::optimize;
-use tessera_types::event::Scalar;
+use tessera_types::event::{NAME, Scalar};
 use tessera_types::{
-    DatasetName, Env, EventBatch, FileId, Kind, LogRow, NodeId, PoolId, SeededRandom, Seq,
+    DatasetName, Env, EventBatch, FileId, Kind, LogRow, NodeId, PoolId, SeededRandom, Seq, SpanRow,
     TenantId, Timestamp, Window,
 };
 use tessera_wal::{EntryBody, FlushTarget, WriterLog, write_l1_files};
@@ -734,4 +736,139 @@ async fn a_join_of_two_scans_folds_on_the_workers() {
         stage.recomputed, 2,
         "the lost producer's share of each side, once: {stage:?}"
     );
+}
+
+/// Trace `trace`: a root `GET /` with a child `db`, which has a child
+/// `cache`, all starting at `start`.
+fn trace(trace: u8, start: i64) -> EventBatch {
+    let span = |id: u8, parent: Option<u8>, name: &str, offset: i64| SpanRow {
+        timestamp: Timestamp::from_nanos(start + offset),
+        observed_timestamp: Timestamp::from_nanos(start + 100),
+        event_id: [trace * 16 + id; 16],
+        trace_id: [trace; 16],
+        span_id: [id; 8],
+        parent_span_id: parent.map(|p| [p; 8]),
+        name: name.into(),
+        duration_ns: 50 - offset,
+        ..SpanRow::default()
+    };
+    EventBatch::from_spans(
+        TenantId::DEFAULT,
+        dataset(),
+        &[
+            span(1, None, "GET /", 0),
+            span(2, Some(1), "db", 10),
+            span(3, Some(2), "cache", 20),
+        ],
+    )
+    .unwrap()
+}
+
+/// Six traces, one file each, and a seventh in the tail.
+async fn populate_spans() -> (Arc<MemoryStore>, Env) {
+    let store = Arc::new(MemoryStore::new());
+    let env = Env::simulated(1, Timestamp::UNIX_EPOCH);
+    let mut log = WriterLog::start(store.clone(), env.clone());
+    registry::register(
+        &*store,
+        &env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        log.writer_id(),
+    )
+    .await
+    .unwrap();
+    let target = FlushTarget {
+        store: store.clone(),
+        pool: PoolId::new("root").unwrap(),
+        format: Arc::new(ParquetFormat::default()),
+    };
+    let mut after = Seq::ZERO;
+    for id in 1..=6u8 {
+        let segment = vec![trace(id, i64::from(id) * 1_000)];
+        let through = log.append_segment(&segment).await.unwrap();
+        let files = write_l1_files(
+            &target,
+            &env,
+            log.writer_id(),
+            after,
+            through,
+            Window::DEFAULT_LENGTH,
+            segment,
+        )
+        .await
+        .unwrap();
+        log.append(EntryBody::Flush {
+            tenant: TenantId::DEFAULT,
+            dataset: dataset(),
+            after,
+            through,
+            files,
+        })
+        .await
+        .unwrap();
+        after = through;
+    }
+    intake::run(
+        store.clone(),
+        &env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        log.writer_id(),
+    )
+    .await
+    .unwrap();
+    log.append_segment(&[trace(7, 70_000)]).await.unwrap();
+    (store, env)
+}
+
+/// The `cache` spans below a `GET /` span, with their candidates
+/// narrowed by the spanset's filters as the `TraceQL` lowering does.
+fn grouped_traces() -> Plan {
+    let spans = Scan::all(TenantId::DEFAULT, dataset(), Kind::Span);
+    let name_is = |name: &str| {
+        Spanset::Filter(Some(
+            Expr::column(NAME).binary(BinaryOp::Eq, Expr::literal(name)),
+        ))
+    };
+    let spanset = Spanset::Structural {
+        left: Box::new(name_is("GET /")),
+        op: Structural {
+            relation: Relation::Descendant,
+            negated: false,
+            union: false,
+        },
+        right: Box::new(name_is("cache")),
+    };
+    let mut candidates = spans.clone();
+    candidates.predicates = vec![spanset.candidates().expect("a filter to narrow by")];
+    optimize(
+        Plan::TraceGroup {
+            candidates: Some(Box::new(Plan::Scan(candidates))),
+            spans: Box::new(Plan::Scan(spans)),
+            spanset,
+        },
+        &Registry::builtin(),
+    )
+    .unwrap()
+}
+
+/// QE-14: a trace group's span phase runs on the workers, every span
+/// of a trace in one partition, and each worker groups its traces.
+#[tokio::test]
+async fn a_trace_group_folds_on_the_workers() {
+    let (store, env) = populate_spans().await;
+    let expected = engine(&store, &env).run(&grouped_traces()).await.unwrap();
+    assert_eq!(expected.num_rows(), 7, "one cache span per trace");
+    let mesh = Arc::new(Mesh::default());
+    let (coordinator, _) = three_nodes(&store, &env, &mesh);
+    let output = coordinator.run(&grouped_traces()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    let stage = &output.analysis.stages[0];
+    assert_eq!(stage.kind, "trace-group");
+    assert!(
+        stage.remote >= 1 && stage.finals == stage.remote,
+        "{stage:?}"
+    );
+    assert_eq!(stage.final_failed, 0);
 }
