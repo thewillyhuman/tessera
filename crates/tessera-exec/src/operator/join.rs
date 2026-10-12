@@ -9,6 +9,12 @@
 //! the left side's columns before the right side's whichever side was
 //! built, under the names the plan's schema gives them.
 //!
+//! An `ASOF JOIN` (section 9.2) pairs a probe row with one build row of
+//! its key, the nearest in time on the side [`AsofMatch`] asks for: the
+//! build rows of each key are kept in time order and a probe row finds
+//! its row by binary search. The right side is always built, since it
+//! is the right row that is chosen for each left one.
+//!
 //! A build side the memory grant does not cover goes through
 //! [`partitioned`] instead (QE-11): both sides are split by a hash of
 //! their keys into runs on local disk and each bucket is joined on its
@@ -17,10 +23,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
-use arrow::compute::{concat_batches, take, take_record_batch};
-use arrow::datatypes::{Field, Schema, SchemaRef};
-use tessera_ir::{Expr, JoinKind, qualify};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, UInt32Array};
+use arrow::compute::{cast, concat_batches, take, take_record_batch};
+use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
+use tessera_ir::{AsofMatch, Expr, JoinKind, qualify};
 use tessera_kernels::{Grouper, buckets_of, evaluate};
 
 use crate::ExecError;
@@ -49,6 +55,8 @@ pub struct JoinInput {
     pub schema: SchemaRef,
     /// The keys, evaluated over the input's own rows.
     pub keys: Vec<Expr>,
+    /// The time an `ASOF JOIN` matches on, over the input's own rows.
+    pub time: Option<Expr>,
     /// The name qualifying the input's columns in the output.
     pub name: String,
 }
@@ -60,9 +68,15 @@ pub struct HashJoin {
     build_side: BuildSide,
     build: RecordBatch,
     table: Grouper,
-    /// The build rows of each key, by the key's group id.
+    /// The build rows of each key, by the key's group id; in time order
+    /// under an `ASOF JOIN`.
     rows_by_key: Vec<Vec<u32>>,
     probe_keys: Vec<Expr>,
+    /// Under an `ASOF JOIN`: which build row a probe row takes, the
+    /// build rows' times and the probe rows' time.
+    asof: Option<AsofMatch>,
+    times: Vec<Option<i64>>,
+    probe_time: Option<Expr>,
     memory: Arc<MemoryPool>,
     reserved: usize,
 }
@@ -70,15 +84,18 @@ pub struct HashJoin {
 impl HashJoin {
     /// A join holding `rows`, the `build` input's rows, hashed by its
     /// keys, to be probed by the other input's batches. A left join
-    /// builds its right side, since every probe row must come out.
+    /// builds its right side, since every probe row must come out, and
+    /// so does an `ASOF JOIN`, whose `asof` says which right row of a
+    /// key each left row takes by the inputs' times.
     ///
     /// # Errors
     ///
-    /// If the keys do not evaluate or the memory grant does not cover
-    /// the build side.
+    /// If the keys or times do not evaluate or the memory grant does
+    /// not cover the build side.
     pub fn new(
         kind: JoinKind,
         build_side: BuildSide,
+        asof: Option<AsofMatch>,
         rows: &[RecordBatch],
         build: &JoinInput,
         probe: &JoinInput,
@@ -89,21 +106,42 @@ impl HashJoin {
                 "a left join probes with its left side".into(),
             ));
         }
+        if asof.is_some() && build_side == BuildSide::Left {
+            return Err(ExecError::Unsupported(
+                "an asof join probes with its left side".into(),
+            ));
+        }
         let rows = match rows.first() {
             Some(first) => concat_batches(&first.schema(), rows)?,
             None => RecordBatch::new_empty(Arc::clone(&build.schema)),
         };
-        let reserved = rows.get_array_memory_size() + rows.num_rows() * size_of::<u32>();
+        let per_row = size_of::<u32>() + if asof.is_some() { size_of::<i64>() } else { 0 };
+        let reserved = rows.get_array_memory_size() + rows.num_rows() * per_row;
         memory.reserve(reserved)?;
+        let times = match (asof, &build.time) {
+            (Some(_), Some(time)) => times_of(time, &rows)?,
+            (Some(_), None) => {
+                return Err(ExecError::Unsupported(
+                    "an asof join needs a time on each side".into(),
+                ));
+            }
+            (None, _) => Vec::new(),
+        };
         let keys = evaluate_keys(&build.keys, &rows)?;
         let mut table = Grouper::new(keys.iter().map(|k| k.data_type().clone()).collect())?;
         let ids = table.group_ids(&keys)?;
         let mut rows_by_key: Vec<Vec<u32>> = vec![Vec::new(); table.len()];
         for (row, id) in ids.into_iter().enumerate() {
-            if keys.iter().any(|k| k.is_null(row)) {
+            let no_time = times.get(row).is_some_and(Option::is_none);
+            if no_time || keys.iter().any(|k| k.is_null(row)) {
                 continue;
             }
             rows_by_key[id as usize].push(u32::try_from(row).unwrap_or(u32::MAX));
+        }
+        if asof.is_some() {
+            for of_key in &mut rows_by_key {
+                of_key.sort_by_key(|row| times[*row as usize]);
+            }
         }
         let (left, right) = match build_side {
             BuildSide::Left => ((build, rows.schema()), (probe, Arc::clone(&probe.schema))),
@@ -117,6 +155,9 @@ impl HashJoin {
             table,
             rows_by_key,
             probe_keys: probe.keys.clone(),
+            asof,
+            times,
+            probe_time: probe.time.clone(),
             memory,
             reserved,
         })
@@ -127,6 +168,35 @@ impl HashJoin {
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
+
+    /// The build rows a probe row of key `id` at `time` pairs with:
+    /// every row of the key, or under an `ASOF JOIN` the one nearest
+    /// in time on the asked side, a tie going to the later build row.
+    fn matches(&self, id: u32, time: Option<i64>) -> &[u32] {
+        let of_key = &self.rows_by_key[id as usize];
+        let Some(matching) = self.asof else {
+            return of_key;
+        };
+        let Some(time) = time else {
+            return &[];
+        };
+        let at = |row: &u32| self.times[*row as usize].unwrap_or(i64::MIN);
+        let found = match matching {
+            AsofMatch::AtOrBefore => of_key[..of_key.partition_point(|r| at(r) <= time)].last(),
+            AsofMatch::Before => of_key[..of_key.partition_point(|r| at(r) < time)].last(),
+            AsofMatch::AtOrAfter => of_key.get(of_key.partition_point(|r| at(r) < time)),
+            AsofMatch::After => of_key.get(of_key.partition_point(|r| at(r) <= time)),
+        };
+        found.map_or(&[], std::slice::from_ref)
+    }
+}
+
+/// `time` over `rows` as integers: nanoseconds for a timestamp, the
+/// value for an integer; none where it is null.
+fn times_of(time: &Expr, rows: &RecordBatch) -> Result<Vec<Option<i64>>, ExecError> {
+    let values = evaluate(time, rows)?;
+    let values = cast(&values, &DataType::Int64)?;
+    Ok(values.as_primitive::<Int64Type>().iter().collect())
 }
 
 /// Joins `build_rows` and `probe_rows` one bucket of keys at a time
@@ -147,6 +217,7 @@ impl HashJoin {
 pub fn partitioned(
     kind: JoinKind,
     build_side: BuildSide,
+    asof: Option<AsofMatch>,
     build_rows: Vec<RecordBatch>,
     build: &JoinInput,
     probe_rows: Vec<RecordBatch>,
@@ -166,7 +237,15 @@ pub fn partitioned(
             Some(run) => run.read()?.collect::<Result<_, _>>()?,
             None => Vec::new(),
         };
-        let mut join = HashJoin::new(kind, build_side, &hashed, build, probe, Arc::clone(memory))?;
+        let mut join = HashJoin::new(
+            kind,
+            build_side,
+            asof,
+            &hashed,
+            build,
+            probe,
+            Arc::clone(memory),
+        )?;
         drop(hashed);
         let mut sink = CollectSink::new();
         for rows in probe_run.read()? {
@@ -269,22 +348,27 @@ impl Operator for HashJoin {
             return Ok(Flow::Continue);
         }
         let keys = evaluate_keys(&self.probe_keys, &rows)?;
+        let times = match (self.asof, &self.probe_time) {
+            (Some(_), Some(time)) => times_of(time, &rows)?,
+            _ => Vec::new(),
+        };
         let mut probe_rows: Vec<u32> = Vec::new();
         let mut build_rows: Vec<Option<u32>> = Vec::new();
         for (row, key) in self.table.lookup(&keys)?.into_iter().enumerate() {
+            let matched = key.map_or(&[][..], |id| {
+                self.matches(id, times.get(row).copied().flatten())
+            });
             let row = u32::try_from(row).unwrap_or(u32::MAX);
-            match key {
-                Some(id) => {
-                    for &matched in &self.rows_by_key[id as usize] {
-                        probe_rows.push(row);
-                        build_rows.push(Some(matched));
-                    }
-                }
-                None if self.kind == JoinKind::Left => {
+            if matched.is_empty() {
+                if self.kind == JoinKind::Left {
                     probe_rows.push(row);
                     build_rows.push(None);
                 }
-                None => {}
+                continue;
+            }
+            for &found in matched {
+                probe_rows.push(row);
+                build_rows.push(Some(found));
             }
         }
         if probe_rows.is_empty() {
@@ -309,8 +393,8 @@ impl Operator for HashJoin {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Int32Array, StringArray};
-    use arrow::datatypes::DataType;
+    use arrow::array::{Int32Array, StringArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, TimeUnit};
 
     use super::*;
     use crate::operator::testing::{rows, run, schema};
@@ -343,21 +427,24 @@ mod tests {
         let logs = JoinInput {
             schema: schema(),
             keys: vec![Expr::column("severity_number")],
+            time: None,
             name: "l".into(),
         };
         let owners = JoinInput {
             schema: owner_schema,
             keys: vec![Expr::column("severity")],
+            time: None,
             name: "o".into(),
         };
         let memory = MemoryPool::unbounded();
         match build_side {
             BuildSide::Right => {
-                HashJoin::new(kind, build_side, &owner_rows, &owners, &logs, memory).unwrap()
+                HashJoin::new(kind, build_side, None, &owner_rows, &owners, &logs, memory).unwrap()
             }
             BuildSide::Left => HashJoin::new(
                 kind,
                 build_side,
+                None,
                 &[rows(&[1, 2, 3, 4])],
                 &logs,
                 &owners,
@@ -444,11 +531,13 @@ mod tests {
         let logs = JoinInput {
             schema: schema(),
             keys: vec![Expr::column("severity_number")],
+            time: None,
             name: "l".into(),
         };
         let owners = JoinInput {
             schema: owner_schema,
             keys: vec![Expr::column("severity")],
+            time: None,
             name: "o".into(),
         };
         let memory = MemoryPool::unbounded();
@@ -456,6 +545,7 @@ mod tests {
             HashJoin::new(
                 JoinKind::Left,
                 BuildSide::Left,
+                None,
                 &[],
                 &logs,
                 &owners,
@@ -466,6 +556,7 @@ mod tests {
         let mut join = HashJoin::new(
             JoinKind::Inner,
             BuildSide::Right,
+            None,
             &[],
             &owners,
             &logs,
@@ -489,17 +580,20 @@ mod tests {
         let logs = JoinInput {
             schema: schema(),
             keys: vec![Expr::column("severity_number")],
+            time: None,
             name: "l".into(),
         };
         let owners = JoinInput {
             schema: owner_schema,
             keys: vec![Expr::column("severity")],
+            time: None,
             name: "o".into(),
         };
         for kind in [JoinKind::Inner, JoinKind::Left] {
             let mut whole = HashJoin::new(
                 kind,
                 BuildSide::Right,
+                None,
                 &owner_rows,
                 &owners,
                 &logs,
@@ -511,6 +605,7 @@ mod tests {
             let got = partitioned(
                 kind,
                 BuildSide::Right,
+                None,
                 owner_rows.clone(),
                 &owners,
                 vec![rows(&[1, 2, 3, 4]), rows(&[5, 6])],
@@ -530,6 +625,106 @@ mod tests {
         assert!(
             std::fs::read_dir(&dir).unwrap().next().is_none(),
             "spill files are removed"
+        );
+    }
+
+    /// Section 9.2: an `ASOF JOIN` pairs a probe row with the one build
+    /// row of its key nearest in time on the asked side, none when no
+    /// row lies on that side, a tie going to the later build row.
+    #[test]
+    fn an_asof_join_takes_the_nearest_row_in_time() {
+        let owner_schema = Arc::new(Schema::new(vec![
+            Field::new("severity", DataType::Int32, true),
+            Field::new(
+                "since",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new("owner", DataType::Utf8, true),
+        ]));
+        let owner_rows = RecordBatch::try_new(
+            Arc::clone(&owner_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 0, 10, 20, 20])),
+                Arc::new(TimestampNanosecondArray::from(vec![0, 5, 100, 2, 3])),
+                Arc::new(StringArray::from(vec!["ann", "amy", "bob", "cy", "dee"])),
+            ],
+        )
+        .unwrap();
+        let owners = JoinInput {
+            schema: owner_schema,
+            keys: vec![Expr::column("severity")],
+            time: Some(Expr::column("since")),
+            name: "o".into(),
+        };
+        let logs = JoinInput {
+            schema: schema(),
+            keys: vec![Expr::column("severity_number")],
+            time: Some(Expr::column("timestamp")),
+            name: "l".into(),
+        };
+        let owners_by = |kind, matching| {
+            let mut join = HashJoin::new(
+                kind,
+                BuildSide::Right,
+                Some(matching),
+                std::slice::from_ref(&owner_rows),
+                &owners,
+                &logs,
+                MemoryPool::unbounded(),
+            )
+            .unwrap();
+            strings(
+                &run(&mut join, vec![rows(&[1, 2, 3, 4]), rows(&[6, 7])]),
+                "o.owner",
+            )
+        };
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|s| Some((*s).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        // Severities 0, 10, 20 and 30 at times 1 to 4, then 0 and 10 at 6 and 7.
+        assert_eq!(
+            owners_by(JoinKind::Inner, AsofMatch::AtOrBefore),
+            names(&["ann", "dee", "amy"])
+        );
+        assert_eq!(
+            owners_by(JoinKind::Left, AsofMatch::AtOrBefore),
+            vec![
+                Some("ann".to_owned()),
+                None,
+                Some("dee".to_owned()),
+                None,
+                Some("amy".to_owned()),
+                None
+            ]
+        );
+        assert_eq!(
+            owners_by(JoinKind::Inner, AsofMatch::Before),
+            names(&["ann", "cy", "amy"])
+        );
+        assert_eq!(
+            owners_by(JoinKind::Inner, AsofMatch::AtOrAfter),
+            names(&["amy", "bob", "dee", "bob"])
+        );
+        assert_eq!(
+            owners_by(JoinKind::Inner, AsofMatch::After),
+            names(&["amy", "bob", "bob"])
+        );
+        assert!(
+            HashJoin::new(
+                JoinKind::Inner,
+                BuildSide::Left,
+                Some(AsofMatch::AtOrBefore),
+                &[rows(&[1])],
+                &logs,
+                &owners,
+                MemoryPool::unbounded(),
+            )
+            .is_err(),
+            "an asof join builds its right side"
         );
     }
 }

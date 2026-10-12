@@ -741,6 +741,7 @@ async fn a_join_pairs_rows_by_key_and_narrows_the_probe_side() {
         right: JoinSide::new(owners.clone(), "o"),
         on: vec![(host.clone(), Expr::column("host"))],
         kind,
+        asof: None,
     };
     let inner = run(
         &engine,
@@ -781,6 +782,7 @@ async fn a_join_pairs_rows_by_key_and_narrows_the_probe_side() {
             right: JoinSide::new(errors, "e"),
             on: vec![(Expr::column(SEVERITY_TEXT), Expr::column("level"))],
             kind: JoinKind::Inner,
+            asof: None,
         },
     )
     .await;
@@ -886,6 +888,7 @@ async fn a_join_past_its_grant_partitions_through_disk() {
         right: JoinSide::new(Plan::Scan(scan()), "l"),
         on: vec![(Expr::column("host"), host)],
         kind: JoinKind::Left,
+        asof: None,
     };
     let whole = engine.run(&join).await.unwrap();
     assert_eq!(whole.analysis.spilled_bytes, 0);

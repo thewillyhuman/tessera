@@ -188,7 +188,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::json;
     use tessera_types::event::Scalar;
-    use tessera_types::{DatasetName, EventBatch, EventRow, Timestamp};
+    use tessera_types::{DatasetName, EventBatch, EventRow, LogRow, Timestamp};
     use tower::ServiceExt;
 
     use crate::AppState;
@@ -257,6 +257,69 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(value["rows"], json!([["errors", "ann"], ["latency", null]]));
+    }
+
+    /// Section 9.2: an `ASOF JOIN` pairs each alert with the one log row
+    /// of its name nearest in time on the side the inequality asks for.
+    #[tokio::test]
+    async fn an_asof_join_takes_the_row_nearest_in_time() {
+        let state = crate::testing::state().await;
+        // One alert at 2023-11-14T22:13:20Z.
+        let alert = EventRow {
+            timestamp: Timestamp::from_nanos(1_700_000_000_000_000_000),
+            observed_timestamp: Timestamp::from_nanos(1_700_000_000_000_000_000),
+            event_id: [1; 16],
+            trace_id: None,
+            span_id: None,
+            name: "errors".into(),
+            attributes: BTreeMap::from([(
+                "attr.alert.fingerprint".to_owned(),
+                Scalar::Text("fp1".into()),
+            )]),
+        };
+        let alerts = EventBatch::from_alerts(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            &[alert],
+        )
+        .unwrap();
+        state.write(alerts).await.unwrap();
+        let logs: Vec<LogRow> = [
+            (-200, "two before"),
+            (-100, "one before"),
+            (100, "one after"),
+            (200, "two after"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (offset, body))| LogRow {
+            timestamp: Timestamp::from_nanos(1_700_000_000_000_000_000 + offset),
+            observed_timestamp: Timestamp::from_nanos(1_700_000_000_000_000_000),
+            event_id: [u8::try_from(i).unwrap() + 2; 16],
+            severity_text: Some("errors".into()),
+            body: Some(body.into()),
+            ..LogRow::default()
+        })
+        .collect();
+        let logs =
+            EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &logs)
+                .unwrap();
+        state.write(logs).await.unwrap();
+        let by = |op: &str| {
+            format!(
+                "SELECT a.name, l.body FROM alerts a ASOF JOIN logs l \
+                 ON a.name = l.severity_text AND a.timestamp {op} l.timestamp"
+            )
+        };
+        let (status, value) = sql(&state, &by(">=")).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"], json!([["errors", "one before"]]));
+        let (status, value) = sql(&state, &by("<=")).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"], json!([["errors", "one after"]]));
+        let (status, value) = sql(&state, &by("<")).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(value["rows"], json!([["errors", "one after"]]));
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 
 use tessera_ir::trace::SPAN_COLUMNS;
 use tessera_ir::{
-    BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, Scan, SortKey, Spanset,
+    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, Scan, SortKey, Spanset,
     VALUE as VALUE_COLUMN, unqualify,
 };
 use tessera_types::event::{BODY, EXTRACTED, KIND, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
@@ -172,6 +172,7 @@ fn push_predicates(plan: Plan, mut pending: Vec<Expr>) -> Plan {
             right,
             on,
             kind,
+            asof,
         } => {
             let (to_left, rest): (Vec<Expr>, Vec<Expr>) = pending
                 .into_iter()
@@ -192,6 +193,7 @@ fn push_predicates(plan: Plan, mut pending: Vec<Expr>) -> Plan {
                 ),
                 on,
                 kind,
+                asof,
             };
             wrap_filter(joined, above)
         }
@@ -303,7 +305,8 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
             right,
             on,
             kind,
-        } => rebuild_join(left, right, on, kind, f),
+            asof,
+        } => rebuild_join(left, right, on, kind, asof, f),
         Plan::TraceGroup {
             candidates,
             spans,
@@ -369,6 +372,7 @@ fn rebuild_join(
     right: JoinSide,
     on: Vec<(Expr, Expr)>,
     kind: JoinKind,
+    asof: Option<Asof>,
     mut f: impl FnMut(Plan) -> Plan,
 ) -> Plan {
     Plan::Join {
@@ -376,6 +380,39 @@ fn rebuild_join(
         right: JoinSide::new(f(*right.plan), right.name),
         on,
         kind,
+        asof,
+    }
+}
+
+/// Pushes a projection into both sides of a join: a side needs what
+/// is asked of it under its name, its keys and, under an `ASOF JOIN`,
+/// its time.
+fn push_projection_join(
+    left: JoinSide,
+    right: JoinSide,
+    on: Vec<(Expr, Expr)>,
+    kind: JoinKind,
+    asof: Option<Asof>,
+    needed: Option<&BTreeSet<String>>,
+    whole: bool,
+) -> Plan {
+    let side = |side: JoinSide, keys: &mut dyn Iterator<Item = &Expr>| {
+        let (needed, whole) = needed_by_side(&side.name, keys, needed, whole);
+        JoinSide::new(push_projection(*side.plan, needed, whole), side.name)
+    };
+    let times = asof.as_ref().map(|a| (&a.left, &a.right));
+    Plan::Join {
+        left: side(
+            left,
+            &mut on.iter().map(|(l, _)| l).chain(times.map(|t| t.0)),
+        ),
+        right: side(
+            right,
+            &mut on.iter().map(|(_, r)| r).chain(times.map(|t| t.1)),
+        ),
+        on,
+        kind,
+        asof,
     }
 }
 
@@ -570,18 +607,8 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
             right,
             on,
             kind,
-        } => {
-            let side = |side: JoinSide, keys: &mut dyn Iterator<Item = &Expr>| {
-                let (needed, whole) = needed_by_side(&side.name, keys, needed.as_ref(), whole);
-                JoinSide::new(push_projection(*side.plan, needed, whole), side.name)
-            };
-            Plan::Join {
-                left: side(left, &mut on.iter().map(|(l, _)| l)),
-                right: side(right, &mut on.iter().map(|(_, r)| r)),
-                on,
-                kind,
-            }
-        }
+            asof,
+        } => push_projection_join(left, right, on, kind, asof, needed.as_ref(), whole),
         Plan::TraceGroup {
             candidates,
             spans,
@@ -785,6 +812,7 @@ mod tests {
             right: JoinSide::new(scan(Kind::Span), "b"),
             on: vec![(Expr::column("trace_id"), Expr::column("trace_id"))],
             kind,
+            asof: None,
         }
         .filter(
             Expr::column("a.severity_number")

@@ -225,6 +225,7 @@ fn spans_source(ctx: &BindContext, range: TimeRange, events: &[Expr]) -> Plan {
                 (Expr::column(SPAN_ID), Expr::column(SPAN_ID)),
             ],
             kind: JoinKind::Left,
+            asof: None,
         }
         .project(exprs);
     }

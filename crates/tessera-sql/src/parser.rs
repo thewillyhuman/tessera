@@ -560,11 +560,16 @@ impl Parser<'_> {
             None
         };
         let mut joins = Vec::new();
-        while let Some(kind) = self.join_kind()? {
+        while let Some((kind, asof)) = self.join_kind()? {
             let table = self.table_ref(true)?;
             self.expect_keyword("on")?;
             let on = self.expr()?;
-            joins.push(Join { kind, table, on });
+            joins.push(Join {
+                kind,
+                asof,
+                table,
+                on,
+            });
         }
         let filter = if self.eat_keyword("where") {
             Some(self.expr()?)
@@ -665,22 +670,27 @@ impl Parser<'_> {
         }
     }
 
-    /// `JOIN`, `INNER JOIN`, `LEFT JOIN` or `LEFT OUTER JOIN`, if one
-    /// starts here.
-    fn join_kind(&mut self) -> Result<Option<JoinKind>, Diagnostic> {
-        if self.eat_keyword("join") {
-            return Ok(Some(JoinKind::Inner));
-        }
-        if self.eat_keyword("inner") {
+    /// `JOIN`, `INNER JOIN`, `LEFT JOIN` or `LEFT OUTER JOIN`, each
+    /// after `ASOF` or not, if one starts here: the kind and whether it
+    /// is an `ASOF JOIN`.
+    fn join_kind(&mut self) -> Result<Option<(JoinKind, bool)>, Diagnostic> {
+        let asof = self.eat_keyword("asof");
+        let kind = if self.eat_keyword("join") {
+            Some(JoinKind::Inner)
+        } else if self.eat_keyword("inner") {
             self.expect_keyword("join")?;
-            return Ok(Some(JoinKind::Inner));
-        }
-        if self.eat_keyword("left") {
+            Some(JoinKind::Inner)
+        } else if self.eat_keyword("left") {
             let _ = self.eat_keyword("outer");
             self.expect_keyword("join")?;
-            return Ok(Some(JoinKind::Left));
+            Some(JoinKind::Left)
+        } else {
+            None
+        };
+        if asof && kind.is_none() {
+            self.expect_keyword("join")?;
         }
-        Ok(None)
+        Ok(kind.map(|kind| (kind, asof)))
     }
 
     /// `[[tenant.]dataset.]table [[AS] alias]`, or where `functions`
@@ -1126,9 +1136,9 @@ const ALERT_KEYWORDS: [&str; 13] = [
 
 /// Keywords that end a select item, so a bare name before them is not an
 /// alias.
-const CLAUSE_KEYWORDS: [&str; 15] = [
+const CLAUSE_KEYWORDS: [&str; 16] = [
     "from", "where", "group", "order", "limit", "offset", "and", "or", "as", "having", "join",
-    "inner", "left", "outer", "on",
+    "inner", "left", "outer", "on", "asof",
 ];
 
 /// Keywords that may follow a table in the statements that name one,
@@ -1288,6 +1298,27 @@ mod tests {
         assert_eq!((from.tenant, from.dataset.as_deref()), (None, Some("prod")));
     }
 
+    /// Section 9.2: `ASOF` before any join kind marks the join, and is
+    /// not an alias of the table before it.
+    #[test]
+    fn parses_asof_joins() {
+        let q = query(
+            "SELECT * FROM logs ASOF JOIN spans s ON logs.trace_id = s.trace_id \
+             AND logs.timestamp >= s.timestamp",
+        );
+        assert_eq!(q.from.unwrap().alias, None);
+        assert!(q.joins[0].asof);
+        assert_eq!(q.joins[0].kind, JoinKind::Inner);
+        let left = query(
+            "SELECT * FROM logs l ASOF LEFT OUTER JOIN spans s ON l.trace_id = s.trace_id \
+             AND l.timestamp >= s.timestamp",
+        );
+        assert!(left.joins[0].asof);
+        assert_eq!(left.joins[0].kind, JoinKind::Left);
+        let error = parse("SELECT * FROM logs ASOF spans ON true").unwrap_err();
+        assert!(error.message.contains("JOIN"), "{}", error.message);
+    }
+
     #[test]
     fn parses_joins_with_aliases() {
         let q = query(
@@ -1311,6 +1342,7 @@ mod tests {
         assert!(q.filter.is_some());
         let inner = query("SELECT * FROM logs l INNER JOIN spans ON l.trace_id = spans.trace_id");
         assert_eq!(inner.joins[0].kind, JoinKind::Inner);
+        assert!(!inner.joins[0].asof);
         assert_eq!(inner.joins[0].table.alias, None);
         let plain = query("SELECT * FROM logs WHERE true");
         assert_eq!(

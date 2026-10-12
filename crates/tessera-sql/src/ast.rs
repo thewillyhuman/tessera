@@ -187,6 +187,9 @@ pub struct TableRef {
 pub struct Join {
     /// Which rows are kept.
     pub kind: JoinKind,
+    /// `ASOF`: each row so far pairs with the one joined row of its keys
+    /// nearest in time, as the inequality of `ON` asks (section 9.2).
+    pub asof: bool,
     /// The joined table.
     pub table: TableRef,
     /// `ON`.

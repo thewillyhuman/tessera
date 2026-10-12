@@ -24,7 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
 use tessera_ir::{
-    BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
+    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
 };
 use tessera_kernels::Grouper;
 use tessera_kernels::promql::Params;
@@ -582,7 +582,11 @@ impl Engine {
                     right,
                     on,
                     kind,
-                } => self.join(left, right, on, *kind, grant, analysis).await,
+                    asof,
+                } => {
+                    self.join(left, right, on, *kind, asof.as_ref(), grant, analysis)
+                        .await
+                }
                 Plan::TraceGroup {
                     candidates,
                     spans,
@@ -882,13 +886,19 @@ impl Engine {
     /// join its key values narrow the left side's read when they are few
     /// (the runtime filter of QE-6). The smaller side is then hashed and
     /// the other probes it (QE-12), except that a left join always
-    /// probes with its left side, every row of which comes out.
+    /// probes with its left side, every row of which comes out, and so
+    /// does an `ASOF JOIN`, which picks a right row for each left one.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the two sides, what joins them and the run's context"
+    )]
     async fn join(
         &self,
         left: &JoinSide,
         right: &JoinSide,
         on: &[(Expr, Expr)],
         kind: JoinKind,
+        asof: Option<&Asof>,
         grant: &Grant,
         analysis: &mut Analysis,
     ) -> Result<Vec<RecordBatch>, EngineError> {
@@ -907,17 +917,21 @@ impl Engine {
         let left_rows = self.execute(&left_plan, grant, analysis).await?;
         let rows_of =
             |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        let build_left = kind == JoinKind::Inner && rows_of(&left_rows) < rows_of(&right_rows);
+        let build_left =
+            kind == JoinKind::Inner && asof.is_none() && rows_of(&left_rows) < rows_of(&right_rows);
         let left_input = JoinInput {
             schema: left.plan.schema(&self.registry)?,
             keys: left_keys,
+            time: asof.map(|a| a.left.clone()),
             name: left.name.clone(),
         };
         let right_input = JoinInput {
             schema: right.plan.schema(&self.registry)?,
             keys: right_keys,
+            time: asof.map(|a| a.right.clone()),
             name: right.name.clone(),
         };
+        let matching = asof.map(|a| a.matching);
         let (build_side, build_rows, build, probe_rows, probe) = if build_left {
             (
                 BuildSide::Left,
@@ -940,7 +954,17 @@ impl Engine {
             let build_rows = build_rows.clone();
             let (build, probe, pool) = (build.clone(), probe.clone(), Arc::clone(&pool));
             self.cpu
-                .spawn(move || HashJoin::new(kind, build_side, &build_rows, &build, &probe, pool))
+                .spawn(move || {
+                    HashJoin::new(
+                        kind,
+                        build_side,
+                        matching,
+                        &build_rows,
+                        &build,
+                        &probe,
+                        pool,
+                    )
+                })
                 .await?
         };
         match whole {
@@ -952,7 +976,8 @@ impl Engine {
                 tracing::debug!(%failure, "join past its grant; partitioning through disk");
                 let task = self.cpu.spawn(move || {
                     partitioned(
-                        kind, build_side, build_rows, &build, probe_rows, &probe, &pool, &dir,
+                        kind, build_side, matching, build_rows, &build, probe_rows, &probe, &pool,
+                        &dir,
                     )
                 });
                 Ok(task.await??)

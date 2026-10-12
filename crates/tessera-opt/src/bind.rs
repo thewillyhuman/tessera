@@ -11,7 +11,7 @@
 
 use arrow::datatypes::DataType;
 use tessera_ir::{
-    AggregateExpr, BinaryOp, Expr, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
+    AggregateExpr, Asof, BinaryOp, Expr, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
     SortKey, expr_type,
 };
 
@@ -48,6 +48,7 @@ fn type_join_keys(plan: Plan, registry: &Registry) -> Result<Plan, PlanError> {
         right,
         on,
         kind,
+        asof,
     } = plan
     else {
         return Ok(plan);
@@ -72,6 +73,7 @@ fn type_join_keys(plan: Plan, registry: &Registry) -> Result<Plan, PlanError> {
         right,
         on,
         kind,
+        asof,
     })
 }
 
@@ -162,12 +164,24 @@ fn bind_plan(plan: Plan) -> Plan {
             right,
             on,
             kind,
+            asof,
         } => Plan::Join {
             left: JoinSide::new(bind_plan(*left.plan), left.name),
             right: JoinSide::new(bind_plan(*right.plan), right.name),
             on: on.into_iter().map(bind_join_key).collect(),
             kind,
+            asof: asof.map(bind_asof),
         },
+    }
+}
+
+/// Binds the two times of an `ASOF JOIN` as a key pair is bound.
+fn bind_asof(asof: Asof) -> Asof {
+    let (left, right) = bind_join_key((asof.left, asof.right));
+    Asof {
+        left,
+        right,
+        matching: asof.matching,
     }
 }
 
@@ -409,6 +423,7 @@ mod tests {
                     (Expr::column("timestamp"), path("attr.at")),
                 ],
                 kind: JoinKind::Inner,
+                asof: None,
             },
             &Registry::builtin(),
         )

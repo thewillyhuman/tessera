@@ -37,6 +37,7 @@ fn assign(plan: Plan, columns: &[PathColumn]) -> Plan {
             right,
             on,
             kind,
+            asof,
         } => {
             // A side reads the paths qualified by its name, unqualified,
             // and the ones below the join.
@@ -59,6 +60,7 @@ fn assign(plan: Plan, columns: &[PathColumn]) -> Plan {
                 right: side(right),
                 on,
                 kind,
+                asof,
             }
         }
         Plan::TraceGroup {
@@ -188,6 +190,7 @@ mod tests {
             right: JoinSide::new(scan(Kind::Span), "b"),
             on: vec![(path("attr.request"), path("attr.request"))],
             kind: JoinKind::Inner,
+            asof: None,
         }
         .project(vec![NamedExpr::new(
             path("b.attr.db.statement"),

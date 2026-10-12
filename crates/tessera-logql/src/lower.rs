@@ -768,6 +768,7 @@ fn vector_binary_plan(
             ),
         ],
         kind: JoinKind::Inner,
+        asof: None,
     };
     let labels = match matching.and_then(|m| m.group.as_ref()) {
         None => restricted(Expr::column("l._extracted")),

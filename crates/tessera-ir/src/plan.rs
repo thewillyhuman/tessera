@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tessera_types::event::{EXTRACTED, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{DatasetName, Kind, TenantId, TimeRange, Timestamp, event};
 
-use crate::expr::{Expr, Literal, qualify};
+use crate::expr::{BinaryOp, Expr, Literal, qualify};
 use crate::function::Registry;
 use crate::promql::PromExpr;
 use crate::trace::{Spanset, trace_group_schema};
@@ -49,6 +49,12 @@ pub enum PlanError {
     /// A join key has different types on the two sides.
     #[error("join keys have different types: {0} and {1}")]
     JoinKeyTypes(String, String),
+    /// The times of an `ASOF JOIN` have different types on the two sides.
+    #[error("asof times have different types: {0} and {1}")]
+    AsofTypes(String, String),
+    /// The times of an `ASOF JOIN` cannot be ordered.
+    #[error("asof times must be timestamps or numbers, not {0}")]
+    AsofType(String),
 }
 
 /// Which rows a join keeps (DM-2).
@@ -68,6 +74,59 @@ impl fmt::Display for JoinKind {
             JoinKind::Left => write!(f, "left"),
         }
     }
+}
+
+/// Which right row an `ASOF JOIN` takes among those with equal keys:
+/// the one whose time is nearest the left row's, on the given side of
+/// it (section 9.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum AsofMatch {
+    /// The latest right time at or before the left one: `left >= right`.
+    AtOrBefore,
+    /// The latest right time before the left one: `left > right`.
+    Before,
+    /// The earliest right time at or after the left one: `left <= right`.
+    AtOrAfter,
+    /// The earliest right time after the left one: `left < right`.
+    After,
+}
+
+impl AsofMatch {
+    /// The match `left op right` asks for; none unless `op` is an
+    /// inequality.
+    #[must_use]
+    pub fn from_op(op: BinaryOp) -> Option<Self> {
+        match op {
+            BinaryOp::GtEq => Some(AsofMatch::AtOrBefore),
+            BinaryOp::Gt => Some(AsofMatch::Before),
+            BinaryOp::LtEq => Some(AsofMatch::AtOrAfter),
+            BinaryOp::Lt => Some(AsofMatch::After),
+            _ => None,
+        }
+    }
+
+    /// The inequality `left op right` every pair satisfies.
+    #[must_use]
+    pub fn op(self) -> BinaryOp {
+        match self {
+            AsofMatch::AtOrBefore => BinaryOp::GtEq,
+            AsofMatch::Before => BinaryOp::Gt,
+            AsofMatch::AtOrAfter => BinaryOp::LtEq,
+            AsofMatch::After => BinaryOp::Lt,
+        }
+    }
+}
+
+/// The time match of an `ASOF JOIN`: each left row pairs with at most
+/// one right row of equal keys, the one [`AsofMatch`] picks by time.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Asof {
+    /// The left row's time, over the left side.
+    pub left: Expr,
+    /// The right row's time, over the right side.
+    pub right: Expr,
+    /// Which right row is taken.
+    pub matching: AsofMatch,
 }
 
 /// One side of a join: the rows and the name that qualifies their
@@ -470,6 +529,10 @@ pub enum Plan {
         on: Vec<(Expr, Expr)>,
         /// Which rows are kept.
         kind: JoinKind,
+        /// The time match, under an `ASOF JOIN`: of the right rows with
+        /// equal keys, each left row pairs with the one nearest in time.
+        #[serde(default)]
+        asof: Option<Asof>,
     },
     /// Derive labels from text: parse `source` by `stage` and add the
     /// results to the `_extracted` column, later stages overriding
@@ -791,7 +854,8 @@ impl Plan {
                 right,
                 on,
                 kind,
-            } => join_schema(left, right, on, *kind, registry),
+                asof,
+            } => join_schema(left, right, on, *kind, asof.as_ref(), registry),
         }
     }
 
@@ -808,8 +872,9 @@ impl Plan {
                 right,
                 on,
                 kind,
+                asof,
             } => {
-                let keys: Vec<String> = on
+                let mut keys: Vec<String> = on
                     .iter()
                     .map(|(l, r)| {
                         format!(
@@ -819,7 +884,16 @@ impl Plan {
                         )
                     })
                     .collect();
-                writeln!(f, "{pad}Join {kind}: {}", keys.join(" AND "))?;
+                if let Some(asof) = asof {
+                    keys.push(format!(
+                        "{} {} {}",
+                        qualified_key(&left.name, &asof.left),
+                        asof.matching.op().symbol(),
+                        qualified_key(&right.name, &asof.right)
+                    ));
+                }
+                let word = if asof.is_some() { " asof" } else { "" };
+                writeln!(f, "{pad}Join {kind}{word}: {}", keys.join(" AND "))?;
                 left.plan.fmt_tree(f, depth + 1)?;
                 right.plan.fmt_tree(f, depth + 1)
             }
@@ -944,12 +1018,14 @@ impl Plan {
 
 /// The schema of a join: the left columns then the right ones, each
 /// qualified by its side's name; the right ones nullable under a left
-/// join. The keys must type on their sides, pairwise alike.
+/// join. The keys must type on their sides, pairwise alike, and the
+/// times of an `ASOF JOIN` alike and ordered.
 fn join_schema(
     left: &JoinSide,
     right: &JoinSide,
     on: &[(Expr, Expr)],
     kind: JoinKind,
+    asof: Option<&Asof>,
     registry: &Registry,
 ) -> Result<SchemaRef, PlanError> {
     if left.name == right.name {
@@ -968,6 +1044,19 @@ fn join_schema(
                 left_type.to_string(),
                 right_type.to_string(),
             ));
+        }
+    }
+    if let Some(asof) = asof {
+        let left_type = expr_type(&asof.left, &left_schema, registry)?;
+        let right_type = expr_type(&asof.right, &right_schema, registry)?;
+        if left_type != right_type {
+            return Err(PlanError::AsofTypes(
+                left_type.to_string(),
+                right_type.to_string(),
+            ));
+        }
+        if !(left_type.is_temporal() || left_type.is_numeric()) {
+            return Err(PlanError::AsofType(left_type.to_string()));
         }
     }
     let qualified = |schema: &Schema, name: &str, nullable: bool| {
@@ -1329,10 +1418,9 @@ impl fmt::Display for Plan {
 mod tests {
     use arrow::datatypes::TimeUnit;
     use tessera_types::Timestamp;
-    use tessera_types::event::{BODY, SEVERITY_NUMBER};
+    use tessera_types::event::{BODY, SEVERITY_NUMBER, TRACE_ID};
 
     use super::*;
-    use crate::expr::BinaryOp;
 
     fn scan() -> Scan {
         Scan::all(
@@ -1363,6 +1451,7 @@ mod tests {
             right: JoinSide::new(silences.clone(), "s"),
             on: on.clone(),
             kind: JoinKind::Left,
+            asof: None,
         };
         let schema = join.schema(&registry()).unwrap();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -1388,6 +1477,7 @@ mod tests {
             right: JoinSide::new(silences.clone(), "t"),
             on: on.clone(),
             kind: JoinKind::Inner,
+            asof: None,
         };
         assert_eq!(
             same_names.schema(&registry()),
@@ -1398,6 +1488,7 @@ mod tests {
             right: JoinSide::new(silences.clone(), "s"),
             on: Vec::new(),
             kind: JoinKind::Inner,
+            asof: None,
         };
         assert_eq!(no_keys.schema(&registry()), Err(PlanError::EmptyJoin));
         let mismatched = Plan::Join {
@@ -1405,11 +1496,55 @@ mod tests {
             right: JoinSide::new(silences, "s"),
             on: vec![(Expr::column(TIMESTAMP), Expr::column("id"))],
             kind: JoinKind::Inner,
+            asof: None,
         };
         assert!(matches!(
             mismatched.schema(&registry()),
             Err(PlanError::JoinKeyTypes(..))
         ));
+    }
+
+    /// Section 9.2: an `ASOF JOIN` pairs each left row with one right
+    /// row by time; its times must share one orderable type, and
+    /// `EXPLAIN` shows the inequality the match answers.
+    #[test]
+    fn an_asof_join_types_its_times_and_shows_its_match() {
+        let logs = Plan::Scan(scan());
+        let spans = Plan::Scan(Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Span,
+        ));
+        let asof = |left: Expr, right: Expr| Plan::Join {
+            left: JoinSide::new(logs.clone(), "l"),
+            right: JoinSide::new(spans.clone(), "s"),
+            on: vec![(Expr::column(TRACE_ID), Expr::column(TRACE_ID))],
+            kind: JoinKind::Left,
+            asof: Some(Asof {
+                left,
+                right,
+                matching: AsofMatch::AtOrBefore,
+            }),
+        };
+        let join = asof(Expr::column(TIMESTAMP), Expr::column(TIMESTAMP));
+        assert!(join.schema(&registry()).is_ok());
+        assert!(
+            join.to_string().starts_with(
+                "Join left asof: l.trace_id = s.trace_id AND l.timestamp >= s.timestamp\n"
+            ),
+            "{join}"
+        );
+        assert!(matches!(
+            asof(Expr::column(TIMESTAMP), Expr::column(event::NAME)).schema(&registry()),
+            Err(PlanError::AsofTypes(..))
+        ));
+        assert!(matches!(
+            asof(Expr::column(BODY), Expr::column(event::NAME)).schema(&registry()),
+            Err(PlanError::AsofType(..))
+        ));
+        assert_eq!(AsofMatch::from_op(BinaryOp::Lt), Some(AsofMatch::After));
+        assert_eq!(AsofMatch::from_op(BinaryOp::Eq), None);
+        assert_eq!(AsofMatch::Before.op(), BinaryOp::Gt);
     }
 
     #[test]

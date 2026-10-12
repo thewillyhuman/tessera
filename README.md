@@ -55,7 +55,10 @@ protocol; a differential suite against SQLite.
 
 Gaps left in M2: joins are hash joins on equality keys, inner or left,
 one `JOIN` per query, with the build side's keys as a runtime filter on
-the other side but no `ASOF`, merge or lookup variants; a subquery
+the other side, and an `ASOF JOIN` pairs each left row with the one
+right row of its keys nearest in time on the side its inequality asks
+for (section 9.2), by binary search over the right rows of each key,
+but there are no merge or lookup variants; a subquery
 is a derived table in `FROM` or an `IN (SELECT ...)` condition of
 `WHERE`, lowered to a join on its distinct keys, but not `EXISTS` or
 a scalar subquery; no window

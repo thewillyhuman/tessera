@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use tessera_ir::{
-    AggregateExpr, AlertDefinition, BinaryOp, BindContext, ControlStatement, Diagnostic, Expr,
-    JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry, RollupDefinition, Scan,
-    SortKey, Span, Statement, qualify, unqualify,
+    AggregateExpr, AlertDefinition, Asof, AsofMatch, BinaryOp, BindContext, ControlStatement,
+    Diagnostic, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
+    RollupDefinition, Scan, SortKey, Span, Statement, qualify, unqualify,
 };
 use tessera_types::{
     DatasetName, Kind, RetentionAction, RetentionClause, RetentionPolicy, TenantId, Timestamp,
@@ -551,6 +551,9 @@ impl TableScope {
     }
 }
 
+/// The keys of a join, and the time match of an `ASOF JOIN`.
+type JoinCondition = (Vec<(Expr, Expr)>, Option<Asof>);
+
 /// The tables an expression may refer to. With one table its columns
 /// go by their own names; with several, every column is qualified by
 /// its table's name, as a join outputs it (DM-2).
@@ -658,7 +661,7 @@ fn lower_query(
             scope,
             substitution: None,
         };
-        let on = lowerer.join_keys(&join.on, &left_name, &right_name)?;
+        let (on, asof) = lowerer.join_keys(&join.on, &left_name, &right_name, join.asof)?;
         scope = lowerer.scope;
         plan = Plan::Join {
             left: JoinSide::new(plan, left_name),
@@ -668,6 +671,7 @@ fn lower_query(
                 ast::JoinKind::Inner => JoinKind::Inner,
                 ast::JoinKind::Left => JoinKind::Left,
             },
+            asof,
         };
     }
     let mut lowerer = Lowerer {
@@ -1369,51 +1373,78 @@ impl Lowerer<'_> {
 
     /// The keys of `ON`: a conjunction of equalities, each between an
     /// expression over `left` and one over `right`, returned in that
-    /// order and over their own tables' names.
+    /// order and over their own tables' names; under an `ASOF JOIN`,
+    /// one inequality between the two tables' times besides, as the
+    /// time match (section 9.2).
     fn join_keys(
         &self,
         on: &ast::Expr,
         left: &str,
         right: &str,
-    ) -> Result<Vec<(Expr, Expr)>, Diagnostic> {
+        asof: bool,
+    ) -> Result<JoinCondition, Diagnostic> {
         let unsupported = || {
-            Diagnostic::at(
-                on.span,
+            let message = if asof {
+                format!(
+                    "an ASOF JOIN condition is equalities between the two tables and one \
+                     inequality between their times, such as {left}.trace_id = \
+                     {right}.trace_id AND {left}.timestamp >= {right}.timestamp"
+                )
+            } else {
                 format!(
                     "join conditions must be equalities between the two tables, \
                      such as {left}.trace_id = {right}.trace_id; other conditions go in WHERE"
-                ),
-            )
+                )
+            };
+            Diagnostic::at(on.span, message)
+        };
+        let side_of = |expr: &Expr| {
+            let names = expr.names();
+            if names.is_empty() {
+                None
+            } else if names.iter().all(|n| unqualify(left, n).is_some()) {
+                Some(true)
+            } else if names.iter().all(|n| unqualify(right, n).is_some()) {
+                Some(false)
+            } else {
+                None
+            }
         };
         let mut keys = Vec::new();
+        let mut time = None;
         for conjunct in self.expr(on)?.conjuncts() {
             let Expr::Binary {
-                op: BinaryOp::Eq,
+                op,
                 left: l,
                 right: r,
             } = conjunct
             else {
                 return Err(unsupported());
             };
-            let side_of = |expr: &Expr| {
-                let names = expr.names();
-                if names.is_empty() {
-                    None
-                } else if names.iter().all(|n| unqualify(left, n).is_some()) {
-                    Some(true)
-                } else if names.iter().all(|n| unqualify(right, n).is_some()) {
-                    Some(false)
-                } else {
-                    None
-                }
-            };
-            keys.push(match (side_of(&l), side_of(&r)) {
-                (Some(true), Some(false)) => (l.unqualify(left), r.unqualify(right)),
-                (Some(false), Some(true)) => (r.unqualify(left), l.unqualify(right)),
+            let (l, r, op) = match (side_of(&l), side_of(&r)) {
+                (Some(true), Some(false)) => (l.unqualify(left), r.unqualify(right), op),
+                (Some(false), Some(true)) => (r.unqualify(left), l.unqualify(right), op.flipped()),
                 _ => return Err(unsupported()),
-            });
+            };
+            if op == BinaryOp::Eq {
+                keys.push((l, r));
+                continue;
+            }
+            match AsofMatch::from_op(op) {
+                Some(matching) if asof && time.is_none() => {
+                    time = Some(Asof {
+                        left: l,
+                        right: r,
+                        matching,
+                    });
+                }
+                _ => return Err(unsupported()),
+            }
         }
-        Ok(keys)
+        if asof && (time.is_none() || keys.is_empty()) {
+            return Err(unsupported());
+        }
+        Ok((keys, time))
     }
 
     /// Lowers an expression; under an aggregate, grouping expressions and
@@ -1563,6 +1594,7 @@ impl Lowerer<'_> {
             } else {
                 JoinKind::Inner
             },
+            asof: None,
         };
         if *negated {
             joined = joined.filter(Expr::IsNull {
@@ -2024,6 +2056,40 @@ mod tests {
             parse("INSERT INTO (SELECT 1) VALUES (1)").is_err(),
             "a derived table is not a target"
         );
+    }
+
+    /// Section 9.2: the one inequality of an `ASOF JOIN` is its time
+    /// match, read with the left table first whichever side it was
+    /// written on; a join without `ASOF` takes no inequality, and an
+    /// `ASOF JOIN` needs exactly one and an equality besides.
+    #[test]
+    fn an_asof_join_lowers_its_inequality_as_the_time_match() {
+        let plan = lowered(
+            "SELECT l.body FROM logs l ASOF JOIN spans s ON l.trace_id = s.trace_id \
+             AND s.timestamp <= l.timestamp",
+        );
+        assert!(
+            plan.to_string().contains(
+                "Join inner asof: l.trace_id = s.trace_id AND l.timestamp >= s.timestamp"
+            ),
+            "{plan}"
+        );
+        let error = |sql: &str| lower(&parse(sql).unwrap(), &ctx()).unwrap_err().message;
+        assert!(
+            error(
+                "SELECT l.body FROM logs l JOIN spans s ON l.trace_id = s.trace_id \
+                 AND l.timestamp >= s.timestamp"
+            )
+            .contains("equalities"),
+        );
+        for sql in [
+            "SELECT l.body FROM logs l ASOF JOIN spans s ON l.trace_id = s.trace_id",
+            "SELECT l.body FROM logs l ASOF JOIN spans s ON l.timestamp >= s.timestamp",
+            "SELECT l.body FROM logs l ASOF JOIN spans s ON l.trace_id = s.trace_id \
+             AND l.timestamp >= s.timestamp AND l.timestamp < s.timestamp",
+        ] {
+            assert!(error(sql).contains("ASOF JOIN"), "{sql}");
+        }
     }
 
     /// QL-3: a language in `FROM` is a relation named after it, under
