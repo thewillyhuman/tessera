@@ -14,11 +14,15 @@
 //! Reading as classic series (QL-5) gives `PromQL` a point's cumulative
 //! `le` buckets, its count and sum, or a summary's quantiles, so that a
 //! stored histogram answers `name_bucket`, `name_count` and `name_sum`
-//! as a scraped one would.
+//! as a scraped one would. Reading as a native histogram gives the
+//! point itself under its own name, and a native histogram writes back
+//! in the stored shape, so that results carry one like a point.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
+
+use crate::promql::histogram::{CUSTOM_SCHEMA, Histogram, MAX_SCHEMA, MIN_SCHEMA, ResetHint};
 
 /// The histograms of `points`, delta points of one series, as one:
 /// counts added, `count` and `sum` added, `min` and `max` kept.
@@ -205,6 +209,147 @@ pub fn quantiles(point: &str) -> Option<Vec<(f64, f64)>> {
         .collect()
 }
 
+/// The native histogram a stored point holds (QL-5): an exponential
+/// point at its scale, reduced to Prometheus' finest schema when finer;
+/// a classic point as custom buckets, its bounds the upper bounds and
+/// its last count the `+Inf` bucket. A missing sum is zero, as
+/// Prometheus reads one; `min` and `max` are not carried. None for a
+/// summary, a point that does not parse, or a scale coarser than
+/// Prometheus supports.
+#[must_use]
+pub fn native(point: &str) -> Option<Histogram> {
+    let object = parse(point)?;
+    let mut histogram = Histogram {
+        hint: object
+            .get("hint")
+            .and_then(Value::as_str)
+            .and_then(ResetHint::parse)
+            .unwrap_or_default(),
+        count: number(object.get("count")).unwrap_or(0.0),
+        sum: number(object.get("sum")).unwrap_or(0.0),
+        ..Histogram::default()
+    };
+    if let Some(bounds) = object.get("bounds").and_then(Value::as_array) {
+        histogram.schema = CUSTOM_SCHEMA;
+        histogram.custom_values = bounds
+            .iter()
+            .map(|b| number(Some(b)))
+            .collect::<Option<_>>()?;
+        for (i, count) in float_counts(object.get("counts"))?.into_iter().enumerate() {
+            histogram.positive.insert(i32::try_from(i).ok()?, count);
+        }
+        return Some(histogram);
+    }
+    let scale = i32::try_from(object.get("scale")?.as_i64()?).ok()?;
+    if scale < MIN_SCHEMA {
+        return None;
+    }
+    histogram.schema = scale;
+    histogram.zero_count = number(object.get("zero_count")).unwrap_or(0.0);
+    histogram.zero_threshold = number(object.get("zero_threshold")).unwrap_or(0.0);
+    histogram.positive = side(object.get("positive"))?;
+    histogram.negative = side(object.get("negative"))?;
+    histogram.reduce_resolution(MAX_SCHEMA);
+    Some(histogram)
+}
+
+/// The stored shape of a native histogram, what [`native`] reads back:
+/// a number JSON cannot hold (`NaN`, `+Inf`, `-Inf`) is written as its
+/// text.
+#[must_use]
+pub fn point(histogram: &Histogram) -> String {
+    let mut object = Map::new();
+    object.insert("count".into(), json_number(histogram.count));
+    object.insert("sum".into(), json_number(histogram.sum));
+    if histogram.uses_custom_buckets() {
+        let counts: Vec<Value> = (0..=histogram.custom_values.len())
+            .map(|i| {
+                let count = i32::try_from(i)
+                    .ok()
+                    .and_then(|i| histogram.positive.get(&i))
+                    .copied()
+                    .unwrap_or(0.0);
+                json_number(count)
+            })
+            .collect();
+        object.insert(
+            "bounds".into(),
+            histogram
+                .custom_values
+                .iter()
+                .map(|b| json_number(*b))
+                .collect(),
+        );
+        object.insert("counts".into(), Value::Array(counts));
+    } else {
+        object.insert("scale".into(), json!(histogram.schema));
+        object.insert("zero_count".into(), json_number(histogram.zero_count));
+        object.insert(
+            "zero_threshold".into(),
+            json_number(histogram.zero_threshold),
+        );
+        object.insert("positive".into(), dense(&histogram.positive));
+        object.insert("negative".into(), dense(&histogram.negative));
+    }
+    if histogram.hint != ResetHint::Unknown {
+        object.insert("hint".into(), json!(histogram.hint.as_str()));
+    }
+    Value::Object(object).to_string()
+}
+
+/// A side's buckets by Prometheus index, which is one above the
+/// stored index: the stored offset names the bucket whose upper bound
+/// is the first bucket's lower bound.
+fn side(value: Option<&Value>) -> Option<BTreeMap<i32, f64>> {
+    let mut out = BTreeMap::new();
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Some(out);
+    };
+    let offset = value.get("offset")?.as_i64()?;
+    for (i, count) in float_counts(value.get("counts"))?.into_iter().enumerate() {
+        let index = offset.checked_add(i64::try_from(i).ok()?)?.checked_add(1)?;
+        out.insert(i32::try_from(index).ok()?, count);
+    }
+    Some(out)
+}
+
+/// Buckets by Prometheus index as the stored offset and a dense run of
+/// counts.
+fn dense(buckets: &BTreeMap<i32, f64>) -> Value {
+    let (Some(first), Some(last)) = (buckets.keys().next(), buckets.keys().next_back()) else {
+        return json!({ "offset": 0, "counts": [] });
+    };
+    let counts: Vec<Value> = (*first..=*last)
+        .map(|i| json_number(buckets.get(&i).copied().unwrap_or(0.0)))
+        .collect();
+    json!({ "offset": i64::from(*first) - 1, "counts": counts })
+}
+
+fn float_counts(value: Option<&Value>) -> Option<Vec<f64>> {
+    value?.as_array()?.iter().map(|v| number(Some(v))).collect()
+}
+
+/// A number, or the text of one JSON cannot hold.
+fn number(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_number(value: f64) -> Value {
+    if value.is_finite() {
+        json!(value)
+    } else if value.is_nan() {
+        json!("NaN")
+    } else if value > 0.0 {
+        json!("+Inf")
+    } else {
+        json!("-Inf")
+    }
+}
+
 fn parse(point: &str) -> Option<Map<String, Value>> {
     match serde_json::from_str::<Value>(point).ok()? {
         Value::Object(object) => Some(object),
@@ -274,6 +419,58 @@ mod tests {
         assert!(classic_buckets(summary).is_none());
         assert!(quantiles(classic).is_none());
         assert!(count_and_sum("not json").is_none());
+    }
+
+    /// QL-5: a stored point reads as a native histogram and writes back
+    /// in the same shape.
+    #[test]
+    fn points_read_as_native_histograms_and_write_back() {
+        let exponential = r#"{"count":7,"sum":3.5,"scale":1,"zero_count":1,"zero_threshold":0.001,"positive":{"offset":-1,"counts":[2,0,3]},"negative":{"offset":2,"counts":[1]},"min":0.1,"max":9.0}"#;
+        let histogram = native(exponential).unwrap();
+        assert_eq!(histogram.schema, 1);
+        assert_eq!(
+            histogram.positive,
+            BTreeMap::from([(0, 2.0), (1, 0.0), (2, 3.0)]),
+            "a stored offset of -1 starts at Prometheus index 0"
+        );
+        assert_eq!(histogram.negative, BTreeMap::from([(3, 1.0)]));
+        assert!((histogram.zero_count - 1.0).abs() < f64::EPSILON);
+        assert!((histogram.zero_threshold - 0.001).abs() < f64::EPSILON);
+        assert!((histogram.count - 7.0).abs() < f64::EPSILON);
+        assert!((histogram.sum - 3.5).abs() < f64::EPSILON);
+        assert_eq!(histogram.hint, ResetHint::Unknown);
+        assert_eq!(native(&point(&histogram)).unwrap(), histogram);
+        let classic = r#"{"count":3,"sum":30.0,"bounds":[10.0,20.0],"counts":[1,2,0]}"#;
+        let custom = native(classic).unwrap();
+        assert_eq!(custom.schema, CUSTOM_SCHEMA);
+        assert_eq!(custom.custom_values, vec![10.0, 20.0]);
+        assert_eq!(
+            custom.positive,
+            BTreeMap::from([(0, 1.0), (1, 2.0), (2, 0.0)])
+        );
+        assert_eq!(native(&point(&custom)).unwrap(), custom);
+        let fine = r#"{"count":2,"sum":2,"scale":10,"zero_count":0,"zero_threshold":0,"positive":{"offset":0,"counts":[1,1]}}"#;
+        let reduced = native(fine).unwrap();
+        assert_eq!(reduced.schema, MAX_SCHEMA, "finer than schema 8 is reduced");
+        assert_eq!(reduced.positive, BTreeMap::from([(1, 2.0)]));
+        assert!(native(r#"{"count":2,"sum":5.0,"quantiles":[[0.5,2.5]]}"#).is_none());
+        assert!(native(r#"{"count":1,"scale":-5,"positive":null}"#).is_none());
+        assert!(native("not json").is_none());
+        let mut gauge = histogram.clone();
+        gauge.sum = f64::NAN;
+        gauge.hint = ResetHint::Gauge;
+        let text = point(&gauge);
+        assert!(
+            text.contains(r#""sum":"NaN""#) && text.contains(r#""hint":"gauge""#),
+            "{text}"
+        );
+        let back = native(&text).unwrap();
+        assert!(back.sum.is_nan());
+        assert_eq!(back.hint, ResetHint::Gauge);
+        let missing_sum =
+            native(r#"{"count":1,"sum":null,"scale":0,"positive":{"offset":0,"counts":[1]}}"#)
+                .unwrap();
+        assert!(missing_sum.sum == 0.0);
     }
 
     #[test]

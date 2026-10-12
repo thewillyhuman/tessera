@@ -13,6 +13,7 @@
 //! calls it turns rows into series and series back into rows.
 
 mod functions;
+pub mod histogram;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,6 +21,8 @@ use tessera_ir::promql::{Group, Matching, PromAggregate, PromExpr, PromOp};
 use tessera_ir::{LOOKBACK, SeriesGrouping};
 
 use crate::KernelError;
+
+pub use histogram::{Bucket, Histogram, ResetHint};
 
 /// The labels of a series, `__name__` among them.
 pub type Labels = BTreeMap<String, String>;
