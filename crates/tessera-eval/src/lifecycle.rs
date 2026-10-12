@@ -64,6 +64,9 @@ pub struct Observation {
     pub labels: BTreeMap<String, String>,
     /// The group's value.
     pub value: f64,
+    /// When the last of the rows behind the value was received, for
+    /// the alert latency of section 17.1; none when not known.
+    pub received: Option<Timestamp>,
 }
 
 /// The fingerprint of a label set: sixteen hex digits of a stable hash
@@ -130,6 +133,10 @@ pub struct Transition {
     pub labels: BTreeMap<String, String>,
     /// The instance's value at the time.
     pub value: f64,
+    /// When the last of the rows behind the value was received, for
+    /// the alert latency of section 17.1; none when not known.
+    #[serde(default)]
+    pub received: Option<Timestamp>,
 }
 
 impl Transition {
@@ -231,6 +238,7 @@ pub fn step(
         at: now,
         labels: labels.clone(),
         value,
+        received: observed.and_then(|o| o.received),
     });
     let instance = (next != Status::Inactive).then(|| Instance {
         rule: rule.to_owned(),
@@ -264,6 +272,7 @@ mod tests {
         Observation {
             labels: BTreeMap::from([("service".to_owned(), "checkout".to_owned())]),
             value,
+            received: None,
         }
     }
 
@@ -296,13 +305,22 @@ mod tests {
             Some(&still_pending),
             "r",
             &fp,
-            Some(&observed(3.0)),
+            Some(&Observation {
+                received: Some(at(119)),
+                ..observed(3.0)
+            }),
             at(120),
             HOLD,
         );
         let firing = fired.instance.unwrap();
         assert_eq!(firing.status, Status::Firing);
-        assert_eq!(fired.transition.unwrap().number, 2);
+        let t2 = fired.transition.unwrap();
+        assert_eq!(t2.number, 2);
+        assert_eq!(
+            t2.received,
+            Some(at(119)),
+            "the transition carries when its last row came (17.1)"
+        );
 
         let resolved = step(Some(&firing), "r", &fp, None, at(300), HOLD);
         let resolved_instance = resolved.instance.unwrap();
@@ -396,6 +414,7 @@ mod tests {
             at: at(0),
             labels: BTreeMap::new(),
             value: 1.0,
+            received: None,
         };
         assert_eq!(t.idempotency_key(), format!("r/{a}/1"));
         assert_eq!(t.event_id("default"), t.event_id("default"));

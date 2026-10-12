@@ -443,6 +443,7 @@ mod tests {
             at: Timestamp::from_nanos(0),
             labels: BTreeMap::new(),
             value: 1.0,
+            received: None,
         }
     }
 

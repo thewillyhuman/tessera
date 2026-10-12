@@ -90,6 +90,11 @@ pub fn metric_rows(
             snapshot.degraded_rules as f64,
             None,
         ),
+        (
+            "tessera_alert_latency_seconds".into(),
+            snapshot.alert_latency.as_secs_f64(),
+            None,
+        ),
     ];
     for (kind, held) in &snapshot.slots {
         points.push((
@@ -315,9 +320,15 @@ mod tests {
             evaluator_lag: Duration::from_secs(3),
             degraded_rules: 0,
             slots: BTreeMap::from([(WorkKind::Partition, 4), (WorkKind::Intake, 1)]),
+            alert_latency: Duration::from_millis(1_200),
         };
         let rows = metric_rows(&snapshot, 3, NodeId::from_u128(7), Timestamp::from_nanos(1));
-        assert_eq!(rows.len(), 10);
+        assert_eq!(rows.len(), 11);
+        let latency = rows
+            .iter()
+            .find(|r| r.name == "tessera_alert_latency_seconds")
+            .unwrap();
+        assert_eq!(latency.value, Some(1.2));
         let conflicts = rows
             .iter()
             .find(|r| r.name == "tessera_commit_conflicts_total")

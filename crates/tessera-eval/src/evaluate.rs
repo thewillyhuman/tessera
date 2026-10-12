@@ -256,7 +256,11 @@ fn observe_rows(output: &QueryOutput) -> Vec<Observation> {
                     _ => {}
                 }
             }
-            observations.push(Observation { labels, value });
+            observations.push(Observation {
+                labels,
+                value,
+                received: None,
+            });
         }
     }
     observations
@@ -287,6 +291,7 @@ fn observe_samples(batches: &[RecordBatch]) -> Vec<Observation> {
                 } else {
                     values.value(row)
                 },
+                received: None,
             });
         }
     }

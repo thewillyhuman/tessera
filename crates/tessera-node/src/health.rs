@@ -100,6 +100,13 @@ pub fn default_rules() -> Vec<AlertRule> {
             "warning",
         ),
         rule(
+            "tessera_alert_latency",
+            "tessera_alert_latency_seconds",
+            "> 3",
+            300,
+            "warning",
+        ),
+        rule(
             "tessera_query_queue",
             "tessera_query_queue_seconds",
             "> 2",
@@ -157,7 +164,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let env = Env::simulated(1, Timestamp::from_nanos(0));
         let controls = ControlStores::new(store, env);
-        assert_eq!(ensure_rules(&controls).await.unwrap(), 8);
+        assert_eq!(ensure_rules(&controls).await.unwrap(), 9);
         let control = controls.open(&TenantId::SYSTEM);
         let mut changed: AlertRule = serde_json::from_value(
             control

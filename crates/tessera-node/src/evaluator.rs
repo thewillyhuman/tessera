@@ -284,10 +284,14 @@ async fn tenant_round(
             }
         }
         match group.deliver(&delivery, now).await {
-            Ok(delivered) if delivered.events > 0 || delivered.repeated > 0 => {
-                tracing::info!(%tenant, group = %name, ?delivered, "alerts delivered");
+            Ok(delivered) => {
+                for latency in &delivered.latencies {
+                    evaluator.load.alert_sent(*latency);
+                }
+                if delivered.events > 0 || delivered.repeated > 0 {
+                    tracing::info!(%tenant, group = %name, ?delivered, "alerts delivered");
+                }
             }
-            Ok(_) => {}
             Err(error) => {
                 tracing::warn!(%tenant, group = %name, error = %error, "alert delivery failed");
             }

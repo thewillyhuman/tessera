@@ -460,6 +460,7 @@ mod tests {
                     ("severity".to_owned(), "critical".to_owned()),
                 ]),
                 value: 3.0,
+                received: None,
             },
             annotations: BTreeMap::from([("summary".to_owned(), "too many".to_owned())]),
             repeat,

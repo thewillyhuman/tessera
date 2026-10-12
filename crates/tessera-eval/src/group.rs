@@ -488,6 +488,11 @@ impl RuleGroup {
                 continue;
             }
             delivered.notified += 1;
+            if let Some(received) = transition.received {
+                delivered
+                    .latencies
+                    .push(now.duration_since(received).unwrap_or_default());
+            }
             done.push(transition);
             if let Some(instance) = state
                 .instances
@@ -632,6 +637,7 @@ impl RuleGroup {
                 at: now,
                 labels: instance.labels.clone(),
                 value: instance.value,
+                received: None,
             };
             match self.notify(delivery, &again, Some(instance), now).await {
                 Outcome::Sent(Some(instance)) => {
@@ -802,6 +808,10 @@ pub struct Delivered {
     pub waiting: usize,
     /// Notifications that failed and stay pending.
     pub failed: usize,
+    /// For each transition notified that knew when its last row was
+    /// received: the time from then to now, the alert latency of
+    /// section 17.1.
+    pub latencies: Vec<Duration>,
 }
 
 enum Outcome {
@@ -937,6 +947,7 @@ fn decide(
                 Observation {
                     labels,
                     value: observation.value,
+                    received: None,
                 },
             );
         }

@@ -31,7 +31,7 @@ use tessera_manifest::registry;
 use tessera_object::{ObjectError, ObjectStore};
 use tessera_opt::optimize;
 use tessera_sql::SqlFrontend;
-use tessera_types::event::{SAMPLE_RATE, TIMESTAMP};
+use tessera_types::event::{OBSERVED_TIMESTAMP, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, TimeRange, Timestamp, WriterId};
 use tessera_wal::{EntryBody, WalError, reader};
 
@@ -423,6 +423,10 @@ pub struct WindowState {
     pub keys: BTreeMap<String, String>,
     /// One partial per aggregate, in the rule's order.
     pub partials: Vec<Partial>,
+    /// When the last of the window's rows was received: the newest
+    /// observed time among them, for the alert latency of section 17.1.
+    #[serde(default)]
+    pub received: Option<Timestamp>,
 }
 
 impl WindowState {
@@ -773,6 +777,9 @@ fn fold_batch(
     let sample_rates = rows
         .column_by_name(SAMPLE_RATE)
         .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
+    let observed = rows
+        .column_by_name(OBSERVED_TIMESTAMP)
+        .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>());
     let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
     let hop = shape
         .hop
@@ -803,10 +810,17 @@ fn fold_batch(
                         start,
                         keys: labels.clone(),
                         partials: vec![Partial::default(); shape.aggregates.len()],
+                        received: None,
                     })
             });
             for (partial, arg) in window.partials.iter_mut().zip(&args) {
                 partial.fold(arg.as_ref().and_then(|a| number(a, row)), weight);
+            }
+            if let Some(observed) = observed
+                && !observed.is_null(row)
+            {
+                let at = Timestamp::from_nanos(observed.value(row));
+                window.received = Some(window.received.map_or(at, |seen| seen.max(at)));
             }
         }
     }
@@ -909,6 +923,7 @@ pub fn observe(
                     start: Timestamp::from_nanos(last_closed),
                     keys: window.keys.clone(),
                     partials: vec![Partial::default(); shape.aggregates.len()],
+                    received: None,
                 });
             }
         }
@@ -933,6 +948,7 @@ pub fn observe(
             observations.push(Observation {
                 labels: window.keys.clone(),
                 value: values.first().copied().unwrap_or(f64::NAN),
+                received: window.received,
             });
         }
     }
@@ -1110,5 +1126,43 @@ mod tests {
         let mut grown = old;
         grown.fold(Some(1.0), 4.0);
         assert!((grown.value("count") - 7.0).abs() < f64::EPSILON);
+    }
+
+    /// Section 17.1: a window remembers when the last of its rows was
+    /// received, which its observations carry on to the transitions.
+    #[test]
+    fn a_window_remembers_when_its_last_row_was_received() {
+        let sql = "SELECT count(*) AS n FROM logs \
+                   GROUP BY tumble(timestamp, INTERVAL '1 minute') HAVING count(*) >= 1";
+        let shape = shape_of_sql(sql, "prod", &TenantId::DEFAULT, None).unwrap();
+        let at = Timestamp::from_nanos(1_700_000_000_000_000_000);
+        let rows: Vec<LogRow> = [1u8, 2, 3]
+            .into_iter()
+            .map(|i| LogRow {
+                timestamp: at,
+                observed_timestamp: Timestamp::from_nanos(at.as_nanos() + i64::from(i) * 7),
+                event_id: [i; 16],
+                ..LogRow::default()
+            })
+            .collect();
+        let batch =
+            EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &rows)
+                .unwrap();
+        let rule = AlertRule::new("timed", Language::Sql, sql);
+        let mut ingested = Ingested::default();
+        fold_batch(
+            &rule,
+            &shape,
+            &EvalState::default(),
+            &mut ingested,
+            batch.rows(),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        let window = ingested.windows.values().next().unwrap();
+        let newest = Timestamp::from_nanos(at.as_nanos() + 21);
+        assert_eq!(window.received, Some(newest));
+        let observed = observe(&rule, &shape, &ingested.windows, Timestamp::MAX).unwrap();
+        assert_eq!(observed[0].received, Some(newest));
     }
 }

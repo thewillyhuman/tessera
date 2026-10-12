@@ -32,6 +32,7 @@ pub struct Load {
     intake_backlog: AtomicU64,
     evaluator_lag_nanos: AtomicU64,
     degraded_rules: AtomicU64,
+    alert_latency_nanos: AtomicU64,
     slots: Mutex<BTreeMap<WorkKind, u64>>,
 }
 
@@ -63,6 +64,9 @@ pub struct Snapshot {
     /// Owned rules whose window state was rebuilt from the files after
     /// falling behind the writer logs (section 11.7).
     pub degraded_rules: u64,
+    /// Smoothed time from the last row an alert's rule received to the
+    /// notification sent (section 17.1).
+    pub alert_latency: Duration,
     /// Slots held per kind of work.
     pub slots: BTreeMap<WorkKind, u64>,
 }
@@ -90,6 +94,18 @@ impl Load {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(old / 5 * 4 + took / 5)
             });
+    }
+
+    /// Records the time from the last row an alert's rule received to
+    /// its notification sent (section 17.1), smoothed like the query
+    /// wait.
+    pub fn alert_sent(&self, latency: Duration) {
+        let latency = u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX);
+        let _ =
+            self.alert_latency_nanos
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old / 5 * 4 + latency / 5)
+                });
     }
 
     /// Records how long a query waited for its turn, smoothed over the
@@ -145,6 +161,7 @@ impl Load {
             intake_backlog: self.intake_backlog.load(Ordering::Relaxed),
             evaluator_lag: Duration::from_nanos(self.evaluator_lag_nanos.load(Ordering::Relaxed)),
             degraded_rules: self.degraded_rules.load(Ordering::Relaxed),
+            alert_latency: Duration::from_nanos(self.alert_latency_nanos.load(Ordering::Relaxed)),
             slots: self
                 .slots
                 .lock()
@@ -198,6 +215,11 @@ impl Snapshot {
             "tessera_rules_degraded",
             "Owned rules whose windows were rebuilt from the files after falling behind the writer logs.",
             self.degraded_rules.to_string(),
+        );
+        gauge(
+            "tessera_alert_latency_seconds",
+            "Time from the last row an alert's rule received to the notification sent, smoothed.",
+            format!("{:.3}", self.alert_latency.as_secs_f64()),
         );
         let _ = writeln!(
             out,
@@ -264,8 +286,13 @@ mod tests {
         load.set_compaction_backlog(2);
         load.set_evaluator_lag(Duration::from_millis(1_500));
         load.set_degraded_rules(1);
+        load.alert_sent(Duration::from_millis(2_500));
         let text = load.snapshot().prometheus_text();
         assert!(text.contains("tessera_rules_degraded 1\n"), "{text}");
+        assert!(
+            text.contains("tessera_alert_latency_seconds 0.500\n"),
+            "one fifth of the first latency: {text}"
+        );
         assert!(text.contains("tessera_ingest_queue_depth 0\n"), "{text}");
         assert!(text.contains("tessera_compaction_backlog 2\n"), "{text}");
         assert!(

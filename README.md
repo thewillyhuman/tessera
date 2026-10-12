@@ -250,8 +250,11 @@ Gaps left in M7: a partition reads every writer log and runs every
 query, so partitions divide the state but not the reading; the
 incremental subset is SQL
 only, counting and summing rows with the weight `1 / sample_rate` as
-the batch aggregates do (QE-13); the alert latency target is set by the evaluation
-interval (five seconds by default) rather than measured; sketches
+the batch aggregates do (QE-13); the alert latency of 17.1, from the
+last row received to the notification sent, is measured for the
+incremental rules, as `tessera_alert_latency_seconds` with a default
+health rule at the target, while a periodic rule's is bounded by its
+evaluation interval (five seconds by default); sketches
 and histograms run periodically, while hopping windows,
 `hop(timestamp, size, step)`, sliding windows, `slide(timestamp,
 size)` stepping by the rule's `EVERY`, and absence, a condition such
