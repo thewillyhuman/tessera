@@ -30,6 +30,8 @@ const RANGE_CASES: &[&str] = &[
     r#"temperature{RUN, job="api"} and on(run) temperature{RUN, job="web"}"#,
     r#"temperature{RUN} unless temperature{RUN, job="api"}"#,
     "http_requests_total{RUN} / on(instance, job) group_left temperature{RUN}",
+    "temperature{RUN} < on(job) group_right http_requests_total{RUN}",
+    "temperature{RUN} < bool on(job) group_right http_requests_total{RUN}",
     "histogram_quantile(0.9, rate(latency_bucket{RUN}[1m]))",
     "changes(temperature{RUN}[1m])",
     "resets(http_requests_total{RUN}[2m])",

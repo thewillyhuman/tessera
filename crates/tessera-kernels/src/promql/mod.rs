@@ -608,11 +608,11 @@ fn scaled(
 }
 
 /// `l op r` between the samples of two matched series: the result, or
-/// none when the pair drops out. A comparison keeps the sample of the
-/// many side, `r` when `swapped`; `bool` gives 1 or 0 instead. Two
+/// none when the pair drops out. A comparison keeps the left sample,
+/// whichever side is the many one; `bool` gives 1 or 0 instead. Two
 /// histograms add, subtract into a gauge, and compare for equality.
-fn combined(op: PromOp, l: &Point, r: &Point, swapped: bool, bool_result: bool) -> Option<Point> {
-    let kept = || if swapped { r.clone() } else { l.clone() };
+fn combined(op: PromOp, l: &Point, r: &Point, bool_result: bool) -> Option<Point> {
+    let kept = || l.clone();
     let held = |held: bool| {
         if bool_result {
             Some(Point::Float(f64::from(u8::from(held))))
@@ -753,7 +753,7 @@ fn vector_match(
         } else {
             (&value, one_value)
         };
-        let Some(result) = combined(op, l, r, swapped, bool_result) else {
+        let Some(result) = combined(op, l, r, bool_result) else {
             continue;
         };
         let mut result_labels = if swapped {
@@ -1430,6 +1430,29 @@ mod tests {
             "group_left pairs every series with the one count"
         );
         assert!((value_of(&rows, "api") - 80.0).abs() < f64::EPSILON);
+        // A comparison keeps the left operand's value with the many
+        // side's labels, as Prometheus does: up (1) < requests (40).
+        let lt_right = PromExpr::Binary {
+            op: PromOp::Lt,
+            left: Box::new(selector(1, None)),
+            right: Box::new(selector(0, None)),
+            matching: Some(Matching {
+                on: true,
+                labels: vec!["job".into()],
+                group: Some(Group {
+                    left: false,
+                    include: vec![],
+                }),
+            }),
+            bool_result: false,
+        };
+        let rows = at(&lt_right, 60);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].labels.as_ref().unwrap()["__name__"], "requests");
+        assert!(
+            (value_of(&rows, "api") - 1.0).abs() < f64::EPSILON,
+            "{rows:?}"
+        );
     }
 
     #[test]
