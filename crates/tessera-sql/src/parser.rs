@@ -427,15 +427,13 @@ impl Parser<'_> {
                         },
                     span: unit,
                 }) = self.peek().cloned()
+                    && !RESERVED.contains(&name.as_str())
+                    && !ALERT_KEYWORDS.contains(&name.as_str())
                 {
-                    if !RESERVED.contains(&name.as_str())
-                        && !ALERT_KEYWORDS.contains(&name.as_str())
-                    {
-                        self.at += 1;
-                        text.push(' ');
-                        text.push_str(&name);
-                        end = unit.end;
-                    }
+                    self.at += 1;
+                    text.push(' ');
+                    text.push_str(&name);
+                    end = unit.end;
                 }
                 Ok((text, Span::new(span.start, end)))
             }

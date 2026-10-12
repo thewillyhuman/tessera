@@ -561,10 +561,10 @@ pub async fn list_partitions(
         if !tail.starts_with("_log/") {
             continue;
         }
-        if let Ok(window) = window.parse::<Window>() {
-            if !windows.contains(&window) {
-                windows.push(window);
-            }
+        if let Ok(window) = window.parse::<Window>()
+            && !windows.contains(&window)
+        {
+            windows.push(window);
         }
     }
     windows.sort_unstable();

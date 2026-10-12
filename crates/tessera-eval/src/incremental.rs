@@ -266,14 +266,14 @@ fn keys_and_window(
     if window.is_zero() {
         return Err("the window must be longer than zero".into());
     }
-    if let Some(hop) = hop {
-        if hop.is_zero() || hop > window || window.as_nanos() % hop.as_nanos() != 0 {
-            return Err(
-                "a window's step must be longer than zero, at most the window and divide it; \
+    if let Some(hop) = hop
+        && (hop.is_zero() || hop > window || window.as_nanos() % hop.as_nanos() != 0)
+    {
+        return Err(
+            "a window's step must be longer than zero, at most the window and divide it; \
                  a sliding window's step is the rule's EVERY"
-                    .into(),
-            );
-        }
+                .into(),
+        );
     }
     Ok((keys, window, hop))
 }

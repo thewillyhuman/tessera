@@ -117,15 +117,15 @@ pub async fn write_path(sim: &Sim) -> Result<Report, Violation> {
                 report.failed += node.pending.drain(..).count() as u64;
             }
         }
-        if random.below(1_000) < RECOVER_PER_MILLE {
-            if let Some(writer) = dead_writers.iter().next().copied() {
-                match recover(&target, &sim.node_env(0), writer, Window::DEFAULT_LENGTH).await {
-                    Ok(Recovery::Recovered { .. } | Recovery::AlreadyEnded) => {
-                        dead_writers.remove(&writer);
-                    }
-                    Ok(_) => {}
-                    Err(_) => report.failed += 1,
+        if random.below(1_000) < RECOVER_PER_MILLE
+            && let Some(writer) = dead_writers.iter().next().copied()
+        {
+            match recover(&target, &sim.node_env(0), writer, Window::DEFAULT_LENGTH).await {
+                Ok(Recovery::Recovered { .. } | Recovery::AlreadyEnded) => {
+                    dead_writers.remove(&writer);
                 }
+                Ok(_) => {}
+                Err(_) => report.failed += 1,
             }
         }
         if random.below(1_000) < INTAKE_PER_MILLE {

@@ -340,10 +340,10 @@ pub fn row_labels(
         // Later scopes must not override earlier ones: insert in reverse.
         for scope in LABEL_SCOPES.iter().rev() {
             for (path, value) in &object {
-                if path.starts_with(scope) {
-                    if let Some(text) = as_text(value.clone()) {
-                        labels.insert(label_name(path), text);
-                    }
+                if path.starts_with(scope)
+                    && let Some(text) = as_text(value.clone())
+                {
+                    labels.insert(label_name(path), text);
                 }
             }
         }

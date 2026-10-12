@@ -274,10 +274,10 @@ impl Engine {
                 .tombstones
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some((at, filters)) = cached.get(&key) {
-                if at.elapsed() < TOMBSTONE_TTL {
-                    return Ok(Arc::clone(filters));
-                }
+            if let Some((at, filters)) = cached.get(&key)
+                && at.elapsed() < TOMBSTONE_TTL
+            {
+                return Ok(Arc::clone(filters));
             }
         }
         let log = self.datasets.open(tenant, dataset);
@@ -551,10 +551,10 @@ impl Engine {
         share: Option<&'a Share>,
     ) -> futures::future::BoxFuture<'a, Result<Vec<RecordBatch>, EngineError>> {
         Box::pin(async move {
-            if share.is_none() {
-                if let Some(batches) = self.staged(plan, grant, analysis).await? {
-                    return Ok(batches);
-                }
+            if share.is_none()
+                && let Some(batches) = self.staged(plan, grant, analysis).await?
+            {
+                return Ok(batches);
             }
             match plan {
                 Plan::Scan(scan) => self.scan_node(scan, grant, analysis, share).await,

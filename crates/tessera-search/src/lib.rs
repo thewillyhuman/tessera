@@ -319,7 +319,7 @@ fn duration_nanos(value: &str) -> Option<i64> {
 }
 
 fn hex(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 || text.is_empty() {
+    if !text.len().is_multiple_of(2) || text.is_empty() {
         return None;
     }
     (0..text.len())

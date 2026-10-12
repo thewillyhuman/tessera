@@ -157,12 +157,12 @@ async fn plan_of(
         None => plan,
     };
     let plan = optimize(plan, engine.registry())?;
-    if let Some(readable) = &options.readable {
-        if let Some(scan) = scans(&plan).into_iter().find(|s| !readable(&s.dataset)) {
-            return Err(QueryError::Forbidden {
-                dataset: scan.dataset.clone(),
-            });
-        }
+    if let Some(readable) = &options.readable
+        && let Some(scan) = scans(&plan).into_iter().find(|s| !readable(&s.dataset))
+    {
+        return Err(QueryError::Forbidden {
+            dataset: scan.dataset.clone(),
+        });
     }
     // A rollup holds every row, so a restricted read keeps to the rows.
     let Some(source) = engine.rollups().filter(|_| options.rollups && !restricted) else {

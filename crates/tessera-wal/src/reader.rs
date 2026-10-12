@@ -43,12 +43,11 @@ pub async fn writers(store: &dyn ObjectStore) -> Result<Vec<WriterId>, WalError>
     let mut listing = store.list(&prefix);
     while let Some(meta) = listing.try_next().await? {
         let mut components = meta.key.as_str().split('/');
-        if let (Some("_wal"), Some(writer)) = (components.next(), components.next()) {
-            if let Ok(writer) = writer.parse::<WriterId>() {
-                if !writers.contains(&writer) {
-                    writers.push(writer);
-                }
-            }
+        if let (Some("_wal"), Some(writer)) = (components.next(), components.next())
+            && let Ok(writer) = writer.parse::<WriterId>()
+            && !writers.contains(&writer)
+        {
+            writers.push(writer);
         }
     }
     writers.sort();

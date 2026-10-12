@@ -1280,43 +1280,42 @@ impl Lowerer<'_> {
             args,
             wildcard,
         } = &expr.kind
+            && self.registry.is_aggregate(name)
         {
-            if self.registry.is_aggregate(name) {
-                if substitution.aggregates.iter().any(|(e, _)| e.same_as(expr)) {
-                    return Ok(());
-                }
-                if *wildcard && !name.starts_with("count") {
-                    return Err(Diagnostic::at(expr.span, format!("{name}(*) is not valid")));
-                }
-                let lowered = args
-                    .iter()
-                    .map(|a| {
-                        if self.has_aggregate(a) {
-                            Err(Diagnostic::at(a.span, "aggregates cannot be nested"))
-                        } else {
-                            self.expr(a)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let base = alias.map_or_else(|| name.clone(), str::to_owned);
-                let taken = |n: &str| {
-                    substitution.aggregates.iter().any(|(_, m)| m == n)
-                        || substitution.groups.iter().any(|(_, m)| m == n)
-                };
-                let mut out = base.clone();
-                let mut i = 1;
-                while taken(&out) {
-                    i += 1;
-                    out = format!("{base}_{i}");
-                }
-                substitution.aggregates.push((expr.clone(), out.clone()));
-                aggregates.push(AggregateExpr {
-                    function: name.clone(),
-                    args: lowered,
-                    name: out,
-                });
+            if substitution.aggregates.iter().any(|(e, _)| e.same_as(expr)) {
                 return Ok(());
             }
+            if *wildcard && !name.starts_with("count") {
+                return Err(Diagnostic::at(expr.span, format!("{name}(*) is not valid")));
+            }
+            let lowered = args
+                .iter()
+                .map(|a| {
+                    if self.has_aggregate(a) {
+                        Err(Diagnostic::at(a.span, "aggregates cannot be nested"))
+                    } else {
+                        self.expr(a)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let base = alias.map_or_else(|| name.clone(), str::to_owned);
+            let taken = |n: &str| {
+                substitution.aggregates.iter().any(|(_, m)| m == n)
+                    || substitution.groups.iter().any(|(_, m)| m == n)
+            };
+            let mut out = base.clone();
+            let mut i = 1;
+            while taken(&out) {
+                i += 1;
+                out = format!("{base}_{i}");
+            }
+            substitution.aggregates.push((expr.clone(), out.clone()));
+            aggregates.push(AggregateExpr {
+                function: name.clone(),
+                args: lowered,
+                name: out,
+            });
+            return Ok(());
         }
         for child in children(expr) {
             self.collect_aggregates(child, None, substitution, aggregates)?;
@@ -1325,10 +1324,10 @@ impl Lowerer<'_> {
     }
 
     fn has_aggregate(&self, expr: &ast::Expr) -> bool {
-        if let ast::ExprKind::Call { name, .. } = &expr.kind {
-            if self.registry.is_aggregate(name) {
-                return true;
-            }
+        if let ast::ExprKind::Call { name, .. } = &expr.kind
+            && self.registry.is_aggregate(name)
+        {
+            return true;
         }
         children(expr).into_iter().any(|c| self.has_aggregate(c))
     }

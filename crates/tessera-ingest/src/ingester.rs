@@ -242,10 +242,10 @@ impl Ingester {
             .duration_since(self.log_started)
             .is_some_and(|age| age >= self.config.max_log_age);
         let full = self.log.next_seq().get() > self.config.max_log_entries;
-        if aged || full {
-            if let Err(error) = self.rotate().await {
-                tracing::warn!(error = %error, "writer log rotation failed; will retry");
-            }
+        if (aged || full)
+            && let Err(error) = self.rotate().await
+        {
+            tracing::warn!(error = %error, "writer log rotation failed; will retry");
         }
         let due: Vec<(TenantId, DatasetName)> = self
             .memtables

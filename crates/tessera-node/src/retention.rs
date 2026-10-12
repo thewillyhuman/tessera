@@ -152,10 +152,10 @@ fn constant(text: &str) -> Option<bool> {
         (" >= ", |a, b| a >= b),
         (" = ", |a, b| (a - b).abs() < f64::EPSILON),
     ] {
-        if let Some((left, right)) = text.split_once(op) {
-            if let (Ok(a), Ok(b)) = (left.trim().parse::<f64>(), right.trim().parse::<f64>()) {
-                return Some(test(a, b));
-            }
+        if let Some((left, right)) = text.split_once(op)
+            && let (Ok(a), Ok(b)) = (left.trim().parse::<f64>(), right.trim().parse::<f64>())
+        {
+            return Some(test(a, b));
         }
     }
     None

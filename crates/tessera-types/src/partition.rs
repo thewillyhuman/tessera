@@ -103,7 +103,7 @@ impl FromStr for Window {
         let (start, length) = value.split_once('-').ok_or_else(invalid)?;
         let start_seconds: u64 = start.parse().map_err(|_| invalid())?;
         let length_seconds: u64 = length.parse().map_err(|_| invalid())?;
-        if length_seconds == 0 || start_seconds % length_seconds != 0 {
+        if length_seconds == 0 || !start_seconds.is_multiple_of(length_seconds) {
             return Err(invalid());
         }
         Ok(Window {

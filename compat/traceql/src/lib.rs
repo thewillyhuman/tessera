@@ -124,7 +124,7 @@ impl Endpoint {
 /// the hex Tessera writes or the base64 Tempo writes.
 fn id(value: &Value) -> String {
     let text = value.as_str().unwrap_or_default();
-    let bytes = if text.len() % 2 == 0 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+    let bytes = if text.len().is_multiple_of(2) && text.chars().all(|c| c.is_ascii_hexdigit()) {
         (0..text.len() / 2)
             .filter_map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
             .collect::<Vec<u8>>()

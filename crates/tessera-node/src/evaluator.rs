@@ -327,10 +327,10 @@ async fn settle(
             None,
         );
     }
-    if !evaluated.recorded.is_empty() {
-        if let Err(error) = group.record(sink, &evaluated.recorded).await {
-            tracing::warn!(%tenant, group = %name, error = %error, "recording rules not written");
-        }
+    if !evaluated.recorded.is_empty()
+        && let Err(error) = group.record(sink, &evaluated.recorded).await
+    {
+        tracing::warn!(%tenant, group = %name, error = %error, "recording rules not written");
     }
 }
 

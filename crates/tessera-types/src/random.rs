@@ -72,7 +72,7 @@ pub fn mutated(seed: &[u8], random: &mut impl Random) -> Vec<u8> {
     let below = |random: &mut dyn Random, n: usize| {
         usize::try_from(random.next_u64() % u64::try_from(n.max(1)).unwrap_or(1)).unwrap_or(0)
     };
-    if random.next_u64() % 8 == 0 {
+    if random.next_u64().is_multiple_of(8) {
         let len = below(random, 64);
         return (0..len)
             .map(|_| u8::try_from(random.next_u64() % 256).unwrap_or(0))

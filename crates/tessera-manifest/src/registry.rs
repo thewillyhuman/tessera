@@ -108,12 +108,11 @@ pub async fn datasets(
     let mut listing = store.list(&prefix);
     while let Some(meta) = listing.try_next().await? {
         let components: Vec<&str> = meta.key.as_str().split('/').collect();
-        if let [_, dataset, "_writers", _] = components.as_slice() {
-            if let Ok(dataset) = DatasetName::new(*dataset) {
-                if !datasets.contains(&dataset) {
-                    datasets.push(dataset);
-                }
-            }
+        if let [_, dataset, "_writers", _] = components.as_slice()
+            && let Ok(dataset) = DatasetName::new(*dataset)
+            && !datasets.contains(&dataset)
+        {
+            datasets.push(dataset);
         }
     }
     datasets.sort();

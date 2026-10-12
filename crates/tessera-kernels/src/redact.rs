@@ -35,26 +35,26 @@ pub fn apply(rows: &RecordBatch, rules: &[Redaction]) -> Result<RecordBatch, Ker
         })
         .collect::<Result<_, _>>()?;
     let mut columns = rows.columns().to_vec();
-    if let Ok(index) = rows.schema().index_of(OVERFLOW) {
-        if let Some(overflow) = rows.column(index).as_any().downcast_ref::<StringArray>() {
-            columns[index] = redact_overflow(overflow, &rules);
-        }
+    if let Ok(index) = rows.schema().index_of(OVERFLOW)
+        && let Some(overflow) = rows.column(index).as_any().downcast_ref::<StringArray>()
+    {
+        columns[index] = redact_overflow(overflow, &rules);
     }
     let body_rules: Vec<&Compiled<'_>> = rules.iter().filter(|r| r.rule.path == BODY).collect();
-    if let (Ok(index), false) = (rows.schema().index_of(BODY), body_rules.is_empty()) {
-        if let Some(body) = rows.column(index).as_any().downcast_ref::<StringArray>() {
-            let redacted: StringArray = (0..body.len())
-                .map(|i| {
-                    if body.is_null(i) {
-                        return None;
-                    }
-                    body_rules
-                        .iter()
-                        .try_fold(body.value(i).to_owned(), |text, rule| rule.redact(&text))
-                })
-                .collect();
-            columns[index] = Arc::new(redacted);
-        }
+    if let (Ok(index), false) = (rows.schema().index_of(BODY), body_rules.is_empty())
+        && let Some(body) = rows.column(index).as_any().downcast_ref::<StringArray>()
+    {
+        let redacted: StringArray = (0..body.len())
+            .map(|i| {
+                if body.is_null(i) {
+                    return None;
+                }
+                body_rules
+                    .iter()
+                    .try_fold(body.value(i).to_owned(), |text, rule| rule.redact(&text))
+            })
+            .collect();
+        columns[index] = Arc::new(redacted);
     }
     Ok(RecordBatch::try_new(rows.schema(), columns)?)
 }

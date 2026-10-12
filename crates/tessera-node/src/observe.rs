@@ -288,10 +288,10 @@ pub async fn run_logs(state: AppState, mut receiver: mpsc::Receiver<LogRow>) {
         for row in &mut pending {
             row.event_id = state.env.random.clone().next_u128().to_be_bytes();
         }
-        if let Ok(batch) = EventBatch::from_logs(TenantId::SYSTEM, dataset.clone(), &pending) {
-            if let Err(error) = state.write(batch).await {
-                tracing::debug!(error = %error.message(), "node logs not written");
-            }
+        if let Ok(batch) = EventBatch::from_logs(TenantId::SYSTEM, dataset.clone(), &pending)
+            && let Err(error) = state.write(batch).await
+        {
+            tracing::debug!(error = %error.message(), "node logs not written");
         }
         pending.clear();
     }

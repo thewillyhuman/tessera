@@ -81,14 +81,15 @@ pub fn parse_bodies(rows: &RecordBatch, parsing: BodyParsing) -> Result<RecordBa
 /// or a logfmt line's pairs as text. Anything else has none.
 fn fields_of(line: &str, parsing: BodyParsing) -> Vec<(String, Value)> {
     let trimmed = line.trim_start();
-    if parsing.json && trimmed.starts_with('{') {
-        if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed) {
-            let mut fields = Vec::new();
-            for (key, value) in object {
-                flatten(&format!("body.{key}"), value, &mut fields);
-            }
-            return fields;
+    if parsing.json
+        && trimmed.starts_with('{')
+        && let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed)
+    {
+        let mut fields = Vec::new();
+        for (key, value) in object {
+            flatten(&format!("body.{key}"), value, &mut fields);
         }
+        return fields;
     }
     if parsing.logfmt && line.contains('=') {
         let pairs = logfmt_labels(line);

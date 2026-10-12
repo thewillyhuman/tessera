@@ -46,10 +46,10 @@ impl Membership {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut next = records;
         for known in view.drain(..) {
-            if let Some(listed) = next.iter_mut().find(|r| r.node == known.node) {
-                if known.heartbeat_at > listed.heartbeat_at {
-                    *listed = known;
-                }
+            if let Some(listed) = next.iter_mut().find(|r| r.node == known.node)
+                && known.heartbeat_at > listed.heartbeat_at
+            {
+                *listed = known;
             }
         }
         *view = next;
@@ -68,10 +68,10 @@ impl Membership {
             if record.node == self.env.node {
                 continue;
             }
-            if let Some(known) = view.iter_mut().find(|r| r.node == record.node) {
-                if record.heartbeat_at > known.heartbeat_at {
-                    *known = record;
-                }
+            if let Some(known) = view.iter_mut().find(|r| r.node == record.node)
+                && record.heartbeat_at > known.heartbeat_at
+            {
+                *known = record;
             }
         }
     }

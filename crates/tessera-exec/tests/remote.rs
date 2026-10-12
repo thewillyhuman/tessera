@@ -123,7 +123,9 @@ struct HalfToPeer {
 
 impl Peers for HalfToPeer {
     fn owner_of(&self, file: FileId) -> Option<Peer> {
-        (file.to_string().as_bytes()[0] % 2 == 0).then(|| self.peer.clone())
+        file.to_string().as_bytes()[0]
+            .is_multiple_of(2)
+            .then(|| self.peer.clone())
     }
 }
 
