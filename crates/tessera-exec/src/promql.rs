@@ -9,10 +9,13 @@
 //! of one series are sorted by time and a later row at the same time
 //! replaces an earlier one, as deduplication would (section 7.5).
 //!
-//! A row holding a histogram point becomes the classic series the
-//! selector asked for through its [`EXPAND`] column: `bucket` gives one
-//! series per `le`, `count` and `sum` the point's totals, and a plain
-//! selector a summary's series per `quantile`.
+//! A row holding a histogram point becomes what the selector asked
+//! for through its [`EXPAND`] column: under the point's own name, the
+//! native histogram sample (QL-5), or a summary's series per
+//! `quantile`; under a suffixed name, the classic series: `bucket`
+//! gives one series per `le`, `count` and `sum` the point's totals.
+//! A native histogram in a result goes out in the stored shape of a
+//! point, in the `histogram` column, with `value` null.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,7 +24,7 @@ use arrow::array::{
     Array, ArrayRef, Float64Array, RecordBatch, StringArray, TimestampNanosecondArray,
 };
 use tessera_ir::promql::PromExpr;
-use tessera_ir::{VALUE, range_vector_schema};
+use tessera_ir::{VALUE, promql_schema};
 use tessera_kernels::promql::{self, NAME_LABEL, Params, Point, Series, format_value};
 use tessera_kernels::{attributes_column, histogram, row_labels};
 use tessera_types::event::{HISTOGRAM, TIMESTAMP};
@@ -34,26 +37,34 @@ pub const EXPAND: &str = "__expand__";
 
 /// The samples one histogram row yields under `form`: the labels it
 /// adds and the value of each.
-fn expanded(point: &str, form: &str) -> Vec<(Option<(&'static str, String)>, f64)> {
+fn expanded(point: &str, form: &str) -> Vec<(Option<(&'static str, String)>, Point)> {
     match form {
         "bucket" => histogram::classic_buckets(point)
             .unwrap_or_default()
             .into_iter()
-            .map(|(le, count)| (Some(("le", format_value(le))), count))
+            .map(|(le, count)| (Some(("le", format_value(le))), Point::Float(count)))
             .collect(),
         "count" => histogram::count_and_sum(point)
-            .map(|(count, _)| (None, count))
+            .map(|(count, _)| (None, Point::Float(count)))
             .into_iter()
             .collect(),
         "sum" => histogram::count_and_sum(point)
-            .and_then(|(_, sum)| sum.map(|sum| (None, sum)))
+            .and_then(|(_, sum)| sum.map(|sum| (None, Point::Float(sum))))
             .into_iter()
             .collect(),
-        _ => histogram::quantiles(point)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(quantile, value)| (Some(("quantile", format_value(quantile))), value))
-            .collect(),
+        _ => match histogram::native(point) {
+            Some(native) => vec![(None, Point::from(native))],
+            None => histogram::quantiles(point)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(quantile, value)| {
+                    (
+                        Some(("quantile", format_value(quantile))),
+                        Point::Float(value),
+                    )
+                })
+                .collect(),
+        },
     }
 }
 
@@ -68,7 +79,7 @@ fn cell(column: Option<&StringArray>, i: usize) -> Option<&str> {
 ///
 /// `Unsupported` when a batch lacks its time or value column.
 pub fn series_of(batches: &[RecordBatch]) -> Result<Vec<Series>, ExecError> {
-    let mut by_labels: BTreeMap<BTreeMap<String, String>, BTreeMap<i64, f64>> = BTreeMap::new();
+    let mut by_labels: BTreeMap<BTreeMap<String, String>, BTreeMap<i64, Point>> = BTreeMap::new();
     for batch in batches {
         let timestamps = batch
             .column_by_name(TIMESTAMP)
@@ -87,11 +98,11 @@ pub fn series_of(batches: &[RecordBatch]) -> Result<Vec<Series>, ExecError> {
         };
         let (names, points, forms) = (text(NAME_LABEL), text(HISTOGRAM), text(EXPAND));
         for i in 0..batch.num_rows() {
-            let samples: Vec<(Option<(&str, String)>, f64)> =
+            let samples: Vec<(Option<(&str, String)>, Point)> =
                 match (cell(points, i), cell(forms, i), values.is_null(i)) {
                     (Some(point), Some(form), _) => expanded(point, form),
                     (_, _, true) => continue,
-                    (_, _, false) => vec![(None, values.value(i))],
+                    (_, _, false) => vec![(None, Point::Float(values.value(i)))],
                 };
             let attributes = overflow.filter(|o| !o.is_null(i)).map(|o| o.value(i));
             let mut labels = row_labels(attributes, None, None);
@@ -114,16 +125,14 @@ pub fn series_of(batches: &[RecordBatch]) -> Result<Vec<Series>, ExecError> {
         .into_iter()
         .map(|(labels, samples)| Series {
             labels,
-            samples: samples
-                .into_iter()
-                .map(|(t, v)| (t, Point::Float(v)))
-                .collect(),
+            samples: samples.into_iter().collect(),
         })
         .collect())
 }
 
 /// Evaluates `expr` over the series of each input and returns the rows
-/// in the range-vector schema.
+/// in the `PromQL` schema: a float sample in `value`, a native
+/// histogram in `histogram`.
 ///
 /// # Errors
 ///
@@ -143,16 +152,18 @@ pub fn evaluate(
                 .map(|l| serde_json::to_string(l).unwrap_or_default())
         })
         .collect();
-    let values: Vec<f64> = rows
+    let values: Vec<Option<f64>> = rows.iter().map(|r| r.value.float()).collect();
+    let histograms: Vec<Option<String>> = rows
         .iter()
-        .map(|r| r.value.float().unwrap_or(f64::NAN))
+        .map(|r| r.value.histogram().map(histogram::point))
         .collect();
     let columns: Vec<ArrayRef> = vec![
         Arc::new(TimestampNanosecondArray::from(times)),
         Arc::new(StringArray::from(labels)),
         Arc::new(Float64Array::from(values)),
+        Arc::new(StringArray::from(histograms)),
     ];
-    Ok(RecordBatch::try_new(range_vector_schema(), columns)?)
+    Ok(RecordBatch::try_new(promql_schema(), columns)?)
 }
 
 #[cfg(test)]
@@ -219,7 +230,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.num_rows(), 1);
-        assert_eq!(out.schema(), range_vector_schema());
+        assert_eq!(out.schema(), promql_schema());
     }
 
     /// QL-5: a histogram row becomes the classic series its selector
@@ -281,5 +292,87 @@ mod tests {
         assert!(near(&sums, 30.0), "{sums:?}");
         let counts = series_of(&[batch("count")]).unwrap();
         assert!(near(&counts, 3.0), "{counts:?}");
+    }
+
+    /// QL-5: under its own name a histogram row is a native histogram
+    /// sample, and a result carries it in the `histogram` column.
+    #[test]
+    fn histogram_rows_become_native_samples_and_histogram_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                TIMESTAMP,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(VALUE, DataType::Float64, true),
+            Field::new(OVERFLOW, DataType::Utf8, true),
+            Field::new(NAME_LABEL, DataType::Utf8, true),
+            Field::new(HISTOGRAM, DataType::Utf8, true),
+            Field::new(EXPAND, DataType::Utf8, true),
+        ]));
+        let point = r#"{"count":3,"sum":30.0,"bounds":[10.0,20.0],"counts":[1,2,0]}"#;
+        let summary = r#"{"count":2,"sum":5.0,"quantiles":[[0.5,2.5]]}"#;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![10, 10])),
+                Arc::new(Float64Array::from(vec![None, None])),
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"attr.job":"api"}"#),
+                    Some(r#"{"attr.job":"web"}"#),
+                ])),
+                Arc::new(StringArray::from(vec![Some("latency"), Some("latency")])),
+                Arc::new(StringArray::from(vec![Some(point), Some(summary)])),
+                Arc::new(StringArray::from(vec![Some("plain"); 2])),
+            ],
+        )
+        .unwrap();
+        let series = series_of(&[batch]).unwrap();
+        assert_eq!(series.len(), 2);
+        let native = series
+            .iter()
+            .find(|s| s.labels["job"] == "api")
+            .and_then(|s| s.samples[0].1.histogram())
+            .expect("a native histogram sample");
+        assert!((native.count - 3.0).abs() < f64::EPSILON);
+        assert_eq!(native.custom_values, vec![10.0, 20.0]);
+        let quantile = series
+            .iter()
+            .find(|s| s.labels["job"] == "web")
+            .expect("the summary's quantile series");
+        assert_eq!(quantile.labels["quantile"], "0.5");
+        let out = evaluate(
+            &PromExpr::Selector {
+                input: 0,
+                range: None,
+                offset: 0,
+                at: None,
+                equal: Vec::new(),
+            },
+            &[series],
+            Params {
+                start: 10,
+                end: 10,
+                step: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(out.schema(), promql_schema());
+        let values = out
+            .column_by_name(VALUE)
+            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+            .unwrap();
+        let histograms = out
+            .column_by_name(HISTOGRAM)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+            .unwrap();
+        let native_row = (0..out.num_rows())
+            .find(|&i| histograms.is_valid(i))
+            .expect("a histogram row");
+        assert!(values.is_null(native_row), "a histogram row has no value");
+        let back = histogram::native(histograms.value(native_row)).unwrap();
+        assert!((back.count - 3.0).abs() < f64::EPSILON);
+        let float_row = 1 - native_row;
+        assert!(histograms.is_null(float_row) && !values.is_null(float_row));
     }
 }

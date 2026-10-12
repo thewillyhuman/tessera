@@ -8,9 +8,11 @@
 //! The tenant and dataset come from the headers the `params` module
 //! reads (CT-5). Times are Unix seconds or RFC 3339, steps durations
 //! or seconds, as Prometheus takes them. Errors take Prometheus' shape
-//! (`status`, `errorType`, `error`). Rules and alerts are served by
-//! the rules module; exemplars come from the trace ids the points
-//! carry (section 16).
+//! (`status`, `errorType`, `error`). A native histogram sample (QL-5)
+//! goes out as Prometheus writes one: `histogram` instead of `value`,
+//! with its count, sum and non-empty buckets by bounds. Rules and
+//! alerts are served by the rules module; exemplars come from the
+//! trace ids the points carry (section 16).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -30,12 +32,13 @@ use serde_json::{Value, json};
 use tessera_exec::QueryError;
 use tessera_ingest::remote_write;
 use tessera_ir::{BindContext, Expr, NamedExpr, Plan, Span, VALUE};
-use tessera_kernels::promql::format_value;
+use tessera_kernels::histogram::native;
+use tessera_kernels::promql::{Histogram, Point, format_value};
 use tessera_kernels::{attributes_column, row_labels};
 use tessera_opt::optimize;
 use tessera_promql::ast::{Expr as PromAst, Matcher};
 use tessera_promql::{Lowered, PromqlFrontend, RangeParams, ResultKind, parse, selector_plan};
-use tessera_types::event::{EXTRACTED, SPAN_ID, TIMESTAMP, TRACE_ID};
+use tessera_types::event::{EXTRACTED, HISTOGRAM, SPAN_ID, TIMESTAMP, TRACE_ID};
 use tessera_types::{TimeRange, Timestamp};
 
 use crate::params::{Need, Scope, parse_step, parse_time, scope};
@@ -389,11 +392,12 @@ async fn run(state: &AppState, scope: &Scope, plan: Plan) -> Result<Vec<RecordBa
     Ok(output.batches)
 }
 
-/// A row of a result: step, labels (none for a scalar) and value.
+/// A row of a result: step, labels (none for a scalar) and value, a
+/// float or a native histogram.
 struct Row {
     time: i64,
     labels: Option<BTreeMap<String, String>>,
-    value: f64,
+    value: Point,
 }
 
 fn rows(batches: &[RecordBatch]) -> Vec<Row> {
@@ -412,14 +416,24 @@ fn rows(batches: &[RecordBatch]) -> Vec<Row> {
         let labels = batch
             .column_by_name(EXTRACTED)
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let histograms = batch
+            .column_by_name(HISTOGRAM)
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
         for i in 0..batch.num_rows() {
             let labels = labels
                 .filter(|l| !l.is_null(i))
                 .and_then(|l| serde_json::from_str(l.value(i)).ok());
+            let value = match histograms
+                .filter(|h| h.is_valid(i))
+                .and_then(|h| native(h.value(i)))
+            {
+                Some(histogram) => Point::from(histogram),
+                None => Point::Float(values.value(i)),
+            };
             out.push(Row {
                 time: times.value(i),
                 labels,
-                value: values.value(i),
+                value,
             });
         }
     }
@@ -438,9 +452,66 @@ fn seconds(nanos: i64) -> Value {
     }
 }
 
-/// `[time, "value"]`.
-fn sample(time: i64, value: f64) -> Value {
-    json!([seconds(time), format_value(value)])
+/// `[time, "value"]`, or `[time, {histogram}]` for a native histogram.
+fn sample(time: i64, value: &Point) -> Value {
+    match value {
+        Point::Float(value) => json!([seconds(time), format_value(*value)]),
+        Point::Histogram(histogram) => json!([seconds(time), histogram_json(histogram)]),
+    }
+}
+
+/// A native histogram as the API writes one: its count, its sum and
+/// its non-empty buckets as `[boundaries, lower, upper, count]`, where
+/// `boundaries` says which bounds the bucket includes: 0 the upper, 1
+/// the lower, 2 neither, 3 both.
+fn histogram_json(histogram: &Histogram) -> Value {
+    let buckets: Vec<Value> = histogram
+        .buckets()
+        .into_iter()
+        .filter(|bucket| bucket.count != 0.0)
+        .map(|bucket| {
+            let boundaries = match (bucket.lower_inclusive, bucket.upper_inclusive) {
+                (true, true) => 3,
+                (true, false) => 1,
+                (false, true) => 0,
+                (false, false) => 2,
+            };
+            json!([
+                boundaries,
+                format_value(bucket.lower),
+                format_value(bucket.upper),
+                format_value(bucket.count)
+            ])
+        })
+        .collect();
+    let mut object = json!({
+        "count": format_value(histogram.count),
+        "sum": format_value(histogram.sum),
+    });
+    if !buckets.is_empty() {
+        object["buckets"] = Value::Array(buckets);
+    }
+    object
+}
+
+/// The samples of one series, by step.
+type Samples<'a> = Vec<&'a (i64, Point)>;
+
+/// The series of a matrix result: `values` for its float samples and
+/// `histograms` for its native histogram samples, each only when there
+/// are some.
+fn matrix_series(labels: &BTreeMap<String, String>, samples: &[(i64, Point)]) -> Value {
+    let mut series = json!({ "metric": labels });
+    let (floats, histograms): (Samples<'_>, Samples<'_>) = samples
+        .iter()
+        .partition(|(_, value)| matches!(value, Point::Float(_)));
+    if !floats.is_empty() {
+        series["values"] = floats.iter().map(|(t, v)| sample(*t, v)).collect();
+    }
+    if !histograms.is_empty() {
+        series["histograms"] = histograms.iter().map(|(t, v)| sample(*t, v)).collect();
+    }
+    series
 }
 
 /// The `data` of a query result from its rows.
@@ -451,29 +522,39 @@ fn result_data(lowered: &Lowered, rows: Vec<Row>, instant: bool, time: Timestamp
             "result": [seconds(time.as_nanos()), lowered.string.clone().unwrap_or_default()],
         }),
         ResultKind::Scalar if instant => {
-            let value = rows.first().map_or(f64::NAN, |r| r.value);
-            json!({ "resultType": "scalar", "result": sample(time.as_nanos(), value) })
+            let value = rows
+                .first()
+                .and_then(|r| r.value.float())
+                .unwrap_or(f64::NAN);
+            json!({ "resultType": "scalar", "result": sample(time.as_nanos(), &Point::Float(value)) })
         }
         ResultKind::Vector if instant => json!({
             "resultType": "vector",
             "result": rows
                 .iter()
-                .map(|r| json!({ "metric": r.labels.clone().unwrap_or_default(), "value": sample(r.time, r.value) }))
+                .map(|r| {
+                    let field = match r.value {
+                        Point::Float(_) => "value",
+                        Point::Histogram(_) => "histogram",
+                    };
+                    json!({ "metric": r.labels.clone().unwrap_or_default(), field: sample(r.time, &r.value) })
+                })
                 .collect::<Vec<_>>(),
         }),
         _ => {
-            let mut by_labels: BTreeMap<BTreeMap<String, String>, Vec<Value>> = BTreeMap::new();
+            let mut by_labels: BTreeMap<BTreeMap<String, String>, Vec<(i64, Point)>> =
+                BTreeMap::new();
             for row in rows {
                 by_labels
                     .entry(row.labels.unwrap_or_default())
                     .or_default()
-                    .push(sample(row.time, row.value));
+                    .push((row.time, row.value));
             }
             json!({
                 "resultType": "matrix",
                 "result": by_labels
                     .into_iter()
-                    .map(|(labels, values)| json!({ "metric": labels, "values": values }))
+                    .map(|(labels, samples)| matrix_series(&labels, &samples))
                     .collect::<Vec<_>>(),
             })
         }
@@ -836,12 +917,86 @@ mod tests {
         );
         let (_, value) = call(&app, get("/api/v1/query?query=latency_sum&time=1700000030")).await;
         assert_eq!(value["data"]["result"][0]["value"][1], "30", "{value}");
-        let (_, value) = call(&app, get("/api/v1/query?query=latency&time=1700000030")).await;
-        assert_eq!(
-            value["data"]["result"].as_array().unwrap().len(),
+    }
+
+    /// QL-5: under its own name a stored histogram answers as a native
+    /// histogram, in the shape Prometheus writes one, and the
+    /// `histogram_*` functions read it; the classic and the native
+    /// reading of one point agree.
+    #[tokio::test]
+    async fn stored_histograms_answer_as_native_histograms() {
+        let app = crate::router(crate::testing::state().await);
+        let metrics = crate::otlp::testing::export_histogram(
+            "api",
+            "latency",
+            "a",
             0,
-            "the plain name has no sample type yet: {value}"
+            &[10.0, 20.0],
+            &[1, 2, 0],
         );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/metrics")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&metrics).unwrap()))
+            .unwrap();
+        let (status, _) = call(&app, request).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, value) = call(&app, get("/api/v1/query?query=latency&time=1700000030")).await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let result = &value["data"]["result"][0];
+        assert_eq!(result["metric"]["__name__"], "latency", "{value}");
+        assert!(result.get("value").is_none(), "{value}");
+        assert_eq!(
+            result["histogram"][0], 1_700_000_030,
+            "an instant sample takes the query time"
+        );
+        assert_eq!(result["histogram"][1]["count"], "3");
+        assert_eq!(result["histogram"][1]["sum"], "30");
+        assert_eq!(
+            result["histogram"][1]["buckets"],
+            json!([[3, "-Inf", "10", "1"], [0, "10", "20", "2"]]),
+            "custom buckets by bound, the empty one left out: {value}"
+        );
+
+        let (_, value) = call(
+            &app,
+            get("/api/v1/query?query=histogram_quantile(0.5,%20latency)&time=1700000030"),
+        )
+        .await;
+        assert_eq!(
+            value["data"]["result"][0]["value"][1], "12.5",
+            "the native reading agrees with the classic one: {value}"
+        );
+        let (_, value) = call(
+            &app,
+            get("/api/v1/query?query=histogram_count(latency)&time=1700000030"),
+        )
+        .await;
+        assert_eq!(value["data"]["result"][0]["value"][1], "3", "{value}");
+        let (_, value) = call(
+            &app,
+            get("/api/v1/query?query=histogram_sum(latency)%20/%20histogram_count(latency)&time=1700000030"),
+        )
+        .await;
+        assert_eq!(value["data"]["result"][0]["value"][1], "10", "{value}");
+
+        let (status, value) = call(
+            &app,
+            get("/api/v1/query_range?query=latency&start=1700000000&end=1700000030&step=15"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let series = &value["data"]["result"][0];
+        assert!(series.get("values").is_none(), "{value}");
+        let histograms = series["histograms"].as_array().unwrap();
+        assert_eq!(
+            histograms.len(),
+            3,
+            "one per step within the lookback: {value}"
+        );
+        assert_eq!(histograms[0][1]["count"], "3");
     }
 
     /// Exemplars (section 16): a point ingested with an exemplar

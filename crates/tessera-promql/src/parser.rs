@@ -44,7 +44,7 @@ pub const PARAMETERIZED: [&str; 6] = [
 ];
 
 /// The functions.
-pub const FUNCTIONS: [&str; 72] = [
+pub const FUNCTIONS: [&str; 78] = [
     "abs",
     "absent",
     "absent_over_time",
@@ -73,7 +73,13 @@ pub const FUNCTIONS: [&str; 72] = [
     "double_exponential_smoothing",
     "exp",
     "floor",
+    "histogram_avg",
+    "histogram_count",
+    "histogram_fraction",
     "histogram_quantile",
+    "histogram_stddev",
+    "histogram_stdvar",
+    "histogram_sum",
     "holt_winters",
     "hour",
     "idelta",

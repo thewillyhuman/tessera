@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
-use tessera_types::event::{EXTRACTED, SAMPLE_RATE, TIMESTAMP};
+use tessera_types::event::{EXTRACTED, HISTOGRAM, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{DatasetName, Kind, TenantId, TimeRange, Timestamp, event};
 
 use crate::expr::{BinaryOp, Expr, Literal, qualify};
@@ -522,6 +522,23 @@ pub fn range_vector_schema() -> SchemaRef {
     ]))
 }
 
+/// The schema a `PromQL` node produces: the range-vector schema and
+/// `histogram`, a native histogram sample in the stored shape of a
+/// histogram point (QL-5), set where `value` is null.
+#[must_use]
+pub fn promql_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(
+            TIMESTAMP,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new(EXTRACTED, DataType::Utf8, true),
+        Field::new(VALUE, DataType::Float64, true),
+        Field::new(HISTOGRAM, DataType::Utf8, true),
+    ]))
+}
+
 /// A node of the operator tree.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Plan {
@@ -935,7 +952,8 @@ impl Plan {
                 Ok(Arc::new(Schema::new(fields)))
             }
             Plan::Extract { input, .. } => Ok(with_extracted(&input.schema(registry)?)),
-            Plan::RangeVector { .. } | Plan::PromQL { .. } => Ok(range_vector_schema()),
+            Plan::RangeVector { .. } => Ok(range_vector_schema()),
+            Plan::PromQL { .. } => Ok(promql_schema()),
             Plan::TraceGroup { .. } => Ok(trace_group_schema()),
             Plan::Format { input, labels, .. } => {
                 let input = input.schema(registry)?;
@@ -2070,7 +2088,7 @@ mod tests {
     }
 
     #[test]
-    fn a_promql_node_lists_its_inputs_and_keeps_the_range_vector_schema() {
+    fn a_promql_node_lists_its_inputs_and_adds_the_histogram_column() {
         let mut scan = scan();
         scan.kind = Kind::Metric;
         let plan = Plan::PromQL {
@@ -2087,9 +2105,11 @@ mod tests {
             step: Duration::from_secs(15),
         };
         assert_eq!(plan.inputs().len(), 2);
+        assert_eq!(plan.schema(&Registry::builtin()).unwrap(), promql_schema());
         assert_eq!(
-            plan.schema(&Registry::builtin()).unwrap(),
-            range_vector_schema()
+            promql_schema().fields().len(),
+            range_vector_schema().fields().len() + 1,
+            "the range-vector schema and the histogram column"
         );
         assert!(plan.ordering().is_empty());
         let text = plan.to_string();

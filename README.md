@@ -153,7 +153,12 @@ with Prometheus 3 semantics: lookback and staleness, counter resets
 and extrapolation in `rate` and `increase`, the `_over_time` family,
 aggregations, vector matching with `group_left` and `group_right`,
 set operators, subqueries, `offset` and `@`, `histogram_quantile`
-over classic buckets, label and calendar functions; and the
+over classic buckets and over native histograms (a stored histogram
+point answers under its own name as a native histogram sample, an
+exponential point at its scale and a classic point as custom buckets,
+with Prometheus 3's arithmetic, counter-reset detection, exponential
+interpolation, the `histogram_*` functions and the API's shape),
+label and calendar functions; and the
 Prometheus HTTP API: queries, series, labels, label values, metadata,
 exemplars and remote write. The PromQL differential suite agrees with
 Prometheus 3.15.0 on every case.
@@ -167,10 +172,10 @@ follow Prometheus' own order of operations, so that a
 `histogram_quantile` whose rank falls on a bucket boundary agrees to
 the last bit.
 
-Gaps left in M5: an OTLP histogram answers PromQL as the classic
-`_bucket`, `_count` and `_sum` series a scrape would give, but there
-is no native histogram sample type, so the `histogram_*` functions
-over one are absent; `info`; two suite cases assume a Prometheus
+Gaps left in M5: native histograms arrive over OTLP only, remote
+write does not store them; sums of histograms are plain where
+Prometheus compensates rounding with Kahan summation; `info`; two
+suite cases assume a Prometheus
 before 3.0, which accepted `label_join` into an invalid label name
 less than it does now.
 
