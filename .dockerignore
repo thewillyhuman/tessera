@@ -1,3 +1,7 @@
 target/
 tessera-data/
 .git/
+Dockerfile
+.dockerignore
+deploy/
+.github/

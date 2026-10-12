@@ -419,8 +419,10 @@ checked against an Avro library in tests and read back with
 
 Gaps left in M10: the scale envelope of 17.2 has not been run, and the
 rolling restart under load is a three-node test in `tessera-node`
-rather than a run of a real upgrade; neither the image nor the chart
-has run on a cluster.
+rather than a run of a real upgrade; the image builds on this
+machine and a node in it, on its distroless base and non-root user,
+takes a push and answers a query, and the chart lints and renders,
+but neither has run on a cluster.
 
 ## Layout
 
