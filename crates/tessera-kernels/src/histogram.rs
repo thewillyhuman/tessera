@@ -7,9 +7,10 @@
 //!
 //! Merging (CO-8) folds the points of an interval so that downsampled
 //! points still answer `histogram_quantile` and the rate functions.
-//! Classic histograms merge when their bounds agree; exponential ones
-//! are brought to the coarser scale first, halving buckets as the
-//! `OpenTelemetry` mapping does.
+//! Classic histograms merge bucket by bucket when their bounds agree
+//! and on the bounds they share otherwise, as Prometheus merges custom
+//! buckets; exponential ones are brought to the coarser scale first,
+//! halving buckets as the `OpenTelemetry` mapping does.
 //!
 //! Reading as classic series (QL-5) gives `PromQL` a point's cumulative
 //! `le` buckets, its count and sum, or a summary's quantiles, so that a
@@ -23,14 +24,15 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 
 use crate::promql::STALE_NAN_BITS;
-use crate::promql::histogram::{CUSTOM_SCHEMA, Histogram, MAX_SCHEMA, MIN_SCHEMA, ResetHint};
+use crate::promql::histogram::{
+    CUSTOM_SCHEMA, Histogram, MAX_SCHEMA, MIN_SCHEMA, ResetHint, common_bounds,
+};
 
 /// The histograms of `points`, delta points of one series, as one:
 /// counts added, `count` and `sum` added, `min` and `max` kept.
 ///
-/// `None` when there is nothing to merge, a point does not parse, or
-/// classic histograms disagree on their bounds; the caller then keeps
-/// the last point as it is.
+/// `None` when there is nothing to merge or a point does not parse;
+/// the caller then keeps the last point as it is.
 #[must_use]
 pub fn merge(points: &[&str]) -> Option<String> {
     let parsed: Vec<Map<String, Value>> = points
@@ -55,20 +57,31 @@ pub fn merge(points: &[&str]) -> Option<String> {
 }
 
 fn merge_classic(into: &mut Map<String, Value>, from: &Map<String, Value>) -> Option<()> {
-    if into.get("bounds") != from.get("bounds") {
-        return None;
-    }
     let a = counts(into.get("counts"))?;
     let b = counts(from.get("counts"))?;
-    if a.len() != b.len() {
-        return None;
+    if into.get("bounds") == from.get("bounds") {
+        if a.len() != b.len() {
+            return None;
+        }
+        let summed: Vec<u64> = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| x.saturating_add(*y))
+            .collect();
+        into.insert("counts".into(), json!(summed));
+    } else {
+        // Different layouts meet on the bounds they share: a bucket goes
+        // to the first shared bound at or above its own, past them all
+        // to the +Inf bucket.
+        let a_bounds = float_counts(into.get("bounds"))?;
+        let b_bounds = float_counts(from.get("bounds"))?;
+        let shared = common_bounds(&a_bounds, &b_bounds);
+        let mut merged = vec![0u64; shared.len() + 1];
+        add_on_bounds(&mut merged, &a, &a_bounds, &shared);
+        add_on_bounds(&mut merged, &b, &b_bounds, &shared);
+        into.insert("bounds".into(), json!(shared));
+        into.insert("counts".into(), json!(merged));
     }
-    let summed: Vec<u64> = a
-        .iter()
-        .zip(&b)
-        .map(|(x, y)| x.saturating_add(*y))
-        .collect();
-    into.insert("counts".into(), json!(summed));
     add(into, from, "count");
     add(into, from, "sum");
     keep(into, from, "min", f64::min);
@@ -95,6 +108,20 @@ fn merge_exponential(into: &mut Map<String, Value>, from: &Map<String, Value>) -
     keep(into, from, "min", f64::min);
     keep(into, from, "max", f64::max);
     Some(())
+}
+
+/// Adds `counts`, one per bucket under `bounds` and the `+Inf` bucket
+/// last, into `merged`, laid out the same way over `shared`.
+fn add_on_bounds(merged: &mut [u64], counts: &[u64], bounds: &[f64], shared: &[f64]) {
+    for (i, count) in counts.iter().enumerate() {
+        let at = match bounds.get(i) {
+            Some(upper) => shared.partition_point(|bound| bound < upper),
+            None => shared.len(),
+        };
+        if let Some(slot) = merged.get_mut(at) {
+            *slot = slot.saturating_add(*count);
+        }
+    }
 }
 
 /// Adds `from[key]` to `into[key]`: as integers while both are, as
@@ -500,11 +527,29 @@ mod tests {
         assert_eq!(merged["bounds"], json!([10.0, 20.0]));
     }
 
+    /// CO-8: classic histograms whose bounds differ merge on the bounds
+    /// they share, as Prometheus merges custom buckets.
     #[test]
-    fn classic_histograms_with_other_bounds_do_not_merge() {
-        let a = r#"{"count":1,"bounds":[10.0],"counts":[1,0]}"#;
-        let b = r#"{"count":1,"bounds":[5.0],"counts":[0,1]}"#;
-        assert_eq!(merge(&[a, b]), None);
+    fn classic_histograms_with_other_bounds_merge_on_the_shared_ones() {
+        let a = r#"{"count":4,"sum":20.0,"bounds":[5.0,10.0],"counts":[1,2,1]}"#;
+        let b = r#"{"count":4,"sum":30.0,"bounds":[10.0],"counts":[3,1]}"#;
+        let merged = parsed(&merge(&[a, b]).unwrap());
+        assert_eq!(merged["bounds"], json!([10.0]));
+        assert_eq!(
+            merged["counts"],
+            json!([6, 2]),
+            "a's buckets up to 5 and 10 both fall under the shared 10"
+        );
+        assert_eq!(merged["count"], 8);
+        assert_eq!(merged["sum"], 50.0);
+        let c = r#"{"count":1,"bounds":[7.0],"counts":[1,0]}"#;
+        let nothing_shared = parsed(&merge(&[a, c]).unwrap());
+        assert_eq!(nothing_shared["bounds"], json!([]));
+        assert_eq!(
+            nothing_shared["counts"],
+            json!([5]),
+            "without a shared bound, every observation is past them all"
+        );
         assert_eq!(merge(&[]), None);
         assert_eq!(merge(&[a, "not json"]), None);
     }

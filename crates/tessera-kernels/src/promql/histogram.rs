@@ -805,7 +805,7 @@ fn side_reset(current: &[(i32, f64)], previous: &[(i32, f64)]) -> bool {
 
 /// The bounds two custom bucket layouts share, in order.
 #[allow(clippy::float_cmp)]
-fn common_bounds(a: &[f64], b: &[f64]) -> Vec<f64> {
+pub(crate) fn common_bounds(a: &[f64], b: &[f64]) -> Vec<f64> {
     let mut out = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {

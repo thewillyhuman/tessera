@@ -357,8 +357,7 @@ Gaps left in M9: the reconciliation has been run against the local
 store only, not against a provider's bill; `EXCEPT ERRORS` sees the
 error spans of the files
 being compacted only, and traces referenced by alert events are not
-exempt; sketches are not merged when downsampling, and classic
-histograms whose bounds differ keep the interval's last point (CO-8);
+exempt; sketches are not merged when downsampling (CO-8);
 Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a
