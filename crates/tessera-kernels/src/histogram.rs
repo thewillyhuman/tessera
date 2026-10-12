@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
+use crate::promql::STALE_NAN_BITS;
 use crate::promql::histogram::{CUSTOM_SCHEMA, Histogram, MAX_SCHEMA, MIN_SCHEMA, ResetHint};
 
 /// The histograms of `points`, delta points of one series, as one:
@@ -329,10 +330,12 @@ fn float_counts(value: Option<&Value>) -> Option<Vec<f64>> {
     value?.as_array()?.iter().map(|v| number(Some(v))).collect()
 }
 
-/// A number, or the text of one JSON cannot hold.
+/// A number, or the text of one JSON cannot hold; `StaleNaN` is the
+/// staleness marker, its own bit pattern of `NaN`.
 fn number(value: Option<&Value>) -> Option<f64> {
     match value? {
         Value::Number(n) => n.as_f64(),
+        Value::String(s) if s == "StaleNaN" => Some(f64::from_bits(STALE_NAN_BITS)),
         Value::String(s) => s.parse().ok(),
         _ => None,
     }
@@ -341,6 +344,8 @@ fn number(value: Option<&Value>) -> Option<f64> {
 fn json_number(value: f64) -> Value {
     if value.is_finite() {
         json!(value)
+    } else if value.to_bits() == STALE_NAN_BITS {
+        json!("StaleNaN")
     } else if value.is_nan() {
         json!("NaN")
     } else if value > 0.0 {
@@ -467,6 +472,13 @@ mod tests {
         let back = native(&text).unwrap();
         assert!(back.sum.is_nan());
         assert_eq!(back.hint, ResetHint::Gauge);
+        let stale = native(r#"{"count":"StaleNaN","sum":"StaleNaN","scale":0}"#).unwrap();
+        assert_eq!(
+            stale.sum.to_bits(),
+            STALE_NAN_BITS,
+            "a staleness marker keeps its bits"
+        );
+        assert!(point(&stale).contains(r#""sum":"StaleNaN""#));
         let missing_sum =
             native(r#"{"count":1,"sum":null,"scale":0,"positive":{"offset":0,"counts":[1]}}"#)
                 .unwrap();

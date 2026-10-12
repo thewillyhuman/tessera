@@ -287,6 +287,7 @@ pub fn fixture(start: i64, count: i64, run: &str) -> WriteRequest {
                 timestamp: (start + i * 15) * 1000,
             })
             .collect(),
+        histograms: Vec::new(),
     };
     let points = |f: &dyn Fn(i64) -> f64| (0..count).map(|i| (i, f(i))).collect::<Vec<_>>();
     let stale = f64::from_bits(tessera_ingest::remote_write::STALE_NAN_BITS);

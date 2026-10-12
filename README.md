@@ -146,7 +146,8 @@ the API by hand.
 
 **M5, metrics: done, with gaps listed below.** Metric data points
 over OTLP (gauges, sums, histograms, exponential histograms and
-summaries) and over Prometheus remote write, with series ids and
+summaries) and over Prometheus remote write, native histograms
+included, with series ids and
 Prometheus names derived from the OpenTelemetry name and unit
 (QL-19); a PromQL front end with a hand-written parser; an evaluator
 with Prometheus 3 semantics: lookback and staleness, counter resets
@@ -172,10 +173,8 @@ follow Prometheus' own order of operations, so that a
 `histogram_quantile` whose rank falls on a bucket boundary agrees to
 the last bit.
 
-Gaps left in M5: native histograms arrive over OTLP only, remote
-write does not store them; sums of histograms are plain where
-Prometheus compensates rounding with Kahan summation; `info`; two
-suite cases assume a Prometheus
+Gaps left in M5: sums of histograms are plain where Prometheus
+compensates rounding with Kahan summation; `info`; two suite cases assume a Prometheus
 before 3.0, which accepted `label_join` into an invalid label name
 less than it does now.
 

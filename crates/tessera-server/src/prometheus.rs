@@ -769,6 +769,7 @@ pub(crate) mod testing {
                                 timestamp: *t,
                             })
                             .collect(),
+                        histograms: Vec::new(),
                     }
                 })
                 .collect(),
