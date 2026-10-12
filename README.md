@@ -352,9 +352,10 @@ are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a
 query reads their samples, not a rollup; a rollup starts at
 its creation unless `BACKFILL <interval>` says how far back its first
-rounds reach; a query whose range is not aligned
-to a rollup's windows or reaches past its progress mark reads the raw
-rows whole; narrow integers come back from a rollup as 64-bit.
+rounds reach; a query whose range reaches outside what a rollup
+covers, or is not aligned to its windows, reads the rollup for the
+whole windows it covers and the raw rows for the rest, the parts in
+one union.
 
 **M10, hardening: done, with gaps listed below.** Authentication by
 API key (CT-5, SE-1): a key belongs to one tenant, is issued once as

@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! Rollup substitution (AD-13, QE-6): an aggregation over a tumbling
-//! window whose source, filter, keys and aggregates match a rollup, and
-//! whose time range the rollup covers in whole windows, is rewritten to
-//! aggregate the rollup's output events instead. Counts and sums are
-//! summed again, minima and maxima taken again, so the result equals
-//! the un-rewritten query exactly, with narrow integers widened to 64
-//! bits; a query is left alone when any part of its shape differs or
-//! its range is not covered in whole windows, and a caller may turn the
-//! pass off.
+//! window whose source, filter, keys and aggregates match a rollup is
+//! rewritten to aggregate the rollup's output events for the whole
+//! windows of its range the rollup covers, and the raw rows as before
+//! for what is left on either side, the parts in one union. Counts and
+//! sums are summed again, minima and maxima taken again, and the
+//! numbers the rollup stores widened cast back to the query's types,
+//! so the result equals the un-rewritten query exactly; a query is
+//! left alone when any part of its shape differs or the rollup covers
+//! no whole window of its range, and a caller may turn the pass off.
 
 use std::time::Duration;
 
 use tessera_ir::rollup::RollupEntry;
-use tessera_ir::{AggregateExpr, BinaryOp, Expr, Literal, NamedExpr, Plan, Scan};
+use tessera_ir::{AggregateExpr, BinaryOp, Expr, Literal, NamedExpr, Plan, Registry, Scan};
 use tessera_types::event::{NAME, TIMESTAMP};
-use tessera_types::{Kind, TimeRange};
+use tessera_types::{Kind, TimeRange, Timestamp};
 
 /// `plan` with every matching aggregation reading its rollup.
 #[must_use]
@@ -85,14 +86,16 @@ fn rewrite(
     rollups.iter().find_map(|rollup| {
         if rollup.dataset != scan.dataset
             || rollup.kind != scan.kind
-            || !covers(rollup, scan)
             || !same_filter(rollup, &conjuncts)
-            || window.as_nanos() % rollup.window.as_nanos().max(1) != 0
+            || !window
+                .as_nanos()
+                .is_multiple_of(rollup.window.as_nanos().max(1))
         {
             return None;
         }
+        let part = covered_part(rollup, scan.time_range, window)?;
         let mut keys = 0;
-        let group_by: Vec<NamedExpr> = group_by
+        let rollup_keys: Vec<NamedExpr> = group_by
             .iter()
             .map(|key| {
                 if window_length(&key.expr).is_some() {
@@ -121,7 +124,7 @@ fn rewrite(
         if keys != rollup.keys.len() {
             return None;
         }
-        let aggregates: Vec<AggregateExpr> = aggregates
+        let merged: Vec<AggregateExpr> = aggregates
             .iter()
             .map(|aggregate| {
                 let stored = rollup.aggregates.iter().find(|a| {
@@ -138,17 +141,121 @@ fn rewrite(
             })
             .collect::<Option<_>>()?;
         let mut target = Scan::all(scan.tenant.clone(), rollup.target.clone(), Kind::Event);
-        target.time_range = scan.time_range;
+        target.time_range = part;
         target.predicates = vec![Expr::column(NAME).binary(
             BinaryOp::Eq,
             Expr::Literal(Literal::Text(rollup.name.clone())),
         )];
-        Some(Plan::Aggregate {
-            input: Box::new(Plan::Scan(target)),
+        let from_rollup = restored(
+            Plan::Aggregate {
+                input: Box::new(Plan::Scan(target)),
+                group_by: rollup_keys,
+                aggregates: merged,
+            },
+            input,
             group_by,
             aggregates,
-        })
+        )?;
+        Some(split(
+            input,
+            group_by,
+            aggregates,
+            scan.time_range,
+            part,
+            from_rollup,
+        ))
     })
+}
+
+/// `from_rollup`, its columns cast back to the types the aggregation
+/// over the raw rows gives them, since a rollup stores narrow numbers
+/// widened to 64 bits; none when either side does not type.
+fn restored(
+    from_rollup: Plan,
+    input: &Plan,
+    group_by: &[NamedExpr],
+    aggregates: &[AggregateExpr],
+) -> Option<Plan> {
+    let registry = Registry::builtin();
+    let wanted = Plan::Aggregate {
+        input: Box::new(input.clone()),
+        group_by: group_by.to_vec(),
+        aggregates: aggregates.to_vec(),
+    }
+    .schema(&registry)
+    .ok()?;
+    let held = from_rollup.schema(&registry).ok()?;
+    if wanted == held {
+        return Some(from_rollup);
+    }
+    let exprs = wanted
+        .fields()
+        .iter()
+        .zip(held.fields())
+        .map(|(wanted, held)| {
+            let column = Expr::column(wanted.name());
+            let expr = if wanted.data_type() == held.data_type() {
+                column
+            } else {
+                Expr::Cast {
+                    expr: Box::new(column),
+                    to: wanted.data_type().clone(),
+                }
+            };
+            NamedExpr::new(expr, wanted.name())
+        })
+        .collect();
+    Some(from_rollup.project(exprs))
+}
+
+/// The aggregation over `range` with `from_rollup` answering `part` of
+/// it: the raw rows aggregated as before for what is left of the
+/// range on either side, all in one union, or the rollup alone when
+/// the part is the whole.
+fn split(
+    input: &Plan,
+    group_by: &[NamedExpr],
+    aggregates: &[AggregateExpr],
+    range: TimeRange,
+    part: TimeRange,
+    from_rollup: Plan,
+) -> Plan {
+    let raw = |range: TimeRange| Plan::Aggregate {
+        input: Box::new(with_range(input, range)),
+        group_by: group_by.to_vec(),
+        aggregates: aggregates.to_vec(),
+    };
+    let mut inputs = Vec::new();
+    let before = TimeRange::new(range.start, part.start);
+    if !before.is_empty() {
+        inputs.push(raw(before));
+    }
+    inputs.push(from_rollup);
+    let after = TimeRange::new(part.end, range.end);
+    if !after.is_empty() {
+        inputs.push(raw(after));
+    }
+    if inputs.len() == 1 {
+        inputs.remove(0)
+    } else {
+        Plan::Union { inputs }
+    }
+}
+
+/// `input`, its filters as they are, over its scan narrowed to `range`.
+fn with_range(input: &Plan, range: TimeRange) -> Plan {
+    match input {
+        Plan::Scan(scan) => {
+            let mut scan = scan.clone();
+            scan.time_range = range;
+            Plan::Scan(scan)
+        }
+        Plan::Filter { input, predicate } => Plan::Filter {
+            input: Box::new(with_range(input, range)),
+            predicate: predicate.clone(),
+        },
+        other => other.clone(),
+    }
 }
 
 /// The scan under `input` through its filters, with the conjuncts of
@@ -201,18 +308,41 @@ fn window_length(expr: &Expr) -> Option<Duration> {
     }
 }
 
-/// Whether the rollup's output covers the scan's range in whole windows.
-fn covers(rollup: &RollupEntry, scan: &Scan) -> bool {
-    let range = scan.time_range;
-    if range == TimeRange::ALL || range.is_empty() {
-        return false;
+/// The part of `range` the rollup answers, in whole windows of its
+/// own: an end of the range the rollup covers and that falls on one
+/// of its windows stands; any other end is cut to the query's
+/// `window`, since a cut between the rollup and the raw rows must
+/// fall on a boundary of the query's own buckets, or a bucket would
+/// come out once from each side. None when nothing is left.
+fn covered_part(rollup: &RollupEntry, range: TimeRange, window: Duration) -> Option<TimeRange> {
+    let inside = range.intersect(rollup.covered);
+    if inside.is_empty() {
+        return None;
     }
-    let window = i128::try_from(rollup.window.as_nanos().max(1)).unwrap_or(i128::MAX);
-    let aligned = |at: tessera_types::Timestamp| i128::from(at.as_nanos()).rem_euclid(window) == 0;
-    range.start >= rollup.covered.start
-        && range.end <= rollup.covered.end
-        && aligned(range.start)
-        && aligned(range.end)
+    let fine = i128::try_from(rollup.window.as_nanos().max(1)).unwrap_or(i128::MAX);
+    let coarse = i128::try_from(window.as_nanos().max(1)).unwrap_or(i128::MAX);
+    let nanos = |at: Timestamp| i128::from(at.as_nanos());
+    let ceiling = |n: i128, length: i128| n + (-n).rem_euclid(length);
+    let floor = |n: i128, length: i128| n - n.rem_euclid(length);
+    let start =
+        if inside.start == range.start && floor(nanos(range.start), fine) == nanos(range.start) {
+            nanos(range.start)
+        } else {
+            ceiling(nanos(inside.start), coarse)
+        };
+    let end = if inside.end == range.end && floor(nanos(range.end), fine) == nanos(range.end) {
+        nanos(range.end)
+    } else {
+        floor(nanos(inside.end), coarse)
+    };
+    if start >= end {
+        return None;
+    }
+    let (start, end) = (i64::try_from(start).ok()?, i64::try_from(end).ok()?);
+    Some(TimeRange::new(
+        Timestamp::from_nanos(start),
+        Timestamp::from_nanos(end),
+    ))
 }
 
 /// Whether the query filters exactly as the rollup does.
@@ -358,6 +488,11 @@ mod tests {
         assert!(text.contains("attr.n"), "{text}");
         assert!(text.contains("sum("), "{text}");
         assert!(!text.contains("prod/log"), "{text}");
+        assert_eq!(
+            rewritten.schema(&Registry::builtin()),
+            query.schema(&Registry::builtin()),
+            "the rollup's widened numbers come back as the query's types"
+        );
         assert!(optimize(rewritten, &Registry::builtin()).is_ok());
     }
 
@@ -396,21 +531,125 @@ mod tests {
              GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
             range(10, 20)
         ));
-        // A range past the progress mark, and one not aligned to windows.
+        // A range the rollup has nothing of, and one too short for a
+        // whole window.
         same(&format!(
             "SELECT count(*) AS n FROM logs WHERE severity_number >= 17 AND {} \
              GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
-            range(10, 200)
+            range(200, 300)
         ));
         same(
             "SELECT count(*) AS n FROM logs WHERE severity_number >= 17 \
-             AND timestamp >= TIMESTAMP '1970-01-01T00:10:30Z' AND timestamp < TIMESTAMP '1970-01-01T00:20:00Z' \
+             AND timestamp >= TIMESTAMP '1970-01-01T00:10:30Z' AND timestamp < TIMESTAMP '1970-01-01T00:11:30Z' \
              GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
         );
-        // No range at all.
-        same(
-            "SELECT count(*) AS n FROM logs WHERE severity_number >= 17 \
+    }
+
+    /// AD-13: a range the rollup covers in part reads the rollup for the
+    /// whole windows it covers and the raw rows for the rest, in a
+    /// union, so that the result still equals the un-rewritten query;
+    /// a range it covers entirely but past the progress mark, or not
+    /// aligned to windows, splits the same way, and no range at all
+    /// reads the rollup to its progress mark.
+    #[test]
+    fn a_partly_covered_range_splits_between_the_rollup_and_the_rows() {
+        let rollup = entry(ROLLUP, covered());
+        let query = |filter: &str| {
+            lowered(&format!(
+                "SELECT count(*) AS n FROM logs WHERE severity_number >= 17 AND {filter} \
+                 GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')"
+            ))
+        };
+        let past = substitute(query(&range(10, 200)), std::slice::from_ref(&rollup));
+        let text = past.to_string();
+        assert!(text.contains("Union"), "{text}");
+        let narrow = lowered(&format!(
+            "SELECT max(severity_number) AS worst FROM logs WHERE severity_number >= 17 AND {} \
              GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
+            range(10, 200)
+        ));
+        let split = substitute(narrow.clone(), std::slice::from_ref(&rollup));
+        assert_eq!(
+            split.schema(&Registry::builtin()),
+            narrow.schema(&Registry::builtin()),
+            "both parts of the union give the query's types: {split}"
+        );
+        assert!(optimize(split, &Registry::builtin()).is_ok());
+        assert!(
+            text.contains("rollup_errors/event [1970-01-01T00:10:00Z, 1970-01-01T01:40:00Z)"),
+            "the rollup to its progress mark: {text}"
+        );
+        assert!(
+            text.contains("prod/log [1970-01-01T01:40:00Z, 1970-01-01T03:20:00Z)"),
+            "the rows from there: {text}"
+        );
+        assert!(optimize(past, &Registry::builtin()).is_ok());
+        let unaligned = substitute(
+            query(
+                "timestamp >= TIMESTAMP '1970-01-01T00:10:30Z' \
+                 AND timestamp < TIMESTAMP '1970-01-01T00:20:00Z'",
+            ),
+            std::slice::from_ref(&rollup),
+        );
+        let text = unaligned.to_string();
+        assert!(
+            text.contains("rollup_errors/event [1970-01-01T00:11:00Z, 1970-01-01T00:20:00Z)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("prod/log [1970-01-01T00:10:30Z, 1970-01-01T00:11:00Z)"),
+            "{text}"
+        );
+        // A query bucketing by two minutes over the rollup's one: a range
+        // the rollup covers whole reads it alone, and a cut falls on the
+        // query's own bucket boundary, not the rollup's.
+        let coarse = |filter: &str, covered: TimeRange| {
+            substitute(
+                lowered(&format!(
+                    "SELECT count(*) AS n FROM logs WHERE severity_number >= 17 AND {filter} \
+                     GROUP BY attr.service, tumble(timestamp, INTERVAL '2 minutes')"
+                )),
+                &[entry(ROLLUP, covered)],
+            )
+        };
+        let whole = coarse(&range(13, 15), covered());
+        let text = whole.to_string();
+        assert!(
+            !text.contains("Union") && !text.contains("prod/log"),
+            "{text}"
+        );
+        let odd_mark = coarse(
+            &range(10, 200),
+            TimeRange::new(
+                Timestamp::from_nanos(0),
+                Timestamp::from_nanos(101 * MINUTE),
+            ),
+        );
+        let text = odd_mark.to_string();
+        assert!(
+            text.contains("rollup_errors/event [1970-01-01T00:10:00Z, 1970-01-01T01:40:00Z)")
+                && text.contains("prod/log [1970-01-01T01:40:00Z, 1970-01-01T03:20:00Z)"),
+            "{text}"
+        );
+        let open = substitute(
+            lowered(
+                "SELECT count(*) AS n FROM logs WHERE severity_number >= 17 \
+                 GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
+            ),
+            std::slice::from_ref(&rollup),
+        );
+        let text = open.to_string();
+        assert!(
+            text.contains("rollup_errors/event [1970-01-01T00:00:00Z, 1970-01-01T01:40:00Z)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("prod/log [1970-01-01T01:40:00Z, ..)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("prod/log [.., 1970-01-01T00:00:00Z)"),
+            "and the rows before what the rollup covers, as the query reads them: {text}"
         );
     }
 
