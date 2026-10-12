@@ -1,6 +1,6 @@
 # A Prometheus for the PromQL differential suite: nothing to scrape,
 # samples arrive over remote write (start it with
-# --web.enable-remote-write-receiver).
+# --web.enable-remote-write-receiver --enable-feature=native-histograms).
 global:
   scrape_interval: 1h
   evaluation_interval: 1m

@@ -162,7 +162,7 @@ interpolation, the `histogram_*` functions and the API's shape),
 label and calendar functions; and the
 Prometheus HTTP API: queries, series, labels, label values, metadata,
 exemplars and remote write. The PromQL differential suite agrees with
-Prometheus 3.15.0 on every case.
+Prometheus 3.15.0 on every case, native histograms included.
 
 The Prometheus compliance suite (539 cases, a Prometheus 3.1.0
 reference scraping the PromLabs demo targets and writing the same

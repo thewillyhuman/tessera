@@ -55,6 +55,43 @@ const RANGE_CASES: &[&str] = &[
     r#"temperature{RUN, instance=~"a|c"}"#,
     r#"temperature{RUN, instance!~"a"}"#,
     r#"http_requests_total{RUN, instance!=""}"#,
+    // Native histograms (QL-5).
+    "latency_native{RUN}",
+    "rate(latency_native{RUN}[1m])",
+    "increase(latency_native{RUN}[1m])",
+    "delta(latency_native{RUN}[1m])",
+    "irate(latency_native{RUN}[1m])",
+    "idelta(latency_native{RUN}[1m])",
+    "histogram_quantile(0.9, rate(latency_native{RUN}[1m]))",
+    "histogram_quantile(0.5, latency_native{RUN})",
+    "histogram_count(rate(latency_native{RUN}[1m]))",
+    "histogram_sum(latency_native{RUN})",
+    "histogram_avg(latency_native{RUN})",
+    "histogram_stddev(latency_native{RUN})",
+    "histogram_stdvar(latency_native{RUN})",
+    "histogram_fraction(1, 4, latency_native{RUN})",
+    "histogram_fraction(0, 2, latency_native{RUN})",
+    "sum(rate(latency_native{RUN}[1m]))",
+    "avg(latency_native{RUN})",
+    "count(latency_native{RUN})",
+    "histogram_quantile(0.5, sum by (run) (rate(latency_native{RUN}[1m])))",
+    "latency_native{RUN} * 2",
+    "latency_native{RUN} / 4",
+    "-latency_native{RUN}",
+    r#"latency_native{RUN, job="api"} + ignoring(job) latency_native{RUN, job="web"}"#,
+    r#"latency_native{RUN, job="api"} - ignoring(job) latency_native{RUN, job="web"}"#,
+    "sum_over_time(latency_native{RUN}[1m])",
+    "avg_over_time(latency_native{RUN}[1m])",
+    "count_over_time(latency_native{RUN}[1m])",
+    "last_over_time(latency_native{RUN}[1m])",
+    "changes(latency_native{RUN}[1m])",
+    "resets(latency_native{RUN}[2m])",
+    "histogram_quantile(0.5, latency_nhcb{RUN})",
+    "histogram_fraction(0, 0.5, latency_nhcb{RUN})",
+    "rate(latency_nhcb{RUN}[1m])",
+    "histogram_count(latency_native{RUN}) > 10",
+    "max(latency_native{RUN})",
+    "abs(latency_native{RUN})",
 ];
 
 /// Instant queries at the end of the data.
@@ -68,6 +105,8 @@ const INSTANT_CASES: &[&str] = &[
     r#""a string""#,
     "year(vector(0))",
     "hour(vector(1700000000)) + minute(vector(1700000000))",
+    "latency_native{RUN}[1m]",
+    r#"scalar(latency_native{RUN, job="api"})"#,
 ];
 
 fn now_seconds() -> i64 {
@@ -137,6 +176,15 @@ async fn tessera_agrees_with_prometheus() {
         tessera.push(&data);
         wait_for(&prometheus, &run, end).unwrap();
         wait_for(&tessera, &run, end).unwrap();
+        // Agreement on nothing would prove nothing: Prometheus must hold
+        // the native histograms it was sent.
+        let native = prometheus
+            .query(&format!("count(latency_native{{run=\"{run}\"}})"), end)
+            .unwrap();
+        assert!(
+            matches!(normalize(&native), Normalized::Vector(v) if !v.is_empty()),
+            "prometheus ingested no native histograms: {native}"
+        );
         let mut failures = Vec::new();
         for template in RANGE_CASES {
             let case = template.replace("RUN", &scope);

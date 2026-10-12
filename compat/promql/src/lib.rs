@@ -7,16 +7,20 @@
 //! and the answers must agree once reduced to what the API promises.
 //!
 //! Prometheus is reached through `TESSERA_PROMETHEUS_URL` (for example
-//! `http://127.0.0.1:9090`, started with the remote write receiver
-//! enabled); without it the suite reports that it was skipped. Every
-//! deviation found this way is documented in the `PromQL` crate.
+//! `http://127.0.0.1:9090`, started with the remote write receiver and
+//! native histograms enabled); without it the suite reports that it
+//! was skipped. Every deviation found this way is documented in the
+//! `PromQL` crate.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use prost::Message;
 use serde_json::Value;
-use tessera_ingest::remote_write::{Label, MetricMetadata, Sample, TimeSeries, WriteRequest};
+use tessera_ingest::remote_write::{
+    BucketSpan, Count, Histogram, Label, MetricMetadata, Sample, TimeSeries, WriteRequest,
+    ZeroCount,
+};
 use tessera_server::AppState;
 
 /// One Prometheus-compatible endpoint.
@@ -131,7 +135,7 @@ impl Endpoint {
 /// A label set.
 pub type Labels = BTreeMap<String, String>;
 /// Samples as (seconds in thousandths, value in millionths, or the text
-/// of a value that is not a finite number).
+/// of a value that is not a finite number, or a histogram's text).
 pub type Samples = Vec<(i64, String)>;
 
 /// A result reduced to what both engines must agree on.
@@ -171,6 +175,51 @@ fn value_text(value: &Value) -> String {
     }
 }
 
+/// A native histogram as text: its count, its sum and its buckets with
+/// their boundary rule, every number reduced like a value.
+fn histogram_text(value: &Value) -> String {
+    let buckets: Vec<String> = value["buckets"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|b| {
+            format!(
+                "{}:{}:{}:{}",
+                b[0],
+                value_text(&b[1]),
+                value_text(&b[2]),
+                value_text(&b[3])
+            )
+        })
+        .collect();
+    format!(
+        "{{count:{} sum:{} [{}]}}",
+        value_text(&value["count"]),
+        value_text(&value["sum"]),
+        buckets.join(" ")
+    )
+}
+
+/// The samples of a matrix series, floats and histograms alike, in
+/// time order.
+fn samples_of(series: &Value) -> Samples {
+    let mut samples: Samples = series["values"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|p| (millis(&p[0]), value_text(&p[1])))
+        .chain(
+            series["histograms"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|p| (millis(&p[0]), histogram_text(&p[1]))),
+        )
+        .collect();
+    samples.sort();
+    samples
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn millis(value: &Value) -> i64 {
     (value.as_f64().unwrap_or_default() * 1000.0).round() as i64
@@ -200,15 +249,7 @@ pub fn normalize(data: &Value) -> Normalized {
                 .as_array()
                 .unwrap_or(&Vec::new())
                 .iter()
-                .map(|s| {
-                    let samples: Samples = s["values"]
-                        .as_array()
-                        .unwrap_or(&Vec::new())
-                        .iter()
-                        .map(|p| (millis(&p[0]), value_text(&p[1])))
-                        .collect();
-                    (labels(&s["metric"]), samples)
-                })
+                .map(|s| (labels(&s["metric"]), samples_of(s)))
                 .filter(|(_, samples)| !samples.is_empty())
                 .collect();
             series.sort();
@@ -219,7 +260,13 @@ pub fn normalize(data: &Value) -> Normalized {
                 .as_array()
                 .unwrap_or(&Vec::new())
                 .iter()
-                .map(|s| (labels(&s["metric"]), value_text(&s["value"][1])))
+                .map(|s| {
+                    let value = match s.get("histogram") {
+                        Some(histogram) => histogram_text(&histogram[1]),
+                        None => value_text(&s["value"][1]),
+                    };
+                    (labels(&s["metric"]), value)
+                })
                 .collect();
             series.sort();
             Normalized::Vector(series)
@@ -264,12 +311,51 @@ pub fn prometheus_from_env() -> Option<Endpoint> {
         })
 }
 
+/// A native histogram sample `i` steps into a counter: `i` observations
+/// in the zero bucket, `1 + i`, `2 + i` and `1 + i` in the first three
+/// positive buckets, `i` in the second negative one.
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+fn native_point(i: i64) -> Histogram {
+    let span = |offset: i32, length: u32| BucketSpan { offset, length };
+    Histogram {
+        count: Some(Count::Int((4 + 5 * i) as u64)),
+        sum: 5.0 + 7.5 * i as f64,
+        schema: 0,
+        zero_threshold: 0.001,
+        zero_count: Some(ZeroCount::Int(i as u64)),
+        positive_spans: vec![span(0, 3)],
+        positive_deltas: vec![1 + i, 1, -1],
+        negative_spans: vec![span(1, 1)],
+        negative_deltas: vec![i],
+        ..Histogram::default()
+    }
+}
+
+/// A custom-bucket histogram sample `i` steps into a counter, with
+/// `i`, `2i` and `1 + i` observations under 0.1, 0.5 and beyond.
+#[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+fn custom_point(i: i64) -> Histogram {
+    Histogram {
+        count: Some(Count::Int((4 * i + 1) as u64)),
+        sum: 0.3 * i as f64,
+        schema: -53,
+        positive_spans: vec![BucketSpan {
+            offset: 0,
+            length: 3,
+        }],
+        positive_deltas: vec![i, i, 1 - i],
+        custom_values: vec![0.1, 0.5],
+        ..Histogram::default()
+    }
+}
+
 /// The samples both engines receive, from `start` seconds, 15 seconds
 /// apart over `count` points: a counter with resets, a gauge, a
-/// classic histogram, and a series that goes stale; every series
-/// carries `run`, which scopes the queries to this run.
+/// classic histogram, a series that goes stale, a native histogram
+/// counter per job (one resetting halfway) and a custom-bucket one;
+/// every series carries `run`, which scopes the queries to this run.
 #[must_use]
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn fixture(start: i64, count: i64, run: &str) -> WriteRequest {
     let label = |name: &str, value: &str| Label {
         name: name.into(),
@@ -290,6 +376,19 @@ pub fn fixture(start: i64, count: i64, run: &str) -> WriteRequest {
         histograms: Vec::new(),
     };
     let points = |f: &dyn Fn(i64) -> f64| (0..count).map(|i| (i, f(i))).collect::<Vec<_>>();
+    let native = |name: &str, extra: &[(&str, &str)], f: &dyn Fn(i64) -> Histogram| TimeSeries {
+        labels: std::iter::once(label("__name__", name))
+            .chain(std::iter::once(label("run", run)))
+            .chain(extra.iter().map(|(k, v)| label(k, v)))
+            .collect(),
+        samples: Vec::new(),
+        histograms: (0..count)
+            .map(|i| Histogram {
+                timestamp: (start + i * 15) * 1000,
+                ..f(i)
+            })
+            .collect(),
+    };
     let stale = f64::from_bits(tessera_ingest::remote_write::STALE_NAN_BITS);
     WriteRequest {
         timeseries: vec![
@@ -344,6 +443,11 @@ pub fn fixture(start: i64, count: i64, run: &str) -> WriteRequest {
                 &[("job", "api"), ("instance", "a")],
                 points(&|i| if i == count - 2 { stale } else { 1.0 }),
             ),
+            native("latency_native", &[("job", "api")], &native_point),
+            native("latency_native", &[("job", "web")], &|i| {
+                native_point(if i < count / 2 { i } else { i - count / 2 })
+            }),
+            native("latency_nhcb", &[("job", "api")], &custom_point),
         ],
         metadata: vec![MetricMetadata {
             r#type: 1,
