@@ -2,16 +2,18 @@
 
 //! Leaf tasks shared with peers: files assigned to another node are read
 //! there (QE-15), a peer that fails is read around (QE-17), and the rows
-//! are the same either way.
+//! are the same either way. A grouped aggregate folds on the workers
+//! over an exchange of their partial outputs (QE-14), and folds here
+//! when a worker or a kept output is lost.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use futures::future::BoxFuture;
 use tessera_exec::{
-    CpuPool, Engine, LeafTask, Peer, Peers, QueryLimits, RemoteError, RemoteScan, StageAnalysis,
-    StageTask,
+    CpuPool, Engine, FinalTask, LeafTask, Peer, Peers, QueryLimits, RemoteError, RemoteScan,
+    StageAnalysis, StageTask,
 };
 use tessera_format::ParquetFormat;
 use tessera_ir::{AggregateExpr, Expr, NamedExpr, Plan, Registry, Scan, SortKey};
@@ -186,11 +188,166 @@ impl RemoteScan for PeerEngine {
 }
 
 fn peer() -> Peer {
-    let mut random = SeededRandom::new(7);
+    peer_seeded(7)
+}
+
+fn peer_seeded(seed: u64) -> Peer {
+    let mut random = SeededRandom::new(seed);
     Peer {
         node: NodeId::random(&mut random),
-        http: "http://peer".into(),
+        http: format!("http://peer{seed}"),
     }
+}
+
+/// Files spread over this node and two peers by their id.
+struct ThreeWay {
+    peers: [Peer; 2],
+}
+
+impl Peers for ThreeWay {
+    fn owner_of(&self, file: FileId) -> Option<Peer> {
+        match file.to_string().as_bytes()[1] % 3 {
+            0 => None,
+            1 => Some(self.peers[0].clone()),
+            _ => Some(self.peers[1].clone()),
+        }
+    }
+}
+
+/// A transport between in-process engines, one per node: stages keep
+/// their outputs on the peer, partitions are fetched from it and final
+/// stages run there, unless the peer is told to fail at one of them.
+#[derive(Default)]
+struct Mesh {
+    engines: Mutex<HashMap<String, Arc<Engine>>>,
+    fail_final: Mutex<Vec<String>>,
+    fail_fetch: Mutex<Vec<String>>,
+    calls: Mutex<Vec<String>>,
+}
+
+impl Mesh {
+    fn add(&self, peer: &Peer, engine: Arc<Engine>) {
+        self.engines
+            .lock()
+            .unwrap()
+            .insert(peer.node.to_string(), engine);
+    }
+
+    fn engine(&self, peer: &Peer) -> Result<Arc<Engine>, RemoteError> {
+        self.engines
+            .lock()
+            .unwrap()
+            .get(&peer.node.to_string())
+            .cloned()
+            .ok_or_else(|| RemoteError(format!("no such node {}", peer.node)))
+    }
+
+    fn record(&self, call: &str, peer: &Peer) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("{call} {}", peer.http));
+    }
+
+    fn told_to_fail(list: &Mutex<Vec<String>>, peer: &Peer) -> bool {
+        list.lock().unwrap().contains(&peer.node.to_string())
+    }
+
+    fn calls(&self, call: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.starts_with(call))
+            .count()
+    }
+}
+
+impl RemoteScan for Mesh {
+    fn leaf<'a>(
+        &'a self,
+        peer: &'a Peer,
+        task: &'a LeafTask,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            self.engine(peer)?
+                .leaf(task)
+                .await
+                .map_err(|e| RemoteError(e.to_string()))
+        })
+    }
+
+    fn stage<'a>(
+        &'a self,
+        peer: &'a Peer,
+        task: &'a StageTask,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            self.record("stage", peer);
+            self.engine(peer)?
+                .stage(task)
+                .await
+                .map_err(|e| RemoteError(e.to_string()))
+        })
+    }
+
+    fn supports_exchange(&self) -> bool {
+        true
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        peer: &'a Peer,
+        id: &'a str,
+        partition: u32,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            self.record("fetch", peer);
+            if Self::told_to_fail(&self.fail_fetch, peer) {
+                return Err(RemoteError("peer lost its output".into()));
+            }
+            self.engine(peer)?
+                .fetch(id, partition)
+                .map(|(_, rows)| rows)
+                .ok_or_else(|| RemoteError("nothing kept".into()))
+        })
+    }
+
+    fn finalize<'a>(
+        &'a self,
+        peer: &'a Peer,
+        task: &'a FinalTask,
+        rows: &'a [RecordBatch],
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            self.record("final", peer);
+            if Self::told_to_fail(&self.fail_final, peer) {
+                return Err(RemoteError("peer down".into()));
+            }
+            self.engine(peer)?
+                .finalize(task, rows.to_vec())
+                .await
+                .map_err(|e| RemoteError(e.to_string()))
+        })
+    }
+}
+
+/// A coordinator with two peers over `mesh`, every file assigned to
+/// one of the three.
+fn three_nodes(store: &Arc<MemoryStore>, env: &Env, mesh: &Arc<Mesh>) -> (Engine, [Peer; 2]) {
+    let peers = [peer_seeded(7), peer_seeded(8)];
+    let view = Arc::new(ThreeWay {
+        peers: peers.clone(),
+    });
+    for peer in &peers {
+        let worker = engine(store, env).with_peers(
+            Arc::clone(&view) as Arc<dyn Peers>,
+            Arc::clone(mesh) as Arc<dyn RemoteScan>,
+        );
+        mesh.add(peer, Arc::new(worker));
+    }
+    let coordinator = engine(store, env).with_peers(view, Arc::clone(mesh) as Arc<dyn RemoteScan>);
+    (coordinator, peers)
 }
 
 fn total_rows(batches: &[RecordBatch]) -> usize {
@@ -322,6 +479,7 @@ async fn an_aggregate_runs_its_partial_stage_on_the_peers() {
             kind: "aggregate",
             remote: 1,
             failed: 0,
+            ..StageAnalysis::default()
         }]
     );
     let stages = remote.stages.lock().unwrap();
@@ -423,4 +581,100 @@ async fn top_k_and_limits_split_and_an_aggregate_over_a_limit_does_not() {
         output.analysis.stages
     );
     assert_eq!(remote.stages.lock().unwrap().len(), 2);
+}
+
+/// QE-14: with a transport that keeps stage outputs, a grouped
+/// aggregate's final half runs on the workers, each over one partition
+/// of the groups fetched from the others, and the coordinator folds
+/// only its own partition.
+#[tokio::test]
+async fn a_grouped_aggregate_folds_on_the_workers() {
+    let (store, env) = populate().await;
+    let expected = engine(&store, &env).run(&grouped_plan()).await.unwrap();
+    let mesh = Arc::new(Mesh::default());
+    let (coordinator, _) = three_nodes(&store, &env, &mesh);
+    let output = coordinator.run(&grouped_plan()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    let stage = &output.analysis.stages[0];
+    assert_eq!(stage.kind, "aggregate");
+    assert!(stage.remote >= 1, "{stage:?}");
+    assert_eq!(
+        stage.finals, stage.remote,
+        "one final partition per producer: {stage:?}"
+    );
+    assert_eq!(stage.final_failed, 0);
+    assert_eq!(stage.recomputed, 0);
+    assert_eq!(mesh.calls("final"), stage.finals);
+    assert!(
+        mesh.calls("fetch") >= stage.remote,
+        "the coordinator fetched its partition from every producer"
+    );
+    assert!(
+        tessera_exec::explain_text(&grouped_plan(), Some(&output.analysis)).contains("final on"),
+        "{}",
+        tessera_exec::explain_text(&grouped_plan(), Some(&output.analysis))
+    );
+
+    // An aggregate without keys has one group: it folds here.
+    let counted = optimize(
+        Plan::Aggregate {
+            input: Box::new(Plan::Scan(Scan::all(
+                TenantId::DEFAULT,
+                dataset(),
+                Kind::Log,
+            ))),
+            group_by: vec![],
+            aggregates: vec![AggregateExpr {
+                function: "count".into(),
+                args: vec![],
+                name: "n".into(),
+            }],
+        },
+        &Registry::builtin(),
+    )
+    .unwrap();
+    let output = coordinator.run(&counted).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), vec!["20.0".to_owned()]);
+    assert_eq!(output.analysis.stages[0].finals, 0);
+}
+
+/// QE-14, QE-17: a worker that cannot fold its partition has it folded
+/// on the coordinator, from the outputs the others kept.
+#[tokio::test]
+async fn a_worker_that_cannot_fold_has_its_partition_folded_here() {
+    let (store, env) = populate().await;
+    let expected = engine(&store, &env).run(&grouped_plan()).await.unwrap();
+    let mesh = Arc::new(Mesh::default());
+    let (coordinator, peers) = three_nodes(&store, &env, &mesh);
+    mesh.fail_final
+        .lock()
+        .unwrap()
+        .push(peers[0].node.to_string());
+    let output = coordinator.run(&grouped_plan()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    let stage = &output.analysis.stages[0];
+    assert_eq!(stage.final_failed, 1, "{stage:?}");
+    assert_eq!(stage.recomputed, 0);
+}
+
+/// QE-17: a producer whose kept output is gone has its share recomputed
+/// on the coordinator from its files, once, and the result holds.
+#[tokio::test]
+async fn a_lost_output_is_recomputed_here() {
+    let (store, env) = populate().await;
+    let expected = engine(&store, &env).run(&grouped_plan()).await.unwrap();
+    let mesh = Arc::new(Mesh::default());
+    let (coordinator, peers) = three_nodes(&store, &env, &mesh);
+    mesh.fail_fetch
+        .lock()
+        .unwrap()
+        .push(peers[0].node.to_string());
+    let output = coordinator.run(&grouped_plan()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    let stage = &output.analysis.stages[0];
+    assert_eq!(stage.recomputed, 1, "{stage:?}");
+    assert!(
+        stage.final_failed >= 1,
+        "the other worker could not fetch from the lost producer either: {stage:?}"
+    );
 }

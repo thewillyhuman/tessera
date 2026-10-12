@@ -14,6 +14,7 @@
 pub mod batch;
 pub mod cache;
 pub mod engine;
+mod exchange;
 pub mod memory;
 pub mod operator;
 pub mod pipeline;
@@ -34,7 +35,7 @@ pub use memory::{MemoryPool, OutOfMemory};
 pub use operator::{CollectSink, Flow, Operator, Sink};
 pub use pipeline::Pipeline;
 pub use query::{QueryError, Readable, Response, RunOptions, explain_text, run_with};
-pub use remote::{LeafTask, Peer, Peers, RemoteError, RemoteScan, StageTask};
+pub use remote::{Exchange, FinalTask, LeafTask, Peer, Peers, RemoteError, RemoteScan, StageTask};
 pub use rollups::RollupSource;
 pub use scan::ScanAnalysis;
 pub use scheduler::{CpuPool, Task, TaskError};

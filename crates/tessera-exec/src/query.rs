@@ -224,6 +224,13 @@ pub fn explain_text(plan: &Plan, analysis: Option<&Analysis>) -> String {
             "Stage {}: partial on {} peers, {} run here after a failure",
             stage.kind, stage.remote, stage.failed
         );
+        if stage.finals > 0 {
+            let _ = writeln!(
+                out,
+                "  final on {} peers, {} run here after a failure, {} shares recomputed here",
+                stage.finals, stage.final_failed, stage.recomputed
+            );
+        }
     }
     for scan in &analysis.scans {
         let _ = writeln!(out, "Scan {}:", scan.source);

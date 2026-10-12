@@ -7,9 +7,17 @@
 //! the CPU pool, and every operator runs there too. The result carries
 //! an [`Analysis`] for `EXPLAIN ANALYZE` (QE-4, QE-8).
 //!
+//! An aggregate, a top-k or a limit over one scan runs in two stages
+//! when the node has peers (QE-14): the partial half on every node over
+//! its share of the files, the final half over the partial outputs. A
+//! grouped aggregate's final half runs on the workers themselves when
+//! the transport allows: each partial output stays on its node as an
+//! exchange, split by group key, and each worker folds one partition
+//! fetched from every producer, so that no node holds every partial
+//! output. The other stages fold on the coordinator.
+//!
 //! Pipelines are not yet fused across nodes nor split into morsels
-//! across stages; that arrives with distributed execution (M6), where
-//! stages and exchanges are introduced.
+//! across stages.
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -31,11 +39,15 @@ use tessera_kernels::promql::Params;
 use tessera_manifest::{DatasetLogs, ManifestError, Manifests, View, view};
 use tessera_object::{PoolError, Pools};
 use tessera_types::event::{OBSERVED_TIMESTAMP, TRACE_ID};
-use tessera_types::{DatasetName, Env, Kind, TenantId, TimeRange, Timestamp, WindowSchedule};
+use tessera_types::{
+    DatasetName, Env, FileMeta, Kind, Random, SharedRandom, TenantId, TimeRange, Timestamp,
+    WindowSchedule,
+};
 
 use crate::ExecError;
 use crate::batch::Batch;
 use crate::cache::{self, ResultCache, ResultKey};
+use crate::exchange::{self, Exchanges};
 use crate::memory::MemoryPool;
 use crate::operator::{
     BuildSide, CollectSink, Extract, Filter, Format, HashAggregate, HashJoin, JoinInput, Limit,
@@ -43,7 +55,7 @@ use crate::operator::{
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
-use crate::remote::{LeafTask, Peers, RemoteScan, StageTask};
+use crate::remote::{Exchange, FinalTask, LeafTask, Peer, Peers, RemoteScan, StageTask};
 use crate::rollups::RollupSource;
 use crate::scan::{self, ScanAnalysis, Share};
 use crate::scheduler::{CpuPool, TaskError};
@@ -111,6 +123,13 @@ pub struct StageAnalysis {
     pub remote: usize,
     /// Partial stages a peer could not run, run here instead.
     pub failed: usize,
+    /// Final partitions run on peers over an exchange.
+    pub finals: usize,
+    /// Final partitions a peer could not run, run here instead.
+    pub final_failed: usize,
+    /// Kept outputs a producer no longer had, recomputed here from
+    /// its files.
+    pub recomputed: usize,
 }
 
 /// The rows of a query and what producing them took.
@@ -195,6 +214,10 @@ pub struct Engine {
     tombstones: Mutex<HashMap<TableKey, KeptFilters>>,
     /// Results of closed-range queries (section 10.8).
     results: ResultCache,
+    /// The partial outputs kept for the workers of final stages (QE-14).
+    exchanges: Exchanges,
+    /// Where exchange ids come from.
+    random: SharedRandom,
     limits: QueryLimits,
     registry: Registry,
 }
@@ -216,6 +239,7 @@ impl Engine {
             env.clone(),
             tessera_manifest::manifests::DEFAULT_CAPACITY,
         );
+        let random = env.random.clone();
         let datasets = DatasetLogs::new(Arc::clone(pools.root().store()), env);
         Engine {
             pools,
@@ -229,6 +253,8 @@ impl Engine {
             spill_dir: None,
             tombstones: Mutex::new(HashMap::new()),
             results: ResultCache::new(cache::DEFAULT_BYTES),
+            exchanges: Exchanges::default(),
+            random,
             limits,
             registry: Registry::builtin(),
         }
@@ -324,25 +350,95 @@ impl Engine {
     }
 
     /// Runs a stage sent by another node (QE-14): its plan over its
-    /// files, under this node's own limits, and returns the output.
+    /// files, under this node's own limits, and returns the output, or
+    /// keeps it under the task's exchange and returns nothing.
     ///
     /// # Errors
     ///
     /// If the plan is malformed, a file cannot be read or an operator
     /// fails.
     pub async fn stage(&self, task: &StageTask) -> Result<Vec<RecordBatch>, EngineError> {
-        let grant = Grant {
-            memory: MemoryPool::with_spill_dir(self.limits.memory_bytes, self.spill_dir.clone()),
-            scan_bytes: self.limits.scan_bytes,
-        };
+        let grant = self.own_grant();
         let mut analysis = Analysis::default();
         let share = Share {
             files: task.files.clone(),
             tail: Vec::new(),
             analysis: ScanAnalysis::default(),
         };
-        self.execute_in(&task.plan, &grant, &mut analysis, Some(&share))
-            .await
+        let rows = self
+            .execute_in(&task.plan, &grant, &mut analysis, Some(&share))
+            .await?;
+        let Some(exchange) = &task.exchange else {
+            return Ok(rows);
+        };
+        let schema = task.plan.schema(&self.registry)?;
+        self.exchanges.keep(exchange, schema, rows)?;
+        Ok(Vec::new())
+    }
+
+    /// The rows a stage of this node kept under exchange `id` for
+    /// `partition`, with their schema, taken once (QE-14).
+    #[must_use]
+    pub fn fetch(&self, id: &str, partition: u32) -> Option<(SchemaRef, Vec<RecordBatch>)> {
+        self.exchanges.take(id, partition)
+    }
+
+    /// Runs a final stage sent by a coordinator over one partition of
+    /// an exchange (QE-14): the task's plan folds `rows`, the partition
+    /// this node kept, and the partition fetched from each producer.
+    ///
+    /// # Errors
+    ///
+    /// If a producer no longer has its partition, the plan is
+    /// malformed or an operator fails.
+    pub async fn finalize(
+        &self,
+        task: &FinalTask,
+        rows: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let mut inputs = rows;
+        // The producers first: a fetch that fails leaves this node's
+        // own partition in place for the coordinator to take.
+        for producer in &task.producers {
+            let Some((_, transport)) = &self.peers else {
+                return Err(unsupported(
+                    "a final stage needs a transport to its producers",
+                ));
+            };
+            let fetched = transport
+                .fetch(producer, &task.exchange.id, task.partition)
+                .await
+                .map_err(|e| {
+                    unsupported(format!(
+                        "exchange {}: producer {}: {e}",
+                        task.exchange.id, producer.node
+                    ))
+                })?;
+            inputs.extend(fetched);
+        }
+        if let Some((_, mine)) = self.exchanges.take(&task.exchange.id, task.partition) {
+            inputs.extend(mine);
+        }
+        let Some(input) = task.plan.inputs().into_iter().next() else {
+            return Err(unsupported("a final stage needs an input"));
+        };
+        let grant = self.own_grant();
+        let operator = self.operator(&task.plan, input, &grant.memory)?;
+        self.pipe(operator, inputs).await
+    }
+
+    /// A grant under this node's own limits, for work sent by another
+    /// node.
+    fn own_grant(&self) -> Grant {
+        Grant {
+            memory: MemoryPool::with_spill_dir(self.limits.memory_bytes, self.spill_dir.clone()),
+            scan_bytes: self.limits.scan_bytes,
+        }
+    }
+
+    /// An exchange id no other stage of this node shares.
+    fn exchange_id(&self) -> String {
+        format!("{:032x}", self.random.fork().next_u128())
     }
 
     /// Runs a leaf task sent by another node: reads its files and
@@ -673,24 +769,42 @@ impl Engine {
         let mut scanned = ScanAnalysis::default();
         let split = scan::split(self, scan, &mut scanned, limit).await?;
         let partial = with_scan(&stage.partial, &split.scan);
+        // A grouped aggregate folds on the workers when the transport
+        // lets them keep and hand out their outputs: one partition of
+        // the groups per node, the coordinator's own included.
+        let exchange = match &stage.keys {
+            Some(keys) if transport.supports_exchange() && !split.remote.is_empty() => {
+                Some(Exchange {
+                    id: self.exchange_id(),
+                    partitions: u32::try_from(split.remote.len() + 1).unwrap_or(u32::MAX),
+                    keys: keys.clone(),
+                })
+            }
+            _ => None,
+        };
         let mut report = StageAnalysis {
             kind: stage.kind,
-            remote: 0,
-            failed: 0,
+            ..StageAnalysis::default()
         };
         let mut local = split.local;
         let mut batches = Vec::new();
+        let mut producers: Vec<(Peer, Vec<FileMeta>)> = Vec::new();
         for (peer, files) in split.remote {
             let task = StageTask {
                 plan: partial.clone(),
                 files,
+                exchange: exchange.clone(),
             };
             report.remote += 1;
             scanned.remote_tasks += 1;
             match transport.stage(&peer, &task).await {
                 Ok(rows) => {
                     scanned.files_remote += task.files.len();
-                    batches.extend(rows);
+                    if exchange.is_some() {
+                        producers.push((peer, task.files));
+                    } else {
+                        batches.extend(rows);
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(peer = %peer.node, error = %error, "stage failed; running here");
@@ -705,13 +819,119 @@ impl Engine {
             tail: split.tail,
             analysis: scanned,
         };
-        batches.extend(
-            self.execute_in(&partial, grant, analysis, Some(&share))
-                .await?,
-        );
+        let mine = self
+            .execute_in(&partial, grant, analysis, Some(&share))
+            .await?;
+        let output = match exchange {
+            Some(exchange) if !producers.is_empty() => {
+                self.exchanged(
+                    &stage,
+                    &partial,
+                    exchange,
+                    producers,
+                    mine,
+                    grant,
+                    analysis,
+                    &mut report,
+                )
+                .await?
+            }
+            _ => {
+                batches.extend(mine);
+                let operator = self.operator(&stage.final_plan, &partial, &grant.memory)?;
+                self.pipe(operator, batches).await?
+            }
+        };
         analysis.stages.push(report);
-        let operator = self.operator(&stage.final_plan, &partial, &grant.memory)?;
-        Ok(Some(self.pipe(operator, batches).await?))
+        Ok(Some(output))
+    }
+
+    /// The final half of a stage over an exchange (QE-14): each
+    /// producer folds one partition of the groups, fetching it from
+    /// the others and taking the coordinator's part with the task; the
+    /// coordinator folds the last partition itself. A partition a
+    /// worker cannot fold is folded here, and a producer that no
+    /// longer has its output has its share recomputed here from its
+    /// files (QE-17), so the result is the same either way.
+    #[allow(clippy::too_many_arguments)]
+    async fn exchanged(
+        &self,
+        stage: &Stage,
+        partial: &Plan,
+        exchange: Exchange,
+        producers: Vec<(Peer, Vec<FileMeta>)>,
+        mine: Vec<RecordBatch>,
+        grant: &Grant,
+        analysis: &mut Analysis,
+        report: &mut StageAnalysis,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let Some((_, transport)) = &self.peers else {
+            return Err(unsupported("an exchange needs peers"));
+        };
+        let partitions = usize::try_from(exchange.partitions).unwrap_or(1);
+        let mut parts = exchange::partition(mine, &exchange.keys, exchange.partitions)?;
+        let mut output = Vec::new();
+        let mut here: Vec<usize> = Vec::new();
+        for (index, (peer, _)) in producers.iter().enumerate() {
+            let task = FinalTask {
+                plan: stage.final_plan.clone(),
+                exchange: exchange.clone(),
+                partition: u32::try_from(index).unwrap_or(u32::MAX),
+                producers: producers
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, (producer, _))| producer.clone())
+                    .collect(),
+            };
+            report.finals += 1;
+            let rows = std::mem::take(&mut parts[index]);
+            match transport.finalize(peer, &task, &rows).await {
+                Ok(folded) => output.extend(folded),
+                Err(error) => {
+                    tracing::warn!(peer = %peer.node, error = %error, "final stage failed; running here");
+                    report.final_failed += 1;
+                    parts[index] = rows;
+                    here.push(index);
+                }
+            }
+        }
+        here.push(partitions - 1);
+        // A producer whose kept output is gone is recomputed once, every
+        // partition of it kept for the ones still to fold here.
+        let mut recomputed: Vec<Option<Vec<Vec<RecordBatch>>>> = vec![None; producers.len()];
+        for index in here {
+            let mut inputs = std::mem::take(&mut parts[index]);
+            for (which, (peer, files)) in producers.iter().enumerate() {
+                if let Some(again) = &mut recomputed[which] {
+                    inputs.extend(std::mem::take(&mut again[index]));
+                    continue;
+                }
+                let partition = u32::try_from(index).unwrap_or(u32::MAX);
+                match transport.fetch(peer, &exchange.id, partition).await {
+                    Ok(rows) => inputs.extend(rows),
+                    Err(error) => {
+                        tracing::warn!(peer = %peer.node, error = %error, "kept output lost; recomputing here");
+                        report.recomputed += 1;
+                        let share = Share {
+                            files: files.clone(),
+                            tail: Vec::new(),
+                            analysis: ScanAnalysis::default(),
+                        };
+                        let rows = self
+                            .execute_in(partial, grant, analysis, Some(&share))
+                            .await?;
+                        let mut again =
+                            exchange::partition(rows, &exchange.keys, exchange.partitions)?;
+                        inputs.extend(std::mem::take(&mut again[index]));
+                        recomputed[which] = Some(again);
+                    }
+                }
+            }
+            let operator = self.operator(&stage.final_plan, partial, &grant.memory)?;
+            output.extend(self.pipe(operator, inputs).await?);
+        }
+        Ok(output)
     }
 
     /// A scan node: the scan runs within what the query's earlier scans
@@ -1015,6 +1235,10 @@ impl Engine {
     }
 }
 
+fn unsupported(message: impl Into<String>) -> EngineError {
+    EngineError::Exec(ExecError::Unsupported(message.into()))
+}
+
 /// What a query may still read (QE-18), given what its earlier scans
 /// spent.
 fn scan_limit(grant: &Grant, analysis: &Analysis) -> Option<scan::ScanLimit> {
@@ -1034,6 +1258,9 @@ struct Stage {
     kind: &'static str,
     partial: Plan,
     final_plan: Plan,
+    /// The columns of the partial output that choose a worker when the
+    /// final half runs on the workers: a grouped aggregate's keys.
+    keys: Option<Vec<String>>,
 }
 
 /// How `plan` splits, if it does: an aggregate whose functions merge
@@ -1064,16 +1291,19 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
                 group_by: keys,
                 aggregates: aggregates.clone(),
             };
+            let names: Vec<String> = group_by.iter().map(|k| k.name.clone()).collect();
             Some(Stage {
                 kind: "aggregate",
                 partial,
                 final_plan,
+                keys: (!names.is_empty()).then_some(names),
             })
         }
         Plan::TopK { .. } => Some(Stage {
             kind: "top-k",
             partial: plan.clone(),
             final_plan: plan.clone(),
+            keys: None,
         }),
         Plan::Limit {
             offset: 0,
@@ -1083,6 +1313,7 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
             kind: "limit",
             partial: plan.clone(),
             final_plan: plan.clone(),
+            keys: None,
         }),
         _ => None,
     }

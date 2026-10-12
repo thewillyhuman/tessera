@@ -4,6 +4,9 @@
 //! to the live `query` nodes by rendezvous hashing on file id (QE-15),
 //! each node reads its share and the coordinator gathers the rows. The
 //! assignment is a hint: a task a peer cannot run is read here (QE-17).
+//! A stage's partial half runs on each node over its share, and its
+//! output either comes back to the coordinator or stays on the node as
+//! an [`Exchange`] for the workers of the final half (QE-14).
 //!
 //! The engine knows peers only through these traits; the node provides
 //! the membership view and the transport.
@@ -26,17 +29,52 @@ pub struct LeafTask {
 /// A stage of a plan that one node runs over its share of a scan's
 /// files (QE-14): a plan whose one scan reads `files` and nothing else,
 /// a partial aggregate, top-k or limit over them, whose output the
-/// coordinator merges with the other shares'.
+/// coordinator merges with the other shares', or which the node keeps
+/// for the workers of the final stage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StageTask {
     /// The plan fragment to run.
     pub plan: Plan,
     /// The files its scan reads.
     pub files: Vec<FileMeta>,
+    /// Where to keep the output rather than return it, when the final
+    /// stage runs on the workers.
+    #[serde(default)]
+    pub exchange: Option<Exchange>,
+}
+
+/// Where a partial stage keeps its output for the workers of the
+/// final stage (QE-14): under `id`, split into `partitions` parts by a
+/// hash of the `keys` columns, each part fetched once by the worker
+/// that runs the final stage over it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exchange {
+    /// The exchange, unique to one stage of one query.
+    pub id: String,
+    /// How many parts the output splits into, one per worker.
+    pub partitions: u32,
+    /// The columns of the output whose values choose the part.
+    pub keys: Vec<String>,
+}
+
+/// A final stage over one partition of an exchange (QE-14): `plan`
+/// folds the rows of `partition` that the worker itself kept, those
+/// the coordinator hands over with the task, and those fetched from
+/// the other `producers`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FinalTask {
+    /// The final plan, over the partial plan it folds.
+    pub plan: Plan,
+    /// The exchange the partial outputs were kept under.
+    pub exchange: Exchange,
+    /// The partition this worker folds.
+    pub partition: u32,
+    /// The other nodes that kept a partial output.
+    pub producers: Vec<Peer>,
 }
 
 /// Another node that runs leaf tasks.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     /// The node.
     pub node: NodeId,
@@ -64,9 +102,10 @@ pub trait RemoteScan: Send + Sync {
         task: &'a LeafTask,
     ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>>;
 
-    /// Runs the stage `task` on `peer` and returns its output (QE-14).
-    /// A transport or a peer that cannot answers with an error, and
-    /// the stage runs on the coordinator instead.
+    /// Runs the stage `task` on `peer` and returns its output (QE-14),
+    /// or nothing when the task names an exchange to keep it under. A
+    /// transport or a peer that cannot answers with an error, and the
+    /// stage runs on the coordinator instead.
     fn stage<'a>(
         &'a self,
         peer: &'a Peer,
@@ -76,6 +115,45 @@ pub trait RemoteScan: Send + Sync {
         Box::pin(async {
             Err(RemoteError(
                 "stages are not supported by this transport".into(),
+            ))
+        })
+    }
+
+    /// Whether peers keep a stage's output, hand it out and run a
+    /// final stage over an exchange (QE-14); a transport that cannot
+    /// has every final stage run on the coordinator.
+    fn supports_exchange(&self) -> bool {
+        false
+    }
+
+    /// The rows `peer` kept under exchange `id` for `partition`.
+    fn fetch<'a>(
+        &'a self,
+        peer: &'a Peer,
+        id: &'a str,
+        partition: u32,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        let _ = (peer, id, partition);
+        Box::pin(async {
+            Err(RemoteError(
+                "exchanges are not supported by this transport".into(),
+            ))
+        })
+    }
+
+    /// Runs the final stage `task` on `peer` over `rows`, the
+    /// coordinator's share of the partition, and what the task's
+    /// producers kept.
+    fn finalize<'a>(
+        &'a self,
+        peer: &'a Peer,
+        task: &'a FinalTask,
+        rows: &'a [RecordBatch],
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        let _ = (peer, task, rows);
+        Box::pin(async {
+            Err(RemoteError(
+                "exchanges are not supported by this transport".into(),
             ))
         })
     }

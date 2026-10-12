@@ -523,6 +523,7 @@ mod tests {
                 }],
             },
             files: Vec::new(),
+            exchange: None,
         };
         let request = Request::builder()
             .method("POST")
