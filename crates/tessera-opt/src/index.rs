@@ -304,6 +304,7 @@ mod tests {
                     column: TRACE_ID.into(),
                 },
             ],
+            ingested_at: None,
         }
     }
 

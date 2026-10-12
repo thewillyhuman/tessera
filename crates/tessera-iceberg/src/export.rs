@@ -442,6 +442,7 @@ mod tests {
                 })
                 .collect(),
             indexes: Vec::new(),
+            ingested_at: None,
         }
     }
 

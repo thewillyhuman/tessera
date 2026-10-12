@@ -122,6 +122,11 @@ pub struct FileMeta {
     /// The indexes in its sidecar; empty when it has none.
     #[serde(default)]
     pub indexes: Vec<IndexRef>,
+    /// When the file's rows were ingested (CP-2): the flush that wrote
+    /// an L1 file, the latest input of a compacted one; none for a
+    /// file written before this was recorded.
+    #[serde(default)]
+    pub ingested_at: Option<Timestamp>,
 }
 
 impl FileMeta {
@@ -170,6 +175,7 @@ mod tests {
                 quantiles: Vec::new(),
             }],
             indexes: Vec::new(),
+            ingested_at: None,
         }
     }
 

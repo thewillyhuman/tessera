@@ -104,8 +104,9 @@ differential suite agrees with Loki 3.3.2 on every case in both
 directions; the deviations found are documented in the `tessera-logql`
 crate.
 
-Gaps left in M3: sort keys on attribute columns and ingest-time
-grouping of compaction inputs (CP-2) wait for column promotion (M8).
+Gaps left in M3: L1 files compact with the others ingested in the
+same hour (CP-2) and L2 files widen to the partition at L3, with no
+level between.
 
 **M4, traces: done, with gaps listed below.** Spans with their span
 events (as `event` rows, DM-8) and links over OTLP; the `TraceGroup`

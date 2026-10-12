@@ -8,9 +8,12 @@
 //! nothing more is likely to join it. When nothing is due, compacted
 //! files written under an older layout epoch than the dataset's are
 //! rewritten into the current one (AD-10); the caller budgets those
-//! rewrites and offers recent partitions first. Grouping by ingest-time
-//! window (CP-2) arrives with partitions large enough to need it.
+//! rewrites and offers recent partitions first. The L1 files of a
+//! partition compact with the others ingested in the same window
+//! (CP-2), so that rows arriving late do not spread a file's time
+//! range over the partition; an L3 file widens to the partition.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use tessera_manifest::ManifestState;
@@ -37,6 +40,10 @@ pub struct Policy {
     /// (CO-9): its compacted files are rewritten to L3 once the
     /// partition's window ended that long ago. None asks for nothing.
     pub retention_after: Option<Duration>,
+    /// L1 files compact with the others ingested in the same window of
+    /// this length (CP-2); a file that does not say when it was
+    /// ingested goes by its newest row.
+    pub ingest_window: Duration,
 }
 
 impl Default for Policy {
@@ -47,6 +54,7 @@ impl Default for Policy {
             max_input_bytes: 512 << 20,
             layout_epoch: 0,
             retention_after: None,
+            ingest_window: Duration::from_secs(3_600),
         }
     }
 }
@@ -83,16 +91,32 @@ pub fn plan(
         now.duration_since(f.max_timestamp)
             .is_some_and(|age| age >= policy.lone_file_age)
     };
-    let due = inputs.len() >= policy.min_inputs || inputs.iter().any(old_enough);
-    if inputs.is_empty() || !due {
+    // The oldest ingest window that is due, on its own (CP-2).
+    let due = by_ingest_window(inputs, policy.ingest_window)
+        .into_iter()
+        .find(|group| group.len() >= policy.min_inputs || group.iter().any(old_enough));
+    let Some(inputs) = due else {
         return retire(partition, state, now, policy)
             .or_else(|| recluster(partition, state, policy));
-    }
+    };
     Some(Job {
         partition: partition.clone(),
         inputs: take_within(inputs, policy.max_input_bytes),
         level: Level::L2,
     })
+}
+
+/// `files` grouped by the window of `length` their ingest time falls
+/// in, oldest window first, each group in the order given; a file
+/// without an ingest time goes by its newest row.
+fn by_ingest_window(files: Vec<FileMeta>, length: Duration) -> Vec<Vec<FileMeta>> {
+    let length = i64::try_from(length.as_nanos()).unwrap_or(i64::MAX).max(1);
+    let mut groups: BTreeMap<i64, Vec<FileMeta>> = BTreeMap::new();
+    for file in files {
+        let at = file.ingested_at.unwrap_or(file.max_timestamp).as_nanos();
+        groups.entry(at.div_euclid(length)).or_default().push(file);
+    }
+    groups.into_values().collect()
 }
 
 /// A job that rewrites a partition's files into one L3 file once a
@@ -218,6 +242,7 @@ mod tests {
             sort_key: vec!["timestamp".into()],
             columns: Vec::new(),
             indexes: Vec::new(),
+            ingested_at: None,
         }
     }
 
@@ -313,6 +338,54 @@ mod tests {
         assert!(
             plan(&logs, &state(&files), old, &policy).is_none(),
             "a log partition retires by retention only"
+        );
+    }
+
+    /// CP-2: L1 files compact with the others ingested in the same
+    /// window, the oldest window that is due first, and a file without
+    /// an ingest time goes by its newest row.
+    #[test]
+    fn l1_files_compact_with_those_ingested_in_the_same_window() {
+        let mut random = SeededRandom::new(5);
+        let minute = 60 * 1_000_000_000;
+        let ingested = |random: &mut SeededRandom, at: i64| {
+            let mut file = file(random, Level::L1, 0, at);
+            file.ingested_at = Some(Timestamp::from_nanos(at));
+            file
+        };
+        let mut files = vec![
+            ingested(&mut random, 50 * minute),
+            ingested(&mut random, 55 * minute),
+        ];
+        files.extend((0..4).map(|i| ingested(&mut random, 60 * minute + i)));
+        let policy = Policy::default();
+        let now = Timestamp::from_nanos(70 * minute);
+        let job = plan(&partition(), &state(&files), now, &policy).unwrap();
+        assert_eq!(
+            job.inputs.len(),
+            4,
+            "the second hour's files are due by count"
+        );
+        assert!(
+            job.inputs
+                .iter()
+                .all(|f| f.ingested_at.unwrap() >= Timestamp::from_nanos(60 * minute))
+        );
+        let later = Timestamp::from_nanos(150 * minute);
+        let job = plan(&partition(), &state(&files), later, &policy).unwrap();
+        assert_eq!(
+            job.inputs.len(),
+            2,
+            "the first hour's files are old enough, and the older window comes first"
+        );
+        let mut unmarked = file(&mut random, Level::L1, 0, 15 * minute);
+        unmarked.ingested_at = None;
+        files.push(unmarked);
+        let job = plan(&partition(), &state(&files), later, &policy).unwrap();
+        assert_eq!(
+            job.inputs.len(),
+            3,
+            "a file without an ingest time joins by its newest row"
         );
     }
 

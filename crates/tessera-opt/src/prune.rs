@@ -262,6 +262,7 @@ mod tests {
                 quantiles: Vec::new(),
             }],
             indexes: Vec::new(),
+            ingested_at: None,
         }
     }
 

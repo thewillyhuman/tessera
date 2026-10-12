@@ -308,6 +308,7 @@ impl Compactor {
             sort_key: written.sort_key,
             columns: written.columns,
             indexes: written.indexes,
+            ingested_at: job.inputs.iter().filter_map(|f| f.ingested_at).max(),
         };
         let inputs: Vec<FileId> = job.inputs.iter().map(|f| f.file_id).collect();
         if manifest

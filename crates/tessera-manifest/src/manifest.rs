@@ -618,6 +618,7 @@ mod tests {
             sort_key: vec!["timestamp".into()],
             columns: Vec::new(),
             indexes: Vec::new(),
+            ingested_at: None,
         }
     }
 

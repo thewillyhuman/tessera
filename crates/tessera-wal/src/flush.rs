@@ -96,6 +96,7 @@ pub async fn write_l1_files(
             sort_key: written.sort_key,
             columns: written.columns,
             indexes: Vec::new(),
+            ingested_at: Some(env.clock.now()),
         });
     }
     Ok(files)

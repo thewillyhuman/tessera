@@ -11,9 +11,8 @@
 //! (GC-2), each deletion preceded by the commit that made the object
 //! unreachable (GC-3).
 //!
-//! Levels beyond L2 (retention sampling, trace completion), ingest-time
-//! grouping (CP-2), tombstones and pattern assignment arrive with their
-//! milestones.
+//! The L1 files of a partition compact with the others ingested in the
+//! same window (CP-2); an L3 file takes the whole partition.
 
 pub mod gc;
 pub mod patterns;

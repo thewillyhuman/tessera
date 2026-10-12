@@ -260,6 +260,7 @@ mod tests {
             sort_key: vec![TS.into()],
             columns: Vec::new(),
             indexes: Vec::new(),
+            ingested_at: None,
         }
     }
 
