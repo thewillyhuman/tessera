@@ -62,7 +62,9 @@ but there are no merge or lookup variants; a subquery
 is a derived table in `FROM`, or an `IN (SELECT ...)` or `EXISTS
 (SELECT ...)` condition of `WHERE` lowered to a join on its distinct
 keys, an `EXISTS` correlated by equalities with the query's columns,
-but not a scalar subquery; window functions (QE-20) are
+and a scalar subquery, an aggregate without `GROUP BY` in
+parentheses, is joined to every row on a constant key; window
+functions (QE-20) are
 `row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,
 `last_value` and any aggregate `OVER (PARTITION BY ... ORDER BY ...)`
 in a select item or `ORDER BY`, computed by one node per distinct

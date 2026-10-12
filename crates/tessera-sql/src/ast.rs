@@ -421,6 +421,9 @@ pub enum ExprKind {
         /// `NOT` when true.
         negated: bool,
     },
+    /// `(SELECT ...)` as a value: the one column of the one row of an
+    /// aggregate without `GROUP BY`.
+    Subquery(Box<Query>),
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// The tested expression.

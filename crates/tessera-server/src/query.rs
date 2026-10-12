@@ -191,8 +191,8 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    #[tokio::test]
-    async fn queries_ingested_logs_with_sql() {
+    /// An app with the logs "first", "second" and "third" written.
+    async fn with_three_logs() -> axum::Router {
         let state = crate::testing::state().await;
         let app = crate::router(state);
         let body = serde_json::to_vec(&export(&["first", "second", "third"])).unwrap();
@@ -207,6 +207,12 @@ mod tests {
             app.clone().oneshot(write).await.unwrap().status(),
             StatusCode::OK
         );
+        app
+    }
+
+    #[tokio::test]
+    async fn queries_ingested_logs_with_sql() {
+        let app = with_three_logs().await;
 
         let (status, value) = post(
             &app,
@@ -253,25 +259,6 @@ mod tests {
             "{explain}"
         );
 
-        // QE-20: window functions see each row's neighbours in order.
-        let (status, value) = post(
-            &app,
-            serde_json::json!({
-                "query": "SELECT body, row_number() OVER (ORDER BY timestamp) AS n, \
-                          lag(body) OVER (ORDER BY timestamp) AS prev FROM logs ORDER BY timestamp",
-                "dataset": "prod"
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{value}");
-        let rows = value["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 3, "{value}");
-        assert_eq!(rows[0][0], "first");
-        assert_eq!(rows[0][1].as_f64(), Some(1.0), "{value}");
-        assert!(rows[0][2].is_null(), "{value}");
-        assert_eq!(rows[2][1].as_f64(), Some(3.0), "{value}");
-        assert_eq!(rows[2][2], "second", "{value}");
-
         // A derived table nests a query.
         let (status, value) = post(
             &app,
@@ -295,6 +282,48 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{value}");
         assert_eq!(value["rows"][0][0], 2.0, "second and third: {value}");
+    }
+
+    /// A scalar subquery is one value on every row, and window
+    /// functions (QE-20) see each row's neighbours in order.
+    #[tokio::test]
+    async fn subqueries_and_windows_read_ingested_logs() {
+        let app = with_three_logs().await;
+        // A scalar subquery is one value on every row.
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT body, (SELECT count(*) FROM logs) AS total FROM logs \
+                          WHERE attr.n >= (SELECT max(attr.n) FROM logs)",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(
+            value["rows"],
+            serde_json::json!([["third", 3.0]]),
+            "{value}"
+        );
+
+        // QE-20: window functions see each row's neighbours in order.
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT body, row_number() OVER (ORDER BY timestamp) AS n, \
+                          lag(body) OVER (ORDER BY timestamp) AS prev FROM logs ORDER BY timestamp",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let rows = value["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{value}");
+        assert_eq!(rows[0][0], "first");
+        assert_eq!(rows[0][1].as_f64(), Some(1.0), "{value}");
+        assert!(rows[0][2].is_null(), "{value}");
+        assert_eq!(rows[2][1].as_f64(), Some(3.0), "{value}");
+        assert_eq!(rows[2][2], "second", "{value}");
     }
 
     /// DM-1: `events` holds every kind on one set of columns, and a

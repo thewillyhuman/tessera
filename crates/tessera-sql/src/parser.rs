@@ -991,6 +991,25 @@ impl Parser<'_> {
         }
     }
 
+    /// After `(` at `start`: a scalar subquery, or an expression in
+    /// parentheses.
+    fn parenthesised(&mut self, start: Span) -> Result<Expr, Diagnostic> {
+        if self.is_keyword("select") {
+            let query = self.query()?;
+            let end = self.expect_symbol(")")?;
+            return Ok(Expr {
+                kind: ExprKind::Subquery(Box::new(query)),
+                span: Span::new(start.start, end.end),
+            });
+        }
+        let inner = self.expr()?;
+        let end = self.expect_symbol(")")?;
+        Ok(Expr {
+            kind: inner.kind,
+            span: Span::new(start.start, end.end),
+        })
+    }
+
     /// `OVER ([PARTITION BY exprs] [ORDER BY items])` after the call
     /// of `function` on `args`, which it makes a window function.
     fn over(
@@ -1056,14 +1075,7 @@ impl Parser<'_> {
                 kind: ExprKind::Parameter(n),
                 span,
             }),
-            Token::Symbol("(") => {
-                let inner = self.expr()?;
-                let end = self.expect_symbol(")")?;
-                Ok(Expr {
-                    kind: inner.kind,
-                    span: Span::new(span.start, end.end),
-                })
-            }
+            Token::Symbol("(") => self.parenthesised(span),
             Token::Symbol(s) => Err(Diagnostic::at(
                 span,
                 format!("expected an expression, found {s:?}"),
@@ -1651,6 +1663,28 @@ mod tests {
             } if partition_by.is_empty() && order_by.is_empty()
         ));
         assert!(parse("SELECT count(*) OVER FROM logs").is_err());
+    }
+
+    /// `(SELECT ...)` in an expression is a scalar subquery.
+    #[test]
+    fn a_parenthesised_select_is_a_scalar_subquery() {
+        let q = query(
+            "SELECT body FROM logs WHERE severity_number > (SELECT avg(severity_number) FROM logs)",
+        );
+        let ExprKind::Binary { right, .. } = &q.filter.unwrap().kind else {
+            panic!("not a comparison");
+        };
+        let ExprKind::Subquery(inner) = &right.kind else {
+            panic!("not a subquery: {right:?}");
+        };
+        assert_eq!(inner.from.as_ref().unwrap().table, "logs");
+        let q = query("SELECT (SELECT count(*) FROM spans) AS spans, (1 + 2) AS three FROM logs");
+        assert!(
+            matches!(&q.items[0], SelectItem::Expr { expr, .. } if matches!(expr.kind, ExprKind::Subquery(_)))
+        );
+        assert!(
+            matches!(&q.items[1], SelectItem::Expr { expr, .. } if matches!(expr.kind, ExprKind::Binary { .. }))
+        );
     }
 
     /// `EXISTS (SELECT ...)` is an expression, negated by `NOT` in front

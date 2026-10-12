@@ -618,6 +618,9 @@ struct Substitution {
     /// Window functions, by their syntax, to the columns their window
     /// nodes add (QE-20).
     windows: Vec<(ast::Expr, String)>,
+    /// Scalar subqueries, by their syntax, to the columns their joins
+    /// add.
+    scalars: Vec<(ast::Expr, String)>,
 }
 
 /// One window node to add: the functions sharing a partition and an
@@ -694,6 +697,7 @@ fn lower_query(
         scope,
         substitution: None,
     };
+    plan = lowerer.scalar_subqueries(query, plan)?;
     if let Some(filter) = &query.filter {
         let (subqueries, rest) = split_subquery_conditions(filter);
         for (index, condition) in subqueries.into_iter().enumerate() {
@@ -725,6 +729,34 @@ fn split_subquery_conditions(filter: &ast::Expr) -> (Vec<&ast::Expr>, Option<ast
         )
     });
     (subqueries, conjunction(rest))
+}
+
+/// The diagnostic for a construct met where the lowering does not
+/// take it: each has its own place in the query.
+fn misplaced(expr: &ast::Expr) -> Diagnostic {
+    let message = match &expr.kind {
+        ast::ExprKind::InSubquery { .. } => {
+            "IN (SELECT ...) is a condition of WHERE on its own, joined to the others by AND"
+        }
+        ast::ExprKind::Exists { .. } => {
+            "EXISTS (SELECT ...) is a condition of WHERE on its own, joined to the others by AND"
+        }
+        ast::ExprKind::Window { .. } => "a window function goes in a SELECT item or ORDER BY",
+        _ => "a scalar subquery goes in WHERE, HAVING, a SELECT item or ORDER BY",
+    };
+    Diagnostic::at(expr.span, message)
+}
+
+/// Every scalar subquery in `expr`, outermost first, not looking
+/// inside one.
+fn collect_subqueries<'a>(expr: &'a ast::Expr, into: &mut Vec<&'a ast::Expr>) {
+    if matches!(expr.kind, ast::ExprKind::Subquery(_)) {
+        into.push(expr);
+        return;
+    }
+    for child in children(expr) {
+        collect_subqueries(child, into);
+    }
 }
 
 /// The top-level conjuncts of `expr`.
@@ -1217,10 +1249,16 @@ impl Lowerer<'_> {
     fn plain_query(&mut self, query: &ast::Query, plan: Plan) -> Result<Plan, Diagnostic> {
         let plan = self.window_plan(query, plan)?;
         let items = self.select_items(query)?;
+        // `*` alone passes the rows through, unless a scalar subquery
+        // added a hidden column that must not come out.
         let all_columns = query
             .items
             .iter()
-            .all(|i| matches!(i, ast::SelectItem::Wildcard));
+            .all(|i| matches!(i, ast::SelectItem::Wildcard))
+            && self
+                .substitution
+                .as_ref()
+                .is_none_or(|s| s.scalars.is_empty());
         let mut plan = plan;
         if !query.order_by.is_empty() {
             // Sort over the input, resolving aliases to their expressions,
@@ -1251,7 +1289,8 @@ impl Lowerer<'_> {
     }
 
     fn aggregate_query(&mut self, query: &ast::Query, plan: Plan) -> Result<Plan, Diagnostic> {
-        let mut substitution = Substitution::default();
+        // The scalar subqueries registered before stay known.
+        let mut substitution = self.substitution.take().unwrap_or_default();
         let mut group_by = Vec::new();
         for (i, key) in query.group_by.iter().enumerate() {
             let expr = self.expr(key)?;
@@ -1323,6 +1362,102 @@ impl Lowerer<'_> {
         }
         plan = plan.project(items);
         self.apply_limit(plan, query)
+    }
+
+    /// `plan` joined with every scalar subquery of the query's `WHERE`,
+    /// `HAVING`, select items and `ORDER BY`: each must be an aggregate
+    /// without `GROUP BY` selecting one column, so that it has one row,
+    /// which a left join on a constant key pairs with every row of
+    /// `plan` under a hidden column the subquery's uses then read.
+    fn scalar_subqueries(&mut self, query: &ast::Query, plan: Plan) -> Result<Plan, Diagnostic> {
+        let mut found: Vec<&ast::Expr> = Vec::new();
+        let items = query.items.iter().filter_map(|item| match item {
+            ast::SelectItem::Expr { expr, .. } => Some(expr),
+            ast::SelectItem::Wildcard => None,
+        });
+        for expr in items
+            .chain(query.filter.iter())
+            .chain(query.having.iter())
+            .chain(query.order_by.iter().map(|item| &item.expr))
+        {
+            collect_subqueries(expr, &mut found);
+        }
+        let mut plan = plan;
+        let mut names: Vec<(ast::Expr, String)> = Vec::new();
+        for expr in found {
+            if names.iter().any(|(e, _)| e.same_as(expr)) {
+                continue;
+            }
+            let ast::ExprKind::Subquery(inner) = &expr.kind else {
+                continue;
+            };
+            let index = names.len();
+            let name = format!("__scalar{index}");
+            plan = self.scalar_join(plan, inner, expr.span, index, &name)?;
+            names.push((expr.clone(), name));
+        }
+        if !names.is_empty() {
+            self.substitution
+                .get_or_insert_with(Substitution::default)
+                .scalars
+                .extend(names);
+        }
+        Ok(plan)
+    }
+
+    /// `plan` with the one value of `inner` under `name` on every row.
+    fn scalar_join(
+        &self,
+        plan: Plan,
+        inner: &ast::Query,
+        span: Span,
+        index: usize,
+        name: &str,
+    ) -> Result<Plan, Diagnostic> {
+        let one_aggregate = inner.group_by.is_empty()
+            && matches!(
+                inner.items.as_slice(),
+                [ast::SelectItem::Expr { expr, .. }] if self.has_aggregate(expr)
+            );
+        if !one_aggregate {
+            return Err(Diagnostic::at(
+                span,
+                "a scalar subquery selects one aggregate without GROUP BY, such as \
+                 (SELECT max(severity_number) FROM logs)",
+            ));
+        }
+        let located = |e: PlanError| Diagnostic::at(span, e.to_string());
+        let value = lower_query(inner, self.ctx, self.registry, self.parameters)?;
+        let column = value
+            .schema(self.registry)
+            .map_err(located)?
+            .field(0)
+            .name()
+            .clone();
+        let key = format!("__key{index}");
+        let right = value.project(vec![
+            NamedExpr::new(Expr::column(&column), name),
+            NamedExpr::new(Expr::literal(1), &key),
+        ]);
+        let own = plan.schema(self.registry).map_err(located)?;
+        let (left_name, right_name) = (format!("__outer{index}"), format!("__value{index}"));
+        let joined = Plan::Join {
+            left: JoinSide::new(plan, left_name.clone()),
+            right: JoinSide::new(right, right_name.clone()),
+            on: vec![(Expr::literal(1), Expr::column(&key))],
+            kind: JoinKind::Left,
+            asof: None,
+        };
+        let mut exprs: Vec<NamedExpr> = own
+            .fields()
+            .iter()
+            .map(|f| NamedExpr::new(Expr::column(qualify(&left_name, f.name())), f.name()))
+            .collect();
+        exprs.push(NamedExpr::new(
+            Expr::column(qualify(&right_name, name)),
+            name,
+        ));
+        Ok(joined.project(exprs))
     }
 
     /// `plan` under one window node per distinct partition and order
@@ -1620,6 +1755,7 @@ impl Lowerer<'_> {
                 .aggregates
                 .iter()
                 .chain(&substitution.windows)
+                .chain(&substitution.scalars)
                 .find(|(e, _)| e.same_as(expr))
             {
                 return Ok(Expr::column(name));
@@ -1666,18 +1802,10 @@ impl Lowerer<'_> {
                 list,
                 negated,
             } => self.in_list(tested, list, *negated),
-            ast::ExprKind::InSubquery { .. } => Err(Diagnostic::at(
-                expr.span,
-                "IN (SELECT ...) is a condition of WHERE on its own, joined to the others by AND",
-            )),
-            ast::ExprKind::Exists { .. } => Err(Diagnostic::at(
-                expr.span,
-                "EXISTS (SELECT ...) is a condition of WHERE on its own, joined to the others by AND",
-            )),
-            ast::ExprKind::Window { .. } => Err(Diagnostic::at(
-                expr.span,
-                "a window function goes in a SELECT item or ORDER BY",
-            )),
+            ast::ExprKind::InSubquery { .. }
+            | ast::ExprKind::Exists { .. }
+            | ast::ExprKind::Window { .. }
+            | ast::ExprKind::Subquery(_) => Err(misplaced(expr)),
             ast::ExprKind::Between {
                 expr: tested,
                 low,
@@ -2379,6 +2507,52 @@ mod tests {
             parse("INSERT INTO (SELECT 1) VALUES (1)").is_err(),
             "a derived table is not a target"
         );
+    }
+
+    /// A scalar subquery, an aggregate without `GROUP BY`, is joined to
+    /// every row on a constant key under a hidden column, in `WHERE`
+    /// and in a select item alike; anything else in the parentheses is
+    /// refused.
+    #[test]
+    fn a_scalar_subquery_joins_its_one_value_to_every_row() {
+        let plan = lowered(
+            "SELECT body FROM logs WHERE severity_number > (SELECT avg(severity_number) FROM logs)",
+        );
+        let text = plan.to_string();
+        assert!(
+            text.contains("Filter: (severity_number > __scalar0)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Join left:") && text.contains("__key0"),
+            "{text}"
+        );
+        assert!(text.starts_with("Project: body AS body\n"), "{text}");
+        let item = lowered("SELECT *, (SELECT count(*) FROM spans) AS spans FROM logs");
+        let text = item.to_string();
+        assert!(text.contains("__scalar0 AS spans"), "{text}");
+        let output = text.lines().next().unwrap_or_default();
+        assert!(
+            !output.contains("AS __scalar0"),
+            "the hidden column stays hidden: {text}"
+        );
+        let grouped = lowered(
+            "SELECT attr.service AS service, count(*) AS n FROM logs \
+             GROUP BY attr.service HAVING count(*) > (SELECT avg(severity_number) FROM logs)",
+        );
+        assert!(grouped.to_string().contains("Aggregate:"), "{grouped}");
+        let error = |sql: &str| lower(&parse(sql).unwrap(), &ctx()).unwrap_err().message;
+        for sql in [
+            "SELECT body FROM logs WHERE severity_number > (SELECT severity_number FROM logs)",
+            "SELECT body FROM logs WHERE severity_number > (SELECT max(severity_number) FROM logs GROUP BY body)",
+            "SELECT body FROM logs WHERE severity_number > (SELECT max(severity_number), min(severity_number) FROM logs)",
+        ] {
+            assert!(
+                error(sql).contains("one aggregate"),
+                "{sql}: {}",
+                error(sql)
+            );
+        }
     }
 
     /// QE-20: window functions in the select items become window nodes
