@@ -4,12 +4,18 @@
 //! `/internal/v1`: a leaf task to run (`POST /internal/v1/scan`, a JSON
 //! `LeafTask`, answered with the rows as an Arrow IPC stream), a stage
 //! to run over a share of a scan's files (`POST /internal/v1/stage`, a
-//! JSON `StageTask`, answered the same way; QE-14) and a
-//! batch to write (`POST /internal/v1/ingest`, an Arrow IPC stream with
-//! the tenant, dataset and kind in headers, answered once durable), and
-//! a membership exchange (`POST /internal/v1/gossip`, the caller's view
-//! as JSON node records, answered with this node's view, section 14.1).
-//! [`HttpRemote`] is the client side of all three.
+//! JSON `StageTask`, answered the same way, or with nothing when the
+//! task names an exchange to keep the output under; QE-14), a kept
+//! partition to hand out (`GET /internal/v1/exchange/{id}/{partition}`,
+//! answered with the rows once, 404 after), a final stage to run over
+//! one partition of an exchange (`POST /internal/v1/final`, the JSON
+//! `FinalTask` and the coordinator's rows framed in one body, answered
+//! with the folded rows), a batch to write (`POST /internal/v1/ingest`,
+//! an Arrow IPC stream with the tenant, dataset and kind in headers,
+//! answered once durable), and a membership exchange (`POST
+//! /internal/v1/gossip`, the caller's view as JSON node records,
+//! answered with this node's view, section 14.1). [`HttpRemote`] is
+//! the client side of all of them.
 //!
 //! These routes carry no authentication yet; they are meant for the
 //! loopback and private networks a cluster runs on (M10 hardens them).
@@ -21,14 +27,14 @@ use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::future::BoxFuture;
 use tessera_cluster::NodeRecord;
-use tessera_exec::{LeafTask, Peer, RemoteError, RemoteScan, StageTask};
+use tessera_exec::{FinalTask, LeafTask, Peer, RemoteError, RemoteScan, StageTask};
 use tessera_ir::Registry;
 use tessera_types::{DatasetName, EventBatch, Kind, TenantId};
 
@@ -43,14 +49,60 @@ pub const DATASET_HEADER: &str = "x-tessera-dataset";
 /// The header naming a forwarded batch's kind.
 pub const KIND_HEADER: &str = "x-tessera-kind";
 
+/// The content type of a final task: its JSON and the rows it carries,
+/// framed by [`encode_final`].
+pub const FINAL_TASK: &str = "application/vnd.tessera.final";
+
 /// The internal router.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/internal/v1/scan", post(scan))
         .route("/internal/v1/stage", post(stage))
+        .route("/internal/v1/exchange/{id}/{partition}", get(exchange))
+        .route("/internal/v1/final", post(finalize))
         .route("/internal/v1/ingest", post(ingest))
         .route("/internal/v1/gossip", post(gossip))
         .with_state(state)
+}
+
+/// A final task with the rows the coordinator hands over as one body:
+/// the task's JSON, preceded by its length as four little-endian
+/// bytes, then the rows as an Arrow IPC stream.
+///
+/// # Errors
+///
+/// If a batch does not match `schema` or the task does not serialize.
+pub fn encode_final(
+    task: &FinalTask,
+    schema: &SchemaRef,
+    rows: &[RecordBatch],
+) -> Result<Vec<u8>, RemoteError> {
+    let json = serde_json::to_vec(task).map_err(|e| RemoteError(e.to_string()))?;
+    let length = u32::try_from(json.len()).map_err(|e| RemoteError(e.to_string()))?;
+    let mut out = length.to_le_bytes().to_vec();
+    out.extend(json);
+    out.extend(encode(schema, rows).map_err(|e| RemoteError(e.to_string()))?);
+    Ok(out)
+}
+
+/// The task and the rows of a body [`encode_final`] framed.
+///
+/// # Errors
+///
+/// If the body is not framed that way.
+pub fn decode_final(bytes: &[u8]) -> Result<(FinalTask, Vec<RecordBatch>), RemoteError> {
+    let (length, rest) = bytes
+        .split_first_chunk::<4>()
+        .ok_or_else(|| RemoteError("final task body too short".into()))?;
+    let length =
+        usize::try_from(u32::from_le_bytes(*length)).map_err(|e| RemoteError(e.to_string()))?;
+    let (json, stream) = rest
+        .split_at_checked(length)
+        .ok_or_else(|| RemoteError("final task body shorter than its task".into()))?;
+    let task: FinalTask = serde_json::from_slice(json)
+        .map_err(|e| RemoteError(format!("invalid final task: {e}")))?;
+    let (_, rows) = decode(stream).map_err(|e| RemoteError(e.to_string()))?;
+    Ok((task, rows))
 }
 
 /// `POST /internal/v1/gossip`: folds the caller's view into this node's,
@@ -139,6 +191,56 @@ async fn stage(
     let batches = state
         .engine
         .stage(&task)
+        .await
+        .map_err(|e| ApiError::query(tessera_exec::QueryError::Engine(e), ""))?;
+    let bytes = encode(&schema_of(&batches, schema), &batches)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok((
+        [(header::CONTENT_TYPE, HeaderValue::from_static(ARROW_STREAM))],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `GET /internal/v1/exchange/{id}/{partition}`: the rows a stage of
+/// this node kept under the exchange for the partition, once (QE-14);
+/// 404 once taken, or never kept.
+async fn exchange(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, partition)): Path<(String, u32)>,
+) -> Result<Response, ApiError> {
+    state.auth.check_cluster(&headers)?;
+    let Some((schema, batches)) = state.engine.fetch(&id, partition) else {
+        return Err(ApiError::not_found(format!(
+            "nothing kept under exchange {id} for partition {partition}"
+        )));
+    };
+    let bytes = encode(&schema, &batches).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok((
+        [(header::CONTENT_TYPE, HeaderValue::from_static(ARROW_STREAM))],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `POST /internal/v1/final`: a final stage sent by a coordinator
+/// (QE-14) over one partition of an exchange, the coordinator's rows
+/// framed with the task, answered with the folded rows.
+async fn finalize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    state.auth.check_cluster(&headers)?;
+    let (task, rows) = decode_final(&body).map_err(|e| ApiError::bad_request(e.0))?;
+    let schema = task
+        .plan
+        .schema(&Registry::builtin())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let batches = state
+        .engine
+        .finalize(&task, rows)
         .await
         .map_err(|e| ApiError::query(tessera_exec::QueryError::Engine(e), ""))?;
     let bytes = encode(&schema_of(&batches, schema), &batches)
@@ -257,9 +359,29 @@ impl HttpRemote {
         for (name, value) in headers {
             request = request.header(*name, value);
         }
-        let mut response = request
+        let response = request
             .send(body)
             .map_err(|e| RemoteError(format!("{url}: {e}")))?;
+        Self::body_of(url, response)
+    }
+
+    /// Fetches `url` and returns the response body, or the failure
+    /// with the response text.
+    fn get(&self, url: &str) -> Result<Vec<u8>, RemoteError> {
+        let mut request = self.agent.get(url);
+        if let Some(secret) = &self.secret {
+            request = request.header("authorization", &format!("Bearer {secret}"));
+        }
+        let response = request
+            .call()
+            .map_err(|e| RemoteError(format!("{url}: {e}")))?;
+        Self::body_of(url, response)
+    }
+
+    fn body_of(
+        url: &str,
+        mut response: ureq::http::Response<ureq::Body>,
+    ) -> Result<Vec<u8>, RemoteError> {
         let status = response.status();
         let bytes = response
             .body_mut()
@@ -357,6 +479,57 @@ impl RemoteScan for HttpRemote {
             Ok(batches)
         })
     }
+
+    fn supports_exchange(&self) -> bool {
+        true
+    }
+
+    fn fetch<'a>(
+        &'a self,
+        peer: &'a Peer,
+        id: &'a str,
+        partition: u32,
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            let url = format!(
+                "{}/internal/v1/exchange/{id}/{partition}",
+                peer.http.trim_end_matches('/')
+            );
+            let client = self.clone();
+            let bytes = tokio::task::spawn_blocking(move || client.get(&url))
+                .await
+                .map_err(|e| RemoteError(e.to_string()))??;
+            let (_, batches) = decode(&bytes).map_err(|e| RemoteError(e.to_string()))?;
+            Ok(batches)
+        })
+    }
+
+    fn finalize<'a>(
+        &'a self,
+        peer: &'a Peer,
+        task: &'a FinalTask,
+        rows: &'a [RecordBatch],
+    ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
+        Box::pin(async move {
+            let schema = task
+                .plan
+                .inputs()
+                .into_iter()
+                .next()
+                .ok_or_else(|| RemoteError("a final task needs an input".into()))?
+                .schema(&Registry::builtin())
+                .map_err(|e| RemoteError(e.to_string()))?;
+            let body = encode_final(task, &schema_of(rows, schema), rows)?;
+            let url = format!("{}/internal/v1/final", peer.http.trim_end_matches('/'));
+            let client = self.clone();
+            let bytes =
+                tokio::task::spawn_blocking(move || client.post(&url, FINAL_TASK, &[], &body))
+                    .await
+                    .map_err(|e| RemoteError(e.to_string()))??;
+            let (_, batches) = decode(&bytes).map_err(|e| RemoteError(e.to_string()))?;
+            Ok(batches)
+        })
+    }
 }
 
 /// The schema of `batches`, or `fallback` when there are none.
@@ -450,6 +623,150 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "checked before the body"
         );
+    }
+
+    /// QE-14: a stage with an exchange keeps its output, which is
+    /// handed out once per partition, and a final stage folds the rows
+    /// it is sent with those it kept. A stage over no files has one
+    /// state, a count of nothing, which lands in the first partition.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn kept_outputs_are_handed_out_once_and_final_stages_fold_them() {
+        let app = crate::router(crate::testing::state().await);
+        let batch = logs();
+        let body = encode(&batch.rows().schema(), std::slice::from_ref(batch.rows())).unwrap();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/v1/ingest")
+            .header(header::CONTENT_TYPE, ARROW_STREAM)
+            .header(TENANT_HEADER, "default")
+            .header(DATASET_HEADER, "prod")
+            .header(KIND_HEADER, "log")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let scan = || {
+            tessera_ir::Plan::Scan(Scan::all(
+                TenantId::DEFAULT,
+                DatasetName::new("prod").unwrap(),
+                Kind::Log,
+            ))
+        };
+        let partial = tessera_ir::Plan::PartialAggregate {
+            input: Box::new(scan()),
+            group_by: vec![],
+            aggregates: vec![tessera_ir::AggregateExpr {
+                function: "count".into(),
+                args: vec![],
+                name: "n".into(),
+            }],
+        };
+        let exchange = tessera_exec::Exchange {
+            id: "e1".into(),
+            partitions: 2,
+            keys: vec![],
+        };
+        let stage = StageTask {
+            plan: partial.clone(),
+            files: Vec::new(),
+            exchange: Some(exchange.clone()),
+        };
+        let post = |uri: &'static str, content_type: &'static str, body: Vec<u8>| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/internal/v1/stage",
+                "application/json",
+                serde_json::to_vec(&stage).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let (_, batches) = decode(&bytes).unwrap();
+        assert!(batches.is_empty(), "kept, not returned");
+
+        let fetch = |partition: u32| {
+            Request::builder()
+                .method("GET")
+                .uri(format!("/internal/v1/exchange/e1/{partition}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let mut kept = 0;
+        for partition in 0..2 {
+            let response = app.clone().oneshot(fetch(partition)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let (schema, batches) = decode(&bytes).unwrap();
+            assert_eq!(schema.fields()[0].name(), "n:state0");
+            kept += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        }
+        assert_eq!(kept, 1, "the one state, in one partition or the other");
+        let response = app.clone().oneshot(fetch(0)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "taken once");
+        let response = app.clone().oneshot(fetch(1)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A final stage over rows the coordinator hands over: the state
+        // of a count of nothing folds to a count of zero.
+        let states = app
+            .clone()
+            .oneshot(post(
+                "/internal/v1/stage",
+                "application/json",
+                serde_json::to_vec(&StageTask {
+                    plan: partial.clone(),
+                    files: Vec::new(),
+                    exchange: None,
+                })
+                .unwrap(),
+            ))
+            .await
+            .unwrap();
+        let bytes = states.into_body().collect().await.unwrap().to_bytes();
+        let (schema, rows) = decode(&bytes).unwrap();
+        let task = FinalTask {
+            plan: tessera_ir::Plan::FinalAggregate {
+                input: Box::new(partial),
+                group_by: vec![],
+                aggregates: vec![tessera_ir::AggregateExpr {
+                    function: "count".into(),
+                    args: vec![],
+                    name: "n".into(),
+                }],
+            },
+            exchange,
+            partition: 1,
+            producers: Vec::new(),
+        };
+        let body = encode_final(&task, &schema, &rows).unwrap();
+        let (back, back_rows) = decode_final(&body).unwrap();
+        assert_eq!(back, task);
+        assert_eq!(back_rows.len(), rows.len());
+        let response = app
+            .clone()
+            .oneshot(post("/internal/v1/final", FINAL_TASK, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let (schema, folded) = decode(&bytes).unwrap();
+        assert_eq!(schema.fields()[0].name(), "n");
+        assert_eq!(folded.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let response = app
+            .oneshot(post("/internal/v1/final", FINAL_TASK, b"xx".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

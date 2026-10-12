@@ -202,19 +202,25 @@ steps (OP-4).
 
 An aggregate, a top-k or a limit over one scan runs in two stages
 (QE-14): the partial half on each query node that scans its share of
-the files, over its share alone, and the final half on the
-coordinator over the partial outputs, so that no node holds the
-whole input and the coordinator holds one partial result per node.
-The partial aggregate ships each group's running state (counts and
-sums, an average's sum and weight, a variance's moments, a quantile's
-values, an extreme) and the final one folds them; a peer that cannot
-run its stage has its share run on the coordinator (QE-17), and
+the files, over its share alone, and the final half over the partial
+outputs. The partial aggregate ships each group's running state
+(counts and sums, an average's sum and weight, a variance's moments,
+a quantile's values, an extreme) and the final one folds them. A
+grouped aggregate folds on the workers: each node keeps its partial
+output as an exchange, split by a hash of the group keys into one
+partition per node, and folds one partition fetched from the others
+over the internal routes, the coordinator folding the last, so that
+no node holds every partial output; a top-k, a limit or a keyless
+aggregate folds on the coordinator over one partial output per node.
+A peer that cannot run its stage has its share run on the
+coordinator, a partition a worker cannot fold is folded there, and a
+kept output that is gone is recomputed there from its files (QE-17);
 `EXPLAIN ANALYZE` reports each stage.
 
 Gaps left in M6: joins, trace grouping, sorts without a limit and
 PromQL evaluation still run on the coordinator over the rows the leaf
-tasks return, and a stage's output goes through the coordinator rather
-than between workers; there is no object byte
+tasks return, and the outputs of top-k, limit and keyless aggregate
+stages go through the coordinator; there is no object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.
