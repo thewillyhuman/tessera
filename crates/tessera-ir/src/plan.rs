@@ -55,6 +55,9 @@ pub enum PlanError {
     /// The times of an `ASOF JOIN` cannot be ordered.
     #[error("asof times must be timestamps or numbers, not {0}")]
     AsofType(String),
+    /// A window function is misused.
+    #[error("window function {0}")]
+    Window(String),
 }
 
 /// Which rows a join keeps (DM-2).
@@ -214,6 +217,93 @@ impl fmt::Display for SortKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let direction = if self.descending { "DESC" } else { "ASC" };
         write!(f, "{} {direction}", self.expr)
+    }
+}
+
+/// A window function (QE-20): a value for every row out of the rows of
+/// its partition, in the window's order. With an order, a row's frame
+/// is the rows up to its last peer, as SQL's default frame is; without
+/// one it is the whole partition.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum WindowFunction {
+    /// The row's number in its partition, from 1.
+    RowNumber,
+    /// The number of the first of the row's peers, from 1.
+    Rank,
+    /// The number of the row's peer group, from 1.
+    DenseRank,
+    /// The value `offset` rows before the row, or the default.
+    Lag,
+    /// The value `offset` rows after the row, or the default.
+    Lead,
+    /// The value of the partition's first row.
+    FirstValue,
+    /// The value of the last of the row's peers.
+    LastValue,
+    /// An aggregate of the registry over the row's frame.
+    Aggregate(String),
+}
+
+impl WindowFunction {
+    /// The function called `name`: one of the window functions, or an
+    /// aggregate `registry` knows; none otherwise.
+    #[must_use]
+    pub fn named(name: &str, registry: &Registry) -> Option<Self> {
+        Some(match name {
+            "row_number" => WindowFunction::RowNumber,
+            "rank" => WindowFunction::Rank,
+            "dense_rank" => WindowFunction::DenseRank,
+            "lag" => WindowFunction::Lag,
+            "lead" => WindowFunction::Lead,
+            "first_value" => WindowFunction::FirstValue,
+            "last_value" => WindowFunction::LastValue,
+            aggregate if registry.is_aggregate(aggregate) => {
+                WindowFunction::Aggregate(aggregate.to_owned())
+            }
+            _ => return None,
+        })
+    }
+
+    /// The function's name as written.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            WindowFunction::RowNumber => "row_number",
+            WindowFunction::Rank => "rank",
+            WindowFunction::DenseRank => "dense_rank",
+            WindowFunction::Lag => "lag",
+            WindowFunction::Lead => "lead",
+            WindowFunction::FirstValue => "first_value",
+            WindowFunction::LastValue => "last_value",
+            WindowFunction::Aggregate(name) => name,
+        }
+    }
+}
+
+/// One window function of a `Window` node, with the column it outputs.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct WindowExpr {
+    /// The function.
+    pub function: WindowFunction,
+    /// The arguments: the value for `lag`, `lead`, `first_value`,
+    /// `last_value` and an aggregate, then for `lag` and `lead` the
+    /// offset and the default, as literals; none for the numbering
+    /// functions and `count(*)`.
+    pub args: Vec<Expr>,
+    /// The output column name.
+    pub name: String,
+}
+
+impl fmt::Display for WindowExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let args: Vec<String> = self.args.iter().map(ToString::to_string).collect();
+        write!(
+            f,
+            "{}({}) AS {}",
+            self.function.name(),
+            args.join(", "),
+            self.name
+        )
     }
 }
 
@@ -499,6 +589,21 @@ pub enum Plan {
         /// Rows to keep, or every remaining row.
         count: Option<usize>,
     },
+    /// The input's rows with one column added per window function,
+    /// each computed over the rows of equal `partition_by` values in
+    /// `order_by` order (QE-20). The rows come out partition by
+    /// partition, in that order.
+    Window {
+        /// The input.
+        input: Box<Plan>,
+        /// The expressions whose equal values make a partition.
+        partition_by: Vec<Expr>,
+        /// The order of the rows within a partition; none leaves every
+        /// row a peer of every other.
+        order_by: Vec<SortKey>,
+        /// The functions, each adding a column.
+        functions: Vec<WindowExpr>,
+    },
     /// The first `k` rows under an ordering, found without a full sort;
     /// within each distinct value of `partition_by` when there is one.
     TopK {
@@ -656,6 +761,23 @@ impl Plan {
         }
     }
 
+    /// Wraps `self` in a window of `functions` over `partition_by` in
+    /// `order_by` order.
+    #[must_use]
+    pub fn window(
+        self,
+        partition_by: Vec<Expr>,
+        order_by: Vec<SortKey>,
+        functions: Vec<WindowExpr>,
+    ) -> Self {
+        Plan::Window {
+            input: Box::new(self),
+            partition_by,
+            order_by,
+            functions,
+        }
+    }
+
     /// Wraps `self` in a limit.
     #[must_use]
     pub fn limit(self, offset: usize, count: Option<usize>) -> Self {
@@ -689,6 +811,7 @@ impl Plan {
             | Plan::PartialAggregate { input, .. }
             | Plan::FinalAggregate { input, .. }
             | Plan::Sort { input, .. }
+            | Plan::Window { input, .. }
             | Plan::Limit { input, .. }
             | Plan::TopK { input, .. }
             | Plan::Extract { input, .. }
@@ -733,6 +856,16 @@ impl Plan {
                 None => Vec::new(),
             },
             Plan::Sort { keys, .. } | Plan::TopK { keys, .. } => keys.clone(),
+            Plan::Window {
+                partition_by,
+                order_by,
+                ..
+            } => partition_by
+                .iter()
+                .cloned()
+                .map(SortKey::ascending)
+                .chain(order_by.iter().cloned())
+                .collect(),
             Plan::Filter { input, .. }
             | Plan::Limit { input, .. }
             | Plan::Extract { input, .. }
@@ -786,6 +919,21 @@ impl Plan {
             | Plan::Sort { input, .. }
             | Plan::Limit { input, .. }
             | Plan::TopK { input, .. } => input.schema(registry),
+            Plan::Window {
+                input, functions, ..
+            } => {
+                let input = input.schema(registry)?;
+                let mut fields: Vec<Field> =
+                    input.fields().iter().map(|f| f.as_ref().clone()).collect();
+                for function in functions {
+                    fields.push(Field::new(
+                        &function.name,
+                        window_type(function, &input, registry)?,
+                        true,
+                    ));
+                }
+                Ok(Arc::new(Schema::new(fields)))
+            }
             Plan::Extract { input, .. } => Ok(with_extracted(&input.schema(registry)?)),
             Plan::RangeVector { .. } | Plan::PromQL { .. } => Ok(range_vector_schema()),
             Plan::TraceGroup { .. } => Ok(trace_group_schema()),
@@ -950,6 +1098,12 @@ impl Plan {
                 let shown: Vec<String> = keys.iter().map(ToString::to_string).collect();
                 writeln!(f, "{pad}Sort: {}", shown.join(", "))
             }
+            Plan::Window {
+                partition_by,
+                order_by,
+                functions,
+                ..
+            } => fmt_window(f, pad, partition_by, order_by, functions),
             Plan::Limit { offset, count, .. } => fmt_limit(f, pad, *offset, *count),
             Plan::TopK {
                 keys,
@@ -1296,6 +1450,74 @@ pub fn aggregate_type(
     })
 }
 
+/// The `EXPLAIN` line of a window: its partition, order and functions.
+fn fmt_window(
+    f: &mut fmt::Formatter<'_>,
+    pad: &str,
+    partition_by: &[Expr],
+    order_by: &[SortKey],
+    functions: &[WindowExpr],
+) -> fmt::Result {
+    let shown = |items: Vec<String>| items.join(", ");
+    writeln!(
+        f,
+        "{pad}Window: partition_by=[{}] order_by=[{}] functions=[{}]",
+        shown(partition_by.iter().map(ToString::to_string).collect()),
+        shown(order_by.iter().map(ToString::to_string).collect()),
+        shown(functions.iter().map(ToString::to_string).collect())
+    )
+}
+
+/// The type of a window function's column: a number for the numbering
+/// functions, the value's type for the ones that take a value, and the
+/// aggregate's for an aggregate.
+///
+/// # Errors
+///
+/// `Window` if the arguments do not fit the function, `Type` if one
+/// does not type.
+pub fn window_type(
+    window: &WindowExpr,
+    input: &Schema,
+    registry: &Registry,
+) -> Result<DataType, PlanError> {
+    let misuse = |message: &str| PlanError::Window(format!("{} {message}", window.function.name()));
+    match &window.function {
+        WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank => {
+            if window.args.is_empty() {
+                Ok(DataType::Int64)
+            } else {
+                Err(misuse("takes no argument"))
+            }
+        }
+        WindowFunction::Lag | WindowFunction::Lead => {
+            let (Some(value), true) = (window.args.first(), window.args.len() <= 3) else {
+                return Err(misuse("takes a value, an offset and a default"));
+            };
+            if !window.args[1..]
+                .iter()
+                .all(|a| matches!(a, Expr::Literal(_)))
+            {
+                return Err(misuse("takes its offset and default as constants"));
+            }
+            Ok(expr_type(value, input, registry)?)
+        }
+        WindowFunction::FirstValue | WindowFunction::LastValue => match window.args.as_slice() {
+            [value] => Ok(expr_type(value, input, registry)?),
+            _ => Err(misuse("takes one value")),
+        },
+        WindowFunction::Aggregate(function) => aggregate_type(
+            &AggregateExpr {
+                function: function.clone(),
+                args: window.args.clone(),
+                name: window.name.clone(),
+            },
+            input,
+            registry,
+        ),
+    }
+}
+
 /// The schema of a `PartialAggregate`: the keys, then each aggregate's
 /// state columns.
 fn partial_aggregate_schema(
@@ -1545,6 +1767,97 @@ mod tests {
         assert_eq!(AsofMatch::from_op(BinaryOp::Lt), Some(AsofMatch::After));
         assert_eq!(AsofMatch::from_op(BinaryOp::Eq), None);
         assert_eq!(AsofMatch::Before.op(), BinaryOp::Gt);
+    }
+
+    /// QE-20: a window adds one typed column per function after the
+    /// input's, shows its partition, order and functions, and refuses
+    /// arguments that do not fit a function.
+    #[test]
+    fn a_window_adds_a_typed_column_per_function() {
+        let window = |function, args: Vec<Expr>| WindowExpr {
+            function,
+            args,
+            name: "w".into(),
+        };
+        let plan = Plan::Scan(scan()).window(
+            vec![Expr::column(SEVERITY_NUMBER)],
+            vec![SortKey::ascending(Expr::column(TIMESTAMP))],
+            vec![
+                WindowExpr {
+                    function: WindowFunction::RowNumber,
+                    args: Vec::new(),
+                    name: "n".into(),
+                },
+                WindowExpr {
+                    function: WindowFunction::Lag,
+                    args: vec![Expr::column(BODY), Expr::literal(1)],
+                    name: "previous".into(),
+                },
+                WindowExpr {
+                    function: WindowFunction::Aggregate("count".into()),
+                    args: Vec::new(),
+                    name: "so_far".into(),
+                },
+            ],
+        );
+        let schema = plan.schema(&registry()).unwrap();
+        let input = Plan::Scan(scan()).schema(&registry()).unwrap();
+        assert_eq!(schema.fields().len(), input.fields().len() + 3);
+        assert_eq!(
+            schema.field_with_name("n").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            schema.field_with_name("previous").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        // Counts over logs are weighted by the sample rate (QE-13).
+        assert_eq!(
+            schema.field_with_name("so_far").unwrap().data_type(),
+            &DataType::Float64
+        );
+        assert_eq!(plan.inputs().len(), 1);
+        assert!(
+            plan.to_string().starts_with(
+                "Window: partition_by=[severity_number] order_by=[timestamp ASC] \
+                 functions=[row_number() AS n, lag(body, 1) AS previous, count() AS so_far]\n"
+            ),
+            "{plan}"
+        );
+        let registry = registry();
+        assert_eq!(
+            WindowFunction::named("dense_rank", &registry),
+            Some(WindowFunction::DenseRank)
+        );
+        assert_eq!(
+            WindowFunction::named("sum", &registry),
+            Some(WindowFunction::Aggregate("sum".into()))
+        );
+        assert_eq!(WindowFunction::named("nope", &registry), None);
+        let misuse = |function, args| {
+            Plan::Scan(scan())
+                .window(Vec::new(), Vec::new(), vec![window(function, args)])
+                .schema(&registry)
+        };
+        assert!(matches!(
+            misuse(WindowFunction::Rank, vec![Expr::column(BODY)]),
+            Err(PlanError::Window(_))
+        ));
+        assert!(matches!(
+            misuse(WindowFunction::Lag, Vec::new()),
+            Err(PlanError::Window(_))
+        ));
+        assert!(matches!(
+            misuse(
+                WindowFunction::Lead,
+                vec![Expr::column(BODY), Expr::column(BODY)]
+            ),
+            Err(PlanError::Window(_))
+        ));
+        assert!(matches!(
+            misuse(WindowFunction::LastValue, Vec::new()),
+            Err(PlanError::Window(_))
+        ));
     }
 
     #[test]

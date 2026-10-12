@@ -441,6 +441,20 @@ pub enum ExprKind {
         /// `f(*)`.
         wildcard: bool,
     },
+    /// `function(args) OVER (PARTITION BY ... ORDER BY ...)`: a window
+    /// function (QE-20), a value per row from the rows of its partition.
+    Window {
+        /// The function name, lowercased.
+        function: String,
+        /// The arguments.
+        args: Vec<Expr>,
+        /// `f(*)`.
+        wildcard: bool,
+        /// `PARTITION BY`.
+        partition_by: Vec<Expr>,
+        /// `ORDER BY`.
+        order_by: Vec<OrderItem>,
+    },
     /// `CAST(expr AS type)` or `expr::type`.
     Cast {
         /// The converted expression.

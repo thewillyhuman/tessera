@@ -48,6 +48,12 @@ pub fn substitute(plan: Plan, rollups: &[RollupEntry]) -> Plan {
             input: Box::new(substitute(*input, rollups)),
             keys,
         },
+        Plan::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => substitute(*input, rollups).window(partition_by, order_by, functions),
         Plan::Limit {
             input,
             offset,

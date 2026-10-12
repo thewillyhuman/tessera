@@ -253,6 +253,25 @@ mod tests {
             "{explain}"
         );
 
+        // QE-20: window functions see each row's neighbours in order.
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT body, row_number() OVER (ORDER BY timestamp) AS n, \
+                          lag(body) OVER (ORDER BY timestamp) AS prev FROM logs ORDER BY timestamp",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let rows = value["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{value}");
+        assert_eq!(rows[0][0], "first");
+        assert_eq!(rows[0][1].as_f64(), Some(1.0), "{value}");
+        assert!(rows[0][2].is_null(), "{value}");
+        assert_eq!(rows[2][1].as_f64(), Some(3.0), "{value}");
+        assert_eq!(rows[2][2], "second", "{value}");
+
         // A derived table nests a query.
         let (status, value) = post(
             &app,

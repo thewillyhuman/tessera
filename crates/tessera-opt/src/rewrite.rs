@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use tessera_ir::trace::SPAN_COLUMNS;
 use tessera_ir::{
     Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, Scan, SortKey, Spanset,
-    VALUE as VALUE_COLUMN, unqualify,
+    VALUE as VALUE_COLUMN, WindowExpr, unqualify,
 };
 use tessera_types::event::{BODY, EXTRACTED, KIND, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
 use tessera_types::{Kind, TimeRange, Timestamp};
@@ -264,6 +264,12 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
         | Plan::PartialAggregate { .. }
         | Plan::FinalAggregate { .. }) => rebuild_aggregation(aggregate, f),
         Plan::Sort { input, keys } => f(*input).sort(keys),
+        Plan::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => f(*input).window(partition_by, order_by, functions),
         Plan::Limit {
             input,
             offset,
@@ -382,6 +388,36 @@ fn rebuild_join(
         kind,
         asof,
     }
+}
+
+/// Pushes a projection into a window's input: the input needs what the
+/// window reads, not the columns the window itself adds.
+fn push_projection_window(
+    input: Plan,
+    partition_by: Vec<Expr>,
+    order_by: Vec<SortKey>,
+    functions: Vec<WindowExpr>,
+    needed: Option<BTreeSet<String>>,
+    whole: bool,
+) -> Plan {
+    let add = |mut set: BTreeSet<String>, expr: &Expr| {
+        set.extend(expr.references());
+        set
+    };
+    let exprs = || {
+        partition_by
+            .iter()
+            .chain(order_by.iter().map(|k| &k.expr))
+            .chain(functions.iter().flat_map(|w| &w.args))
+    };
+    let needed = needed.map(|mut n| {
+        for window in &functions {
+            n.remove(&window.name);
+        }
+        exprs().fold(n, add)
+    });
+    let whole = whole || exprs().any(Expr::needs_overflow_whole);
+    push_projection(input, needed, whole).window(partition_by, order_by, functions)
 }
 
 /// Pushes a projection into both sides of a join: a side needs what
@@ -580,6 +616,12 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
             let whole = whole || keys.iter().any(|k| k.expr.needs_overflow_whole());
             push_projection(*input, needed, whole).sort(keys)
         }
+        Plan::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => push_projection_window(*input, partition_by, order_by, functions, needed, whole),
         Plan::TopK {
             input,
             keys,

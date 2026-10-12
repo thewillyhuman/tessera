@@ -590,23 +590,7 @@ impl Parser<'_> {
         } else {
             None
         };
-        let mut order_by = Vec::new();
-        if self.eat_keyword("order") {
-            self.expect_keyword("by")?;
-            loop {
-                let expr = self.expr()?;
-                let descending = if self.eat_keyword("desc") {
-                    true
-                } else {
-                    let _ = self.eat_keyword("asc");
-                    false
-                };
-                order_by.push(OrderItem { expr, descending });
-                if !self.eat_symbol(",") {
-                    break;
-                }
-            }
-        }
+        let order_by = self.order_by()?;
         let mut limit = None;
         let mut offset = None;
         loop {
@@ -629,6 +613,28 @@ impl Parser<'_> {
             limit,
             offset,
         })
+    }
+
+    /// `ORDER BY item [ASC|DESC], ...`, if it starts here.
+    fn order_by(&mut self) -> Result<Vec<OrderItem>, Diagnostic> {
+        let mut order_by = Vec::new();
+        if self.eat_keyword("order") {
+            self.expect_keyword("by")?;
+            loop {
+                let expr = self.expr()?;
+                let descending = if self.eat_keyword("desc") {
+                    true
+                } else {
+                    let _ = self.eat_keyword("asc");
+                    false
+                };
+                order_by.push(OrderItem { expr, descending });
+                if !self.eat_symbol(",") {
+                    break;
+                }
+            }
+        }
+        Ok(order_by)
     }
 
     /// A row count of `LIMIT` or `OFFSET`: a whole number or `$n`.
@@ -985,6 +991,39 @@ impl Parser<'_> {
         }
     }
 
+    /// `OVER ([PARTITION BY exprs] [ORDER BY items])` after the call
+    /// of `function` on `args`, which it makes a window function.
+    fn over(
+        &mut self,
+        function: String,
+        args: Vec<Expr>,
+        wildcard: bool,
+        start: Span,
+    ) -> Result<Expr, Diagnostic> {
+        self.expect_keyword("over")?;
+        self.expect_symbol("(")?;
+        let mut partition_by = Vec::new();
+        if self.eat_keyword("partition") {
+            self.expect_keyword("by")?;
+            partition_by.push(self.expr()?);
+            while self.eat_symbol(",") {
+                partition_by.push(self.expr()?);
+            }
+        }
+        let order_by = self.order_by()?;
+        let end = self.expect_symbol(")")?;
+        Ok(Expr {
+            kind: ExprKind::Window {
+                function,
+                args,
+                wildcard,
+                partition_by,
+                order_by,
+            },
+            span: Span::new(start.start, end.end),
+        })
+    }
+
     /// `EXISTS (SELECT ...)`, after the keyword at `start`.
     fn exists(&mut self, start: Span) -> Result<Expr, Diagnostic> {
         self.expect_symbol("(")?;
@@ -1097,30 +1136,23 @@ impl Parser<'_> {
 
     fn name_or_call(&mut self, first: String, start: Span) -> Result<Expr, Diagnostic> {
         if self.eat_symbol("(") {
-            if self.eat_symbol("*") {
-                let end = self.expect_symbol(")")?;
-                return Ok(Expr {
-                    kind: ExprKind::Call {
-                        name: first,
-                        args: Vec::new(),
-                        wildcard: true,
-                    },
-                    span: Span::new(start.start, end.end),
-                });
-            }
+            let wildcard = self.eat_symbol("*");
             let mut args = Vec::new();
-            if !self.is_symbol(")") {
+            if !wildcard && !self.is_symbol(")") {
                 args.push(self.expr()?);
                 while self.eat_symbol(",") {
                     args.push(self.expr()?);
                 }
             }
             let end = self.expect_symbol(")")?;
+            if self.is_keyword("over") {
+                return self.over(first, args, wildcard, start);
+            }
             return Ok(Expr {
                 kind: ExprKind::Call {
                     name: first,
                     args,
-                    wildcard: false,
+                    wildcard,
                 },
                 span: Span::new(start.start, end.end),
             });
@@ -1165,9 +1197,9 @@ const ALERT_KEYWORDS: [&str; 13] = [
 
 /// Keywords that end a select item, so a bare name before them is not an
 /// alias.
-const CLAUSE_KEYWORDS: [&str; 16] = [
+const CLAUSE_KEYWORDS: [&str; 17] = [
     "from", "where", "group", "order", "limit", "offset", "and", "or", "as", "having", "join",
-    "inner", "left", "outer", "on", "asof",
+    "inner", "left", "outer", "on", "asof", "over",
 ];
 
 /// Keywords that may follow a table in the statements that name one,
@@ -1576,6 +1608,49 @@ mod tests {
             ExprKind::InList { list, .. } if list[0].kind == ExprKind::Parameter(2)
         ));
         assert!(parse("SELECT $ FROM logs").is_err());
+    }
+
+    /// QE-20: `OVER` after a call makes it a window function, with its
+    /// partition and order, either empty; `OVER` is not an alias.
+    #[test]
+    fn parses_window_functions() {
+        let q = query(
+            "SELECT lag(body, 1) OVER (PARTITION BY severity_text, attr.service \
+             ORDER BY timestamp DESC) AS prev, count(*) OVER () FROM logs",
+        );
+        let SelectItem::Expr { expr, alias } = &q.items[0] else {
+            panic!("not an item");
+        };
+        assert_eq!(alias.as_deref(), Some("prev"));
+        let ExprKind::Window {
+            function,
+            args,
+            wildcard,
+            partition_by,
+            order_by,
+        } = &expr.kind
+        else {
+            panic!("not a window: {expr:?}");
+        };
+        assert_eq!(function, "lag");
+        assert_eq!(args.len(), 2);
+        assert!(!wildcard);
+        assert_eq!(partition_by.len(), 2);
+        assert_eq!(order_by.len(), 1);
+        assert!(order_by[0].descending);
+        let SelectItem::Expr { expr, alias: None } = &q.items[1] else {
+            panic!("not an unaliased item");
+        };
+        assert!(matches!(
+            &expr.kind,
+            ExprKind::Window {
+                wildcard: true,
+                partition_by,
+                order_by,
+                ..
+            } if partition_by.is_empty() && order_by.is_empty()
+        ));
+        assert!(parse("SELECT count(*) OVER FROM logs").is_err());
     }
 
     /// `EXISTS (SELECT ...)` is an expression, negated by `NOT` in front

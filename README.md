@@ -62,8 +62,15 @@ but there are no merge or lookup variants; a subquery
 is a derived table in `FROM`, or an `IN (SELECT ...)` or `EXISTS
 (SELECT ...)` condition of `WHERE` lowered to a join on its distinct
 keys, an `EXISTS` correlated by equalities with the query's columns,
-but not a scalar subquery; no window
-functions; `$n` parameters bind over the PostgreSQL protocol with
+but not a scalar subquery; window functions (QE-20) are
+`row_number`, `rank`, `dense_rank`, `lag`, `lead`, `first_value`,
+`last_value` and any aggregate `OVER (PARTITION BY ... ORDER BY ...)`
+in a select item or `ORDER BY`, computed by one node per distinct
+partition and order over rows sorted through the sort operator's
+buffer, so that they spill past the grant, with the default frame
+only, up to the row's last peer, each partition held whole while its
+columns are computed, and an aggregate through the group-by's own
+accumulator; `$n` parameters bind over the PostgreSQL protocol with
 their types inferred from the columns they meet, as whole numbers in
 `LIMIT` and `OFFSET`;
 sorts and trace groups spill sorted runs to local disk when their

@@ -11,8 +11,8 @@
 
 use arrow::datatypes::DataType;
 use tessera_ir::{
-    AggregateExpr, Asof, BinaryOp, Expr, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
-    SortKey, expr_type,
+    AggregateExpr, Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError,
+    Registry, SortKey, WindowExpr, expr_type,
 };
 
 use crate::rewrite::rebuild_inputs;
@@ -141,6 +141,12 @@ fn bind_plan(plan: Plan) -> Plan {
         Plan::Sort { input, keys } => {
             bind_plan(*input).sort(keys.into_iter().map(bind_key).collect())
         }
+        Plan::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => bind_window(*input, partition_by, order_by, functions),
         Plan::TopK {
             input,
             keys,
@@ -165,14 +171,45 @@ fn bind_plan(plan: Plan) -> Plan {
             on,
             kind,
             asof,
-        } => Plan::Join {
-            left: JoinSide::new(bind_plan(*left.plan), left.name),
-            right: JoinSide::new(bind_plan(*right.plan), right.name),
-            on: on.into_iter().map(bind_join_key).collect(),
-            kind,
-            asof: asof.map(bind_asof),
-        },
+        } => bind_join(left, right, on, kind, asof),
     }
+}
+
+/// Binds both sides of a join, its keys and its time match.
+fn bind_join(
+    left: JoinSide,
+    right: JoinSide,
+    on: Vec<(Expr, Expr)>,
+    kind: JoinKind,
+    asof: Option<Asof>,
+) -> Plan {
+    Plan::Join {
+        left: JoinSide::new(bind_plan(*left.plan), left.name),
+        right: JoinSide::new(bind_plan(*right.plan), right.name),
+        on: on.into_iter().map(bind_join_key).collect(),
+        kind,
+        asof: asof.map(bind_asof),
+    }
+}
+
+/// Binds a window's partition, order and every function's arguments.
+fn bind_window(
+    input: Plan,
+    partition_by: Vec<Expr>,
+    order_by: Vec<SortKey>,
+    functions: Vec<WindowExpr>,
+) -> Plan {
+    bind_plan(input).window(
+        partition_by.into_iter().map(bind_expr).collect(),
+        order_by.into_iter().map(bind_key).collect(),
+        functions
+            .into_iter()
+            .map(|window| WindowExpr {
+                args: window.args.into_iter().map(bind_expr).collect(),
+                ..window
+            })
+            .collect(),
+    )
 }
 
 /// Binds the two times of an `ASOF JOIN` as a key pair is bound.

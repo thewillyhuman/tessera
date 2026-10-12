@@ -123,6 +123,21 @@ fn collect_plan(plan: &Plan, into: &mut BTreeMap<String, DataType>) {
             }
             collect_plan(input, into);
         }
+        Plan::Window {
+            input,
+            partition_by,
+            order_by,
+            functions,
+        } => {
+            for expr in partition_by
+                .iter()
+                .chain(order_by.iter().map(|k| &k.expr))
+                .chain(functions.iter().flat_map(|w| &w.args))
+            {
+                collect_expr(expr, into);
+            }
+            collect_plan(input, into);
+        }
         Plan::Join {
             left, right, on, ..
         } => {

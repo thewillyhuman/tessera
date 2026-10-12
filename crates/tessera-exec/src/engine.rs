@@ -39,7 +39,7 @@ use crate::cache::{self, ResultCache, ResultKey};
 use crate::memory::MemoryPool;
 use crate::operator::{
     BuildSide, CollectSink, Extract, Filter, Format, HashAggregate, HashJoin, JoinInput, Limit,
-    Operator, Project, RangeVector, Sort, Steps, TopK, TraceGroup, partitioned,
+    Operator, Project, RangeVector, Sort, Steps, TopK, TraceGroup, Window, partitioned,
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
@@ -771,6 +771,19 @@ impl Engine {
             Plan::Sort { keys, .. } => Box::new(Sort::new(
                 keys.clone(),
                 input.schema(registry)?,
+                Arc::clone(memory),
+            )),
+            Plan::Window {
+                partition_by,
+                order_by,
+                functions,
+                ..
+            } => Box::new(Window::new(
+                partition_by.clone(),
+                order_by.clone(),
+                functions.clone(),
+                input.schema(registry)?,
+                plan.schema(registry)?,
                 Arc::clone(memory),
             )),
             Plan::TopK {

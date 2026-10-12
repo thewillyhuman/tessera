@@ -18,7 +18,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use tessera_ir::{
     AggregateExpr, AlertDefinition, Asof, AsofMatch, BinaryOp, BindContext, ControlStatement,
     Diagnostic, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
-    RollupDefinition, Scan, SortKey, Span, Statement, qualify, unqualify,
+    RollupDefinition, Scan, SortKey, Span, Statement, WindowExpr, WindowFunction, qualify,
+    unqualify,
 };
 use tessera_types::{
     DatasetName, Kind, RetentionAction, RetentionClause, RetentionPolicy, TenantId, Timestamp,
@@ -614,6 +615,17 @@ struct Substitution {
     groups: Vec<(ast::Expr, String)>,
     /// Aggregate calls, by their syntax, to output names.
     aggregates: Vec<(ast::Expr, String)>,
+    /// Window functions, by their syntax, to the columns their window
+    /// nodes add (QE-20).
+    windows: Vec<(ast::Expr, String)>,
+}
+
+/// One window node to add: the functions sharing a partition and an
+/// order.
+struct WindowSpec {
+    partition_by: Vec<Expr>,
+    order_by: Vec<SortKey>,
+    functions: Vec<WindowExpr>,
 }
 
 struct Lowerer<'a> {
@@ -1203,6 +1215,7 @@ pub fn describe(
 
 impl Lowerer<'_> {
     fn plain_query(&mut self, query: &ast::Query, plan: Plan) -> Result<Plan, Diagnostic> {
+        let plan = self.window_plan(query, plan)?;
         let items = self.select_items(query)?;
         let all_columns = query
             .items
@@ -1286,6 +1299,7 @@ impl Lowerer<'_> {
                 predicate: self.expr(having)?,
             };
         }
+        plan = self.window_plan(query, plan)?;
         let items = self.select_items(query)?;
         if !query.order_by.is_empty() {
             let aliases: BTreeMap<&str, &Expr> =
@@ -1309,6 +1323,113 @@ impl Lowerer<'_> {
         }
         plan = plan.project(items);
         self.apply_limit(plan, query)
+    }
+
+    /// `plan` under one window node per distinct partition and order
+    /// among the window functions of the select items and `ORDER BY`
+    /// (QE-20), each function's column named by its alias when the
+    /// whole item is the function, and the functions registered so
+    /// that the items read the columns.
+    fn window_plan(&mut self, query: &ast::Query, plan: Plan) -> Result<Plan, Diagnostic> {
+        let mut specs: Vec<WindowSpec> = Vec::new();
+        let mut names: Vec<(ast::Expr, String)> = Vec::new();
+        for item in &query.items {
+            if let ast::SelectItem::Expr { expr, alias } = item {
+                self.collect_windows(expr, alias.as_deref(), &mut specs, &mut names)?;
+            }
+        }
+        for item in &query.order_by {
+            self.collect_windows(&item.expr, None, &mut specs, &mut names)?;
+        }
+        if names.is_empty() {
+            return Ok(plan);
+        }
+        self.substitution
+            .get_or_insert_with(Substitution::default)
+            .windows
+            .extend(names);
+        Ok(specs.into_iter().fold(plan, |plan, spec| {
+            plan.window(spec.partition_by, spec.order_by, spec.functions)
+        }))
+    }
+
+    /// Registers every window function in `expr` under its partition
+    /// and order in `specs`, naming the column by `alias` when the whole
+    /// item is the function and the name is free, else by a hidden name.
+    fn collect_windows(
+        &self,
+        expr: &ast::Expr,
+        alias: Option<&str>,
+        specs: &mut Vec<WindowSpec>,
+        names: &mut Vec<(ast::Expr, String)>,
+    ) -> Result<(), Diagnostic> {
+        let ast::ExprKind::Window {
+            function,
+            args,
+            wildcard,
+            partition_by,
+            order_by,
+        } = &expr.kind
+        else {
+            for child in children(expr) {
+                self.collect_windows(child, None, specs, names)?;
+            }
+            return Ok(());
+        };
+        if names.iter().any(|(e, _)| e.same_as(expr)) {
+            return Ok(());
+        }
+        let Some(function) = WindowFunction::named(function, self.registry) else {
+            return Err(Diagnostic::at(
+                expr.span,
+                format!("unknown window function {function}"),
+            ));
+        };
+        if *wildcard && function != WindowFunction::Aggregate("count".into()) {
+            return Err(Diagnostic::at(
+                expr.span,
+                format!("{}(*) is not valid", function.name()),
+            ));
+        }
+        let args = args
+            .iter()
+            .map(|a| self.expr(a))
+            .collect::<Result<Vec<_>, _>>()?;
+        let partition_by = partition_by
+            .iter()
+            .map(|p| self.expr(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        let order_by = order_by
+            .iter()
+            .map(|item| {
+                Ok(SortKey {
+                    expr: self.expr(&item.expr)?,
+                    descending: item.descending,
+                })
+            })
+            .collect::<Result<Vec<_>, Diagnostic>>()?;
+        let name = match alias {
+            Some(alias) if names.iter().all(|(_, taken)| taken != alias) => alias.to_owned(),
+            _ => format!("__w{}", names.len()),
+        };
+        let window = WindowExpr {
+            function,
+            args,
+            name: name.clone(),
+        };
+        match specs
+            .iter_mut()
+            .find(|s| s.partition_by == partition_by && s.order_by == order_by)
+        {
+            Some(spec) => spec.functions.push(window),
+            None => specs.push(WindowSpec {
+                partition_by,
+                order_by,
+                functions: vec![window],
+            }),
+        }
+        names.push((expr.clone(), name));
+        Ok(())
     }
 
     /// Registers every aggregate call in `expr`, naming the call by
@@ -1498,6 +1619,7 @@ impl Lowerer<'_> {
             if let Some((_, name)) = substitution
                 .aggregates
                 .iter()
+                .chain(&substitution.windows)
                 .find(|(e, _)| e.same_as(expr))
             {
                 return Ok(Expr::column(name));
@@ -1551,6 +1673,10 @@ impl Lowerer<'_> {
             ast::ExprKind::Exists { .. } => Err(Diagnostic::at(
                 expr.span,
                 "EXISTS (SELECT ...) is a condition of WHERE on its own, joined to the others by AND",
+            )),
+            ast::ExprKind::Window { .. } => Err(Diagnostic::at(
+                expr.span,
+                "a window function goes in a SELECT item or ORDER BY",
             )),
             ast::ExprKind::Between {
                 expr: tested,
@@ -2122,6 +2248,16 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
             expr, low, high, ..
         } => vec![expr, low, high],
         ast::ExprKind::Call { args, .. } => args.iter().collect(),
+        ast::ExprKind::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => args
+            .iter()
+            .chain(partition_by)
+            .chain(order_by.iter().map(|item| &item.expr))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -2131,7 +2267,9 @@ fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
 fn default_name(expr: &ast::Expr, index: usize) -> String {
     match &expr.kind {
         ast::ExprKind::Name(parts) => parts.join("."),
-        ast::ExprKind::Call { name, .. } => name.clone(),
+        ast::ExprKind::Call { name, .. } | ast::ExprKind::Window { function: name, .. } => {
+            name.clone()
+        }
         ast::ExprKind::Cast { expr, .. } => default_name(expr, index),
         _ => format!("column{}", index + 1),
     }
@@ -2241,6 +2379,56 @@ mod tests {
             parse("INSERT INTO (SELECT 1) VALUES (1)").is_err(),
             "a derived table is not a target"
         );
+    }
+
+    /// QE-20: window functions in the select items become window nodes
+    /// over the filtered rows, one per distinct partition and order,
+    /// their columns named by the items' aliases; over a grouped query
+    /// they read the aggregates' columns; elsewhere they are refused.
+    #[test]
+    fn window_functions_become_window_nodes() {
+        let plan = lowered(
+            "SELECT body, row_number() OVER (PARTITION BY severity_text ORDER BY timestamp) AS n, \
+             lag(body) OVER (PARTITION BY severity_text ORDER BY timestamp) AS prev, \
+             count(*) OVER () AS total FROM logs WHERE severity_number >= 17 ORDER BY n",
+        );
+        let text = plan.to_string();
+        assert!(
+            text.starts_with(
+                "Project: body AS body, n AS n, prev AS prev, total AS total\n  Sort: n ASC\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "Window: partition_by=[severity_text] order_by=[timestamp ASC] \
+                 functions=[row_number() AS n, lag(body) AS prev]"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Window: partition_by=[] order_by=[] functions=[count() AS total]"),
+            "{text}"
+        );
+        assert!(text.contains("Filter: (severity_number >= 17)"), "{text}");
+        let grouped = lowered(
+            "SELECT attr.service AS service, count(*) AS n, \
+             sum(count(*)) OVER (ORDER BY count(*) DESC) AS running FROM logs GROUP BY attr.service",
+        );
+        let text = grouped.to_string();
+        assert!(
+            text.contains(
+                "Window: partition_by=[] order_by=[n DESC] functions=[sum(n) AS running]"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Aggregate:"), "{text}");
+        let error = |sql: &str| lower(&parse(sql).unwrap(), &ctx()).unwrap_err().message;
+        assert!(
+            error("SELECT body FROM logs WHERE row_number() OVER () = 1").contains("SELECT item"),
+        );
+        assert!(error("SELECT nope() OVER () FROM logs").contains("unknown window function"));
+        assert!(error("SELECT sum(*) OVER () FROM logs").contains("not valid"));
     }
 
     /// `[NOT] EXISTS (SELECT ...)` correlates by the equalities between
