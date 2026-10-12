@@ -796,10 +796,17 @@ impl Parser<'_> {
         if self.eat_keyword("not") {
             let inner = self.not_expr()?;
             let span = Span::new(start.start, inner.span.end);
-            return Ok(Expr {
-                kind: ExprKind::Not(Box::new(inner)),
-                span,
-            });
+            let kind = match inner.kind {
+                ExprKind::Exists { query, negated } => ExprKind::Exists {
+                    query,
+                    negated: !negated,
+                },
+                other => ExprKind::Not(Box::new(Expr {
+                    kind: other,
+                    span: inner.span,
+                })),
+            };
+            return Ok(Expr { kind, span });
         }
         self.comparison()
     }
@@ -978,6 +985,20 @@ impl Parser<'_> {
         }
     }
 
+    /// `EXISTS (SELECT ...)`, after the keyword at `start`.
+    fn exists(&mut self, start: Span) -> Result<Expr, Diagnostic> {
+        self.expect_symbol("(")?;
+        let query = self.query()?;
+        let end = self.expect_symbol(")")?;
+        Ok(Expr {
+            kind: ExprKind::Exists {
+                query: Box::new(query),
+                negated: false,
+            },
+            span: Span::new(start.start, end.end),
+        })
+    }
+
     fn primary(&mut self) -> Result<Expr, Diagnostic> {
         let Some(next) = self.advance() else {
             return Err(self.unexpected("expected an expression"));
@@ -1053,6 +1074,7 @@ impl Parser<'_> {
                         span: Span::new(span.start, end.end),
                     })
                 }
+                "exists" => self.exists(span),
                 "cast" => {
                     self.expect_symbol("(")?;
                     let inner = self.expr()?;
@@ -1554,6 +1576,30 @@ mod tests {
             ExprKind::InList { list, .. } if list[0].kind == ExprKind::Parameter(2)
         ));
         assert!(parse("SELECT $ FROM logs").is_err());
+    }
+
+    /// `EXISTS (SELECT ...)` is an expression, negated by `NOT` in front
+    /// of it rather than wrapped.
+    #[test]
+    fn exists_takes_a_subquery() {
+        let q = query(
+            "SELECT body FROM logs l WHERE EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = l.trace_id)",
+        );
+        let ExprKind::Exists {
+            query: subquery,
+            negated,
+        } = &q.filter.unwrap().kind
+        else {
+            panic!("not an EXISTS");
+        };
+        assert!(!negated);
+        assert_eq!(subquery.from.as_ref().unwrap().table, "spans");
+        let q = query("SELECT body FROM logs WHERE NOT EXISTS (SELECT 1 FROM spans) AND true");
+        let ExprKind::Binary { left, .. } = &q.filter.unwrap().kind else {
+            panic!("not a conjunction");
+        };
+        assert!(matches!(left.kind, ExprKind::Exists { negated: true, .. }));
+        assert!(parse("SELECT body FROM logs WHERE EXISTS spans").is_err());
     }
 
     #[test]

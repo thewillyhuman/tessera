@@ -703,35 +703,44 @@ fn lower_query(
     }
 }
 
-/// The `IN (SELECT ...)` conditions among the top-level conjuncts of
+/// The `IN (SELECT ...)` and `EXISTS (SELECT ...)` conditions among the top-level conjuncts of
 /// `filter`, and the rest of it joined back with `AND`.
 fn split_subquery_conditions(filter: &ast::Expr) -> (Vec<&ast::Expr>, Option<ast::Expr>) {
-    fn conjuncts(expr: &ast::Expr) -> Vec<&ast::Expr> {
-        match &expr.kind {
-            ast::ExprKind::Binary {
-                op: ast::BinaryOp::And,
-                left,
-                right,
-            } => {
-                let mut all = conjuncts(left);
-                all.extend(conjuncts(right));
-                all
-            }
-            _ => vec![expr],
+    let (subqueries, rest): (Vec<_>, Vec<_>) = conjuncts(filter).into_iter().partition(|c| {
+        matches!(
+            c.kind,
+            ast::ExprKind::InSubquery { .. } | ast::ExprKind::Exists { .. }
+        )
+    });
+    (subqueries, conjunction(rest))
+}
+
+/// The top-level conjuncts of `expr`.
+fn conjuncts(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    match &expr.kind {
+        ast::ExprKind::Binary {
+            op: ast::BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut all = conjuncts(left);
+            all.extend(conjuncts(right));
+            all
         }
+        _ => vec![expr],
     }
-    let (subqueries, rest): (Vec<_>, Vec<_>) = conjuncts(filter)
-        .into_iter()
-        .partition(|c| matches!(c.kind, ast::ExprKind::InSubquery { .. }));
-    let rest = rest.into_iter().cloned().reduce(|left, right| ast::Expr {
+}
+
+/// `exprs` joined by `AND`; none for none.
+fn conjunction(exprs: Vec<&ast::Expr>) -> Option<ast::Expr> {
+    exprs.into_iter().cloned().reduce(|left, right| ast::Expr {
         span: Span::new(left.span.start, right.span.end),
         kind: ast::ExprKind::Binary {
             op: ast::BinaryOp::And,
             left: Box::new(left),
             right: Box::new(right),
         },
-    });
-    (subqueries, rest)
+    })
 }
 
 /// The rows of a table in `FROM` or `JOIN`, and what its columns are
@@ -1539,6 +1548,10 @@ impl Lowerer<'_> {
                 expr.span,
                 "IN (SELECT ...) is a condition of WHERE on its own, joined to the others by AND",
             )),
+            ast::ExprKind::Exists { .. } => Err(Diagnostic::at(
+                expr.span,
+                "EXISTS (SELECT ...) is a condition of WHERE on its own, joined to the others by AND",
+            )),
             ast::ExprKind::Between {
                 expr: tested,
                 low,
@@ -1575,62 +1588,83 @@ impl Lowerer<'_> {
         }
     }
 
-    /// `tested [NOT] IN (SELECT key ...)` over `plan`: a join on the
-    /// distinct keys of the subquery, inner to keep the rows with a
-    /// match, left plus `IS NULL` to keep the rows without one, then
-    /// a projection back to `plan`'s own columns so that the rest of
-    /// the query sees the same names. `index` numbers the hidden sides.
-    /// A null key on the right never matches, as `NOT EXISTS` behaves.
+    /// `tested [NOT] IN (SELECT key ...)` or `[NOT] EXISTS (SELECT ...)`
+    /// over `plan`: a join on the distinct keys of the subquery, inner
+    /// to keep the rows with a match, left plus `IS NULL` to keep the
+    /// rows without one, then a projection back to `plan`'s own columns
+    /// so that the rest of the query sees the same names. `index`
+    /// numbers the hidden sides. A null key on the right never matches,
+    /// as `NOT EXISTS` behaves.
     fn semi_join(
         &self,
         plan: Plan,
         condition: &ast::Expr,
         index: usize,
     ) -> Result<Plan, Diagnostic> {
-        let ast::ExprKind::InSubquery {
-            expr: tested,
-            query,
-            negated,
-        } = &condition.kind
-        else {
-            return Err(Diagnostic::at(condition.span, "expected IN (SELECT ...)"));
-        };
         let located = |e: PlanError| Diagnostic::at(condition.span, e.to_string());
-        let right = lower_query(query, self.ctx, self.registry, self.parameters)?;
-        let right_schema = right.schema(self.registry).map_err(located)?;
-        let [key] = right_schema.fields().iter().collect::<Vec<_>>()[..] else {
-            return Err(Diagnostic::at(
-                condition.span,
-                format!(
-                    "the subquery of IN must select one column, this one {}",
-                    right_schema.fields().len()
-                ),
-            ));
+        let (right, keys, negated) = match &condition.kind {
+            ast::ExprKind::InSubquery {
+                expr: tested,
+                query,
+                negated,
+            } => {
+                let right = lower_query(query, self.ctx, self.registry, self.parameters)?;
+                let right_schema = right.schema(self.registry).map_err(located)?;
+                let [key] = right_schema.fields().iter().collect::<Vec<_>>()[..] else {
+                    return Err(Diagnostic::at(
+                        condition.span,
+                        format!(
+                            "the subquery of IN must select one column, this one {}",
+                            right_schema.fields().len()
+                        ),
+                    ));
+                };
+                (
+                    right,
+                    vec![(self.expr(tested)?, key.name().clone())],
+                    *negated,
+                )
+            }
+            ast::ExprKind::Exists { query, negated } => {
+                let (right, keys) = self.exists_keys(condition.span, query)?;
+                (right, keys, *negated)
+            }
+            _ => {
+                return Err(Diagnostic::at(
+                    condition.span,
+                    "expected IN (SELECT ...) or EXISTS (SELECT ...)",
+                ));
+            }
         };
-        let key = key.name().clone();
         let distinct = Plan::Aggregate {
             input: Box::new(right),
-            group_by: vec![NamedExpr::new(Expr::column(&key), &key)],
+            group_by: keys
+                .iter()
+                .map(|(_, key)| NamedExpr::new(Expr::column(key), key))
+                .collect(),
             aggregates: Vec::new(),
         };
         let own = plan.schema(self.registry).map_err(located)?;
         let left_name = format!("__rows{index}");
         let right_name = format!("__in{index}");
-        let tested = self.expr(tested)?;
+        let first_key = keys.first().map(|(_, key)| key.clone()).unwrap_or_default();
         let mut joined = Plan::Join {
             left: JoinSide::new(plan, left_name.clone()),
             right: JoinSide::new(distinct, right_name.clone()),
-            on: vec![(tested, Expr::column(&key))],
-            kind: if *negated {
+            on: keys
+                .into_iter()
+                .map(|(tested, key)| (tested, Expr::column(&key)))
+                .collect(),
+            kind: if negated {
                 JoinKind::Left
             } else {
                 JoinKind::Inner
             },
             asof: None,
         };
-        if *negated {
+        if negated {
             joined = joined.filter(Expr::IsNull {
-                expr: Box::new(Expr::column(qualify(&right_name, &key))),
+                expr: Box::new(Expr::column(qualify(&right_name, &first_key))),
                 negated: false,
             });
         }
@@ -1642,6 +1676,120 @@ impl Lowerer<'_> {
                 .map(|f| NamedExpr::new(Expr::column(qualify(&left_name, f.name())), f.name()))
                 .collect(),
         })
+    }
+
+    /// The subquery of `EXISTS` lowered to its correlation keys: each
+    /// condition of its `WHERE` equating one of its columns with one of
+    /// the query's is a key pair, the query's side lowered and the
+    /// subquery's selected under a hidden name; the other conditions
+    /// filter it. Without a key both sides key on the constant 1, so
+    /// that the join keeps the rows when the subquery has any row.
+    fn exists_keys(
+        &self,
+        span: Span,
+        query: &ast::Query,
+    ) -> Result<(Plan, Vec<(Expr, String)>), Diagnostic> {
+        let simple = query.joins.is_empty() && query.group_by.is_empty() && query.having.is_none();
+        let (Some(from), true) = (&query.from, simple) else {
+            return Err(Diagnostic::at(
+                span,
+                "EXISTS takes a subquery of one table and a WHERE",
+            ));
+        };
+        let (table, _) = source(from, self.ctx, self.registry, self.parameters)?;
+        let inner = Lowerer {
+            ctx: self.ctx,
+            registry: self.registry,
+            parameters: self.parameters,
+            scope: Scope::single(table),
+            substitution: None,
+        };
+        let mut keys: Vec<(Expr, ast::Expr)> = Vec::new();
+        let mut rest: Vec<&ast::Expr> = Vec::new();
+        for conjunct in query.filter.iter().flat_map(conjuncts) {
+            if let ast::ExprKind::Binary {
+                op: ast::BinaryOp::Eq,
+                left,
+                right,
+            } = &conjunct.kind
+            {
+                // A side the subquery cannot lower but the query can is
+                // the query's; the subquery's own names come first.
+                let outer = |e: &ast::Expr| inner.expr(e).is_err() && self.expr(e).is_ok();
+                let own = |e: &ast::Expr| inner.expr(e).is_ok();
+                if outer(left) && own(right) {
+                    keys.push((self.expr(left)?, (**right).clone()));
+                    continue;
+                }
+                if own(left) && outer(right) {
+                    keys.push((self.expr(right)?, (**left).clone()));
+                    continue;
+                }
+            }
+            if inner.expr(conjunct).is_err() && self.mentions_own_column(conjunct) {
+                return Err(Diagnostic::at(
+                    conjunct.span,
+                    "an EXISTS subquery refers to the query's columns only in equalities with \
+                     its own, such as s.trace_id = l.trace_id",
+                ));
+            }
+            rest.push(conjunct);
+        }
+        let name = |i: usize| format!("__key{i}");
+        let (items, outer): (Vec<ast::SelectItem>, Vec<Expr>) = if keys.is_empty() {
+            let one = ast::Expr {
+                kind: ast::ExprKind::Number("1".into()),
+                span,
+            };
+            (
+                vec![ast::SelectItem::Expr {
+                    expr: one,
+                    alias: Some(name(0)),
+                }],
+                vec![Expr::literal(1)],
+            )
+        } else {
+            keys.into_iter()
+                .enumerate()
+                .map(|(i, (outer, own))| {
+                    (
+                        ast::SelectItem::Expr {
+                            expr: own,
+                            alias: Some(name(i)),
+                        },
+                        outer,
+                    )
+                })
+                .unzip()
+        };
+        let rewritten = ast::Query {
+            items,
+            from: Some(from.clone()),
+            joins: Vec::new(),
+            filter: conjunction(rest),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+        let right = lower_query(&rewritten, self.ctx, self.registry, self.parameters)?;
+        Ok((
+            right,
+            outer
+                .into_iter()
+                .enumerate()
+                .map(|(i, expr)| (expr, name(i)))
+                .collect(),
+        ))
+    }
+
+    /// Whether `expr` names a column of the tables in scope.
+    fn mentions_own_column(&self, expr: &ast::Expr) -> bool {
+        (matches!(expr.kind, ast::ExprKind::Name(_)) && self.expr(expr).is_ok())
+            || children(expr)
+                .into_iter()
+                .any(|child| self.mentions_own_column(child))
     }
 
     /// `tested [NOT] IN (list)`: the list is constants, read in the
@@ -2092,6 +2240,54 @@ mod tests {
         assert!(
             parse("INSERT INTO (SELECT 1) VALUES (1)").is_err(),
             "a derived table is not a target"
+        );
+    }
+
+    /// `[NOT] EXISTS (SELECT ...)` correlates by the equalities between
+    /// the subquery's columns and the query's, which key a semi or anti
+    /// join on the subquery's distinct rows; without one the join keys
+    /// on a constant, and any other use of the query's columns is
+    /// refused.
+    #[test]
+    fn exists_lowers_to_a_semi_join_on_its_correlation() {
+        let plan = lowered(
+            "SELECT l.body FROM logs l WHERE EXISTS (SELECT 1 FROM spans s \
+             WHERE s.trace_id = l.trace_id AND s.status_code = 'error')",
+        );
+        let text = plan.to_string();
+        assert!(
+            text.contains("Join inner: __rows0.trace_id = __in0.__key0"),
+            "{text}"
+        );
+        assert!(text.contains("status_code"), "{text}");
+        let anti = lowered(
+            "SELECT body FROM logs WHERE NOT EXISTS (SELECT 1 FROM spans \
+             WHERE logs.trace_id = spans.trace_id)",
+        );
+        assert!(anti.to_string().contains("Join left:"), "{anti}");
+        let constant = lowered(
+            "SELECT body FROM logs WHERE EXISTS (SELECT 1 FROM spans WHERE status_code = 'error')",
+        );
+        let text = constant.to_string();
+        assert!(
+            text.contains("= __in0.__key0") && text.contains("Project: 1 AS __key0"),
+            "{text}"
+        );
+        let error = |sql: &str| lower(&parse(sql).unwrap(), &ctx()).unwrap_err().message;
+        assert!(
+            error(
+                "SELECT body FROM logs l WHERE EXISTS (SELECT 1 FROM spans s \
+                 WHERE s.start_timestamp > l.timestamp)"
+            )
+            .contains("equalities"),
+        );
+        assert!(
+            error("SELECT body FROM logs WHERE body = 'x' OR EXISTS (SELECT 1 FROM spans)")
+                .contains("on its own"),
+        );
+        assert!(
+            error("SELECT body FROM logs WHERE EXISTS (SELECT 1 FROM spans GROUP BY name)")
+                .contains("one table"),
         );
     }
 

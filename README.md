@@ -59,9 +59,10 @@ the other side, and an `ASOF JOIN` pairs each left row with the one
 right row of its keys nearest in time on the side its inequality asks
 for (section 9.2), by binary search over the right rows of each key,
 but there are no merge or lookup variants; a subquery
-is a derived table in `FROM` or an `IN (SELECT ...)` condition of
-`WHERE`, lowered to a join on its distinct keys, but not `EXISTS` or
-a scalar subquery; no window
+is a derived table in `FROM`, or an `IN (SELECT ...)` or `EXISTS
+(SELECT ...)` condition of `WHERE` lowered to a join on its distinct
+keys, an `EXISTS` correlated by equalities with the query's columns,
+but not a scalar subquery; no window
 functions; `$n` parameters bind over the PostgreSQL protocol with
 their types inferred from the columns they meet, as whole numbers in
 `LIMIT` and `OFFSET`;

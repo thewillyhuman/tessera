@@ -413,6 +413,14 @@ pub enum ExprKind {
         /// `NOT` when true.
         negated: bool,
     },
+    /// `[NOT] EXISTS (SELECT ...)`: whether the query, which may refer
+    /// to the columns of the query around it, has any row.
+    Exists {
+        /// The query.
+        query: Box<Query>,
+        /// `NOT` when true.
+        negated: bool,
+    },
     /// `expr [NOT] BETWEEN low AND high`.
     Between {
         /// The tested expression.

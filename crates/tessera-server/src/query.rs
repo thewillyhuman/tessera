@@ -455,9 +455,10 @@ mod tests {
     }
 
     /// Trace 1 has an erroring span, trace 2 none; `IN (SELECT ...)`
-    /// keeps the spans of the traces the subquery names, once each.
+    /// keeps the spans of the traces the subquery names, once each, and
+    /// `EXISTS (SELECT ...)` correlated on the trace does the same.
     #[tokio::test]
-    async fn in_subquery_filters_by_the_rows_of_another_query() {
+    async fn subqueries_filter_by_the_rows_of_another_query() {
         let app = crate::router(crate::testing::state().await);
         let span = |trace, id, name, error| SpanSpec {
             service: "api",
@@ -510,6 +511,30 @@ mod tests {
             serde_json::json!({
                 "query": "SELECT name FROM spans WHERE trace_id NOT IN (SELECT trace_id FROM spans \
                           WHERE status_code = 'error') ORDER BY name",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(names(&value), ["root"], "trace 2's root: {value}");
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT s.name FROM spans s WHERE EXISTS (SELECT 1 FROM spans e \
+                          WHERE e.trace_id = s.trace_id AND e.status_code = 'error') \
+                          AND s.name = 'root' ORDER BY s.name",
+                "dataset": "prod"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        assert_eq!(names(&value), ["root"], "trace 1's root, once: {value}");
+        let (status, value) = post(
+            &app,
+            serde_json::json!({
+                "query": "SELECT s.name FROM spans s WHERE NOT EXISTS (SELECT 1 FROM spans e \
+                          WHERE e.trace_id = s.trace_id AND e.status_code = 'error') \
+                          ORDER BY s.name",
                 "dataset": "prod"
             }),
         )
