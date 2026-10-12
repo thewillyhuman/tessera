@@ -23,11 +23,13 @@
 
 pub mod rollups;
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tessera_manifest::{Advice, Alternative, LayoutRecord};
+use tessera_types::event::Scalar;
 use tessera_types::event::TIMESTAMP;
 use tessera_types::{Kind, Timestamp};
 
@@ -61,6 +63,10 @@ pub struct Observation {
     pub columns: BTreeSet<String>,
     /// Its predicates: column and operator.
     pub predicates: Vec<(String, String)>,
+    /// The bounds of its range predicates, per column: the lower and
+    /// the upper, either absent (AD-6).
+    #[serde(default)]
+    pub bounds: BTreeMap<String, (Option<Scalar>, Option<Scalar>)>,
     /// The columns it grouped by.
     pub group_by: Vec<String>,
     /// Bytes the scan fetched.
@@ -81,6 +87,9 @@ pub struct FileSummary {
     /// Distinct values per column, as the file's statistics count them
     /// (AD-6).
     pub distinct: BTreeMap<String, u64>,
+    /// The octiles per column, as the file's statistics keep them
+    /// (AD-6).
+    pub quantiles: BTreeMap<String, Vec<Scalar>>,
     /// Its sort key, `timestamp` last.
     pub sort_key: Vec<String>,
     /// Its layout epoch.
@@ -154,12 +163,12 @@ pub fn advise(inputs: &Inputs) -> Outcome {
     let weighted = weigh(&inputs.observations, inputs.now);
     let pins = inputs.pins.clone().unwrap_or_default();
     let current_key = full_key(&inputs.current.sort_key);
-    let cardinalities = cardinalities(&inputs.files);
+    let statistics = statistics(&inputs.files);
     let cost_of = |candidate: &[String]| {
         cost(
             &weighted,
             &inputs.files,
-            &cardinalities,
+            &statistics,
             &current_key,
             candidate,
         )
@@ -175,7 +184,7 @@ pub fn advise(inputs: &Inputs) -> Outcome {
         None => greedy(
             &weighted,
             &inputs.files,
-            &cardinalities,
+            &statistics,
             &current_key,
             &mut alternatives,
         ),
@@ -325,6 +334,62 @@ fn full_key(sort_key: &[String]) -> Vec<String> {
     key
 }
 
+/// What the files tell of their columns (AD-6): the most distinct
+/// values any file counted, and every file's octiles with its rows.
+#[derive(Default)]
+struct Statistics {
+    cardinalities: BTreeMap<String, u64>,
+    octiles: BTreeMap<String, Vec<(u64, Vec<Scalar>)>>,
+}
+
+fn statistics(files: &[FileSummary]) -> Statistics {
+    let mut octiles: BTreeMap<String, Vec<(u64, Vec<Scalar>)>> = BTreeMap::new();
+    for file in files {
+        for (column, points) in &file.quantiles {
+            octiles
+                .entry(column.clone())
+                .or_default()
+                .push((file.rows, points.clone()));
+        }
+    }
+    Statistics {
+        cardinalities: cardinalities(files),
+        octiles,
+    }
+}
+
+/// The share of a column's values a range keeps, read off the octiles
+/// of the files weighted by their rows: a bound's share is the eighths
+/// at or below it; none when no file has octiles or the range has no
+/// bound.
+#[allow(clippy::cast_precision_loss)]
+fn range_selectivity(
+    statistics: &Statistics,
+    column: &str,
+    bounds: Option<&(Option<Scalar>, Option<Scalar>)>,
+) -> Option<f64> {
+    let (low, high) = bounds?;
+    if low.is_none() && high.is_none() {
+        return None;
+    }
+    let files = statistics.octiles.get(column)?;
+    let share_below = |points: &[Scalar], bound: &Scalar| {
+        let at_or_below = points
+            .iter()
+            .filter(|p| p.compare(bound).is_some_and(|o| o != Ordering::Greater))
+            .count();
+        at_or_below as f64 / (points.len() + 1) as f64
+    };
+    let (mut kept, mut rows) = (0.0, 0.0);
+    for (count, points) in files.iter().filter(|(_, points)| !points.is_empty()) {
+        let below_low = low.as_ref().map_or(0.0, |l| share_below(points, l));
+        let up_to_high = high.as_ref().map_or(1.0, |h| share_below(points, h));
+        kept += *count as f64 * (up_to_high - below_low).clamp(0.0, 1.0);
+        rows += *count as f64;
+    }
+    (rows > 0.0).then(|| kept / rows)
+}
+
 /// The distinct values of each column across the files (AD-6): the
 /// most any one file counted, a floor of what the dataset holds.
 fn cardinalities(files: &[FileSummary]) -> BTreeMap<String, u64> {
@@ -340,13 +405,14 @@ fn cardinalities(files: &[FileSummary]) -> BTreeMap<String, u64> {
 
 /// The per-column selectivity of a query: its observed selectivity
 /// spread over its predicates, else one value among the column's
-/// distinct ones for an equality when the files counted them (AD-6),
+/// distinct ones for an equality when the files counted them, or the
+/// share of the column's octiles a range's bounds take in (AD-6),
 /// else a guess by operator.
 #[allow(clippy::cast_precision_loss)]
 fn column_selectivity(
     observation: &Observation,
     column: &str,
-    cardinalities: &BTreeMap<String, u64>,
+    statistics: &Statistics,
 ) -> Option<f64> {
     let predicates: Vec<&(String, String)> = observation
         .predicates
@@ -354,8 +420,10 @@ fn column_selectivity(
         .filter(|(_, op)| matches!(op.as_str(), "=" | "in" | "range"))
         .collect();
     let (_, op) = predicates.iter().find(|(c, _)| c == column)?;
-    let guess: f64 = match (op.as_str(), cardinalities.get(column)) {
-        ("range", _) => 0.5,
+    let guess: f64 = match (op.as_str(), statistics.cardinalities.get(column)) {
+        ("range", _) => {
+            range_selectivity(statistics, column, observation.bounds.get(column)).unwrap_or(0.5)
+        }
         (_, Some(distinct)) if *distinct > 0 => 1.0 / *distinct as f64,
         _ => 0.1,
     };
@@ -372,17 +440,13 @@ fn column_selectivity(
 /// The bytes a query would scan under a sort key: its bytes times the
 /// selectivity of every leading key column it filters on, a range
 /// predicate ending the prefix.
-fn estimated_bytes(
-    observation: &Observation,
-    sort_key: &[String],
-    cardinalities: &BTreeMap<String, u64>,
-) -> f64 {
+fn estimated_bytes(observation: &Observation, sort_key: &[String], statistics: &Statistics) -> f64 {
     let mut bytes = bytes_of(observation);
     for column in sort_key {
         if column == TIMESTAMP {
             break;
         }
-        let Some(selectivity) = column_selectivity(observation, column, cardinalities) else {
+        let Some(selectivity) = column_selectivity(observation, column, statistics) else {
             break;
         };
         bytes *= selectivity;
@@ -402,13 +466,13 @@ fn estimated_bytes(
 fn cost(
     weighted: &[Weighted],
     files: &[FileSummary],
-    cardinalities: &BTreeMap<String, u64>,
+    statistics: &Statistics,
     current: &[String],
     candidate: &[String],
 ) -> f64 {
     let scan: f64 = weighted
         .iter()
-        .map(|w| w.weight * estimated_bytes(&w.observation, candidate, cardinalities))
+        .map(|w| w.weight * estimated_bytes(&w.observation, candidate, statistics))
         .sum();
     let rewrite: f64 = if current == candidate {
         0.0
@@ -454,7 +518,7 @@ fn storage_delta(files: &[FileSummary], candidate: &[String]) -> f64 {
 fn greedy(
     weighted: &[Weighted],
     files: &[FileSummary],
-    cardinalities: &BTreeMap<String, u64>,
+    statistics: &Statistics,
     current: &[String],
     alternatives: &mut Vec<Alternative>,
 ) -> Vec<String> {
@@ -468,7 +532,7 @@ fn greedy(
     }
     let mut key: Vec<String> = Vec::new();
     // The bar to clear is the layout in force, which costs no rewrite.
-    let mut best = cost(weighted, files, cardinalities, current, current);
+    let mut best = cost(weighted, files, statistics, current, current);
     while key.len() < MAX_SORT_COLUMNS {
         let mut winner: Option<(String, f64, f64)> = None;
         for column in candidates.keys() {
@@ -477,15 +541,15 @@ fn greedy(
             }
             let mut trial = key.clone();
             trial.push(column.clone());
-            let trial_cost = cost(weighted, files, cardinalities, current, &full_key(&trial));
+            let trial_cost = cost(weighted, files, statistics, current, &full_key(&trial));
             // Lower cardinality earlier: among near-equal costs, prefer
             // the column with fewer distinct values, as the files
             // counted them, else the one whose predicates keep more rows.
-            let cardinality = match cardinalities.get(column) {
+            let cardinality = match statistics.cardinalities.get(column) {
                 Some(distinct) if *distinct > 0 => 1.0 / *distinct as f64,
                 _ => weighted
                     .iter()
-                    .filter_map(|w| column_selectivity(&w.observation, column, cardinalities))
+                    .filter_map(|w| column_selectivity(&w.observation, column, statistics))
                     .fold(0.0_f64, f64::max),
             };
             let better = match &winner {
@@ -627,6 +691,7 @@ mod tests {
             rows_scanned: 10_000,
             selectivity: Some(selectivity),
             text: format!("SELECT ... WHERE {column} {op} ..."),
+            bounds: BTreeMap::new(),
         }
     }
 
@@ -639,6 +704,7 @@ mod tests {
                 epoch: 0,
                 rows: 10_000,
                 window_start: at(f64::from(u32::try_from(i).unwrap_or(0))),
+                quantiles: BTreeMap::new(),
             })
             .collect()
     }
@@ -683,8 +749,8 @@ mod tests {
             "unseen layouts change nothing"
         );
         assert!(
-            cost(&[], &mixed, &BTreeMap::new(), &current, &hosted)
-                < cost(&[], &same_size, &BTreeMap::new(), &current, &hosted),
+            cost(&[], &mixed, &Statistics::default(), &current, &hosted)
+                < cost(&[], &same_size, &Statistics::default(), &current, &hosted),
             "the saving counts against the rewrite"
         );
     }
@@ -696,6 +762,7 @@ mod tests {
     fn counted_distinct_values_set_the_selectivity_of_an_equality() {
         let unmeasured = |column: &str| Observation {
             selectivity: None,
+            bounds: BTreeMap::new(),
             ..query(9.5, column, "=", 0.0)
         };
         let workload: Vec<Observation> = (0..10)
@@ -713,14 +780,60 @@ mod tests {
             counted.advice.proposed.sort_key[0], "attr.host",
             "one host in a thousand keeps fewer rows than one region in four"
         );
-        let cardinalities = cardinalities(&with_counts.files);
-        let host = column_selectivity(&unmeasured("attr.host"), "attr.host", &cardinalities);
+        let statistics = statistics(&with_counts.files);
+        let host = column_selectivity(&unmeasured("attr.host"), "attr.host", &statistics);
         assert!(host.is_some_and(|s| (s - 0.001).abs() < 1e-9), "{host:?}");
-        let unknown = column_selectivity(&unmeasured("attr.host"), "attr.host", &BTreeMap::new());
+        let unknown = column_selectivity(
+            &unmeasured("attr.host"),
+            "attr.host",
+            &Statistics::default(),
+        );
         assert!(
             unknown.is_some_and(|s| (s - 0.1).abs() < 1e-9),
             "the guess stands: {unknown:?}"
         );
+    }
+
+    /// AD-6: a range on a column keeps the share of values its bounds
+    /// take in, read off the octiles the files keep and weighted by
+    /// their rows; without octiles the guess of a half stands.
+    #[test]
+    fn octiles_set_the_selectivity_of_a_range() {
+        let mut above = Observation {
+            selectivity: None,
+            bounds: BTreeMap::new(),
+            ..query(9.5, "attr.latency", "range", 0.0)
+        };
+        above
+            .bounds
+            .insert("attr.latency".into(), (Some(Scalar::Int(75)), None));
+        let mut files = files(&["timestamp"], 2);
+        files[0].quantiles.insert(
+            "attr.latency".into(),
+            (1..8).map(|k| Scalar::Int(k * 10)).collect(),
+        );
+        files[1].quantiles.insert(
+            "attr.latency".into(),
+            (1..8).map(|k| Scalar::Int(k * 100)).collect(),
+        );
+        let statistics = statistics(&files);
+        let kept = column_selectivity(&above, "attr.latency", &statistics).unwrap();
+        assert!(
+            (kept - 0.5625).abs() < 1e-9,
+            "one eighth of the first file and all of the second: {kept}"
+        );
+        let mut between = above.clone();
+        between.bounds.insert(
+            "attr.latency".into(),
+            (Some(Scalar::Int(15)), Some(Scalar::Int(45))),
+        );
+        let kept = column_selectivity(&between, "attr.latency", &statistics).unwrap();
+        assert!(
+            (kept - 3.0 / 16.0).abs() < 1e-9,
+            "three eighths of the first file, none of the second: {kept}"
+        );
+        let unknown = column_selectivity(&above, "attr.latency", &Statistics::default()).unwrap();
+        assert!((unknown - 0.5).abs() < 1e-9, "{unknown}");
     }
 
     #[test]
@@ -768,6 +881,7 @@ mod tests {
         let workload: Vec<Observation> = (0..5)
             .map(|i| Observation {
                 predicates: Vec::new(),
+                bounds: BTreeMap::new(),
                 ..query(9.0 + f64::from(i) / 10.0, "body", "search", 0.5)
             })
             .collect();
@@ -825,6 +939,7 @@ mod tests {
                 epoch: 0,
                 rows: 1_000,
                 window_start: at(f64::from(i % 2)),
+                quantiles: BTreeMap::new(),
             })
             .collect();
         assert_eq!(window_for(&many), Duration::from_secs(3_600));

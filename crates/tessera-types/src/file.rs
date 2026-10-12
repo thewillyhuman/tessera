@@ -79,6 +79,12 @@ pub struct ColumnStats {
     /// stands for "many" (AD-6); none when the type cannot be compared.
     #[serde(default)]
     pub distinct: Option<u64>,
+    /// The octiles (AD-6): the non-null values at the eighths of their
+    /// order, 1/8 to 7/8, off which the share of values at or below a
+    /// bound is read; empty when the type has no order or the values
+    /// are fewer than eight.
+    #[serde(default)]
+    pub quantiles: Vec<Scalar>,
 }
 
 /// A data file's manifest entry.
@@ -161,6 +167,7 @@ mod tests {
                 max: None,
                 null_count: 3,
                 distinct: None,
+                quantiles: Vec::new(),
             }],
             indexes: Vec::new(),
         }

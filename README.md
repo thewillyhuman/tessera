@@ -282,8 +282,10 @@ sort column and rewrite its files without intervention.
 
 Gaps left in M8: the cost model
 estimates selectivity from the workload, or for an equality from the
-distinct values the files counted, exact up to 65,536 per file, with
-no quantile sketches (AD-6); the storage term of the cost
+distinct values the files counted, exact up to 65,536 per file, and
+for a range from the octiles the files keep per column, the share of
+their values the bounds take in (AD-6), with no sketch finer than
+eighths; the storage term of the cost
 counts only the compression a layout has shown on files already in
 it; a
 promoted column is read from `_overflow` by the tail and by files

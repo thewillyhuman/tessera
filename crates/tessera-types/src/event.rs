@@ -11,6 +11,7 @@
 //! object of path to scalar: the fallback encoding of ST-13, used until
 //! Variant support in the Parquet implementation is verified.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
@@ -261,6 +262,25 @@ pub enum Scalar {
     Float(f64),
     /// Text.
     Text(String),
+}
+
+impl Scalar {
+    /// How `self` orders against `other`: numbers among themselves, an
+    /// integer against a float as floats, text against text and
+    /// booleans against booleans; none across kinds or for a NaN.
+    #[must_use]
+    pub fn compare(&self, other: &Scalar) -> Option<Ordering> {
+        #[allow(clippy::cast_precision_loss)]
+        match (self, other) {
+            (Scalar::Int(a), Scalar::Int(b)) => Some(a.cmp(b)),
+            (Scalar::Float(a), Scalar::Float(b)) => a.partial_cmp(b),
+            (Scalar::Int(a), Scalar::Float(b)) => (*a as f64).partial_cmp(b),
+            (Scalar::Float(a), Scalar::Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Scalar::Text(a), Scalar::Text(b)) => Some(a.cmp(b)),
+            (Scalar::Bool(a), Scalar::Bool(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
 }
 
 /// Flattened attributes of one event: dotted path to scalar, under the
@@ -1512,5 +1532,36 @@ mod tests {
         let merged = attributes_column(&rows).unwrap();
         assert_eq!(merged.value(0), r#"{"attr.code":500}"#);
         assert_eq!(merged.value(1), r#"{"attr.code":"500"}"#);
+    }
+}
+
+#[cfg(test)]
+mod scalar_tests {
+    use super::*;
+
+    #[test]
+    fn scalars_compare_within_their_kind() {
+        assert_eq!(
+            Scalar::Int(1).compare(&Scalar::Int(2)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Scalar::Int(2).compare(&Scalar::Float(1.5)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            Scalar::Float(1.5).compare(&Scalar::Int(2)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            Scalar::Text("a".into()).compare(&Scalar::Text("a".into())),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            Scalar::Bool(false).compare(&Scalar::Bool(true)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(Scalar::Int(1).compare(&Scalar::Text("1".into())), None);
+        assert_eq!(Scalar::Float(f64::NAN).compare(&Scalar::Float(1.0)), None);
     }
 }

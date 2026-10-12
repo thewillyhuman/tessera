@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
-//! Per-column statistics for manifest entries (ST-12): min, max and null
-//! count of every column whose type has an order, and the distinct
-//! non-null values of every comparable column, exact up to
+//! Per-column statistics for manifest entries (ST-12): min, max, null
+//! count and octiles of every column whose type has an order, and the
+//! distinct non-null values of every comparable column, exact up to
 //! [`DISTINCT_CAP`] (AD-6). Columns of other types get a null count only.
 
 use std::collections::HashSet;
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
 };
+use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::row::{RowConverter, SortField};
 use tessera_types::ColumnStats;
@@ -20,6 +21,9 @@ use tessera_types::event::Scalar;
 /// Distinct values are counted exactly up to this many; the cap then
 /// stands for "many", which is what a sort-key choice needs to know.
 pub const DISTINCT_CAP: u64 = 65_536;
+
+/// The octiles divide the ordered values into this many parts.
+const OCTILES: usize = 8;
 
 /// Statistics of one column.
 #[must_use]
@@ -31,6 +35,50 @@ pub fn column_stats(name: &str, array: &ArrayRef) -> ColumnStats {
         max,
         null_count: array.null_count() as u64,
         distinct: distinct(array),
+        quantiles: quantiles(array),
+    }
+}
+
+/// The octiles of `array`'s non-null values (AD-6): the value at each
+/// eighth of their order, 1/8 to 7/8; none for fewer than eight values
+/// or a type without an order.
+fn quantiles(array: &ArrayRef) -> Vec<Scalar> {
+    let present = array.len() - array.null_count();
+    if present < OCTILES {
+        return Vec::new();
+    }
+    let last_nulls = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    let Ok(sorted) = arrow::compute::sort(array, Some(last_nulls)) else {
+        return Vec::new();
+    };
+    (1..OCTILES)
+        .filter_map(|eighth| scalar_at(&sorted, eighth * present / OCTILES))
+        .collect()
+}
+
+/// The value of `array` at `index` as a scalar, for the ordered types.
+fn scalar_at(array: &ArrayRef, index: usize) -> Option<Scalar> {
+    let any = array.as_any();
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => any
+            .downcast_ref::<TimestampNanosecondArray>()
+            .map(|a| Scalar::Int(a.value(index))),
+        DataType::Int64 => any
+            .downcast_ref::<Int64Array>()
+            .map(|a| Scalar::Int(a.value(index))),
+        DataType::Int32 => any
+            .downcast_ref::<Int32Array>()
+            .map(|a| Scalar::Int(i64::from(a.value(index)))),
+        DataType::Float64 => any
+            .downcast_ref::<Float64Array>()
+            .map(|a| Scalar::Float(a.value(index))),
+        DataType::Utf8 => any
+            .downcast_ref::<StringArray>()
+            .map(|a| Scalar::Text(a.value(index).to_owned())),
+        _ => None,
     }
 }
 
@@ -144,6 +192,41 @@ mod tests {
         let past_cap = i64::try_from(DISTINCT_CAP).unwrap() + 7;
         let many: ArrayRef = Arc::new(Int64Array::from_iter_values(0..past_cap));
         assert_eq!(column_stats("m", &many).distinct, Some(DISTINCT_CAP));
+    }
+
+    /// AD-6: the octiles mark where a column's values lie, nulls left
+    /// out, and fewer than eight values give none.
+    #[test]
+    fn octiles_mark_the_spread_of_the_values() {
+        let hundred: ArrayRef = Arc::new(Int64Array::from_iter_values((0..100).rev()));
+        assert_eq!(
+            column_stats("n", &hundred).quantiles,
+            [12, 25, 37, 50, 62, 75, 87].map(Scalar::Int)
+        );
+        let with_nulls: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+        ]));
+        assert_eq!(
+            column_stats("n", &with_nulls).quantiles,
+            [2, 3, 4, 5, 6, 7, 8].map(Scalar::Int)
+        );
+        let few: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        assert!(column_stats("n", &few).quantiles.is_empty());
+        let text: ArrayRef = Arc::new(StringArray::from(
+            (0..16).map(|i| format!("{i:02}")).collect::<Vec<_>>(),
+        ));
+        assert_eq!(
+            column_stats("s", &text).quantiles[0],
+            Scalar::Text("02".into())
+        );
     }
 
     #[test]

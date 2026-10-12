@@ -259,6 +259,7 @@ mod tests {
                 max: Some(Scalar::Int(severity.1)),
                 null_count: 0,
                 distinct: None,
+                quantiles: Vec::new(),
             }],
             indexes: Vec::new(),
         }
@@ -343,6 +344,7 @@ mod tests {
             max: Some(Scalar::Int(200)),
             null_count: 0,
             distinct: None,
+            quantiles: Vec::new(),
         });
         let mut files = vec![typed];
         let path = |data_type: DataType| Expr::Path {
@@ -366,6 +368,7 @@ mod tests {
             max: Some(Scalar::Text("b".into())),
             null_count: 0,
             distinct: None,
+            quantiles: Vec::new(),
         });
         let (kept, _) = prune_files(&scan, &files);
         assert_eq!(
@@ -392,6 +395,7 @@ mod tests {
             max: Some(Scalar::Text(max.into())),
             null_count: nulls,
             distinct: None,
+            quantiles: Vec::new(),
         };
         let numbered = |nulls: u64| ColumnStats {
             name: NEST_LEFT.into(),
@@ -399,6 +403,7 @@ mod tests {
             max: Some(Scalar::Int(9)),
             null_count: nulls,
             distinct: None,
+            quantiles: Vec::new(),
         };
         let mut complete = file(1, 0, 10, (1, 5));
         complete

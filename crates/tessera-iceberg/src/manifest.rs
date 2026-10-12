@@ -281,6 +281,7 @@ mod tests {
                 max: Some(Scalar::Int(9)),
                 null_count: 1,
                 distinct: Some(2),
+                quantiles: Vec::new(),
             }],
             indexes: Vec::new(),
         }

@@ -10,7 +10,8 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
-use tessera_ir::{AggregateExpr, BinaryOp, Expr, NamedExpr, Plan, Scan};
+use tessera_ir::{AggregateExpr, BinaryOp, Expr, Literal, NamedExpr, Plan, Scan};
+use tessera_types::event::Scalar;
 use tessera_types::{DatasetName, Kind, TenantId};
 
 use crate::engine::Analysis;
@@ -23,6 +24,12 @@ pub struct PredicateUse {
     pub column: String,
     /// The operator, as `=`, `<`, `like`, `in`, `search` or `other`.
     pub op: String,
+    /// The lower bound of a range, inclusive or not, as a scalar (AD-6).
+    #[serde(default)]
+    pub low: Option<Scalar>,
+    /// The upper bound of a range, likewise.
+    #[serde(default)]
+    pub high: Option<Scalar>,
 }
 
 /// What a query asked of one scanned table.
@@ -232,27 +239,38 @@ fn predicate_uses(expr: &Expr, into: &mut Vec<PredicateUse>) {
             predicate_uses(right, into);
         }
         Expr::Binary { op, left, right } => {
-            let column = operand(left).or_else(|| operand(right));
-            let constant =
-                matches!(**left, Expr::Literal(_)) || matches!(**right, Expr::Literal(_));
-            if let Some(column) = column.filter(|_| constant) {
-                into.push(PredicateUse {
-                    column,
-                    op: match op {
-                        BinaryOp::Eq => "=",
-                        BinaryOp::NotEq => "<>",
-                        BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => "range",
-                        _ => "other",
-                    }
-                    .to_owned(),
-                });
-            }
+            // The column on the left, the constant on the right.
+            let (column, literal, op) = match (operand(left), operand(right), &**left, &**right) {
+                (Some(column), _, _, Expr::Literal(literal)) => (column, literal, *op),
+                (_, Some(column), Expr::Literal(literal), _) => (column, literal, op.flipped()),
+                _ => return,
+            };
+            let bound = scalar_of(literal);
+            let (low, high) = match op {
+                BinaryOp::Gt | BinaryOp::GtEq => (bound, None),
+                BinaryOp::Lt | BinaryOp::LtEq => (None, bound),
+                _ => (None, None),
+            };
+            into.push(PredicateUse {
+                column,
+                op: match op {
+                    BinaryOp::Eq => "=",
+                    BinaryOp::NotEq => "<>",
+                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => "range",
+                    _ => "other",
+                }
+                .to_owned(),
+                low,
+                high,
+            });
         }
         Expr::Like { expr, .. } => {
             if let Some(column) = operand(expr) {
                 into.push(PredicateUse {
                     column,
                     op: "like".into(),
+                    low: None,
+                    high: None,
                 });
             }
         }
@@ -261,6 +279,8 @@ fn predicate_uses(expr: &Expr, into: &mut Vec<PredicateUse>) {
                 into.push(PredicateUse {
                     column,
                     op: "in".into(),
+                    low: None,
+                    high: None,
                 });
             }
         }
@@ -270,6 +290,8 @@ fn predicate_uses(expr: &Expr, into: &mut Vec<PredicateUse>) {
                     into.push(PredicateUse {
                         column,
                         op: "search".into(),
+                        low: None,
+                        high: None,
                     });
                 }
             }
@@ -279,10 +301,25 @@ fn predicate_uses(expr: &Expr, into: &mut Vec<PredicateUse>) {
                 into.push(PredicateUse {
                     column,
                     op: "null".into(),
+                    low: None,
+                    high: None,
                 });
             }
         }
         _ => {}
+    }
+}
+
+/// A literal as the scalar a bound is kept as: a timestamp by its
+/// nanoseconds; none for a kind without an order.
+fn scalar_of(literal: &Literal) -> Option<Scalar> {
+    match literal {
+        Literal::Int(i) => Some(Scalar::Int(*i)),
+        Literal::Float(f) => Some(Scalar::Float(*f)),
+        Literal::Text(t) => Some(Scalar::Text(t.clone())),
+        Literal::Bool(b) => Some(Scalar::Bool(*b)),
+        Literal::Timestamp(t) => Some(Scalar::Int(t.as_nanos())),
+        Literal::Null | Literal::Duration(_) | Literal::Bytes(_) => None,
     }
 }
 
@@ -548,11 +585,15 @@ mod tests {
             [
                 PredicateUse {
                     column: "severity_number".into(),
-                    op: "range".into()
+                    op: "range".into(),
+                    low: Some(Scalar::Int(17)),
+                    high: None,
                 },
                 PredicateUse {
                     column: "attr.host".into(),
-                    op: "=".into()
+                    op: "=".into(),
+                    low: None,
+                    high: None,
                 }
             ]
         );

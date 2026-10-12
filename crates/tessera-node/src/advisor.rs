@@ -11,7 +11,7 @@
 //! stay valid until re-clustered. Aggregation shapes the workload
 //! repeats become rollups (section 8.7), one owner per tenant.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +26,7 @@ use tessera_ir::{BindContext, RollupDefinition};
 use tessera_manifest::{DatasetLogs, Manifests, list_partitions, registry};
 use tessera_object::ObjectStore;
 use tessera_sql::SqlFrontend;
+use tessera_types::event::Scalar;
 use tessera_types::{DatasetName, Env, Kind, TenantId, Timestamp, WorkKind};
 
 use crate::leases::Owned;
@@ -259,6 +260,12 @@ async fn file_summaries(
                     .iter()
                     .filter_map(|c| c.distinct.map(|d| (c.name.clone(), d)))
                     .collect(),
+                quantiles: f
+                    .columns
+                    .iter()
+                    .filter(|c| !c.quantiles.is_empty())
+                    .map(|c| (c.name.clone(), c.quantiles.clone()))
+                    .collect(),
                 sort_key: f.sort_key.clone(),
                 epoch: f.layout_epoch,
                 rows: f.row_count,
@@ -344,6 +351,19 @@ async fn read_observations(
                 .iter()
                 .map(|p| (p.column.clone(), p.op.clone()))
                 .collect();
+            let mut bounds: BTreeMap<String, (Option<Scalar>, Option<Scalar>)> = BTreeMap::new();
+            for p in predicate_uses
+                .iter()
+                .filter(|p| p.low.is_some() || p.high.is_some())
+            {
+                let bound = bounds.entry(p.column.clone()).or_default();
+                if p.low.is_some() {
+                    bound.0.clone_from(&p.low);
+                }
+                if p.high.is_some() {
+                    bound.1.clone_from(&p.high);
+                }
+            }
             let summary = format!(
                 "predicates {:?}, group by {:?}",
                 predicates
@@ -357,6 +377,7 @@ async fn read_observations(
                 columns: serde_json::from_str::<BTreeSet<String>>(&text(columns))
                     .unwrap_or_default(),
                 predicates,
+                bounds,
                 group_by,
                 bytes_scanned: bytes
                     .filter(|b| !b.is_null(i))
