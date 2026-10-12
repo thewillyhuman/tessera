@@ -14,7 +14,7 @@
 use arrow::array::RecordBatch;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use tessera_ir::{Plan, Scan};
+use tessera_ir::{Expr, Plan, Scan};
 use tessera_types::{FileId, FileMeta, NodeId};
 
 /// The files of one scan that one node reads.
@@ -47,29 +47,38 @@ pub struct StageTask {
 /// final stage (QE-14): under `id`, split into `partitions` parts by a
 /// hash of the `keys` columns, each part fetched once by the worker
 /// that runs the final stage over it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Exchange {
     /// The exchange, unique to one stage of one query.
     pub id: String,
     /// How many parts the output splits into, one per worker.
     pub partitions: u32,
-    /// The columns of the output whose values choose the part.
-    pub keys: Vec<String>,
+    /// The expressions over the output whose values choose the part.
+    pub keys: Vec<Expr>,
 }
 
-/// A final stage over one partition of an exchange (QE-14): `plan`
-/// folds the rows of `partition` that the worker itself kept, those
-/// the coordinator hands over with the task, and those fetched from
-/// the other `producers`.
+/// A final stage over one partition of its inputs' exchanges (QE-14):
+/// `plan` folds, for each of its inputs, the rows of `partition` that
+/// the worker itself kept, those the coordinator hands over with the
+/// task, and those fetched from the input's other producers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FinalTask {
-    /// The final plan, over the partial plan it folds.
+    /// The final plan: a final aggregate over its partial plan, or a
+    /// join over its two sides.
     pub plan: Plan,
-    /// The exchange the partial outputs were kept under.
-    pub exchange: Exchange,
     /// The partition this worker folds.
     pub partition: u32,
-    /// The other nodes that kept a partial output.
+    /// One per input of the plan, in its order.
+    pub inputs: Vec<FinalInput>,
+}
+
+/// One input of a final stage: the exchange its rows were kept under
+/// and the other nodes that kept some.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FinalInput {
+    /// The exchange.
+    pub exchange: Exchange,
+    /// The other nodes that kept a partial output under it.
     pub producers: Vec<Peer>,
 }
 
@@ -142,13 +151,13 @@ pub trait RemoteScan: Send + Sync {
     }
 
     /// Runs the final stage `task` on `peer` over `rows`, the
-    /// coordinator's share of the partition, and what the task's
-    /// producers kept.
+    /// coordinator's share of the partition for each input, and what
+    /// the inputs' producers kept.
     fn finalize<'a>(
         &'a self,
         peer: &'a Peer,
         task: &'a FinalTask,
-        rows: &'a [RecordBatch],
+        rows: &'a [Vec<RecordBatch>],
     ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
         let _ = (peer, task, rows);
         Box::pin(async {

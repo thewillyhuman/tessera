@@ -217,10 +217,17 @@ coordinator, a partition a worker cannot fold is folded there, and a
 kept output that is gone is recomputed there from its files (QE-17);
 `EXPLAIN ANALYZE` reports each stage.
 
-Gaps left in M6: joins, trace grouping, sorts without a limit and
-PromQL evaluation still run on the coordinator over the rows the leaf
-tasks return, and the outputs of top-k, limit and keyless aggregate
-stages go through the coordinator; there is no object byte
+A join whose two sides are scans folds on the workers the same way,
+each side an exchange split by its join keys and each worker joining
+one partition of both sides; the runtime filter an inner join's left
+side gets from the right side's keys on one node is not applied
+there.
+
+Gaps left in M6: trace grouping, sorts without a limit, PromQL
+evaluation and joins over other inputs still run on the coordinator
+over the rows the leaf tasks return, and the outputs of top-k, limit
+and keyless aggregate stages go through the coordinator; there is no
+object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.

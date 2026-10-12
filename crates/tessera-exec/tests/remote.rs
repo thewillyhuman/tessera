@@ -10,13 +10,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::DataType;
 use futures::future::BoxFuture;
 use tessera_exec::{
     CpuPool, Engine, FinalTask, LeafTask, Peer, Peers, QueryLimits, RemoteError, RemoteScan,
     StageAnalysis, StageTask,
 };
 use tessera_format::ParquetFormat;
-use tessera_ir::{AggregateExpr, Expr, NamedExpr, Plan, Registry, Scan, SortKey};
+use tessera_ir::{
+    AggregateExpr, Expr, JoinKind, JoinSide, NamedExpr, Plan, Registry, Scan, SortKey,
+};
 use tessera_manifest::{intake, registry};
 use tessera_object::{MemoryStore, Pools};
 use tessera_opt::optimize;
@@ -317,7 +320,7 @@ impl RemoteScan for Mesh {
         &'a self,
         peer: &'a Peer,
         task: &'a FinalTask,
-        rows: &'a [RecordBatch],
+        rows: &'a [Vec<RecordBatch>],
     ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
         Box::pin(async move {
             self.record("final", peer);
@@ -676,5 +679,59 @@ async fn a_lost_output_is_recomputed_here() {
     assert!(
         stage.final_failed >= 1,
         "the other worker could not fetch from the lost producer either: {stage:?}"
+    );
+}
+
+/// A self join of the logs on their number: every row meets itself.
+fn joined_plan() -> Plan {
+    let scan = || Plan::Scan(Scan::all(TenantId::DEFAULT, dataset(), Kind::Log));
+    let n = Expr::Path {
+        path: "attr.n".into(),
+        data_type: DataType::Int64,
+    };
+    optimize(
+        Plan::Join {
+            left: JoinSide::new(scan(), "l"),
+            right: JoinSide::new(scan(), "r"),
+            on: vec![(n.clone(), n)],
+            kind: JoinKind::Inner,
+            asof: None,
+        }
+        .project(vec![
+            NamedExpr::new(Expr::column("l.body"), "left"),
+            NamedExpr::new(Expr::column("r.body"), "right"),
+        ]),
+        &Registry::builtin(),
+    )
+    .unwrap()
+}
+
+/// QE-14: a join of two scans runs on the workers, each side an
+/// exchange split by its join keys and each worker joining one
+/// partition of both; a lost output is made up for here.
+#[tokio::test]
+async fn a_join_of_two_scans_folds_on_the_workers() {
+    let (store, env) = populate().await;
+    let expected = engine(&store, &env).run(&joined_plan()).await.unwrap();
+    assert_eq!(expected.num_rows(), 20, "every row meets itself");
+    let mesh = Arc::new(Mesh::default());
+    let (coordinator, peers) = three_nodes(&store, &env, &mesh);
+    let output = coordinator.run(&joined_plan()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    let stage = &output.analysis.stages[0];
+    assert_eq!(stage.kind, "join");
+    assert!(stage.remote >= 2, "a stage per side and peer: {stage:?}");
+    assert!(stage.finals >= 1 && stage.final_failed == 0, "{stage:?}");
+
+    mesh.fail_fetch
+        .lock()
+        .unwrap()
+        .push(peers[1].node.to_string());
+    let output = coordinator.run(&joined_plan()).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    let stage = &output.analysis.stages[0];
+    assert_eq!(
+        stage.recomputed, 2,
+        "the lost producer's share of each side, once: {stage:?}"
     );
 }

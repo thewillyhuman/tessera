@@ -8,9 +8,9 @@
 //! task names an exchange to keep the output under; QE-14), a kept
 //! partition to hand out (`GET /internal/v1/exchange/{id}/{partition}`,
 //! answered with the rows once, 404 after), a final stage to run over
-//! one partition of an exchange (`POST /internal/v1/final`, the JSON
-//! `FinalTask` and the coordinator's rows framed in one body, answered
-//! with the folded rows), a batch to write (`POST /internal/v1/ingest`,
+//! one partition of its inputs' exchanges (`POST /internal/v1/final`,
+//! the JSON `FinalTask` and the coordinator's rows of each input framed
+//! in one body, answered with the folded rows), a batch to write (`POST /internal/v1/ingest`,
 //! an Arrow IPC stream with the tenant, dataset and kind in headers,
 //! answered once durable), and a membership exchange (`POST
 //! /internal/v1/gossip`, the caller's view as JSON node records,
@@ -66,42 +66,60 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// A final task with the rows the coordinator hands over as one body:
-/// the task's JSON, preceded by its length as four little-endian
-/// bytes, then the rows as an Arrow IPC stream.
+/// the task's JSON, then the rows of each input as an Arrow IPC
+/// stream, every part preceded by its length as four little-endian
+/// bytes.
 ///
 /// # Errors
 ///
-/// If a batch does not match `schema` or the task does not serialize.
+/// If a batch does not match its input's schema or the task does not
+/// serialize.
 pub fn encode_final(
     task: &FinalTask,
-    schema: &SchemaRef,
-    rows: &[RecordBatch],
+    schemas: &[SchemaRef],
+    rows: &[Vec<RecordBatch>],
 ) -> Result<Vec<u8>, RemoteError> {
-    let json = serde_json::to_vec(task).map_err(|e| RemoteError(e.to_string()))?;
-    let length = u32::try_from(json.len()).map_err(|e| RemoteError(e.to_string()))?;
-    let mut out = length.to_le_bytes().to_vec();
-    out.extend(json);
-    out.extend(encode(schema, rows).map_err(|e| RemoteError(e.to_string()))?);
+    let mut out = Vec::new();
+    let mut part = |bytes: Vec<u8>| -> Result<(), RemoteError> {
+        let length = u32::try_from(bytes.len()).map_err(|e| RemoteError(e.to_string()))?;
+        out.extend(length.to_le_bytes());
+        out.extend(bytes);
+        Ok(())
+    };
+    part(serde_json::to_vec(task).map_err(|e| RemoteError(e.to_string()))?)?;
+    for (schema, rows) in schemas.iter().zip(rows) {
+        part(encode(schema, rows).map_err(|e| RemoteError(e.to_string()))?)?;
+    }
     Ok(out)
 }
 
-/// The task and the rows of a body [`encode_final`] framed.
+/// The task and the rows of each input of a body [`encode_final`]
+/// framed.
 ///
 /// # Errors
 ///
 /// If the body is not framed that way.
-pub fn decode_final(bytes: &[u8]) -> Result<(FinalTask, Vec<RecordBatch>), RemoteError> {
-    let (length, rest) = bytes
-        .split_first_chunk::<4>()
-        .ok_or_else(|| RemoteError("final task body too short".into()))?;
-    let length =
-        usize::try_from(u32::from_le_bytes(*length)).map_err(|e| RemoteError(e.to_string()))?;
-    let (json, stream) = rest
-        .split_at_checked(length)
-        .ok_or_else(|| RemoteError("final task body shorter than its task".into()))?;
-    let task: FinalTask = serde_json::from_slice(json)
+pub fn decode_final(bytes: &[u8]) -> Result<(FinalTask, Vec<Vec<RecordBatch>>), RemoteError> {
+    let mut rest = bytes;
+    let mut part = || -> Result<&[u8], RemoteError> {
+        let (length, after) = rest
+            .split_first_chunk::<4>()
+            .ok_or_else(|| RemoteError("final task body too short".into()))?;
+        let length =
+            usize::try_from(u32::from_le_bytes(*length)).map_err(|e| RemoteError(e.to_string()))?;
+        let (taken, after) = after
+            .split_at_checked(length)
+            .ok_or_else(|| RemoteError("final task body shorter than its parts".into()))?;
+        rest = after;
+        Ok(taken)
+    };
+    let task: FinalTask = serde_json::from_slice(part()?)
         .map_err(|e| RemoteError(format!("invalid final task: {e}")))?;
-    let (_, rows) = decode(stream).map_err(|e| RemoteError(e.to_string()))?;
+    let mut rows = Vec::with_capacity(task.inputs.len());
+    for _ in 0..task.inputs.len() {
+        let (_, batches) = decode(part()?).map_err(|e| RemoteError(e.to_string()))?;
+        rows.push(batches);
+    }
     Ok((task, rows))
 }
 
@@ -225,8 +243,9 @@ async fn exchange(
 }
 
 /// `POST /internal/v1/final`: a final stage sent by a coordinator
-/// (QE-14) over one partition of an exchange, the coordinator's rows
-/// framed with the task, answered with the folded rows.
+/// (QE-14) over one partition of its inputs' exchanges, the
+/// coordinator's rows framed with the task, answered with the folded
+/// rows.
 async fn finalize(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -508,18 +527,22 @@ impl RemoteScan for HttpRemote {
         &'a self,
         peer: &'a Peer,
         task: &'a FinalTask,
-        rows: &'a [RecordBatch],
+        rows: &'a [Vec<RecordBatch>],
     ) -> BoxFuture<'a, Result<Vec<RecordBatch>, RemoteError>> {
         Box::pin(async move {
-            let schema = task
+            let schemas: Vec<SchemaRef> = task
                 .plan
                 .inputs()
                 .into_iter()
-                .next()
-                .ok_or_else(|| RemoteError("a final task needs an input".into()))?
-                .schema(&Registry::builtin())
-                .map_err(|e| RemoteError(e.to_string()))?;
-            let body = encode_final(task, &schema_of(rows, schema), rows)?;
+                .zip(rows)
+                .map(|(input, rows)| {
+                    let fallback = input
+                        .schema(&Registry::builtin())
+                        .map_err(|e| RemoteError(e.to_string()))?;
+                    Ok(schema_of(rows, fallback))
+                })
+                .collect::<Result<_, RemoteError>>()?;
+            let body = encode_final(task, &schemas, rows)?;
             let url = format!("{}/internal/v1/final", peer.http.trim_end_matches('/'));
             let client = self.clone();
             let bytes =
@@ -543,6 +566,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use tessera_exec::FinalInput;
     use tessera_ir::Scan;
     use tessera_types::event::Scalar;
     use tessera_types::{LogRow, Timestamp};
@@ -744,14 +768,17 @@ mod tests {
                     name: "n".into(),
                 }],
             },
-            exchange,
             partition: 1,
-            producers: Vec::new(),
+            inputs: vec![FinalInput {
+                exchange,
+                producers: Vec::new(),
+            }],
         };
-        let body = encode_final(&task, &schema, &rows).unwrap();
+        let body = encode_final(&task, &[schema], std::slice::from_ref(&rows)).unwrap();
         let (back, back_rows) = decode_final(&body).unwrap();
         assert_eq!(back, task);
-        assert_eq!(back_rows.len(), rows.len());
+        assert_eq!(back_rows.len(), 1);
+        assert_eq!(back_rows[0].len(), rows.len());
         let response = app
             .clone()
             .oneshot(post("/internal/v1/final", FINAL_TASK, body))

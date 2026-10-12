@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::SchemaRef;
-use tessera_kernels::buckets_of;
+use tessera_ir::Expr;
+use tessera_kernels::{buckets_of, evaluate};
 
 use crate::ExecError;
 use crate::remote::Exchange;
@@ -43,7 +44,7 @@ impl Exchanges {
     ///
     /// # Errors
     ///
-    /// If a key is not a column of the rows.
+    /// If a key does not evaluate over the rows.
     pub(crate) fn keep(
         &self,
         exchange: &Exchange,
@@ -83,15 +84,15 @@ impl Exchanges {
 }
 
 /// `rows` split into `partitions` parts by a hash of the `keys`
-/// columns, the same on every node for equal keys; everything in the
-/// first part when there are no keys.
+/// evaluated over them, the same on every node for equal values;
+/// everything in the first part when there are no keys.
 ///
 /// # Errors
 ///
-/// If a key is not a column of the rows.
+/// If a key does not evaluate over the rows.
 pub(crate) fn partition(
     rows: Vec<RecordBatch>,
-    keys: &[String],
+    keys: &[Expr],
     partitions: u32,
 ) -> Result<Vec<Vec<RecordBatch>>, ExecError> {
     let count = usize::try_from(partitions).unwrap_or(1).max(1);
@@ -103,13 +104,7 @@ pub(crate) fn partition(
     for batch in rows {
         let columns: Vec<ArrayRef> = keys
             .iter()
-            .map(|key| {
-                batch.column_by_name(key).cloned().ok_or_else(|| {
-                    ExecError::Unsupported(format!(
-                        "exchange key {key} is not a column of the stage's output"
-                    ))
-                })
-            })
+            .map(|key| evaluate(key, &batch))
             .collect::<Result<_, _>>()?;
         let buckets = buckets_of(&columns, partitions)?;
         for (index, part) in out.iter_mut().enumerate() {
@@ -173,7 +168,7 @@ mod tests {
     /// same again.
     #[test]
     fn partitions_follow_the_keys() {
-        let keys = vec!["k".to_owned()];
+        let keys = vec![Expr::column("k")];
         let batches = vec![
             rows(&["a", "b", "c", "a"], &[1, 2, 3, 4]),
             rows(&["b", "c", "d"], &[5, 6, 7]),
@@ -201,8 +196,8 @@ mod tests {
         assert_eq!(key_values(&whole)[0].len(), 7, "no keys, one partition");
         assert!(whole[1..].iter().all(Vec::is_empty));
         assert!(matches!(
-            partition(batches, &["missing".to_owned()], 2),
-            Err(ExecError::Unsupported(_))
+            partition(batches, &[Expr::column("missing")], 2),
+            Err(ExecError::Kernel(_))
         ));
     }
 
@@ -212,7 +207,7 @@ mod tests {
         let exchange = Exchange {
             id: "x".into(),
             partitions: 2,
-            keys: vec!["k".into()],
+            keys: vec![Expr::column("k")],
         };
         let batch = rows(&["a", "b", "c", "d"], &[1, 2, 3, 4]);
         exchanges

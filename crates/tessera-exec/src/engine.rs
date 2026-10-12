@@ -14,7 +14,9 @@
 //! the transport allows: each partial output stays on its node as an
 //! exchange, split by group key, and each worker folds one partition
 //! fetched from every producer, so that no node holds every partial
-//! output. The other stages fold on the coordinator.
+//! output. A join whose two sides are scans runs the same way, each
+//! side an exchange split by its join keys and each worker joining
+//! one partition of both. The other stages fold on the coordinator.
 //!
 //! Pipelines are not yet fused across nodes nor split into morsels
 //! across stages.
@@ -55,7 +57,9 @@ use crate::operator::{
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
-use crate::remote::{Exchange, FinalTask, LeafTask, Peer, Peers, RemoteScan, StageTask};
+use crate::remote::{
+    Exchange, FinalInput, FinalTask, LeafTask, Peer, Peers, RemoteScan, StageTask,
+};
 use crate::rollups::RollupSource;
 use crate::scan::{self, ScanAnalysis, Share};
 use crate::scheduler::{CpuPool, TaskError};
@@ -117,7 +121,7 @@ pub struct Analysis {
 /// (QE-14), for `EXPLAIN ANALYZE`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StageAnalysis {
-    /// What was split: `aggregate`, `top-k` or `limit`.
+    /// What was split: `aggregate`, `join`, `top-k` or `limit`.
     pub kind: &'static str,
     /// Partial stages sent to peers.
     pub remote: usize,
@@ -384,8 +388,9 @@ impl Engine {
     }
 
     /// Runs a final stage sent by a coordinator over one partition of
-    /// an exchange (QE-14): the task's plan folds `rows`, the partition
-    /// this node kept, and the partition fetched from each producer.
+    /// its inputs' exchanges (QE-14): the task's plan folds, per input,
+    /// `rows`, the partition this node kept, and the partition fetched
+    /// from each producer.
     ///
     /// # Errors
     ///
@@ -394,37 +399,78 @@ impl Engine {
     pub async fn finalize(
         &self,
         task: &FinalTask,
-        rows: Vec<RecordBatch>,
+        rows: Vec<Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, EngineError> {
-        let mut inputs = rows;
+        let mut gathered: Vec<Vec<RecordBatch>> = rows;
+        gathered.resize_with(task.inputs.len(), Vec::new);
         // The producers first: a fetch that fails leaves this node's
-        // own partition in place for the coordinator to take.
-        for producer in &task.producers {
-            let Some((_, transport)) = &self.peers else {
-                return Err(unsupported(
-                    "a final stage needs a transport to its producers",
-                ));
-            };
-            let fetched = transport
-                .fetch(producer, &task.exchange.id, task.partition)
+        // own partitions in place for the coordinator to take.
+        for (input, rows) in task.inputs.iter().zip(&mut gathered) {
+            for producer in &input.producers {
+                let Some((_, transport)) = &self.peers else {
+                    return Err(unsupported(
+                        "a final stage needs a transport to its producers",
+                    ));
+                };
+                let fetched = transport
+                    .fetch(producer, &input.exchange.id, task.partition)
+                    .await
+                    .map_err(|e| {
+                        unsupported(format!(
+                            "exchange {}: producer {}: {e}",
+                            input.exchange.id, producer.node
+                        ))
+                    })?;
+                rows.extend(fetched);
+            }
+        }
+        for (input, rows) in task.inputs.iter().zip(&mut gathered) {
+            if let Some((_, mine)) = self.exchanges.take(&input.exchange.id, task.partition) {
+                rows.extend(mine);
+            }
+        }
+        self.fold(&task.plan, gathered, &self.own_grant()).await
+    }
+
+    /// `plan` over `rows`, one list per input: a join of its two sides,
+    /// an operator over its one input otherwise.
+    async fn fold(
+        &self,
+        plan: &Plan,
+        rows: Vec<Vec<RecordBatch>>,
+        grant: &Grant,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let mut rows = rows.into_iter();
+        match plan {
+            Plan::Join {
+                left,
+                right,
+                on,
+                kind,
+                asof,
+            } => {
+                let left_rows = rows.next().unwrap_or_default();
+                let right_rows = rows.next().unwrap_or_default();
+                self.join_rows(
+                    left,
+                    right,
+                    on,
+                    *kind,
+                    asof.as_ref(),
+                    left_rows,
+                    right_rows,
+                    grant,
+                )
                 .await
-                .map_err(|e| {
-                    unsupported(format!(
-                        "exchange {}: producer {}: {e}",
-                        task.exchange.id, producer.node
-                    ))
-                })?;
-            inputs.extend(fetched);
+            }
+            other => {
+                let Some(input) = other.inputs().into_iter().next() else {
+                    return Err(unsupported("a final stage needs an input"));
+                };
+                let operator = self.operator(other, input, &grant.memory)?;
+                self.pipe(operator, rows.next().unwrap_or_default()).await
+            }
         }
-        if let Some((_, mine)) = self.exchanges.take(&task.exchange.id, task.partition) {
-            inputs.extend(mine);
-        }
-        let Some(input) = task.plan.inputs().into_iter().next() else {
-            return Err(unsupported("a final stage needs an input"));
-        };
-        let grant = self.own_grant();
-        let operator = self.operator(&task.plan, input, &grant.memory)?;
-        self.pipe(operator, inputs).await
     }
 
     /// A grant under this node's own limits, for work sent by another
@@ -759,6 +805,14 @@ impl Engine {
         let Some((_, transport)) = &self.peers else {
             return Ok(None);
         };
+        if let Plan::Join {
+            left, right, on, ..
+        } = plan
+        {
+            return self
+                .join_staged(plan, left, right, on, grant, analysis)
+                .await;
+        }
         let Some(stage) = stage_of(plan, &self.registry) else {
             return Ok(None);
         };
@@ -824,12 +878,17 @@ impl Engine {
             .await?;
         let output = match exchange {
             Some(exchange) if !producers.is_empty() => {
-                self.exchanged(
-                    &stage,
-                    &partial,
+                let workers: Vec<Peer> = producers.iter().map(|(p, _)| p.clone()).collect();
+                let input = ExchangeInput {
                     exchange,
+                    partial: partial.clone(),
                     producers,
                     mine,
+                };
+                self.exchanged(
+                    &stage.final_plan,
+                    vec![input],
+                    workers,
                     grant,
                     analysis,
                     &mut report,
@@ -846,21 +905,132 @@ impl Engine {
         Ok(Some(output))
     }
 
-    /// The final half of a stage over an exchange (QE-14): each
-    /// producer folds one partition of the groups, fetching it from
-    /// the others and taking the coordinator's part with the task; the
-    /// coordinator folds the last partition itself. A partition a
-    /// worker cannot fold is folded here, and a producer that no
-    /// longer has its output has its share recomputed here from its
-    /// files (QE-17), so the result is the same either way.
-    #[allow(clippy::too_many_arguments)]
+    /// A join whose two sides are fragments over scans runs on the
+    /// workers (QE-14): each side's partial stages keep their rows as
+    /// an exchange split by the side's join keys, and every producer
+    /// joins one partition of both sides, the coordinator the last.
+    /// The runtime filter an inner join applies to its left side on
+    /// one node is not applied here. `None` when the transport has no
+    /// exchange, the join has no keys, a side is not a fragment any
+    /// node can run a share of, or no peer owns a file of either side.
+    async fn join_staged(
+        &self,
+        plan: &Plan,
+        left: &JoinSide,
+        right: &JoinSide,
+        on: &[(Expr, Expr)],
+        grant: &Grant,
+        analysis: &mut Analysis,
+    ) -> Result<Option<Vec<RecordBatch>>, EngineError> {
+        let Some((_, transport)) = &self.peers else {
+            return Ok(None);
+        };
+        if !transport.supports_exchange() || on.is_empty() {
+            return Ok(None);
+        }
+        let (Some(left_scan), Some(right_scan)) =
+            (fragment_scan_of(&left.plan), fragment_scan_of(&right.plan))
+        else {
+            return Ok(None);
+        };
+        let limit = scan_limit(grant, analysis);
+        let mut left_scanned = ScanAnalysis::default();
+        let left_split = scan::split(self, left_scan, &mut left_scanned, limit).await?;
+        let mut right_scanned = ScanAnalysis::default();
+        let right_split = scan::split(self, right_scan, &mut right_scanned, limit).await?;
+        let mut workers: Vec<Peer> = Vec::new();
+        for (peer, _) in left_split.remote.iter().chain(&right_split.remote) {
+            if !workers.iter().any(|w| w.node == peer.node) {
+                workers.push(peer.clone());
+            }
+        }
+        if workers.is_empty() {
+            return Ok(None);
+        }
+        let partitions = u32::try_from(workers.len() + 1).unwrap_or(u32::MAX);
+        let id = self.exchange_id();
+        let mut report = StageAnalysis {
+            kind: "join",
+            ..StageAnalysis::default()
+        };
+        let sides = [
+            (left, left_split, left_scanned, "l", 0),
+            (right, right_split, right_scanned, "r", 1),
+        ];
+        let mut inputs = Vec::new();
+        for (side, split, mut scanned, suffix, which) in sides {
+            let partial = with_scan(&side.plan, &split.scan);
+            let exchange = Exchange {
+                id: format!("{id}-{suffix}"),
+                partitions,
+                keys: on
+                    .iter()
+                    .map(|keys| {
+                        if which == 0 {
+                            keys.0.clone()
+                        } else {
+                            keys.1.clone()
+                        }
+                    })
+                    .collect(),
+            };
+            let mut local = split.local;
+            let mut producers: Vec<(Peer, Vec<FileMeta>)> = Vec::new();
+            for (peer, files) in split.remote {
+                let task = StageTask {
+                    plan: partial.clone(),
+                    files,
+                    exchange: Some(exchange.clone()),
+                };
+                report.remote += 1;
+                scanned.remote_tasks += 1;
+                match transport.stage(&peer, &task).await {
+                    Ok(_) => {
+                        scanned.files_remote += task.files.len();
+                        producers.push((peer, task.files));
+                    }
+                    Err(error) => {
+                        tracing::warn!(peer = %peer.node, error = %error, "stage failed; running here");
+                        report.failed += 1;
+                        scanned.remote_failed += 1;
+                        local.extend(task.files);
+                    }
+                }
+            }
+            let share = Share {
+                files: local,
+                tail: split.tail,
+                analysis: scanned,
+            };
+            let mine = self
+                .execute_in(&partial, grant, analysis, Some(&share))
+                .await?;
+            inputs.push(ExchangeInput {
+                exchange,
+                partial,
+                producers,
+                mine,
+            });
+        }
+        let output = self
+            .exchanged(plan, inputs, workers, grant, analysis, &mut report)
+            .await?;
+        analysis.stages.push(report);
+        Ok(Some(output))
+    }
+
+    /// The final half of a stage over its inputs' exchanges (QE-14):
+    /// each worker folds one partition, fetching every input's part
+    /// from its producers and taking the coordinator's part with the
+    /// task; the coordinator folds the last partition itself. A
+    /// partition a worker cannot fold is folded here, and a producer
+    /// that no longer has its output has its share recomputed here
+    /// from its files (QE-17), so the result is the same either way.
     async fn exchanged(
         &self,
-        stage: &Stage,
-        partial: &Plan,
-        exchange: Exchange,
-        producers: Vec<(Peer, Vec<FileMeta>)>,
-        mine: Vec<RecordBatch>,
+        final_plan: &Plan,
+        mut inputs: Vec<ExchangeInput>,
+        workers: Vec<Peer>,
         grant: &Grant,
         analysis: &mut Analysis,
         report: &mut StageAnalysis,
@@ -868,30 +1038,48 @@ impl Engine {
         let Some((_, transport)) = &self.peers else {
             return Err(unsupported("an exchange needs peers"));
         };
-        let partitions = usize::try_from(exchange.partitions).unwrap_or(1);
-        let mut parts = exchange::partition(mine, &exchange.keys, exchange.partitions)?;
+        let partitions = workers.len() + 1;
+        // The coordinator's own parts, by input and partition.
+        let mut parts: Vec<Vec<Vec<RecordBatch>>> = Vec::new();
+        for input in &mut inputs {
+            parts.push(exchange::partition(
+                std::mem::take(&mut input.mine),
+                &input.exchange.keys,
+                input.exchange.partitions,
+            )?);
+        }
         let mut output = Vec::new();
         let mut here: Vec<usize> = Vec::new();
-        for (index, (peer, _)) in producers.iter().enumerate() {
+        for (index, worker) in workers.iter().enumerate() {
             let task = FinalTask {
-                plan: stage.final_plan.clone(),
-                exchange: exchange.clone(),
+                plan: final_plan.clone(),
                 partition: u32::try_from(index).unwrap_or(u32::MAX),
-                producers: producers
+                inputs: inputs
                     .iter()
-                    .enumerate()
-                    .filter(|(other, _)| *other != index)
-                    .map(|(_, (producer, _))| producer.clone())
+                    .map(|input| FinalInput {
+                        exchange: input.exchange.clone(),
+                        producers: input
+                            .producers
+                            .iter()
+                            .filter(|(producer, _)| producer.node != worker.node)
+                            .map(|(producer, _)| producer.clone())
+                            .collect(),
+                    })
                     .collect(),
             };
             report.finals += 1;
-            let rows = std::mem::take(&mut parts[index]);
-            match transport.finalize(peer, &task, &rows).await {
+            let rows: Vec<Vec<RecordBatch>> = parts
+                .iter_mut()
+                .map(|part| std::mem::take(&mut part[index]))
+                .collect();
+            match transport.finalize(worker, &task, &rows).await {
                 Ok(folded) => output.extend(folded),
                 Err(error) => {
-                    tracing::warn!(peer = %peer.node, error = %error, "final stage failed; running here");
+                    tracing::warn!(peer = %worker.node, error = %error, "final stage failed; running here");
                     report.final_failed += 1;
-                    parts[index] = rows;
+                    for (part, rows) in parts.iter_mut().zip(rows) {
+                        part[index] = rows;
+                    }
                     here.push(index);
                 }
             }
@@ -899,37 +1087,46 @@ impl Engine {
         here.push(partitions - 1);
         // A producer whose kept output is gone is recomputed once, every
         // partition of it kept for the ones still to fold here.
-        let mut recomputed: Vec<Option<Vec<Vec<RecordBatch>>>> = vec![None; producers.len()];
+        let mut recomputed: Vec<Vec<Option<Vec<Vec<RecordBatch>>>>> = inputs
+            .iter()
+            .map(|input| vec![None; input.producers.len()])
+            .collect();
         for index in here {
-            let mut inputs = std::mem::take(&mut parts[index]);
-            for (which, (peer, files)) in producers.iter().enumerate() {
-                if let Some(again) = &mut recomputed[which] {
-                    inputs.extend(std::mem::take(&mut again[index]));
-                    continue;
-                }
-                let partition = u32::try_from(index).unwrap_or(u32::MAX);
-                match transport.fetch(peer, &exchange.id, partition).await {
-                    Ok(rows) => inputs.extend(rows),
-                    Err(error) => {
-                        tracing::warn!(peer = %peer.node, error = %error, "kept output lost; recomputing here");
-                        report.recomputed += 1;
-                        let share = Share {
-                            files: files.clone(),
-                            tail: Vec::new(),
-                            analysis: ScanAnalysis::default(),
-                        };
-                        let rows = self
-                            .execute_in(partial, grant, analysis, Some(&share))
-                            .await?;
-                        let mut again =
-                            exchange::partition(rows, &exchange.keys, exchange.partitions)?;
-                        inputs.extend(std::mem::take(&mut again[index]));
-                        recomputed[which] = Some(again);
+            let mut gathered: Vec<Vec<RecordBatch>> = Vec::new();
+            for (which, input) in inputs.iter().enumerate() {
+                let mut rows = std::mem::take(&mut parts[which][index]);
+                for (producer, (peer, files)) in input.producers.iter().enumerate() {
+                    if let Some(again) = &mut recomputed[which][producer] {
+                        rows.extend(std::mem::take(&mut again[index]));
+                        continue;
+                    }
+                    let partition = u32::try_from(index).unwrap_or(u32::MAX);
+                    match transport.fetch(peer, &input.exchange.id, partition).await {
+                        Ok(fetched) => rows.extend(fetched),
+                        Err(error) => {
+                            tracing::warn!(peer = %peer.node, error = %error, "kept output lost; recomputing here");
+                            report.recomputed += 1;
+                            let share = Share {
+                                files: files.clone(),
+                                tail: Vec::new(),
+                                analysis: ScanAnalysis::default(),
+                            };
+                            let output = self
+                                .execute_in(&input.partial, grant, analysis, Some(&share))
+                                .await?;
+                            let mut again = exchange::partition(
+                                output,
+                                &input.exchange.keys,
+                                input.exchange.partitions,
+                            )?;
+                            rows.extend(std::mem::take(&mut again[index]));
+                            recomputed[which][producer] = Some(again);
+                        }
                     }
                 }
+                gathered.push(rows);
             }
-            let operator = self.operator(&stage.final_plan, partial, &grant.memory)?;
-            output.extend(self.pipe(operator, inputs).await?);
+            output.extend(self.fold(final_plan, gathered, grant).await?);
         }
         Ok(output)
     }
@@ -1148,6 +1345,27 @@ impl Engine {
             JoinKind::Left => left.plan.as_ref().clone(),
         };
         let left_rows = self.execute(&left_plan, grant, analysis).await?;
+        self.join_rows(left, right, on, kind, asof, left_rows, right_rows, grant)
+            .await
+    }
+
+    /// Joins the rows of both sides, hashing the smaller side of an
+    /// inner join; past the grant, one bucket of keys at a time through
+    /// local disk (QE-11).
+    #[allow(clippy::too_many_arguments)]
+    async fn join_rows(
+        &self,
+        left: &JoinSide,
+        right: &JoinSide,
+        on: &[(Expr, Expr)],
+        kind: JoinKind,
+        asof: Option<&Asof>,
+        left_rows: Vec<RecordBatch>,
+        right_rows: Vec<RecordBatch>,
+        grant: &Grant,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let left_keys: Vec<Expr> = on.iter().map(|(l, _)| l.clone()).collect();
+        let right_keys: Vec<Expr> = on.iter().map(|(_, r)| r.clone()).collect();
         let rows_of =
             |batches: &[RecordBatch]| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         let build_left =
@@ -1202,8 +1420,7 @@ impl Engine {
         };
         match whole {
             Ok(operator) => self.pipe(Box::new(operator), probe_rows).await,
-            // Past the grant, one bucket of keys at a time through local
-            // disk (QE-11); without a spill directory the grant stands.
+            // Without a spill directory the grant stands.
             Err(ExecError::Memory(failure)) if self.spill_dir.is_some() => {
                 let dir = self.spill_dir.clone().unwrap_or_default();
                 tracing::debug!(%failure, "join past its grant; partitioning through disk");
@@ -1258,9 +1475,20 @@ struct Stage {
     kind: &'static str,
     partial: Plan,
     final_plan: Plan,
-    /// The columns of the partial output that choose a worker when the
-    /// final half runs on the workers: a grouped aggregate's keys.
-    keys: Option<Vec<String>>,
+    /// The expressions over the partial output that choose a worker
+    /// when the final half runs on the workers: a grouped aggregate's
+    /// keys.
+    keys: Option<Vec<Expr>>,
+}
+
+/// One input of a final stage run over an exchange: what its partial
+/// stages kept, the coordinator's own rows of it, and how to recompute
+/// a producer's share.
+struct ExchangeInput {
+    exchange: Exchange,
+    partial: Plan,
+    producers: Vec<(Peer, Vec<FileMeta>)>,
+    mine: Vec<RecordBatch>,
 }
 
 /// How `plan` splits, if it does: an aggregate whose functions merge
@@ -1291,7 +1519,7 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
                 group_by: keys,
                 aggregates: aggregates.clone(),
             };
-            let names: Vec<String> = group_by.iter().map(|k| k.name.clone()).collect();
+            let names: Vec<Expr> = group_by.iter().map(|k| Expr::column(&k.name)).collect();
             Some(Stage {
                 kind: "aggregate",
                 partial,
@@ -1323,7 +1551,13 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
 /// over a chain of row-wise operators over one scan that any node can
 /// run its share of; a scan that stops early on its own stays whole.
 fn fragment_scan(partial: &Plan) -> Option<&tessera_ir::Scan> {
-    let mut node = partial.inputs().into_iter().next()?;
+    fragment_scan_of(partial.inputs().into_iter().next()?)
+}
+
+/// The scan `plan` reads, when it is a chain of row-wise operators
+/// over one scan that any node can run its share of.
+fn fragment_scan_of(plan: &Plan) -> Option<&tessera_ir::Scan> {
+    let mut node = plan;
     loop {
         match node {
             Plan::Scan(scan) if scan.newest_first_limit.is_none() => return Some(scan),
