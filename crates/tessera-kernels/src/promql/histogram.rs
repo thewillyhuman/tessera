@@ -19,6 +19,7 @@
 //! a query answers as Prometheus would.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// The schema of a histogram with custom buckets.
 pub const CUSTOM_SCHEMA: i32 = -53;
@@ -426,6 +427,29 @@ impl Histogram {
         }
         variance += compensation;
         variance / self.count
+    }
+}
+
+impl fmt::Display for Histogram {
+    /// `{count:4, sum:5, (0.5,1]:1, (1,2]:2}`, as Prometheus writes a
+    /// histogram; empty buckets are left out.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{count:{}, sum:{}", self.count, self.sum)?;
+        for bucket in self.buckets() {
+            if bucket.count == 0.0 {
+                continue;
+            }
+            write!(
+                f,
+                ", {}{},{}{}:{}",
+                if bucket.lower_inclusive { '[' } else { '(' },
+                bucket.lower,
+                bucket.upper,
+                if bucket.upper_inclusive { ']' } else { ')' },
+                bucket.count
+            )?;
+        }
+        write!(f, "}}")
     }
 }
 
@@ -1645,6 +1669,10 @@ mod tests {
                 (5.0, 10.0, false),
                 (10.0, f64::INFINITY, false)
             ]
+        );
+        assert_eq!(
+            histogram.to_string(),
+            "{count:6, sum:0, [-2,-1.5):3, [-1.5,1.5]:1, (1.5,2]:2}"
         );
     }
 

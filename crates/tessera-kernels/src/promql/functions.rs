@@ -2,15 +2,18 @@
 
 //! The `PromQL` functions, with Prometheus' algorithms: the rate family
 //! with counter resets and extrapolation, the `_over_time` family,
-//! arithmetic and rounding, label rewriting, `histogram_quantile` over
-//! classic buckets, and the calendar functions.
+//! arithmetic and rounding, label rewriting, `histogram_quantile` and
+//! `histogram_fraction` over native histograms and classic buckets,
+//! the `histogram_*` readers of a native histogram, and the calendar
+//! functions. A function of floats leaves histogram samples out, as
+//! Prometheus does with a note.
 
 use std::collections::BTreeMap;
 
 use tessera_ir::promql::PromExpr;
 
 use super::{
-    Evaluator, Labels, NAME_LABEL, Sample, Series, Value, quantile, unsupported, without_name,
+    Evaluator, Histogram, Labels, Point, Sample, Series, Value, quantile, unsupported, without_name,
 };
 use crate::KernelError;
 
@@ -27,13 +30,16 @@ pub(super) fn call(
     if let Some(value) = call_rounding(evaluator, function, args, t)? {
         return Ok(value);
     }
+    if let Some(value) = call_histogram(evaluator, function, args, t)? {
+        return Ok(value);
+    }
     match function {
         "absent" => {
             let Value::Vector(vector) = evaluator.eval(&args[0], t)? else {
                 return Err(unsupported("absent needs an instant vector"));
             };
             Ok(Value::Vector(if vector.is_empty() {
-                vec![(absent_labels(&args[0]), 1.0)]
+                vec![(absent_labels(&args[0]), Point::Float(1.0))]
             } else {
                 Vec::new()
             }))
@@ -44,15 +50,16 @@ pub(super) fn call(
             let Value::Vector(vector) = evaluator.eval(&args[0], t)? else {
                 return Err(unsupported("scalar needs an instant vector"));
             };
-            Ok(Value::Scalar(if vector.len() == 1 {
-                vector[0].1
-            } else {
-                f64::NAN
+            // The one float of the vector; histograms do not count.
+            let mut floats = vector.iter().filter_map(|(_, v)| v.float());
+            Ok(Value::Scalar(match (floats.next(), floats.next()) {
+                (Some(value), None) => value,
+                _ => f64::NAN,
             }))
         }
         "vector" => {
             let value = scalar_argument(evaluator, function, args, 0, t)?;
-            Ok(Value::Vector(vec![(Labels::new(), value)]))
+            Ok(Value::Vector(vec![(Labels::new(), Point::Float(value))]))
         }
         "timestamp" => {
             let series = vector_argument(evaluator, function, args, 0, t)?;
@@ -60,40 +67,40 @@ pub(super) fn call(
             Ok(Value::Vector(
                 series
                     .into_iter()
-                    .map(|(labels, _)| (without_name(labels), seconds(t)))
+                    .map(|(labels, _)| (without_name(labels), Point::Float(seconds(t))))
                     .collect(),
             ))
         }
         "sort" | "sort_desc" => {
-            let mut series = vector_argument(evaluator, function, args, 0, t)?;
+            let mut series = float_samples(vector_argument(evaluator, function, args, 0, t)?);
             series.sort_by(|a, b| a.1.total_cmp(&b.1));
             if function == "sort_desc" {
                 series.reverse();
             }
-            Ok(Value::Vector(series))
+            Ok(Value::Vector(
+                series
+                    .into_iter()
+                    .map(|(labels, v)| (labels, Point::Float(v)))
+                    .collect(),
+            ))
         }
         "label_replace" => label_replace(evaluator, args, t),
         "label_join" => label_join(evaluator, args, t),
-        "histogram_quantile" => {
-            let q = scalar_argument(evaluator, function, args, 0, t)?;
-            let buckets = vector_argument(evaluator, function, args, 1, t)?;
-            Ok(Value::Vector(histogram_quantile(q, buckets)))
-        }
         "day_of_month" | "day_of_week" | "day_of_year" | "days_in_month" | "hour" | "minute"
         | "month" | "year" => {
             let series = if args.is_empty() {
-                vec![(Labels::new(), seconds(t))]
+                vec![(Labels::new(), Point::Float(seconds(t)))]
             } else {
                 vector_argument(evaluator, function, args, 0, t)?
             };
-            Ok(map_vector(series, |v| calendar(function, v)))
+            Ok(map_floats(series, |v| calendar(function, v)))
         }
         _ => {
             let Some(math) = math_function(function) else {
                 return Err(unsupported(format!("unknown function {function}")));
             };
             let series = vector_argument(evaluator, function, args, 0, t)?;
-            Ok(map_vector(series, math))
+            Ok(map_floats(series, math))
         }
     }
 }
@@ -136,9 +143,15 @@ fn call_range(
             Value::Vector(
                 series
                     .into_iter()
-                    .map(|s| {
-                        let mut values: Vec<f64> = s.samples.iter().map(|(_, v)| *v).collect();
-                        (without_name(s.labels), quantile(q, &mut values))
+                    .filter_map(|s| {
+                        let mut values: Vec<f64> =
+                            s.samples.iter().filter_map(|(_, v)| v.float()).collect();
+                        (!values.is_empty()).then(|| {
+                            (
+                                without_name(s.labels),
+                                Point::Float(quantile(q, &mut values)),
+                            )
+                        })
                     })
                     .collect(),
             )
@@ -151,8 +164,11 @@ fn call_range(
                 series
                     .into_iter()
                     .filter_map(|s| {
-                        let (slope, intercept) = linear_regression(&s.samples, end)?;
-                        Some((without_name(s.labels), intercept + slope * seconds))
+                        let (slope, intercept) = linear_regression(&floats_of(&s.samples), end)?;
+                        Some((
+                            without_name(s.labels),
+                            Point::Float(intercept + slope * seconds),
+                        ))
                     })
                     .collect(),
             )
@@ -165,7 +181,8 @@ fn call_range(
                 series
                     .into_iter()
                     .filter_map(|s| {
-                        Some((without_name(s.labels), holt_winters(&s.samples, sf, tf)?))
+                        let value = holt_winters(&floats_of(&s.samples), sf, tf)?;
+                        Some((without_name(s.labels), Point::Float(value)))
                     })
                     .collect(),
             )
@@ -173,7 +190,7 @@ fn call_range(
         "absent_over_time" => {
             let series = range_argument(evaluator, function, args, 0, t)?;
             Value::Vector(if series.is_empty() {
-                vec![(absent_labels(&args[0]), 1.0)]
+                vec![(absent_labels(&args[0]), Point::Float(1.0))]
             } else {
                 Vec::new()
             })
@@ -197,7 +214,7 @@ fn call_rounding(
             } else {
                 1.0
             };
-            map_vector(series, |v| (v / to_nearest).round() * to_nearest)
+            map_floats(series, |v| (v / to_nearest).round() * to_nearest)
         }
         "clamp" => {
             let series = vector_argument(evaluator, function, args, 0, t)?;
@@ -206,17 +223,63 @@ fn call_rounding(
             if min > max {
                 return Ok(Some(Value::Vector(Vec::new())));
             }
-            map_vector(series, |v| v.max(min).min(max))
+            map_floats(series, |v| v.max(min).min(max))
         }
         "clamp_min" => {
             let series = vector_argument(evaluator, function, args, 0, t)?;
             let min = scalar_argument(evaluator, function, args, 1, t)?;
-            map_vector(series, |v| v.max(min))
+            map_floats(series, |v| v.max(min))
         }
         "clamp_max" => {
             let series = vector_argument(evaluator, function, args, 0, t)?;
             let max = scalar_argument(evaluator, function, args, 1, t)?;
-            map_vector(series, |v| v.min(max))
+            map_floats(series, |v| v.min(max))
+        }
+        _ => return Ok(None),
+    }))
+}
+
+/// The functions over native histograms (QL-5), or `None` for any
+/// other name. `histogram_quantile` and `histogram_fraction` read
+/// classic `le` buckets as well.
+fn call_histogram(
+    evaluator: &Evaluator<'_>,
+    function: &str,
+    args: &[PromExpr],
+    t: i64,
+) -> Result<Option<Value>, KernelError> {
+    let reader: Option<fn(&Histogram) -> f64> = match function {
+        "histogram_count" => Some(|h| h.count),
+        "histogram_sum" => Some(|h| h.sum),
+        "histogram_avg" => Some(|h| h.sum / h.count),
+        "histogram_stddev" => Some(|h| h.variance().sqrt()),
+        "histogram_stdvar" => Some(Histogram::variance),
+        _ => None,
+    };
+    Ok(Some(match function {
+        _ if reader.is_some() => {
+            let read = reader.unwrap_or(|h| h.count);
+            let series = vector_argument(evaluator, function, args, 0, t)?;
+            Value::Vector(
+                series
+                    .into_iter()
+                    .filter_map(|(labels, point)| {
+                        let histogram = point.histogram()?;
+                        Some((without_name(labels), Point::Float(read(histogram))))
+                    })
+                    .collect(),
+            )
+        }
+        "histogram_quantile" => {
+            let q = scalar_argument(evaluator, function, args, 0, t)?;
+            let vector = vector_argument(evaluator, function, args, 1, t)?;
+            Value::Vector(histogram_quantile(q, vector))
+        }
+        "histogram_fraction" => {
+            let lower = scalar_argument(evaluator, function, args, 0, t)?;
+            let upper = scalar_argument(evaluator, function, args, 1, t)?;
+            let vector = vector_argument(evaluator, function, args, 2, t)?;
+            Value::Vector(histogram_fraction(lower, upper, vector))
         }
         _ => return Ok(None),
     }))
@@ -228,13 +291,31 @@ fn seconds(t: i64) -> f64 {
     s
 }
 
-fn map_vector(series: Vec<(Labels, f64)>, f: impl Fn(f64) -> f64) -> Value {
+/// The float samples of `series`, names dropped, mapped through `f`;
+/// histogram samples drop out.
+fn map_floats(series: Vec<(Labels, Point)>, f: impl Fn(f64) -> f64) -> Value {
     Value::Vector(
-        series
+        float_samples(series)
             .into_iter()
-            .map(|(labels, v)| (without_name(labels), f(v)))
+            .map(|(labels, v)| (without_name(labels), Point::Float(f(v))))
             .collect(),
     )
+}
+
+/// The float samples of a vector.
+fn float_samples(series: Vec<(Labels, Point)>) -> Vec<(Labels, f64)> {
+    series
+        .into_iter()
+        .filter_map(|(labels, v)| Some((labels, v.float()?)))
+        .collect()
+}
+
+/// The float samples of a series, in time order.
+fn floats_of(samples: &[Sample]) -> Vec<(i64, f64)> {
+    samples
+        .iter()
+        .filter_map(|(t, v)| Some((*t, v.float()?)))
+        .collect()
 }
 
 fn math_function(name: &str) -> Option<fn(f64) -> f64> {
@@ -302,7 +383,7 @@ fn vector_argument(
     args: &[PromExpr],
     index: usize,
     t: i64,
-) -> Result<Vec<(Labels, f64)>, KernelError> {
+) -> Result<Vec<(Labels, Point)>, KernelError> {
     match evaluator.eval(argument(function, args, index)?, t)? {
         Value::Vector(vector) => Ok(vector),
         other => Err(unsupported(format!(
@@ -358,10 +439,21 @@ fn absent_labels(expr: &PromExpr) -> Labels {
 }
 
 /// A function over the samples of one series in the window ending at
-/// `end` and `range` long. `changes` compares values exactly, as
-/// Prometheus does.
+/// `end` and `range` long, reading the float samples.
+fn range_function(function: &str, samples: &[Sample], end: i64, range: i64) -> Option<Point> {
+    float_range_function(function, &floats_of(samples), end, range).map(Point::Float)
+}
+
+/// A function over the float samples of one series in the window
+/// ending at `end` and `range` long. `changes` compares values
+/// exactly, as Prometheus does.
 #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
-fn range_function(function: &str, samples: &[Sample], end: i64, range: i64) -> Option<f64> {
+fn float_range_function(
+    function: &str,
+    samples: &[(i64, f64)],
+    end: i64,
+    range: i64,
+) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
@@ -427,7 +519,7 @@ fn range_function(function: &str, samples: &[Sample], end: i64, range: i64) -> O
 /// samples sit far from them, and divided by the window for a rate.
 #[allow(clippy::cast_precision_loss)]
 fn extrapolated_rate(
-    samples: &[Sample],
+    samples: &[(i64, f64)],
     start: i64,
     end: i64,
     counter: bool,
@@ -483,7 +575,7 @@ fn extrapolated_rate(
 /// The slope and intercept of the least-squares line through `samples`,
 /// time measured in seconds from `intercept_time`.
 #[allow(clippy::cast_precision_loss, clippy::float_cmp)]
-fn linear_regression(samples: &[Sample], intercept_time: i64) -> Option<(f64, f64)> {
+fn linear_regression(samples: &[(i64, f64)], intercept_time: i64) -> Option<(f64, f64)> {
     if samples.len() < 2 {
         return None;
     }
@@ -508,7 +600,7 @@ fn linear_regression(samples: &[Sample], intercept_time: i64) -> Option<(f64, f6
 
 /// Holt-Winters double exponential smoothing with `sf` for the level
 /// and `tf` for the trend.
-fn holt_winters(samples: &[Sample], sf: f64, tf: f64) -> Option<f64> {
+fn holt_winters(samples: &[(i64, f64)], sf: f64, tf: f64) -> Option<f64> {
     if samples.len() < 2 || !(0.0..=1.0).contains(&sf) || !(0.0..=1.0).contains(&tf) {
         return None;
     }
@@ -574,7 +666,7 @@ fn valid_label_name(name: &str) -> bool {
 
 /// `series` as a vector: every label set once, or the error Prometheus
 /// gives when a label function makes two series alike.
-fn unique(series: Vec<(Labels, f64)>) -> Result<Vec<(Labels, f64)>, KernelError> {
+fn unique(series: Vec<(Labels, Point)>) -> Result<Vec<(Labels, Point)>, KernelError> {
     let mut seen = std::collections::BTreeSet::new();
     for (labels, _) in &series {
         if !seen.insert(labels) {
@@ -616,28 +708,86 @@ fn label_join(evaluator: &Evaluator<'_>, args: &[PromExpr], t: i64) -> Result<Va
     Ok(Value::Vector(unique(joined)?))
 }
 
-/// `histogram_quantile(q, buckets)` over classic `le` buckets, with
-/// Prometheus' interpolation inside the bucket that holds the rank.
-#[allow(clippy::cast_precision_loss)]
-fn histogram_quantile(q: f64, buckets: Vec<(Labels, f64)>) -> Vec<(Labels, f64)> {
-    let mut groups: BTreeMap<Labels, Vec<(f64, f64)>> = BTreeMap::new();
-    for (mut labels, count) in buckets {
-        let Some(le) = labels.remove("le") else {
-            continue;
-        };
-        let Ok(upper) = le.parse::<f64>() else {
-            continue;
-        };
-        labels.remove(NAME_LABEL);
-        groups.entry(labels).or_default().push((upper, count));
+/// The classic buckets of a label set: upper bound and cumulative count.
+type ClassicBuckets = Vec<(f64, f64)>;
+/// A vector split into its native histogram samples and its classic
+/// buckets by label set.
+type Split = (
+    Vec<(Labels, Box<Histogram>)>,
+    BTreeMap<Labels, ClassicBuckets>,
+);
+
+/// The native histogram samples of `vector` and its classic buckets
+/// grouped by label set without `le`. A label set that has both at
+/// once is dropped from both sides, as Prometheus does.
+fn split_histograms(vector: Vec<(Labels, Point)>) -> Split {
+    let mut natives = Vec::new();
+    let mut classics: BTreeMap<Labels, ClassicBuckets> = BTreeMap::new();
+    for (mut labels, point) in vector {
+        match point {
+            Point::Histogram(histogram) => natives.push((labels, histogram)),
+            Point::Float(count) => {
+                let Some(le) = labels.remove("le") else {
+                    continue;
+                };
+                let Ok(upper) = le.parse::<f64>() else {
+                    continue;
+                };
+                classics.entry(labels).or_default().push((upper, count));
+            }
+        }
     }
-    groups
+    let kept = natives
         .into_iter()
-        .map(|(labels, mut buckets)| {
-            buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
-            (labels, bucket_quantile(q, &mut buckets))
+        .filter(|(labels, _)| classics.remove(labels).is_none())
+        .collect();
+    (kept, classics)
+}
+
+/// `histogram_quantile(q, v)`: of each native histogram sample, and of
+/// each classic histogram's `le` buckets with Prometheus' interpolation
+/// inside the bucket that holds the rank.
+fn histogram_quantile(q: f64, vector: Vec<(Labels, Point)>) -> Vec<(Labels, Point)> {
+    let (natives, classics) = split_histograms(vector);
+    let mut out: Vec<(Labels, Point)> = natives
+        .into_iter()
+        .map(|(labels, histogram)| (without_name(labels), Point::Float(histogram.quantile(q))))
+        .collect();
+    out.extend(classics.into_iter().map(|(labels, mut buckets)| {
+        buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (
+            without_name(labels),
+            Point::Float(bucket_quantile(q, &mut buckets)),
+        )
+    }));
+    out
+}
+
+/// `histogram_fraction(lower, upper, v)`: the share of observations
+/// between the bounds, of each native histogram sample and of each
+/// classic histogram's `le` buckets.
+fn histogram_fraction(
+    lower: f64,
+    upper: f64,
+    vector: Vec<(Labels, Point)>,
+) -> Vec<(Labels, Point)> {
+    let (natives, classics) = split_histograms(vector);
+    let mut out: Vec<(Labels, Point)> = natives
+        .into_iter()
+        .map(|(labels, histogram)| {
+            (
+                without_name(labels),
+                Point::Float(histogram.fraction(lower, upper)),
+            )
         })
-        .collect()
+        .collect();
+    out.extend(classics.into_iter().map(|(labels, mut buckets)| {
+        (
+            without_name(labels),
+            Point::Float(bucket_fraction(lower, upper, &mut buckets)),
+        )
+    }));
+    out
 }
 
 fn bucket_quantile(q: f64, buckets: &mut [(f64, f64)]) -> f64 {
@@ -682,6 +832,75 @@ fn bucket_quantile(q: f64, buckets: &mut [(f64, f64)]) -> f64 {
     }
     let bucket_end = buckets[b].0;
     bucket_start + (bucket_end - bucket_start) * (rank / count)
+}
+
+/// Prometheus' `BucketFraction`: the share of a classic histogram's
+/// observations between `lower` and `upper`, interpolated linearly
+/// inside a bucket; the lowest bucket starts at 0 unless it ends at or
+/// below 0. `NaN` without observations, for a `NaN` bound or without a
+/// `+Inf` bucket; 0 when `lower` is not below `upper`.
+#[allow(clippy::float_cmp)]
+fn bucket_fraction(lower: f64, upper: f64, buckets: &mut Vec<(f64, f64)>) -> f64 {
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if buckets.last().is_none_or(|last| last.0 != f64::INFINITY) {
+        return f64::NAN;
+    }
+    buckets.dedup_by(|next, kept| {
+        let same = next.0 == kept.0;
+        if same {
+            kept.1 += next.1;
+        }
+        same
+    });
+    let count = buckets[buckets.len() - 1].1;
+    if count == 0.0 || lower.is_nan() || upper.is_nan() {
+        return f64::NAN;
+    }
+    if lower >= upper {
+        return 0.0;
+    }
+    let (mut rank, mut lower_rank, mut upper_rank) = (0.0, None, None);
+    let mut lower_bound = if buckets[0].0 <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        0.0
+    };
+    for (i, &(upper_bound, cumulative)) in buckets.iter().enumerate() {
+        if i > 0 {
+            lower_bound = buckets[i - 1].0;
+        }
+        // A bucket from -Inf cannot be interpolated into and counts
+        // whole; the +Inf one adds nothing, as the formula gives.
+        let interpolate = |v: f64| {
+            if lower_bound == f64::NEG_INFINITY {
+                cumulative
+            } else {
+                rank + (cumulative - rank) * (v - lower_bound) / (upper_bound - lower_bound)
+            }
+        };
+        if lower_rank.is_none() && lower_bound >= lower {
+            lower_rank = Some(rank);
+        }
+        if upper_rank.is_none() && lower_bound >= upper {
+            upper_rank = Some(rank);
+        }
+        if lower_rank.is_some() && upper_rank.is_some() {
+            break;
+        }
+        if lower_rank.is_none() && lower_bound < lower && upper_bound > lower {
+            lower_rank = Some(interpolate(lower));
+        }
+        if upper_rank.is_none() && lower_bound < upper && upper_bound > upper {
+            upper_rank = Some(interpolate(upper));
+        }
+        if lower_rank.is_some() && upper_rank.is_some() {
+            break;
+        }
+        rank = cumulative;
+    }
+    let lower_rank = lower_rank.filter(|r| *r <= count).unwrap_or(count);
+    let upper_rank = upper_rank.filter(|r| *r <= count).unwrap_or(count);
+    (upper_rank - lower_rank) / count
 }
 
 /// The calendar functions over a Unix time in seconds, in UTC.
@@ -754,6 +973,41 @@ mod tests {
         assert!(bucket_quantile(2.0, &mut buckets).is_infinite());
     }
 
+    /// Prometheus' `BucketFraction` over classic buckets.
+    #[test]
+    fn bucket_fraction_interpolates_linearly() {
+        let buckets = || vec![(0.1, 1.0), (0.5, 3.0), (1.0, 4.0), (f64::INFINITY, 4.0)];
+        let near = |actual: f64, expected: f64| (actual - expected).abs() < 1e-9;
+        assert!(near(bucket_fraction(0.1, 0.5, &mut buckets()), 0.5));
+        assert!(near(bucket_fraction(0.0, 0.1, &mut buckets()), 0.25));
+        // Halfway into (0.1, 0.5]: 1 + 2 * 0.5 = 2 of 4 observations.
+        assert!(near(bucket_fraction(0.0, 0.3, &mut buckets()), 0.5));
+        assert!(near(bucket_fraction(0.3, 1.0, &mut buckets()), 0.5));
+        assert!(near(
+            bucket_fraction(f64::NEG_INFINITY, f64::INFINITY, &mut buckets()),
+            1.0
+        ));
+        assert!(
+            near(bucket_fraction(1.0, 2.0, &mut buckets()), 0.0),
+            "nothing above 1 but +Inf"
+        );
+        assert!(near(bucket_fraction(0.5, 0.1, &mut buckets()), 0.0));
+        assert!(bucket_fraction(f64::NAN, 1.0, &mut buckets()).is_nan());
+        assert!(bucket_fraction(0.0, 1.0, &mut vec![(1.0, 1.0)]).is_nan());
+        assert!(bucket_fraction(0.0, 1.0, &mut vec![(1.0, 0.0), (f64::INFINITY, 0.0)]).is_nan());
+        let mut negative = vec![(-1.0, 2.0), (1.0, 3.0), (f64::INFINITY, 4.0)];
+        assert!(
+            near(bucket_fraction(-5.0, -1.0, &mut negative), 0.0),
+            "nothing of a bucket from -Inf lies within a finite range"
+        );
+        assert!(near(bucket_fraction(-5.0, 0.0, &mut negative), 0.125));
+        let mut doubled = vec![(0.5, 1.0), (0.5, 1.0), (f64::INFINITY, 4.0)];
+        assert!(
+            near(bucket_fraction(0.0, 0.5, &mut doubled), 0.5),
+            "same bounds coalesce"
+        );
+    }
+
     #[test]
     fn calendar_functions_read_utc() {
         // 2023-11-14T22:13:20Z, a Tuesday.
@@ -770,7 +1024,7 @@ mod tests {
 
     #[test]
     fn regression_and_smoothing() {
-        let samples: Vec<Sample> = (0..5i32)
+        let samples: Vec<(i64, f64)> = (0..5i32)
             .map(|i| (i64::from(i) * 1_000_000_000, 2.0 * f64::from(i) + 1.0))
             .collect();
         let (slope, intercept) = linear_regression(&samples, 0).unwrap();
@@ -787,9 +1041,15 @@ mod tests {
         assert!(!valid_label_name("1a"));
         assert!(!valid_label_name(""));
         let labels = |job: &str| Labels::from([("job".to_owned(), job.to_owned())]);
-        assert!(unique(vec![(labels("a"), 1.0), (labels("b"), 2.0)]).is_ok());
+        assert!(
+            unique(vec![
+                (labels("a"), Point::Float(1.0)),
+                (labels("b"), Point::Float(2.0))
+            ])
+            .is_ok()
+        );
         assert!(matches!(
-            unique(vec![(labels("a"), 1.0), (labels("a"), 2.0)]),
+            unique(vec![(labels("a"), Point::Float(1.0)), (labels("a"), Point::Float(2.0))]),
             Err(KernelError::Unsupported(message)) if message.contains("same labelset")
         ));
     }
@@ -802,7 +1062,7 @@ mod tests {
     fn rate_takes_the_zero_point_after_the_extrapolation_cap() {
         // Samples 10 s apart from t = 30 s, values 5, 15: the slope reaches
         // zero 5 s before the first sample; the range starts at 0.
-        let samples: Vec<Sample> = vec![(30_000_000_000, 5.0), (40_000_000_000, 15.0)];
+        let samples: Vec<(i64, f64)> = vec![(30_000_000_000, 5.0), (40_000_000_000, 15.0)];
         let increase = extrapolated_rate(&samples, 0, 50_000_000_000, true, false).unwrap();
         // 30 s to the start is past the 11 s threshold: the cap of 5 s
         // applies, and the zero point, 5 s, is not nearer. End: 10 s to

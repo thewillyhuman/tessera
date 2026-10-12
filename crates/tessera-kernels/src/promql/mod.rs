@@ -11,6 +11,12 @@
 //! follow its label rules; a subquery evaluates its expression at the
 //! substeps of its range. The evaluator is pure: the operator that
 //! calls it turns rows into series and series back into rows.
+//!
+//! A sample is a float or a native histogram ([`Point`]). A histogram
+//! takes part where Prometheus lets it: scaled by a float, added to or
+//! subtracted from another, summed or averaged, compared for equality,
+//! counted, and read by the `histogram_*` functions; elsewhere the
+//! sample drops out, as it does where Prometheus warns.
 
 mod functions;
 pub mod histogram;
@@ -26,8 +32,68 @@ pub use histogram::{Bucket, Histogram, ResetHint};
 
 /// The labels of a series, `__name__` among them.
 pub type Labels = BTreeMap<String, String>;
+
+/// The value of one sample: a float, or a native histogram (QL-5).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Point {
+    /// A float sample.
+    Float(f64),
+    /// A native histogram sample.
+    Histogram(Box<Histogram>),
+}
+
+impl Point {
+    /// The float, if the sample is one.
+    #[must_use]
+    pub fn float(&self) -> Option<f64> {
+        match self {
+            Point::Float(value) => Some(*value),
+            Point::Histogram(_) => None,
+        }
+    }
+
+    /// The histogram, if the sample is one.
+    #[must_use]
+    pub fn histogram(&self) -> Option<&Histogram> {
+        match self {
+            Point::Float(_) => None,
+            Point::Histogram(histogram) => Some(histogram),
+        }
+    }
+
+    /// Whether the sample is Prometheus' staleness marker: its `NaN`
+    /// as the value, or as a histogram's sum.
+    #[must_use]
+    pub fn is_stale(&self) -> bool {
+        match self {
+            Point::Float(value) => is_stale(*value),
+            Point::Histogram(histogram) => is_stale(histogram.sum),
+        }
+    }
+
+    /// The sample as text, as `count_values` labels it.
+    fn text(&self) -> String {
+        match self {
+            Point::Float(value) => format_value(*value),
+            Point::Histogram(histogram) => histogram.to_string(),
+        }
+    }
+}
+
+impl From<f64> for Point {
+    fn from(value: f64) -> Self {
+        Point::Float(value)
+    }
+}
+
+impl From<Histogram> for Point {
+    fn from(histogram: Histogram) -> Self {
+        Point::Histogram(Box::new(histogram))
+    }
+}
+
 /// A sample: time in nanoseconds and value.
-pub type Sample = (i64, f64);
+pub type Sample = (i64, Point);
 
 /// The label that names a metric.
 pub const NAME_LABEL: &str = "__name__";
@@ -65,7 +131,7 @@ pub enum Value {
     /// A string.
     Text(String),
     /// Series with one value each.
-    Vector(Vec<(Labels, f64)>),
+    Vector(Vec<(Labels, Point)>),
     /// Series with samples over a range.
     Matrix(Vec<Series>),
 }
@@ -79,7 +145,7 @@ pub struct Row {
     /// The labels; `None` for a scalar.
     pub labels: Option<Labels>,
     /// The value.
-    pub value: f64,
+    pub value: Point,
 }
 
 /// Whether `value` is a staleness marker.
@@ -107,7 +173,7 @@ pub fn evaluate(
             Value::Scalar(value) => rows.push(Row {
                 time: t,
                 labels: None,
-                value,
+                value: Point::Float(value),
             }),
             Value::Vector(vector) => rows.extend(vector.into_iter().map(|(labels, value)| Row {
                 time: t,
@@ -170,7 +236,7 @@ impl Evaluator<'_> {
                 Value::Vector(vector) => Value::Vector(
                     vector
                         .into_iter()
-                        .map(|(labels, v)| (without_name(labels), -v))
+                        .map(|(labels, v)| (without_name(labels), negated(v)))
                         .collect(),
                 ),
                 other => return Err(unsupported(format!("cannot negate {}", kind_of(&other)))),
@@ -249,7 +315,10 @@ impl Evaluator<'_> {
                             }
                         }
                         Value::Scalar(value) => {
-                            series.entry(Labels::new()).or_default().push((sub, value));
+                            series
+                                .entry(Labels::new())
+                                .or_default()
+                                .push((sub, Point::Float(value)));
                         }
                         other => {
                             return Err(unsupported(format!(
@@ -274,7 +343,7 @@ impl Evaluator<'_> {
 
     /// The last sample of each series of `input` within the lookback
     /// delta before `t`, staleness honoured.
-    fn instant(&self, input: usize, t: i64) -> Vec<(Labels, f64)> {
+    fn instant(&self, input: usize, t: i64) -> Vec<(Labels, Point)> {
         let lookback = i64::try_from(LOOKBACK.as_nanos()).unwrap_or(i64::MAX);
         let since = t - lookback;
         self.inputs
@@ -284,8 +353,9 @@ impl Evaluator<'_> {
                     .iter()
                     .filter_map(|s| {
                         let index = s.samples.partition_point(|(ts, _)| *ts <= t);
-                        let (ts, value) = *s.samples.get(index.checked_sub(1)?)?;
-                        (ts > since && !is_stale(value)).then(|| (s.labels.clone(), value))
+                        let (ts, value) = s.samples.get(index.checked_sub(1)?)?;
+                        (*ts > since && !value.is_stale())
+                            .then(|| (s.labels.clone(), value.clone()))
                     })
                     .collect()
             })
@@ -305,8 +375,8 @@ impl Evaluator<'_> {
                         let to = s.samples.partition_point(|(ts, _)| *ts <= end);
                         let samples: Vec<Sample> = s.samples[from..to]
                             .iter()
-                            .copied()
-                            .filter(|(_, v)| !is_stale(*v))
+                            .filter(|(_, v)| !v.is_stale())
+                            .cloned()
                             .collect();
                         (!samples.is_empty()).then(|| Series {
                             labels: s.labels.clone(),
@@ -341,6 +411,22 @@ fn kind_of_expr(expr: &PromExpr) -> &'static str {
 fn without_name(mut labels: Labels) -> Labels {
     labels.remove(NAME_LABEL);
     labels
+}
+
+/// `-point`: a histogram negated becomes a gauge.
+fn negated(point: Point) -> Point {
+    match point {
+        Point::Float(value) => Point::Float(-value),
+        Point::Histogram(mut histogram) => {
+            histogram.mul(-1.0);
+            Point::Histogram(histogram)
+        }
+    }
+}
+
+/// The floats among `members`; histogram samples have no part.
+fn floats(members: &[(Labels, Point)]) -> Vec<f64> {
+    members.iter().filter_map(|(_, v)| v.float()).collect()
 }
 
 /// The labels that identify a series for matching: all but `__name__`,
@@ -423,22 +509,6 @@ fn binary(
         };
     }
     let drop_name = !op.is_comparison() || bool_result;
-    let keep_or_mark = |value: f64, other: f64, swapped: bool| -> Option<f64> {
-        let (l, r) = if swapped {
-            (other, value)
-        } else {
-            (value, other)
-        };
-        if !op.is_comparison() {
-            return Some(arithmetic(op, l, r));
-        }
-        let held = holds(op, l, r);
-        if bool_result {
-            Some(f64::from(u8::from(held)))
-        } else {
-            held.then_some(value)
-        }
-    };
     Ok(match (left, right) {
         (Value::Scalar(l), Value::Scalar(r)) => {
             if op.is_comparison() && !bool_result {
@@ -457,7 +527,7 @@ fn binary(
                     } else {
                         labels
                     };
-                    keep_or_mark(v, scalar, false).map(|v| (labels, v))
+                    with_scalar(op, v, scalar, false, bool_result).map(|v| (labels, v))
                 })
                 .collect(),
         ),
@@ -470,7 +540,7 @@ fn binary(
                     } else {
                         labels
                     };
-                    keep_or_mark(v, scalar, true).map(|v| (labels, v))
+                    with_scalar(op, v, scalar, true, bool_result).map(|v| (labels, v))
                 })
                 .collect(),
         ),
@@ -488,13 +558,108 @@ fn binary(
     })
 }
 
+/// `value op scalar`, or `scalar op value` when `swapped`: the result,
+/// or none when the sample drops out, as a comparison that does not
+/// hold does. A histogram is scaled by a float and divided by one;
+/// nothing else, a comparison included, has a result.
+fn with_scalar(
+    op: PromOp,
+    value: Point,
+    scalar: f64,
+    swapped: bool,
+    bool_result: bool,
+) -> Option<Point> {
+    let histogram = match value {
+        Point::Float(v) => {
+            let (l, r) = if swapped { (scalar, v) } else { (v, scalar) };
+            if !op.is_comparison() {
+                return Some(Point::Float(arithmetic(op, l, r)));
+            }
+            let held = holds(op, l, r);
+            return if bool_result {
+                Some(Point::Float(f64::from(u8::from(held))))
+            } else {
+                held.then_some(Point::Float(v))
+            };
+        }
+        Point::Histogram(histogram) => histogram,
+    };
+    scaled(op, histogram, scalar, swapped).map(Point::Histogram)
+}
+
+/// A histogram times a float, or divided by a float on its right.
+fn scaled(
+    op: PromOp,
+    mut histogram: Box<Histogram>,
+    scalar: f64,
+    float_on_left: bool,
+) -> Option<Box<Histogram>> {
+    match op {
+        PromOp::Mul => {
+            histogram.mul(scalar);
+        }
+        PromOp::Div if !float_on_left => {
+            histogram.div(scalar);
+        }
+        _ => return None,
+    }
+    histogram.compact();
+    Some(histogram)
+}
+
+/// `l op r` between the samples of two matched series: the result, or
+/// none when the pair drops out. A comparison keeps the sample of the
+/// many side, `r` when `swapped`; `bool` gives 1 or 0 instead. Two
+/// histograms add, subtract into a gauge, and compare for equality.
+fn combined(op: PromOp, l: &Point, r: &Point, swapped: bool, bool_result: bool) -> Option<Point> {
+    let kept = || if swapped { r.clone() } else { l.clone() };
+    let held = |held: bool| {
+        if bool_result {
+            Some(Point::Float(f64::from(u8::from(held))))
+        } else {
+            held.then(kept)
+        }
+    };
+    match (l, r) {
+        (Point::Float(a), Point::Float(b)) => {
+            if op.is_comparison() {
+                held(holds(op, *a, *b))
+            } else {
+                Some(Point::Float(arithmetic(op, *a, *b)))
+            }
+        }
+        (Point::Float(f), Point::Histogram(h)) => {
+            scaled(op, h.clone(), *f, true).map(Point::Histogram)
+        }
+        (Point::Histogram(h), Point::Float(f)) => {
+            scaled(op, h.clone(), *f, false).map(Point::Histogram)
+        }
+        (Point::Histogram(a), Point::Histogram(b)) => match op {
+            PromOp::Add | PromOp::Sub => {
+                let mut result = a.clone();
+                if op == PromOp::Add {
+                    result.add(b).ok()?;
+                } else {
+                    result.sub(b).ok()?;
+                    result.hint = ResetHint::Gauge;
+                }
+                result.compact();
+                Some(Point::Histogram(result))
+            }
+            PromOp::Eq => held(a.equals(b)),
+            PromOp::NotEq => held(!a.equals(b)),
+            _ => None,
+        },
+    }
+}
+
 /// `and`, `or` and `unless` on the series' signatures.
 fn set_operation(
     op: PromOp,
-    left: Vec<(Labels, f64)>,
-    right: Vec<(Labels, f64)>,
+    left: Vec<(Labels, Point)>,
+    right: Vec<(Labels, Point)>,
     matching: Option<&Matching>,
-) -> Vec<(Labels, f64)> {
+) -> Vec<(Labels, Point)> {
     let right_signatures: BTreeSet<Labels> =
         right.iter().map(|(l, _)| signature(l, matching)).collect();
     match op {
@@ -547,11 +712,11 @@ fn result_labels(left: &Labels, matching: Option<&Matching>, drop_name: bool) ->
 /// one-to-many with `group_right`.
 fn vector_match(
     op: PromOp,
-    left: Vec<(Labels, f64)>,
-    right: Vec<(Labels, f64)>,
+    left: Vec<(Labels, Point)>,
+    right: Vec<(Labels, Point)>,
     matching: Option<&Matching>,
     bool_result: bool,
-) -> Result<Vec<(Labels, f64)>, KernelError> {
+) -> Result<Vec<(Labels, Point)>, KernelError> {
     let drop_name = !op.is_comparison() || bool_result;
     let group = matching.and_then(|m| m.group.as_ref());
     // The "one" side is indexed by signature; with group_right the sides
@@ -562,7 +727,7 @@ fn vector_match(
     } else {
         (left, right)
     };
-    let mut by_signature: BTreeMap<Labels, (Labels, f64)> = BTreeMap::new();
+    let mut by_signature: BTreeMap<Labels, (Labels, Point)> = BTreeMap::new();
     for (labels, value) in one {
         let key = signature(&labels, matching);
         if by_signature.insert(key, (labels, value)).is_some() {
@@ -584,21 +749,12 @@ fn vector_match(
             ));
         }
         let (l, r) = if swapped {
-            (*one_value, value)
+            (one_value, &value)
         } else {
-            (value, *one_value)
+            (&value, one_value)
         };
-        let result = if op.is_comparison() {
-            let held = holds(op, l, r);
-            if bool_result {
-                f64::from(u8::from(held))
-            } else if held {
-                if swapped { r } else { l }
-            } else {
-                continue;
-            }
-        } else {
-            arithmetic(op, l, r)
+        let Some(result) = combined(op, l, r, swapped, bool_result) else {
+            continue;
         };
         let mut result_labels = if swapped {
             // group_right keeps the right (many) side's labels.
@@ -682,11 +838,14 @@ pub(crate) fn quantile(q: f64, values: &mut [f64]) -> f64 {
     values[lower] * (1.0 - weight) + values[upper] * weight
 }
 
-/// An aggregation over the series of `vector`.
-#[allow(clippy::cast_precision_loss)]
+/// An aggregation over the series of `vector`. `sum` and `avg` take
+/// histograms as well as floats, but not both in one group; `count`,
+/// `group`, `count_values`, `limitk` and `limit_ratio` take any
+/// sample; the others read floats only.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn aggregate(
     op: PromAggregate,
-    vector: Vec<(Labels, f64)>,
+    vector: Vec<(Labels, Point)>,
     parameter: Option<&Value>,
     grouping: Option<&SeriesGrouping>,
 ) -> Result<Value, KernelError> {
@@ -694,7 +853,7 @@ fn aggregate(
         Some(Value::Scalar(v)) => Ok(*v),
         _ => Err(unsupported(format!("{} needs a number", op.name()))),
     };
-    let mut groups: BTreeMap<Labels, Vec<(Labels, f64)>> = BTreeMap::new();
+    let mut groups: BTreeMap<Labels, Vec<(Labels, Point)>> = BTreeMap::new();
     for (labels, value) in vector {
         groups
             .entry(group_labels(&labels, grouping))
@@ -703,16 +862,30 @@ fn aggregate(
     }
     let mut out = Vec::new();
     for (key, members) in groups {
-        let values: Vec<f64> = members.iter().map(|(_, v)| *v).collect();
+        let values = floats(&members);
         let n = values.len() as f64;
+        let push = |out: &mut Vec<(Labels, Point)>, value: f64| {
+            out.push((key.clone(), Point::Float(value)));
+        };
         match op {
-            PromAggregate::Sum => out.push((key, values.iter().sum())),
-            PromAggregate::Min => out.push((key, values.iter().copied().fold(f64::NAN, nan_min))),
-            PromAggregate::Max => out.push((key, values.iter().copied().fold(f64::NAN, nan_max))),
-            PromAggregate::Avg => out.push((key, values.iter().sum::<f64>() / n)),
-            PromAggregate::Count => out.push((key, n)),
-            PromAggregate::Group => out.push((key, 1.0)),
+            PromAggregate::Sum | PromAggregate::Avg => {
+                if let Some(value) = sum_or_avg(op, &members) {
+                    out.push((key, value));
+                }
+            }
+            PromAggregate::Min if !values.is_empty() => {
+                push(&mut out, values.iter().copied().fold(f64::NAN, nan_min));
+            }
+            PromAggregate::Max if !values.is_empty() => {
+                push(&mut out, values.iter().copied().fold(f64::NAN, nan_max));
+            }
+            PromAggregate::Min | PromAggregate::Max => {}
+            PromAggregate::Count => push(&mut out, members.len() as f64),
+            PromAggregate::Group => push(&mut out, 1.0),
             PromAggregate::Stddev | PromAggregate::Stdvar => {
+                if values.is_empty() {
+                    continue;
+                }
                 let mean = values.iter().sum::<f64>() / n;
                 let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
                 let value = if op == PromAggregate::Stddev {
@@ -720,25 +893,28 @@ fn aggregate(
                 } else {
                     variance
                 };
-                out.push((key, value));
+                push(&mut out, value);
             }
             PromAggregate::Quantile => {
                 let q = scalar_parameter()?;
+                if values.is_empty() {
+                    continue;
+                }
                 let mut values = values;
-                out.push((key, quantile(q, &mut values)));
+                push(&mut out, quantile(q, &mut values));
             }
             PromAggregate::CountValues => {
                 let Some(Value::Text(name)) = parameter else {
                     return Err(unsupported("count_values needs a label name"));
                 };
                 let mut counts: BTreeMap<String, f64> = BTreeMap::new();
-                for value in &values {
-                    *counts.entry(format_value(*value)).or_default() += 1.0;
+                for (_, value) in &members {
+                    *counts.entry(value.text()).or_default() += 1.0;
                 }
                 for (text, count) in counts {
                     let mut labels = key.clone();
                     labels.insert(name.clone(), text);
-                    out.push((labels, count));
+                    out.push((labels, Point::Float(count)));
                 }
             }
             PromAggregate::Topk | PromAggregate::Bottomk => {
@@ -746,7 +922,10 @@ fn aggregate(
                 if k.is_nan() || k < 1.0 {
                     continue;
                 }
-                let mut members = members;
+                let mut members: Vec<(Labels, f64)> = members
+                    .into_iter()
+                    .filter_map(|(labels, v)| Some((labels, v.float()?)))
+                    .collect();
                 members.sort_by(|a, b| {
                     let order = a.1.total_cmp(&b.1);
                     if op == PromAggregate::Topk {
@@ -759,7 +938,12 @@ fn aggregate(
                 members.sort_by_key(|(_, v)| v.is_nan());
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let k = k as usize;
-                out.extend(members.into_iter().take(k));
+                out.extend(
+                    members
+                        .into_iter()
+                        .take(k)
+                        .map(|(labels, v)| (labels, Point::Float(v))),
+                );
             }
             PromAggregate::Limitk => {
                 let k = scalar_parameter()?;
@@ -788,6 +972,36 @@ fn aggregate(
         }
     }
     Ok(Value::Vector(out))
+}
+
+/// The `sum` or `avg` of a group: of its floats, or of its histograms
+/// added at the coarser schema; a group with both has no result, as
+/// Prometheus warns, nor one whose histograms cannot be combined.
+#[allow(clippy::cast_precision_loss)]
+fn sum_or_avg(op: PromAggregate, members: &[(Labels, Point)]) -> Option<Point> {
+    let n = members.len() as f64;
+    let histograms: Vec<&Histogram> = members.iter().filter_map(|(_, v)| v.histogram()).collect();
+    if histograms.is_empty() {
+        let sum: f64 = floats(members).iter().sum();
+        return Some(Point::Float(if op == PromAggregate::Avg {
+            sum / n
+        } else {
+            sum
+        }));
+    }
+    let (first, rest) = histograms.split_first()?;
+    if rest.len() + 1 != members.len() {
+        return None;
+    }
+    let mut total = (*first).clone();
+    for histogram in rest {
+        total.add(histogram).ok()?;
+    }
+    if op == PromAggregate::Avg {
+        total.div(n);
+    }
+    total.compact();
+    Some(Point::from(total))
 }
 
 /// Where a series falls in `[0, 1)` by a stable hash of its labels, so
@@ -846,7 +1060,37 @@ mod tests {
     fn series(pairs: &[(&str, &str)], samples: &[(i64, f64)]) -> Series {
         Series {
             labels: labels(pairs),
-            samples: samples.iter().map(|(t, v)| (t * S, *v)).collect(),
+            samples: samples
+                .iter()
+                .map(|(t, v)| (t * S, Point::Float(*v)))
+                .collect(),
+        }
+    }
+
+    /// A schema 0 histogram with `buckets` from index 0 upward.
+    fn hist(count: f64, sum: f64, buckets: &[f64]) -> Point {
+        Point::from(Histogram {
+            count,
+            sum,
+            positive: buckets
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (i32::try_from(i).unwrap(), *c))
+                .collect(),
+            ..Histogram::default()
+        })
+    }
+
+    /// A histogram series `name{job=...}` with one sample per entry of
+    /// `points`, 15 s apart from 0.
+    fn histogram_series(name: &str, job: &str, points: &[Point]) -> Series {
+        Series {
+            labels: labels(&[("__name__", name), ("job", job)]),
+            samples: points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i64::try_from(i).unwrap() * 15 * S, p.clone()))
+                .collect(),
         }
     }
 
@@ -902,7 +1146,26 @@ mod tests {
                     .map(String::as_str)
                     == Some(job)
             })
-            .map_or(f64::NAN, |r| r.value)
+            .map_or(f64::NAN, |r| r.value.float().unwrap_or(f64::NAN))
+    }
+
+    fn histogram_of(rows: &[Row], job: &str) -> Option<Histogram> {
+        rows.iter()
+            .find(|r| {
+                r.labels
+                    .as_ref()
+                    .and_then(|l| l.get("job"))
+                    .map(String::as_str)
+                    == Some(job)
+            })
+            .and_then(|r| r.value.histogram().cloned())
+    }
+
+    fn call(function: &str, args: Vec<PromExpr>) -> PromExpr {
+        PromExpr::Call {
+            function: function.into(),
+            args,
+        }
     }
 
     #[test]
@@ -910,7 +1173,7 @@ mod tests {
         let rows = at(&selector(1, None), 100);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].labels.as_ref().unwrap()["__name__"], "up");
-        assert!((rows[0].value - 1.0).abs() < f64::EPSILON);
+        assert!((rows[0].value.float().unwrap() - 1.0).abs() < f64::EPSILON);
         assert!(
             at(&selector(1, None), 331).is_empty(),
             "301s after the last sample"
@@ -1016,7 +1279,7 @@ mod tests {
         let rows = at(&total, 60);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].labels.as_ref().unwrap().is_empty());
-        assert!((rows[0].value - 46.0).abs() < f64::EPSILON);
+        assert!((rows[0].value.float().unwrap() - 46.0).abs() < f64::EPSILON);
         let topk = PromExpr::Aggregate {
             op: PromAggregate::Topk,
             input: Box::new(selector(0, None)),
@@ -1049,7 +1312,7 @@ mod tests {
         };
         let rows = at(&ratio, 60);
         assert_eq!(rows.len(), 1, "only api has an up series");
-        assert!((rows[0].value - 40.0).abs() < f64::EPSILON);
+        assert!((rows[0].value.float().unwrap() - 40.0).abs() < f64::EPSILON);
         assert!(!rows[0].labels.as_ref().unwrap().contains_key("__name__"));
         let gt = PromExpr::Binary {
             op: PromOp::Gt,
@@ -1179,5 +1442,257 @@ mod tests {
         assert!(quantile(1.5, &mut [1.0]).is_infinite());
         assert_eq!(format_value(3.0), "3");
         assert_eq!(format_value(2.5), "2.5");
+    }
+
+    /// QL-5: a histogram sample takes part where Prometheus lets it:
+    /// scaled by a float, added, subtracted into a gauge, negated,
+    /// summed, averaged, counted, compared for equality; and drops out
+    /// elsewhere, as it does where Prometheus warns.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn histogram_samples_flow_through_operators_and_aggregations() {
+        let inputs = vec![
+            vec![
+                histogram_series("latency", "api", &[hist(4.0, 5.0, &[1.0, 2.0, 1.0])]),
+                histogram_series("latency", "web", &[hist(2.0, 3.0, &[0.0, 1.0, 1.0])]),
+            ],
+            vec![series(&[("__name__", "up"), ("job", "api")], &[(0, 3.0)])],
+        ];
+        let eval = |expr: &PromExpr| {
+            evaluate(
+                expr,
+                &inputs,
+                Params {
+                    start: 0,
+                    end: 0,
+                    step: 0,
+                },
+            )
+            .unwrap()
+        };
+        let binary = |op, left, right| PromExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            matching: None,
+            bool_result: false,
+        };
+        let aggregate = |op, parameter: Option<PromExpr>| PromExpr::Aggregate {
+            op,
+            input: Box::new(selector(0, None)),
+            parameter: parameter.map(Box::new),
+            grouping: None,
+        };
+        let rows = eval(&selector(0, None));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].labels.as_ref().unwrap()["__name__"], "latency");
+        let doubled = eval(&binary(
+            PromOp::Mul,
+            selector(0, None),
+            PromExpr::Number(2.0),
+        ));
+        let api = histogram_of(&doubled, "api").unwrap();
+        assert!((api.count - 8.0).abs() < f64::EPSILON);
+        assert!((api.positive[&1] - 4.0).abs() < f64::EPSILON);
+        assert!(!doubled[0].labels.as_ref().unwrap().contains_key("__name__"));
+        let halved = eval(&binary(
+            PromOp::Div,
+            selector(0, None),
+            PromExpr::Number(2.0),
+        ));
+        assert!((histogram_of(&halved, "api").unwrap().sum - 2.5).abs() < f64::EPSILON);
+        let scaled = eval(&binary(
+            PromOp::Mul,
+            PromExpr::Number(3.0),
+            selector(0, None),
+        ));
+        assert!((histogram_of(&scaled, "web").unwrap().count - 6.0).abs() < f64::EPSILON);
+        assert!(
+            eval(&binary(
+                PromOp::Div,
+                PromExpr::Number(3.0),
+                selector(0, None)
+            ))
+            .is_empty(),
+            "a float divided by a histogram has no result"
+        );
+        assert!(
+            eval(&binary(
+                PromOp::Add,
+                selector(0, None),
+                PromExpr::Number(1.0)
+            ))
+            .is_empty()
+        );
+        assert!(
+            eval(&binary(
+                PromOp::Gt,
+                selector(0, None),
+                PromExpr::Number(1.0)
+            ))
+            .is_empty()
+        );
+        let by_up = eval(&binary(PromOp::Mul, selector(0, None), selector(1, None)));
+        assert_eq!(by_up.len(), 1, "only api has an up series");
+        assert!((histogram_of(&by_up, "api").unwrap().count - 12.0).abs() < f64::EPSILON);
+        assert!(eval(&binary(PromOp::Add, selector(0, None), selector(1, None))).is_empty());
+        let total = eval(&aggregate(PromAggregate::Sum, None));
+        assert_eq!(total.len(), 1);
+        let sum = total[0].value.histogram().unwrap();
+        assert!((sum.count - 6.0).abs() < f64::EPSILON);
+        assert_eq!(sum.positive, BTreeMap::from([(0, 1.0), (1, 3.0), (2, 2.0)]));
+        let mean = eval(&aggregate(PromAggregate::Avg, None));
+        assert!((mean[0].value.histogram().unwrap().count - 3.0).abs() < f64::EPSILON);
+        let count = eval(&aggregate(PromAggregate::Count, None));
+        assert!((count[0].value.float().unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!(eval(&aggregate(PromAggregate::Max, None)).is_empty());
+        assert!(eval(&aggregate(PromAggregate::Topk, Some(PromExpr::Number(1.0)))).is_empty());
+        assert_eq!(
+            eval(&aggregate(
+                PromAggregate::Limitk,
+                Some(PromExpr::Number(1.0))
+            ))
+            .len(),
+            1
+        );
+        let counted = eval(&aggregate(
+            PromAggregate::CountValues,
+            Some(PromExpr::Text("v".into())),
+        ));
+        assert_eq!(counted.len(), 2);
+        assert!(
+            counted
+                .iter()
+                .any(|r| r.labels.as_ref().unwrap()["v"].starts_with("{count:4"))
+        );
+        let doubled_sum = eval(&binary(PromOp::Add, selector(0, None), selector(0, None)));
+        assert!((histogram_of(&doubled_sum, "api").unwrap().count - 8.0).abs() < f64::EPSILON);
+        let nothing = eval(&binary(PromOp::Sub, selector(0, None), selector(0, None)));
+        let zero = histogram_of(&nothing, "api").unwrap();
+        assert!(zero.count == 0.0 && zero.positive.is_empty(), "{zero:?}");
+        assert_eq!(zero.hint, ResetHint::Gauge, "a difference is a gauge");
+        let negated = eval(&PromExpr::Negate(Box::new(selector(0, None))));
+        let negative = histogram_of(&negated, "api").unwrap();
+        assert!((negative.count + 4.0).abs() < f64::EPSILON);
+        assert_eq!(negative.hint, ResetHint::Gauge);
+        let same = eval(&binary(PromOp::Eq, selector(0, None), selector(0, None)));
+        assert_eq!(same.len(), 2, "a histogram equals itself");
+        assert!(eval(&binary(PromOp::NotEq, selector(0, None), selector(0, None))).is_empty());
+        assert!(eval(&binary(PromOp::Gt, selector(0, None), selector(0, None))).is_empty());
+        let mixed = vec![vec![
+            histogram_series("m", "api", &[hist(4.0, 5.0, &[1.0, 2.0, 1.0])]),
+            series(&[("__name__", "m"), ("job", "web")], &[(0, 1.0)]),
+        ]];
+        let total = evaluate(
+            &aggregate(PromAggregate::Sum, None),
+            &mixed,
+            Params {
+                start: 0,
+                end: 0,
+                step: 0,
+            },
+        )
+        .unwrap();
+        assert!(total.is_empty(), "floats and histograms do not add up");
+    }
+
+    /// QL-5: the `histogram_*` functions read native histograms, and
+    /// `histogram_quantile` and `histogram_fraction` classic buckets
+    /// too; functions of floats leave histograms out.
+    #[test]
+    fn histogram_functions_read_native_and_classic_samples() {
+        let bucket = |le: &str, count: f64| {
+            series(
+                &[("__name__", "classic_bucket"), ("job", "api"), ("le", le)],
+                &[(0, count)],
+            )
+        };
+        let inputs = vec![
+            vec![histogram_series(
+                "latency",
+                "api",
+                &[hist(4.0, 5.0, &[1.0, 2.0, 1.0])],
+            )],
+            vec![
+                bucket("0.1", 1.0),
+                bucket("0.5", 3.0),
+                bucket("1", 4.0),
+                bucket("+Inf", 4.0),
+            ],
+        ];
+        let eval = |expr: &PromExpr| {
+            evaluate(
+                expr,
+                &inputs,
+                Params {
+                    start: 0,
+                    end: 0,
+                    step: 0,
+                },
+            )
+            .unwrap()
+        };
+        let one = |rows: Vec<Row>| {
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert!(!rows[0].labels.as_ref().unwrap().contains_key("__name__"));
+            rows[0].value.float().unwrap()
+        };
+        let read = |function: &str| one(eval(&call(function, vec![selector(0, None)])));
+        assert!((read("histogram_count") - 4.0).abs() < f64::EPSILON);
+        assert!((read("histogram_sum") - 5.0).abs() < f64::EPSILON);
+        assert!((read("histogram_avg") - 1.25).abs() < f64::EPSILON);
+        assert!(read("histogram_stdvar") > 0.0);
+        assert!((read("histogram_stddev").powi(2) - read("histogram_stdvar")).abs() < 1e-12);
+        let median = one(eval(&call(
+            "histogram_quantile",
+            vec![PromExpr::Number(0.5), selector(0, None)],
+        )));
+        assert!((median - std::f64::consts::SQRT_2).abs() < 1e-12);
+        let half = one(eval(&call(
+            "histogram_fraction",
+            vec![
+                PromExpr::Number(1.0),
+                PromExpr::Number(2.0),
+                selector(0, None),
+            ],
+        )));
+        assert!((half - 0.5).abs() < f64::EPSILON);
+        let classic_median = one(eval(&call(
+            "histogram_quantile",
+            vec![PromExpr::Number(0.5), selector(1, None)],
+        )));
+        assert!((classic_median - 0.3).abs() < 1e-9);
+        let classic_half = one(eval(&call(
+            "histogram_fraction",
+            vec![
+                PromExpr::Number(0.1),
+                PromExpr::Number(0.5),
+                selector(1, None),
+            ],
+        )));
+        assert!((classic_half - 0.5).abs() < 1e-9);
+        assert!(eval(&call("histogram_count", vec![selector(1, None)])).is_empty());
+        assert!(eval(&call("abs", vec![selector(0, None)])).is_empty());
+        assert!(eval(&call("sort", vec![selector(0, None)])).is_empty());
+        assert!(eval(&call("round", vec![selector(0, None)])).is_empty());
+        assert!(eval(&call("hour", vec![selector(0, None)])).is_empty());
+        let scalar = eval(&call("scalar", vec![selector(0, None)]));
+        assert!(scalar[0].value.float().unwrap().is_nan());
+        assert!(
+            (one(eval(&call("timestamp", vec![selector(0, None)]))) - 0.0).abs() < f64::EPSILON
+        );
+        assert!(eval(&call("absent", vec![selector(0, None)])).is_empty());
+        let replaced = eval(&call(
+            "label_replace",
+            vec![
+                selector(0, None),
+                PromExpr::Text("site".into()),
+                PromExpr::Text("$1".into()),
+                PromExpr::Text("job".into()),
+                PromExpr::Text("(.*)".into()),
+            ],
+        ));
+        assert_eq!(replaced[0].labels.as_ref().unwrap()["site"], "api");
+        assert!(replaced[0].value.histogram().is_some());
     }
 }

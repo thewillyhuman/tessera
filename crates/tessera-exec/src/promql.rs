@@ -22,7 +22,7 @@ use arrow::array::{
 };
 use tessera_ir::promql::PromExpr;
 use tessera_ir::{VALUE, range_vector_schema};
-use tessera_kernels::promql::{self, NAME_LABEL, Params, Series, format_value};
+use tessera_kernels::promql::{self, NAME_LABEL, Params, Point, Series, format_value};
 use tessera_kernels::{attributes_column, histogram, row_labels};
 use tessera_types::event::{HISTOGRAM, TIMESTAMP};
 
@@ -114,7 +114,10 @@ pub fn series_of(batches: &[RecordBatch]) -> Result<Vec<Series>, ExecError> {
         .into_iter()
         .map(|(labels, samples)| Series {
             labels,
-            samples: samples.into_iter().collect(),
+            samples: samples
+                .into_iter()
+                .map(|(t, v)| (t, Point::Float(v)))
+                .collect(),
         })
         .collect())
 }
@@ -140,7 +143,10 @@ pub fn evaluate(
                 .map(|l| serde_json::to_string(l).unwrap_or_default())
         })
         .collect();
-    let values: Vec<f64> = rows.iter().map(|r| r.value).collect();
+    let values: Vec<f64> = rows
+        .iter()
+        .map(|r| r.value.float().unwrap_or(f64::NAN))
+        .collect();
     let columns: Vec<ArrayRef> = vec![
         Arc::new(TimestampNanosecondArray::from(times)),
         Arc::new(StringArray::from(labels)),
@@ -192,7 +198,10 @@ mod tests {
         assert_eq!(series.len(), 1, "a null value makes no series");
         assert_eq!(series[0].labels["__name__"], "up");
         assert_eq!(series[0].labels["job"], "api");
-        assert_eq!(series[0].samples, vec![(10, 5.0), (20, 2.0)]);
+        assert_eq!(
+            series[0].samples,
+            vec![(10, Point::Float(5.0)), (20, Point::Float(2.0))]
+        );
         let out = evaluate(
             &PromExpr::Selector {
                 input: 0,
@@ -247,7 +256,7 @@ mod tests {
         let series = series_of(&[batch("bucket")]).unwrap();
         let les: Vec<(String, f64)> = series
             .iter()
-            .filter_map(|s| Some((s.labels.get("le")?.clone(), s.samples[0].1)))
+            .filter_map(|s| Some((s.labels.get("le")?.clone(), s.samples[0].1.float()?)))
             .collect();
         assert_eq!(
             les,
@@ -261,12 +270,11 @@ mod tests {
         let near = |series: &[Series], value: f64| {
             series
                 .iter()
-                .any(|s| (s.samples[0].1 - value).abs() < f64::EPSILON)
+                .any(|s| (s.samples[0].1.float().unwrap_or(f64::NAN) - value).abs() < f64::EPSILON)
         };
         assert!(
-            series.iter().any(
-                |s| !s.labels.contains_key("le") && (s.samples[0].1 - 7.0).abs() < f64::EPSILON
-            ),
+            series.iter().any(|s| !s.labels.contains_key("le")
+                && (s.samples[0].1.float().unwrap_or(f64::NAN) - 7.0).abs() < f64::EPSILON),
             "a plain row beside them stays a plain sample"
         );
         let sums = series_of(&[batch("sum")]).unwrap();

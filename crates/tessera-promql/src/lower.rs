@@ -68,7 +68,11 @@ fn arity(function: &str) -> (usize, usize) {
     match function {
         "time" | "pi" => (0, 0),
         "round" => (1, 2),
-        "clamp" | "label_replace" | "holt_winters" | "double_exponential_smoothing" => {
+        "clamp"
+        | "label_replace"
+        | "holt_winters"
+        | "double_exponential_smoothing"
+        | "histogram_fraction" => {
             if function == "label_replace" {
                 (5, 5)
             } else {
