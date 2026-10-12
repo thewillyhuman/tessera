@@ -5,15 +5,18 @@
 //! arithmetic and rounding, label rewriting, `histogram_quantile` and
 //! `histogram_fraction` over native histograms and classic buckets,
 //! the `histogram_*` readers of a native histogram, and the calendar
-//! functions. A function of floats leaves histogram samples out, as
-//! Prometheus does with a note.
+//! functions. The rate family, `irate` and `idelta`, `changes`,
+//! `resets`, `sum_over_time`, `avg_over_time` and the counting
+//! functions take native histogram samples as Prometheus does; a
+//! function of floats leaves them out, as Prometheus does with a note.
 
 use std::collections::BTreeMap;
 
 use tessera_ir::promql::PromExpr;
 
 use super::{
-    Evaluator, Histogram, Labels, Point, Sample, Series, Value, quantile, unsupported, without_name,
+    Evaluator, Histogram, Labels, Point, ResetHint, Sample, Series, Value, quantile, unsupported,
+    without_name,
 };
 use crate::KernelError;
 
@@ -439,62 +442,215 @@ fn absent_labels(expr: &PromExpr) -> Labels {
 }
 
 /// A function over the samples of one series in the window ending at
-/// `end` and `range` long, reading the float samples.
+/// `end` and `range` long: over histogram samples where Prometheus
+/// defines it, over the floats otherwise. A rate, a sum or an average
+/// of a series that mixes both has no result, as Prometheus warns.
+#[allow(clippy::cast_precision_loss)]
 fn range_function(function: &str, samples: &[Sample], end: i64, range: i64) -> Option<Point> {
-    float_range_function(function, &floats_of(samples), end, range).map(Point::Float)
+    if samples.is_empty() {
+        return None;
+    }
+    let floats = floats_of(samples);
+    let histograms: Vec<(i64, &Histogram)> = samples
+        .iter()
+        .filter_map(|(t, v)| Some((*t, v.histogram()?)))
+        .collect();
+    let mixed = !floats.is_empty() && !histograms.is_empty();
+    match function {
+        "rate" | "increase" | "delta" => {
+            if mixed {
+                return None;
+            }
+            let counter = function != "delta";
+            let rate = function == "rate";
+            if histograms.is_empty() {
+                return extrapolated_rate(&floats, end - range, end, counter, rate)
+                    .map(Point::Float);
+            }
+            extrapolated_histogram_rate(&histograms, end - range, end, counter, rate)
+                .map(Point::from)
+        }
+        "irate" | "idelta" => instant_value(samples, function == "irate"),
+        "changes" => Some(Point::Float(
+            samples
+                .windows(2)
+                .filter(|w| changed(&w[0].1, &w[1].1))
+                .count() as f64,
+        )),
+        "resets" => Some(Point::Float(
+            samples
+                .windows(2)
+                .filter(|w| reset(&w[0].1, &w[1].1))
+                .count() as f64,
+        )),
+        "count_over_time" => Some(Point::Float(samples.len() as f64)),
+        "present_over_time" => Some(Point::Float(1.0)),
+        "last_over_time" => samples.last().map(|(_, v)| v.clone()),
+        "sum_over_time" | "avg_over_time" => {
+            if mixed {
+                return None;
+            }
+            let Some((first, rest)) = histograms.split_first() else {
+                return float_range_function(function, &floats).map(Point::Float);
+            };
+            let mut total = first.1.clone();
+            for (_, histogram) in rest {
+                total.add(histogram).ok()?;
+            }
+            if function == "avg_over_time" {
+                total.div(histograms.len() as f64);
+            }
+            Some(Point::from(total))
+        }
+        _ => float_range_function(function, &floats).map(Point::Float),
+    }
+}
+
+/// Whether `changes` counts a step from `a` to `b`: floats that differ
+/// (two `NaN` do not), histograms that differ in data, or a change of
+/// kind.
+#[allow(clippy::float_cmp)]
+fn changed(a: &Point, b: &Point) -> bool {
+    match (a, b) {
+        (Point::Float(a), Point::Float(b)) => a != b && !(a.is_nan() && b.is_nan()),
+        (Point::Histogram(a), Point::Histogram(b)) => !a.equals(b),
+        _ => true,
+    }
+}
+
+/// Whether `resets` counts a step from `a` to `b`: a float that fell,
+/// a histogram that reset, or a change of kind.
+fn reset(a: &Point, b: &Point) -> bool {
+    match (a, b) {
+        (Point::Float(a), Point::Float(b)) => b < a,
+        (Point::Histogram(a), Point::Histogram(b)) => b.detect_reset(a),
+        _ => true,
+    }
+}
+
+/// `irate` and `idelta`: the change between the last two samples, per
+/// second for `irate`, which also takes a counter reset as a change
+/// from zero. Two samples of different kinds have no result.
+#[allow(clippy::cast_precision_loss)]
+fn instant_value(samples: &[Sample], is_rate: bool) -> Option<Point> {
+    let n = samples.len();
+    if n < 2 {
+        return None;
+    }
+    let (prev, last) = (&samples[n - 2], &samples[n - 1]);
+    let seconds = (last.0 - prev.0) as f64 / 1e9;
+    if seconds <= 0.0 {
+        return None;
+    }
+    match (&prev.1, &last.1) {
+        (Point::Float(a), Point::Float(b)) => {
+            let change = if is_rate && b < a { *b } else { b - a };
+            Some(Point::Float(if is_rate {
+                change / seconds
+            } else {
+                change
+            }))
+        }
+        (Point::Histogram(a), Point::Histogram(b)) => {
+            let mut result = b.clone();
+            if !is_rate || !b.detect_reset(a) {
+                result.sub(a).ok()?;
+            }
+            result.hint = ResetHint::Gauge;
+            result.compact();
+            if is_rate {
+                result.div(seconds);
+            }
+            Some(Point::Histogram(result))
+        }
+        _ => None,
+    }
+}
+
+/// Prometheus' `extrapolatedRate` over native histograms: the change
+/// from the first to the last sample with counter resets added back,
+/// extrapolated like a float's.
+fn extrapolated_histogram_rate(
+    points: &[(i64, &Histogram)],
+    start: i64,
+    end: i64,
+    counter: bool,
+    rate: bool,
+) -> Option<Histogram> {
+    if points.len() < 2 {
+        return None;
+    }
+    let mut result = histogram_rate(points, counter)?;
+    let (first, last) = (points[0], points[points.len() - 1]);
+    let zero_share = (counter && result.count > 0.0 && first.1.count >= 0.0)
+        .then(|| first.1.count / result.count);
+    let factor = extrapolation_factor(first.0, last.0, points.len(), start, end, rate, zero_share);
+    result.mul(factor);
+    Some(result)
+}
+
+/// Prometheus' `histogramRate`: the last sample less the first, at the
+/// coarsest schema of the window, with every sample before a counter
+/// reset added back; a gauge. None when exponential and custom buckets
+/// mix in the window.
+fn histogram_rate(points: &[(i64, &Histogram)], counter: bool) -> Option<Histogram> {
+    let last = points[points.len() - 1].1;
+    let mut prev = points[0].1.clone();
+    if counter && points[1].1.detect_reset(points[0].1) {
+        // The first sample is before a reset: it counts nothing, and
+        // its layout does not matter.
+        prev = Histogram {
+            schema: points[1].1.schema,
+            custom_values: points[1].1.custom_values.clone(),
+            ..Histogram::default()
+        };
+    }
+    let custom = prev.uses_custom_buckets();
+    if last.uses_custom_buckets() != custom {
+        return None;
+    }
+    let mut min_schema = last.schema.min(prev.schema);
+    for (_, current) in &points[1..points.len() - 1] {
+        if !counter {
+            continue;
+        }
+        min_schema = min_schema.min(current.schema);
+        if current.uses_custom_buckets() != custom {
+            return None;
+        }
+    }
+    let mut result = last.clone();
+    result.reduce_resolution(min_schema);
+    result.sub(&prev).ok()?;
+    if counter {
+        let mut prev = &prev;
+        for (_, current) in &points[1..] {
+            if current.detect_reset(prev) {
+                result.add(prev).ok()?;
+            }
+            prev = current;
+        }
+    }
+    result.hint = ResetHint::Gauge;
+    result.compact();
+    Some(result)
 }
 
 /// A function over the float samples of one series in the window
-/// ending at `end` and `range` long. `changes` compares values
-/// exactly, as Prometheus does.
-#[allow(clippy::cast_precision_loss, clippy::float_cmp)]
-fn float_range_function(
-    function: &str,
-    samples: &[(i64, f64)],
-    end: i64,
-    range: i64,
-) -> Option<f64> {
+/// ending at `end` and `range` long.
+#[allow(clippy::cast_precision_loss)]
+fn float_range_function(function: &str, samples: &[(i64, f64)]) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
     let values = || samples.iter().map(|(_, v)| *v);
     let n = samples.len() as f64;
     Some(match function {
-        "rate" => extrapolated_rate(samples, end - range, end, true, true)?,
-        "increase" => extrapolated_rate(samples, end - range, end, true, false)?,
-        "delta" => extrapolated_rate(samples, end - range, end, false, false)?,
-        "irate" | "idelta" => {
-            let (prev, last) = (
-                samples[samples.len().checked_sub(2)?],
-                samples[samples.len() - 1],
-            );
-            let mut change = last.1 - prev.1;
-            if function == "irate" && last.1 < prev.1 {
-                change = last.1;
-            }
-            if function == "irate" {
-                let seconds = (last.0 - prev.0) as f64 / 1e9;
-                if seconds <= 0.0 {
-                    return None;
-                }
-                change / seconds
-            } else {
-                change
-            }
-        }
-        "changes" => samples
-            .windows(2)
-            .filter(|w| w[0].1 != w[1].1 && !(w[0].1.is_nan() && w[1].1.is_nan()))
-            .count() as f64,
-        "resets" => samples.windows(2).filter(|w| w[1].1 < w[0].1).count() as f64,
         "deriv" => linear_regression(samples, samples[0].0)?.0,
         "avg_over_time" => values().sum::<f64>() / n,
         "min_over_time" => values().fold(f64::NAN, super::nan_min),
         "max_over_time" => values().fold(f64::NAN, super::nan_max),
         "sum_over_time" => values().sum(),
-        "count_over_time" => n,
-        "last_over_time" => samples[samples.len() - 1].1,
-        "present_over_time" => 1.0,
         "stddev_over_time" | "stdvar_over_time" => {
             let mean = values().sum::<f64>() / n;
             let variance = values().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
@@ -517,7 +673,6 @@ fn float_range_function(
 /// Prometheus' `extrapolatedRate`: the change over the window, counter
 /// resets added back, extrapolated to the window's edges unless the
 /// samples sit far from them, and divided by the window for a rate.
-#[allow(clippy::cast_precision_loss)]
 fn extrapolated_rate(
     samples: &[(i64, f64)],
     start: i64,
@@ -539,23 +694,45 @@ fn extrapolated_rate(
             previous = value;
         }
     }
-    // The operations and their order are Prometheus' own
-    // (extrapolatedRate), so that the last bit of a rate agrees with it:
-    // a quantile whose rank falls on a bucket boundary is decided by it.
+    let zero_share = (counter && result > 0.0 && first.1 >= 0.0).then(|| first.1 / result);
+    let factor = extrapolation_factor(first.0, last.0, samples.len(), start, end, rate, zero_share);
+    Some(result * factor)
+}
+
+/// The factor that extrapolates a change measured between the samples
+/// at `first` and `last`, `n` of them, to the window `(start, end]`:
+/// all the way to an edge the samples come close to, by half a sample
+/// interval otherwise, and no further back than a counter's zero
+/// point, `zero_share` of the sampled interval before the first
+/// sample. Divided by the window's length for a rate.
+///
+/// The operations and their order are Prometheus' own, so that the
+/// last bit of a rate agrees with it: a quantile whose rank falls on a
+/// bucket boundary is decided by it.
+#[allow(clippy::cast_precision_loss)]
+fn extrapolation_factor(
+    first: i64,
+    last: i64,
+    n: usize,
+    start: i64,
+    end: i64,
+    rate: bool,
+    zero_share: Option<f64>,
+) -> f64 {
     let seconds = |nanos: i64| nanos as f64 / 1e9;
-    let mut duration_to_start = seconds(first.0 - start);
-    let mut duration_to_end = seconds(end - last.0);
-    let sampled_interval = seconds(last.0 - first.0);
-    let average_between_samples = sampled_interval / (samples.len() - 1) as f64;
+    let mut duration_to_start = seconds(first - start);
+    let mut duration_to_end = seconds(end - last);
+    let sampled_interval = seconds(last - first);
+    let average_between_samples = sampled_interval / (n - 1) as f64;
     let threshold = average_between_samples * 1.1;
     let mut extrapolate_to = sampled_interval;
     if duration_to_start >= threshold {
         duration_to_start = average_between_samples / 2.0;
     }
-    if counter && result > 0.0 && first.1 >= 0.0 {
+    if let Some(share) = zero_share {
         // A counter cannot be negative: the start is at most where the
         // slope reaches zero.
-        let duration_to_zero = sampled_interval * (first.1 / result);
+        let duration_to_zero = sampled_interval * share;
         if duration_to_zero < duration_to_start {
             duration_to_start = duration_to_zero;
         }
@@ -569,7 +746,7 @@ fn extrapolated_rate(
     if rate {
         factor /= seconds(end - start);
     }
-    Some(result * factor)
+    factor
 }
 
 /// The slope and intercept of the least-squares line through `samples`,

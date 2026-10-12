@@ -1069,16 +1069,64 @@ mod tests {
 
     /// A schema 0 histogram with `buckets` from index 0 upward.
     fn hist(count: f64, sum: f64, buckets: &[f64]) -> Point {
-        Point::from(Histogram {
-            count,
-            sum,
-            positive: buckets
+        exp(0, count, sum, (0.0, 0.0), buckets, &[])
+    }
+
+    /// A histogram as Prometheus' test format writes one: `buckets`
+    /// from index 0 upward, `n_buckets` likewise on the negative side.
+    fn exp(
+        schema: i32,
+        count: f64,
+        sum: f64,
+        zero: (f64, f64),
+        buckets: &[f64],
+        n_buckets: &[f64],
+    ) -> Point {
+        let side = |counts: &[f64]| {
+            counts
                 .iter()
                 .enumerate()
                 .map(|(i, c)| (i32::try_from(i).unwrap(), *c))
-                .collect(),
+                .collect()
+        };
+        Point::from(Histogram {
+            schema,
+            zero_count: zero.0,
+            zero_threshold: zero.1,
+            count,
+            sum,
+            positive: side(buckets),
+            negative: side(n_buckets),
             ..Histogram::default()
         })
+    }
+
+    /// A histogram with custom buckets.
+    fn custom(count: f64, sum: f64, bounds: &[f64], buckets: &[f64]) -> Point {
+        let mut histogram = Histogram {
+            schema: histogram::CUSTOM_SCHEMA,
+            count,
+            sum,
+            custom_values: bounds.to_vec(),
+            ..Histogram::default()
+        };
+        for (i, c) in buckets.iter().enumerate() {
+            histogram.positive.insert(i32::try_from(i).unwrap(), *c);
+        }
+        Point::from(histogram)
+    }
+
+    /// A series `name` with one sample per entry of `points`, `every`
+    /// seconds apart from 0.
+    fn timed(name: &str, every: i64, points: &[Point]) -> Series {
+        Series {
+            labels: labels(&[("__name__", name)]),
+            samples: points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i64::try_from(i).unwrap() * every * S, p.clone()))
+                .collect(),
+        }
     }
 
     /// A histogram series `name{job=...}` with one sample per entry of
@@ -1694,5 +1742,198 @@ mod tests {
         ));
         assert_eq!(replaced[0].labels.as_ref().unwrap()["site"], "api");
         assert!(replaced[0].value.histogram().is_some());
+    }
+
+    /// QL-5: the range functions over native histograms, with the
+    /// cases of Prometheus' `native_histograms.test`.
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::unreadable_literal)]
+    fn range_functions_read_histogram_samples() {
+        const M: i64 = 60;
+        let near = |actual: f64, expected: f64| {
+            assert!(
+                (actual - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+                "expected {expected}, got {actual}"
+            );
+        };
+        let incr: Vec<Point> = (0..=10)
+            .map(|i| {
+                hist(
+                    4.0 + f64::from(i),
+                    4.0 + 2.0 * f64::from(i),
+                    &[1.0, 2.0 + f64::from(i), 1.0],
+                )
+            })
+            .collect();
+        let reset_in_bucket = [
+            hist(4.0, 5.0, &[1.0, 2.0, 1.0]),
+            hist(5.0, 6.0, &[1.0, 1.0, 3.0]),
+            hist(6.0, 7.0, &[1.0, 2.0, 3.0]),
+        ];
+        let mut long_lived = vec![hist(15.0, 25.0, &[5.0, 10.0])];
+        long_lived.extend(std::iter::repeat_n(hist(2490.0, 75.0, &[15.0, 2475.0]), 55));
+        let four = [
+            exp(
+                0,
+                25.0,
+                1234.5,
+                (4.0, 0.001),
+                &[1.0, 2.0, 0.0, 1.0, 1.0],
+                &[2.0, 4.0, 0.0, 0.0, 1.0, 9.0],
+            ),
+            exp(
+                0,
+                41.0,
+                2345.6,
+                (5.0, 0.001),
+                &[1.0, 3.0, 1.0, 2.0, 1.0, 1.0, 1.0],
+                &[0.0, 1.0, 4.0, 2.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 2.0],
+            ),
+            exp(
+                0,
+                41.0,
+                1111.1,
+                (5.0, 0.001),
+                &[1.0, 3.0, 1.0, 2.0, 1.0, 1.0, 1.0],
+                &[0.0, 1.0, 4.0, 2.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 2.0],
+            ),
+            exp(1, 0.0, 0.0, (0.0, 0.0), &[], &[]),
+        ];
+        let mixed = [hist(1.0, 1.0, &[1.0]), Point::Float(1.0)];
+        let nhcb = [
+            custom(1.0, 1.0, &[5.0], &[1.0]),
+            custom(1.0, 1.0, &[5.0], &[1.0]),
+            custom(1.0, 1.0, &[5.0, 10.0], &[1.0]),
+        ];
+        let inputs = vec![
+            vec![timed("incr", 5 * M, &incr)],
+            vec![timed("reset", 5 * M, &reset_in_bucket)],
+            vec![timed("long", M, &long_lived)],
+            vec![timed("four", M, &four)],
+            vec![timed("mixed", 15, &mixed)],
+            vec![timed("nhcb", 6 * M, &nhcb)],
+        ];
+        let at = |expr: &PromExpr, t: i64| {
+            evaluate(
+                expr,
+                &inputs,
+                Params {
+                    start: t * S,
+                    end: t * S,
+                    step: 0,
+                },
+            )
+            .unwrap()
+        };
+        let range = |function: &str, input: usize, seconds: u64| {
+            call(function, vec![selector(input, Some(seconds))])
+        };
+        let histogram = |rows: Vec<Row>| {
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            rows[0].value.histogram().unwrap().clone()
+        };
+        let rate = at(&range("rate", 0, 600), 50 * M);
+        assert!(!rate[0].labels.as_ref().unwrap().contains_key("__name__"));
+        let rate = histogram(rate);
+        near(rate.count, 1.0 / 300.0);
+        near(rate.sum, 2.0 / 300.0);
+        near(rate.positive[&1], 1.0 / 300.0);
+        assert_eq!(rate.positive.len(), 1, "empty buckets are compacted away");
+        assert_eq!(rate.hint, ResetHint::Gauge);
+        let increase = histogram(at(&range("increase", 1, 900), 10 * M));
+        near(increase.count, 9.0);
+        near(increase.sum, 10.5);
+        near(increase.positive[&0], 1.5);
+        near(increase.positive[&1], 3.0);
+        near(increase.positive[&2], 4.5);
+        let bounded = histogram(at(&range("increase", 2, 5400), 55 * M));
+        near(bounded.count, 2490.0);
+        near(bounded.sum, 50.303030303030305);
+        near(bounded.positive[&0], 10.06060606060606);
+        near(bounded.positive[&1], 2479.939393939394);
+        let delta = histogram(at(&range("delta", 1, 900), 10 * M));
+        near(delta.count, 3.0);
+        let total = histogram(at(&range("sum_over_time", 3, 240), 3 * M));
+        near(total.count, 107.0);
+        near(total.sum, 4691.2);
+        near(total.zero_count, 14.0);
+        assert_eq!(
+            total.positive.values().copied().collect::<Vec<_>>(),
+            vec![3.0, 8.0, 2.0, 5.0, 3.0, 2.0, 2.0]
+        );
+        assert_eq!(
+            total.negative.values().copied().collect::<Vec<_>>(),
+            vec![
+                2.0, 6.0, 8.0, 4.0, 15.0, 9.0, 0.0, 0.0, 0.0, 10.0, 10.0, 4.0
+            ]
+        );
+        let mean = histogram(at(&range("avg_over_time", 3, 240), 3 * M));
+        near(mean.count, 26.75);
+        near(mean.zero_count, 3.5);
+        let irate = histogram(at(&range("irate", 0, 600), 50 * M));
+        near(irate.count, 1.0 / 300.0);
+        assert_eq!(irate.hint, ResetHint::Gauge);
+        let idelta = histogram(at(&range("idelta", 0, 600), 50 * M));
+        near(idelta.sum, 2.0);
+        assert!(
+            at(&range("rate", 4, 60), 15).is_empty(),
+            "floats and histograms do not rate"
+        );
+        assert!(at(&range("sum_over_time", 4, 60), 15).is_empty());
+        assert!(at(&range("irate", 4, 60), 15).is_empty());
+        let count = at(&range("count_over_time", 4, 60), 15);
+        near(count[0].value.float().unwrap(), 2.0);
+        near(
+            at(&range("changes", 4, 60), 15)[0].value.float().unwrap(),
+            1.0,
+        );
+        near(
+            at(&range("resets", 4, 60), 15)[0].value.float().unwrap(),
+            1.0,
+        );
+        let last = at(&range("last_over_time", 4, 60), 15);
+        assert_eq!(last[0].labels.as_ref().unwrap()["__name__"], "mixed");
+        near(last[0].value.float().unwrap(), 1.0);
+        let present = at(&range("present_over_time", 0, 60), 50 * M);
+        near(present[0].value.float().unwrap(), 1.0);
+        assert!(at(&range("max_over_time", 0, 600), 50 * M).is_empty());
+        near(
+            at(&range("resets", 1, 900), 10 * M)[0]
+                .value
+                .float()
+                .unwrap(),
+            1.0,
+        );
+        near(
+            at(&range("changes", 1, 900), 10 * M)[0]
+                .value
+                .float()
+                .unwrap(),
+            2.0,
+        );
+        let nhcb_sum = histogram(at(&range("sum_over_time", 5, 780), 12 * M));
+        assert_eq!(nhcb_sum.custom_values, vec![5.0]);
+        near(nhcb_sum.count, 3.0);
+        assert_eq!(nhcb_sum.positive, BTreeMap::from([(0, 3.0)]));
+        near(
+            at(&range("changes", 5, 780), 12 * M)[0]
+                .value
+                .float()
+                .unwrap(),
+            1.0,
+        );
+        near(
+            at(&range("resets", 5, 780), 12 * M)[0]
+                .value
+                .float()
+                .unwrap(),
+            0.0,
+        );
+        let nhcb_rate = histogram(at(&range("rate", 5, 780), 12 * M));
+        assert_eq!(nhcb_rate.custom_values, vec![5.0]);
+        near(nhcb_rate.count, 0.0);
+        assert!(nhcb_rate.positive.is_empty());
+        let nhcb_last = histogram(at(&range("last_over_time", 5, 780), 12 * M));
+        assert_eq!(nhcb_last.custom_values, vec![5.0, 10.0]);
     }
 }
