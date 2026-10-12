@@ -11,6 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -1025,7 +1026,7 @@ fn lower_constant_query(
         schema: std::sync::Arc::new(Schema::new(fields)),
         rows: vec![row],
     };
-    Ok(apply_limit(plan, query))
+    lowerer.apply_limit(plan, query)
 }
 
 fn resolve_table(
@@ -1114,11 +1115,42 @@ fn one_of<'a>(
     }
 }
 
-fn apply_limit(plan: Plan, query: &ast::Query) -> Plan {
-    if query.limit.is_some() || query.offset.is_some() {
-        plan.limit(query.offset.unwrap_or(0), query.limit)
-    } else {
-        plan
+impl Lowerer<'_> {
+    /// `plan` under the query's `LIMIT` and `OFFSET`, each written or a
+    /// `$n` bound to a whole number; while types are inferred a `$n`
+    /// is noted as an integer and no limit applies.
+    fn apply_limit(&self, plan: Plan, query: &ast::Query) -> Result<Plan, Diagnostic> {
+        let limit = self.count(query.limit)?;
+        let offset = self.count(query.offset)?;
+        Ok(if limit.is_some() || offset.is_some() {
+            plan.limit(offset.unwrap_or(0), limit)
+        } else {
+            plan
+        })
+    }
+
+    fn count(&self, count: Option<ast::Count>) -> Result<Option<usize>, Diagnostic> {
+        let (n, span) = match count {
+            None => return Ok(None),
+            Some(ast::Count::Written(n)) => return Ok(Some(n)),
+            Some(ast::Count::Parameter { n, span }) => (n, span),
+        };
+        self.note_parameter_type(n, DataType::Int64);
+        let not_a_count = |value: &dyn fmt::Display| {
+            Diagnostic::at(
+                span,
+                format!("LIMIT and OFFSET take a whole number; parameter ${n} is {value}"),
+            )
+        };
+        match self.parameter(n, span)? {
+            Expr::Literal(Literal::Int(value)) => usize::try_from(value)
+                .map(Some)
+                .map_err(|_| not_a_count(&value)),
+            Expr::Literal(Literal::Null) if matches!(self.parameters, Parameters::Inferring(_)) => {
+                Ok(None)
+            }
+            other => Err(not_a_count(&other)),
+        }
     }
 }
 
@@ -1193,7 +1225,7 @@ impl Lowerer<'_> {
         if !all_columns {
             plan = plan.project(items);
         }
-        Ok(apply_limit(plan, query))
+        self.apply_limit(plan, query)
     }
 
     fn aggregate_query(&mut self, query: &ast::Query, plan: Plan) -> Result<Plan, Diagnostic> {
@@ -1267,7 +1299,7 @@ impl Lowerer<'_> {
             plan = plan.sort(keys);
         }
         plan = plan.project(items);
-        Ok(apply_limit(plan, query))
+        self.apply_limit(plan, query)
     }
 
     /// Registers every aggregate call in `expr`, naming the call by
@@ -1677,17 +1709,22 @@ impl Lowerer<'_> {
         }
     }
 
-    /// Notes that `parameter`, if it is a `$n`, has `data_type`; the
-    /// first note wins.
+    /// Notes that `parameter`, if it is a `$n`, has `data_type`.
     fn infer_as(&self, parameter: &ast::Expr, data_type: DataType) {
-        let (ast::ExprKind::Parameter(n), Parameters::Inferring(types)) =
-            (&parameter.kind, self.parameters)
-        else {
+        if let ast::ExprKind::Parameter(n) = &parameter.kind {
+            self.note_parameter_type(*n, data_type);
+        }
+    }
+
+    /// Notes that `$n` has `data_type` while types are inferred; the
+    /// first note wins.
+    fn note_parameter_type(&self, n: usize, data_type: DataType) {
+        let Parameters::Inferring(types) = self.parameters else {
             return;
         };
         let mut types = types.borrow_mut();
-        if types.len() < *n {
-            types.resize(*n, None);
+        if types.len() < n {
+            types.resize(n, None);
         }
         let slot = &mut types[n - 1];
         if slot.is_none() {
@@ -2731,6 +2768,38 @@ mod tests {
             "text binds as a timestamp against a timestamp column: {text}"
         );
         assert!(text.contains("NULL IS NULL"), "{text}");
+    }
+
+    /// A `$n` in `LIMIT` or `OFFSET` binds to a whole number, is
+    /// described as an integer, and anything else is refused.
+    #[test]
+    fn parameters_bind_in_limit_and_offset() {
+        let statement = parse("SELECT body FROM logs LIMIT $1 OFFSET $2").unwrap();
+        let values = [Parameter::Int(5), Parameter::Int(10)];
+        let plan = match lower_with(&statement, &ctx(), &Parameters::Bound(&values)).unwrap() {
+            Statement::Query(plan) => plan,
+            other => panic!("not a query: {other:?}"),
+        };
+        assert!(
+            plan.to_string().starts_with("Limit: offset=10 count=5\n"),
+            "{plan}"
+        );
+        let (_, types) = describe(&statement, &ctx()).unwrap();
+        assert_eq!(types, vec![Some(DataType::Int64), Some(DataType::Int64)]);
+        let error = lower_with(
+            &statement,
+            &ctx(),
+            &Parameters::Bound(&[Parameter::Text("ten".into()), Parameter::Int(0)]),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("whole number"), "{}", error.message);
+        let error = lower_with(
+            &statement,
+            &ctx(),
+            &Parameters::Bound(&[Parameter::Int(-1), Parameter::Int(0)]),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("whole number"), "{}", error.message);
     }
 
     #[test]

@@ -63,7 +63,8 @@ is a derived table in `FROM` or an `IN (SELECT ...)` condition of
 `WHERE`, lowered to a join on its distinct keys, but not `EXISTS` or
 a scalar subquery; no window
 functions; `$n` parameters bind over the PostgreSQL protocol with
-their types inferred from the columns they meet, but not in `LIMIT`;
+their types inferred from the columns they meet, as whole numbers in
+`LIMIT` and `OFFSET`;
 sorts and trace groups spill sorted runs to local disk when their
 memory grant runs out and read them back merged, an aggregate
 spills its groups' running states by bucket of their key and folds

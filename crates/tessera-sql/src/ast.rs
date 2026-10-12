@@ -141,9 +141,23 @@ pub struct Query {
     /// `ORDER BY` items.
     pub order_by: Vec<OrderItem>,
     /// `LIMIT`, if any.
-    pub limit: Option<usize>,
+    pub limit: Option<Count>,
     /// `OFFSET`, if any.
-    pub offset: Option<usize>,
+    pub offset: Option<Count>,
+}
+
+/// A row count in `LIMIT` or `OFFSET`: written, or a `$n` parameter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Count {
+    /// A whole number.
+    Written(usize),
+    /// `$n`, bound to a whole number when the query runs.
+    Parameter {
+        /// The parameter's number.
+        n: usize,
+        /// Where it is written.
+        span: Span,
+    },
 }
 
 /// One item of the select list.

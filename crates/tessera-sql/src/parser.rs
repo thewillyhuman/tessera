@@ -9,8 +9,9 @@
 use tessera_ir::{Diagnostic, Span};
 
 use crate::ast::{
-    BinaryOp, CreateAlert, CreateRetentionPolicy, CreateRollup, Expr, ExprKind, Join, JoinKind,
-    OrderItem, Query, RetentionActionAst, RetentionClauseAst, SelectItem, Statement, TableRef,
+    BinaryOp, Count, CreateAlert, CreateRetentionPolicy, CreateRollup, Expr, ExprKind, Join,
+    JoinKind, OrderItem, Query, RetentionActionAst, RetentionClauseAst, SelectItem, Statement,
+    TableRef,
 };
 use crate::lexer::{Spanned, Token, tokenize};
 
@@ -630,14 +631,20 @@ impl Parser<'_> {
         })
     }
 
-    fn count(&mut self) -> Result<usize, Diagnostic> {
+    /// A row count of `LIMIT` or `OFFSET`: a whole number or `$n`.
+    fn count(&mut self) -> Result<Count, Diagnostic> {
         match self.advance() {
             Some(Spanned {
                 token: Token::Number(n),
                 span,
             }) => n
                 .parse()
+                .map(Count::Written)
                 .map_err(|_| Diagnostic::at(span, format!("expected a whole number, found {n}"))),
+            Some(Spanned {
+                token: Token::Parameter(n),
+                span,
+            }) => Ok(Count::Parameter { n, span }),
             Some(other) => Err(Diagnostic::at(
                 other.span,
                 format!("expected a number, found {}", describe(&other.token)),
@@ -1369,8 +1376,12 @@ mod tests {
         assert_eq!(q.order_by.len(), 2);
         assert!(q.order_by[0].descending);
         assert!(!q.order_by[1].descending);
-        assert_eq!(q.limit, Some(10));
-        assert_eq!(q.offset, Some(5));
+        assert_eq!(q.limit, Some(Count::Written(10)));
+        assert_eq!(q.offset, Some(Count::Written(5)));
+        let bound = query("SELECT body FROM logs LIMIT $1 OFFSET $2");
+        assert!(matches!(bound.limit, Some(Count::Parameter { n: 1, .. })));
+        assert!(matches!(bound.offset, Some(Count::Parameter { n: 2, .. })));
+        assert!(parse("SELECT body FROM logs LIMIT 'ten'").is_err());
     }
 
     #[test]
