@@ -13,9 +13,10 @@
 //! bucket `i` reaches up to `custom_values[i]` and the last to `+Inf`.
 //!
 //! Counts are floats, as a rate makes them, and buckets are held
-//! sparsely by index. The bounds, the quantile, the fraction and the
-//! variance are Prometheus 3.15's (`model/histogram`,
-//! `promql/quantile.go`), so that a query answers as Prometheus would.
+//! sparsely by index. The bounds, the arithmetic, the counter-reset
+//! detection, the quantile, the fraction and the variance are
+//! Prometheus 3.15's (`model/histogram`, `promql/quantile.go`), so that
+//! a query answers as Prometheus would.
 
 use std::collections::BTreeMap;
 
@@ -425,6 +426,396 @@ impl Histogram {
         }
         variance += compensation;
         variance / self.count
+    }
+}
+
+/// Two histograms cannot be combined: one has exponential buckets and
+/// the other custom ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("cannot combine exponential and custom bucket histograms")]
+pub struct MixedSchemas;
+
+impl Histogram {
+    /// Adds `other`: the counts, the sum and the buckets, both brought
+    /// to the coarser schema and the wider zero bucket first, custom
+    /// buckets to the bounds both have. True when the reset hints
+    /// collide, one saying reset and the other no reset; the result's
+    /// hint is then unknown.
+    ///
+    /// # Errors
+    ///
+    /// `MixedSchemas` when one histogram has exponential buckets and
+    /// the other custom ones.
+    pub fn add(&mut self, other: &Histogram) -> Result<bool, MixedSchemas> {
+        self.combine(other, 1.0)
+    }
+
+    /// Subtracts `other`, the mirror of [`Histogram::add`].
+    ///
+    /// # Errors
+    ///
+    /// `MixedSchemas` when one histogram has exponential buckets and
+    /// the other custom ones.
+    pub fn sub(&mut self, other: &Histogram) -> Result<bool, MixedSchemas> {
+        self.combine(other, -1.0)
+    }
+
+    fn combine(&mut self, other: &Histogram, sign: f64) -> Result<bool, MixedSchemas> {
+        if self.uses_custom_buckets() != other.uses_custom_buckets() {
+            return Err(MixedSchemas);
+        }
+        let collision = self.adjust_reset_hint(other);
+        if self.uses_custom_buckets() {
+            self.count += sign * other.count;
+            self.sum += sign * other.sum;
+            if self.custom_values == other.custom_values {
+                for (&index, &count) in &other.positive {
+                    *self.positive.entry(index).or_insert(0.0) += sign * count;
+                }
+            } else {
+                let bounds = common_bounds(&self.custom_values, &other.custom_values);
+                let mut merged = BTreeMap::new();
+                map_to_bounds(
+                    &self.positive,
+                    &self.custom_values,
+                    &bounds,
+                    1.0,
+                    &mut merged,
+                );
+                map_to_bounds(
+                    &other.positive,
+                    &other.custom_values,
+                    &bounds,
+                    sign,
+                    &mut merged,
+                );
+                merged.retain(|_, count| *count != 0.0);
+                self.positive = merged;
+                self.custom_values = bounds;
+            }
+            return Ok(collision);
+        }
+        let other_zero_count = self.reconcile_zero_buckets(other);
+        self.zero_count += sign * other_zero_count;
+        self.count += sign * other.count;
+        self.sum += sign * other.sum;
+        if other.schema < self.schema {
+            self.reduce_resolution(other.schema);
+        }
+        let at_schema = |buckets: &BTreeMap<i32, f64>| {
+            if other.schema > self.schema {
+                reduced(buckets, other.schema, self.schema)
+            } else {
+                buckets.clone()
+            }
+        };
+        let (positive, negative) = (at_schema(&other.positive), at_schema(&other.negative));
+        add_buckets(
+            &mut self.positive,
+            &positive,
+            self.schema,
+            self.zero_threshold,
+            sign,
+        );
+        add_buckets(
+            &mut self.negative,
+            &negative,
+            self.schema,
+            self.zero_threshold,
+            sign,
+        );
+        Ok(collision)
+    }
+
+    /// The hint of a sum of two samples; true on a collision.
+    fn adjust_reset_hint(&mut self, other: &Histogram) -> bool {
+        match (self.hint, other.hint) {
+            (a, b) if a == b => false,
+            (ResetHint::Gauge, _) => false,
+            (_, ResetHint::Gauge) => {
+                self.hint = ResetHint::Gauge;
+                false
+            }
+            (ResetHint::Unknown, _) => false,
+            (_, ResetHint::Unknown) => {
+                self.hint = ResetHint::Unknown;
+                false
+            }
+            _ => {
+                self.hint = ResetHint::Unknown;
+                true
+            }
+        }
+    }
+
+    /// Widens the zero bucket to hold both histograms' zero buckets,
+    /// with a threshold on a bucket boundary of each, and returns the
+    /// count `other`'s zero bucket has at that threshold.
+    #[allow(clippy::float_cmp)]
+    fn reconcile_zero_buckets(&mut self, other: &Histogram) -> f64 {
+        let mut other_zero_count = other.zero_count;
+        let mut other_threshold = other.zero_threshold;
+        while other_threshold != self.zero_threshold
+            && !other_threshold.is_nan()
+            && !self.zero_threshold.is_nan()
+        {
+            if self.zero_threshold > other_threshold {
+                (other_zero_count, other_threshold) =
+                    other.zero_count_for_larger_threshold(self.zero_threshold);
+            }
+            if other_threshold > self.zero_threshold {
+                (self.zero_count, self.zero_threshold) =
+                    self.zero_count_for_larger_threshold(other_threshold);
+                self.trim_buckets_in_zero_bucket();
+            }
+        }
+        other_zero_count
+    }
+
+    /// The zero count once the threshold grows to `larger`, and the
+    /// threshold itself: moved up to the bucket boundary when `larger`
+    /// falls inside a populated bucket.
+    #[allow(clippy::float_cmp)]
+    fn zero_count_for_larger_threshold(&self, larger: f64) -> (f64, f64) {
+        let mut larger = larger;
+        if larger == self.zero_threshold {
+            return (self.zero_count, larger);
+        }
+        'again: loop {
+            let mut zero_count = self.zero_count;
+            for (&index, &count) in &self.positive {
+                let bucket = self.side_bucket(true, index, count);
+                if bucket.lower >= larger {
+                    break;
+                }
+                zero_count += count;
+                if bucket.upper > larger {
+                    if count != 0.0 {
+                        larger = bucket.upper;
+                    }
+                    break;
+                }
+            }
+            for (&index, &count) in &self.negative {
+                let bucket = self.side_bucket(false, index, count);
+                if bucket.upper <= -larger {
+                    break;
+                }
+                zero_count += count;
+                if bucket.lower < -larger {
+                    if count != 0.0 {
+                        // The positive side must be redone at this threshold.
+                        larger = -bucket.lower;
+                        continue 'again;
+                    }
+                    break;
+                }
+            }
+            return (zero_count, larger);
+        }
+    }
+
+    /// Drops the buckets within the zero bucket, whose counts the zero
+    /// count holds already, and every empty bucket with them.
+    fn trim_buckets_in_zero_bucket(&mut self) {
+        let threshold = self.zero_threshold;
+        let inside: Vec<i32> = self
+            .positive
+            .keys()
+            .copied()
+            .take_while(|&index| self.bound(index - 1) < threshold)
+            .collect();
+        for index in inside {
+            self.positive.remove(&index);
+        }
+        let inside: Vec<i32> = self
+            .negative
+            .keys()
+            .copied()
+            .take_while(|&index| -self.bound(index - 1) > -threshold)
+            .collect();
+        for index in inside {
+            self.negative.remove(&index);
+        }
+        self.compact();
+    }
+
+    /// Whether this sample follows a counter reset of `previous`: a
+    /// count lower than before in all, in the zero bucket or in any
+    /// bucket, a populated bucket of `previous` gone, a finer schema or
+    /// a narrower zero bucket. A hint of reset or no reset decides
+    /// outright. Buckets of `previous` are merged to this sample's
+    /// coarser schema and wider zero bucket before the comparison.
+    #[must_use]
+    #[allow(clippy::float_cmp)]
+    pub fn detect_reset(&self, previous: &Histogram) -> bool {
+        match self.hint {
+            ResetHint::Reset => return true,
+            ResetHint::NoReset => return false,
+            ResetHint::Unknown | ResetHint::Gauge => {}
+        }
+        if self.count < previous.count {
+            return true;
+        }
+        if self.uses_custom_buckets() {
+            if !previous.uses_custom_buckets() {
+                return true;
+            }
+            if self.custom_values != previous.custom_values {
+                return self.reset_with_other_bounds(previous);
+            }
+        }
+        if self.schema > previous.schema || self.zero_threshold < previous.zero_threshold {
+            return true;
+        }
+        let (previous_zero_count, threshold) =
+            previous.zero_count_for_larger_threshold(self.zero_threshold);
+        if threshold != self.zero_threshold || self.zero_count < previous_zero_count {
+            return true;
+        }
+        let threshold = self.zero_threshold;
+        side_reset(
+            &self.side_at(true, self.schema, threshold),
+            &previous.side_at(true, self.schema, threshold),
+        ) || side_reset(
+            &self.side_at(false, self.schema, threshold),
+            &previous.side_at(false, self.schema, threshold),
+        )
+    }
+
+    /// One side's buckets merged to the coarser `schema`, without those
+    /// whose upper bound is within `start`.
+    fn side_at(&self, positive: bool, schema: i32, start: f64) -> Vec<(i32, f64)> {
+        let buckets = if positive {
+            &self.positive
+        } else {
+            &self.negative
+        };
+        let merged = if !self.uses_custom_buckets() && schema < self.schema {
+            reduced(buckets, self.schema, schema)
+        } else {
+            buckets.clone()
+        };
+        merged
+            .into_iter()
+            .filter(|&(index, _)| {
+                self.uses_custom_buckets()
+                    || start == 0.0
+                    || exponential_bound(index, schema) > start
+            })
+            .collect()
+    }
+
+    /// A reset between custom bucket histograms whose bounds differ:
+    /// at every bound both share, the observations since the last
+    /// shared bound must not have decreased.
+    #[allow(clippy::float_cmp)]
+    fn reset_with_other_bounds(&self, previous: &Histogram) -> bool {
+        let bound_at = |bounds: &[f64], i: usize| bounds.get(i).copied().unwrap_or(f64::INFINITY);
+        let (mut i, mut j) = (0, 0);
+        let mut last_shared = f64::NEG_INFINITY;
+        while i <= self.custom_values.len() && j <= previous.custom_values.len() {
+            let (current, before) = (
+                bound_at(&self.custom_values, i),
+                bound_at(&previous.custom_values, j),
+            );
+            if current == before {
+                if self.custom_count_between(last_shared, current)
+                    < previous.custom_count_between(last_shared, current)
+                {
+                    return true;
+                }
+                last_shared = current;
+                i += 1;
+                j += 1;
+            } else if current < before {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        false
+    }
+
+    /// The observations of custom buckets whose upper bound lies in
+    /// `(low, high]`.
+    fn custom_count_between(&self, low: f64, high: f64) -> f64 {
+        self.positive
+            .iter()
+            .filter(|&(&index, _)| {
+                let upper = self.bound(index);
+                low < upper && upper <= high
+            })
+            .map(|(_, count)| count)
+            .sum()
+    }
+}
+
+/// Adds `sign` times `other`'s buckets to `into`, leaving out those
+/// whose upper bound is within the zero bucket.
+fn add_buckets(
+    into: &mut BTreeMap<i32, f64>,
+    other: &BTreeMap<i32, f64>,
+    schema: i32,
+    threshold: f64,
+    sign: f64,
+) {
+    for (&index, &count) in other {
+        if exponential_bound(index, schema) <= threshold {
+            continue;
+        }
+        *into.entry(index).or_insert(0.0) += sign * count;
+    }
+}
+
+/// Whether any populated bucket of `previous` is missing from `current`
+/// or lower in it; both sides are sorted by index.
+fn side_reset(current: &[(i32, f64)], previous: &[(i32, f64)]) -> bool {
+    previous.iter().any(
+        |&(index, count)| match current.binary_search_by_key(&index, |&(i, _)| i) {
+            Ok(at) => current[at].1 < count,
+            Err(_) => count != 0.0,
+        },
+    )
+}
+
+/// The bounds two custom bucket layouts share, in order.
+#[allow(clippy::float_cmp)]
+fn common_bounds(a: &[f64], b: &[f64]) -> Vec<f64> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push(a[i]);
+            i += 1;
+            j += 1;
+        } else if a[i] < b[j] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
+/// Adds `sign` times `buckets`, laid out by `bounds`, into the layout
+/// of `target`: each bucket goes to the first target bucket whose bound
+/// reaches its own, the `+Inf` bucket when none does.
+fn map_to_bounds(
+    buckets: &BTreeMap<i32, f64>,
+    bounds: &[f64],
+    target: &[f64],
+    sign: f64,
+    into: &mut BTreeMap<i32, f64>,
+) {
+    for (&index, &count) in buckets {
+        let at = match usize::try_from(index).ok().and_then(|i| bounds.get(i)) {
+            Some(&upper) => target.partition_point(|bound| *bound < upper),
+            None => target.len(),
+        };
+        *into
+            .entry(i32::try_from(at).unwrap_or(i32::MAX))
+            .or_insert(0.0) += sign * count;
     }
 }
 
@@ -1517,5 +1908,303 @@ mod tests {
         let mut unchanged = a.clone();
         unchanged.reduce_resolution(0);
         assert_eq!(unchanged, a, "custom buckets keep their schema");
+    }
+
+    /// Addition brings both histograms to the coarser schema and the
+    /// wider zero bucket, as Prometheus' `native_histograms.test` shows.
+    #[test]
+    fn addition_aligns_schemas_and_zero_buckets() {
+        let mut low = exponential(-1, 1.0, 4.0, (0.0, 0.0), &[0.0, 1.0], &[]);
+        let high = exponential(0, 4.0, 4.0, (0.0, 0.0), &[0.0, 2.0, 2.0], &[]);
+        assert_eq!(low.add(&high), Ok(false));
+        assert_eq!(low.schema, -1);
+        assert_near(low.count, 5.0);
+        assert_near(low.sum, 8.0);
+        let mut compacted = low.clone();
+        compacted.compact();
+        assert_eq!(compacted.positive, BTreeMap::from([(1, 5.0)]));
+        let mut fine = high.clone();
+        assert_eq!(
+            fine.add(&exponential(-1, 1.0, 4.0, (0.0, 0.0), &[0.0, 1.0], &[])),
+            Ok(false)
+        );
+        assert_eq!(fine.schema, -1, "the receiver is coarsened too");
+        fine.compact();
+        assert_eq!(fine.positive, BTreeMap::from([(1, 5.0)]));
+        let series = [
+            exponential(
+                0,
+                25.0,
+                3.1,
+                (4.0, 0.001),
+                &[1.0, 2.0, 0.0, 1.0, 1.0],
+                &[2.0, 4.0, 0.0, 0.0, 1.0, 9.0],
+            ),
+            exponential(
+                0,
+                41.0,
+                10.0,
+                (5.0, 0.001),
+                &[1.0, 3.0, 1.0, 2.0, 1.0, 1.0, 1.0],
+                &[0.0, 1.0, 4.0, 2.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 2.0],
+            ),
+            exponential(
+                0,
+                41.0,
+                -10.0,
+                (5.0, 0.001),
+                &[1.0, 3.0, 1.0, 2.0, 1.0, 1.0, 1.0],
+                &[0.0, 1.0, 4.0, 2.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 2.0],
+            ),
+            exponential(
+                1,
+                0.0,
+                1.3,
+                (3.0, 0.001),
+                &[2.0, 4.0, 2.0, 3.0, 2.0, 2.0],
+                &[1.0, 2.0, 5.0, 3.0, 8.0, 1.0, 1.0, 1.0, 1.0, 6.0, 3.0],
+            ),
+        ];
+        let mut total = series[0].clone();
+        for next in &series[1..] {
+            assert_eq!(total.add(next), Ok(false));
+        }
+        assert_near(total.count, 107.0);
+        assert_near(total.sum, 4.4);
+        assert_near(total.zero_count, 17.0);
+        let positive: Vec<f64> = total.positive.values().copied().collect();
+        assert_eq!(positive, vec![5.0, 14.0, 7.0, 7.0, 3.0, 2.0, 2.0]);
+        let negative: Vec<f64> = total.negative.values().copied().collect();
+        assert_eq!(
+            negative,
+            vec![
+                3.0, 13.0, 19.0, 6.0, 17.0, 18.0, 0.0, 0.0, 0.0, 10.0, 10.0, 4.0
+            ]
+        );
+    }
+
+    /// A wider zero bucket swallows the buckets inside it, and moves
+    /// out to a bucket boundary when it would cut a populated bucket.
+    #[test]
+    fn addition_widens_the_zero_bucket() {
+        let mut narrow = Histogram {
+            schema: 0,
+            zero_threshold: 0.5,
+            zero_count: 1.0,
+            count: 3.0,
+            sum: 3.0,
+            positive: BTreeMap::from([(1, 2.0)]),
+            ..Histogram::default()
+        };
+        let wide = Histogram {
+            schema: 0,
+            zero_threshold: 2.0,
+            zero_count: 3.0,
+            count: 4.0,
+            sum: 10.0,
+            positive: BTreeMap::from([(2, 1.0)]),
+            ..Histogram::default()
+        };
+        assert_eq!(narrow.add(&wide), Ok(false));
+        assert_near(narrow.zero_threshold, 2.0);
+        assert_near(narrow.zero_count, 6.0);
+        assert_eq!(narrow.positive, BTreeMap::from([(2, 1.0)]));
+        // A threshold inside a populated bucket moves to its boundary.
+        let mut narrow = Histogram {
+            schema: 0,
+            zero_threshold: 0.5,
+            zero_count: 1.0,
+            count: 3.0,
+            sum: 3.0,
+            positive: BTreeMap::from([(1, 2.0)]),
+            ..Histogram::default()
+        };
+        let mut inside = wide.clone();
+        inside.zero_threshold = 1.5;
+        assert_eq!(narrow.add(&inside), Ok(false));
+        assert_near(narrow.zero_threshold, 2.0);
+        assert_near(narrow.zero_count, 6.0);
+        let mut sum_of_wide = wide.clone();
+        assert_eq!(sum_of_wide.add(&inside), Ok(false));
+        assert_near(sum_of_wide.zero_threshold, 2.0);
+        assert_near(sum_of_wide.zero_count, 6.0);
+    }
+
+    /// Subtraction mirrors addition; nothing marks the result a gauge,
+    /// the operator does.
+    #[test]
+    fn subtraction_mirrors_addition() {
+        let big = exponential(
+            0,
+            41.0,
+            2345.6,
+            (5.0, 0.001),
+            &[1.0, 3.0, 1.0, 2.0, 1.0, 1.0, 1.0],
+            &[0.0, 1.0, 4.0, 2.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 2.0],
+        );
+        let small = exponential(
+            0,
+            11.0,
+            1234.5,
+            (3.0, 0.001),
+            &[0.0, 2.0, 1.0],
+            &[0.0, 0.0, 3.0, 2.0],
+        );
+        let mut difference = big.clone();
+        assert_eq!(difference.sub(&small), Ok(false));
+        assert_near(difference.count, 30.0);
+        assert_near(difference.sum, 1111.1);
+        assert_near(difference.zero_count, 2.0);
+        let positive: Vec<f64> = difference.positive.values().copied().collect();
+        assert_eq!(positive, vec![1.0, 1.0, 0.0, 2.0, 1.0, 1.0, 1.0]);
+        let negative: Vec<f64> = difference.negative.values().copied().collect();
+        assert_eq!(
+            negative,
+            vec![0.0, 1.0, 1.0, 0.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 2.0]
+        );
+        assert_eq!(difference.hint, ResetHint::Unknown);
+        let mut fine_small = small.clone();
+        fine_small.schema = 1;
+        let mut difference = big.clone();
+        assert_eq!(difference.sub(&fine_small), Ok(false));
+        let positive: Vec<f64> = difference.positive.values().copied().collect();
+        assert_eq!(positive, vec![1.0, 0.0, 1.0, 2.0, 1.0, 1.0, 1.0]);
+        let negative: Vec<f64> = difference.negative.values().copied().collect();
+        assert_eq!(
+            negative,
+            vec![0.0, -2.0, 2.0, 2.0, 7.0, 0.0, 0.0, 0.0, 0.0, 5.0, 5.0, 2.0]
+        );
+        let mut reversed = fine_small.clone();
+        assert_eq!(reversed.sub(&big), Ok(false));
+        assert_eq!(reversed.schema, 0);
+        assert_near(reversed.count, -30.0);
+        let positive: Vec<f64> = reversed.positive.values().copied().collect();
+        assert_eq!(positive, vec![-1.0, 0.0, -1.0, -2.0, -1.0, -1.0, -1.0]);
+        let negative: Vec<f64> = reversed.negative.values().copied().collect();
+        assert_eq!(
+            negative,
+            vec![
+                0.0, 2.0, -2.0, -2.0, -7.0, 0.0, 0.0, 0.0, 0.0, -5.0, -5.0, -2.0
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_buckets_combine_on_their_common_bounds() {
+        let mut a = with_bounds(1.0, 1.0, &[5.0, 10.0], &[1.0]);
+        let b = with_bounds(1.0, 1.0, &[10.0], &[1.0]);
+        assert_eq!(a.add(&b), Ok(false));
+        assert_eq!(a.custom_values, vec![10.0]);
+        assert_eq!(a.positive, BTreeMap::from([(0, 2.0)]));
+        assert_near(a.count, 2.0);
+        let mut same = with_bounds(4.0, 5.0, &[5.0, 10.0], &[1.0, 2.0, 1.0]);
+        let other = with_bounds(4.0, 5.0, &[5.0, 10.0], &[1.0, 2.0, 1.0]);
+        assert_eq!(same.add(&other), Ok(false));
+        assert_eq!(
+            same.positive,
+            BTreeMap::from([(0, 2.0), (1, 4.0), (2, 2.0)])
+        );
+        let mut over = with_bounds(5.0, 1.0, &[5.0, 10.0], &[1.0, 1.0, 3.0]);
+        let under = with_bounds(1.0, 1.0, &[1.0, 5.0], &[1.0]);
+        assert_eq!(over.sub(&under), Ok(false));
+        assert_eq!(over.custom_values, vec![5.0]);
+        assert_eq!(
+            over.positive,
+            BTreeMap::from([(1, 4.0)]),
+            "both buckets past 5 fold into +Inf, 1 - 1 below it vanishes"
+        );
+        let mut exponential = exponential(0, 1.0, 1.0, (0.0, 0.0), &[1.0], &[]);
+        assert_eq!(exponential.add(&b), Err(MixedSchemas));
+        assert_eq!(a.sub(&exponential), Err(MixedSchemas));
+    }
+
+    #[test]
+    fn reset_hints_combine_like_prometheus() {
+        use ResetHint::{Gauge, NoReset, Reset, Unknown};
+        let hinted = |hint| Histogram {
+            hint,
+            ..exponential(0, 1.0, 1.0, (0.0, 0.0), &[1.0], &[])
+        };
+        let combined = |a: ResetHint, b: ResetHint| {
+            let mut sum = hinted(a);
+            let collision = sum.add(&hinted(b)).unwrap();
+            (sum.hint, collision)
+        };
+        assert_eq!(combined(Unknown, Unknown), (Unknown, false));
+        assert_eq!(combined(NoReset, NoReset), (NoReset, false));
+        assert_eq!(combined(Gauge, Reset), (Gauge, false));
+        assert_eq!(combined(Reset, Gauge), (Gauge, false));
+        assert_eq!(combined(Unknown, NoReset), (Unknown, false));
+        assert_eq!(combined(NoReset, Unknown), (Unknown, false));
+        assert_eq!(combined(Reset, NoReset), (Unknown, true));
+        assert_eq!(combined(NoReset, Reset), (Unknown, true));
+    }
+
+    #[test]
+    fn resets_are_detected_by_counts_buckets_schema_and_zero_bucket() {
+        let base = exponential(0, 4.0, 5.0, (0.0, 0.0), &[1.0, 2.0, 1.0], &[]);
+        let grown = exponential(0, 6.0, 7.0, (0.0, 0.0), &[1.0, 2.0, 3.0], &[]);
+        assert!(!grown.detect_reset(&base));
+        assert!(base.detect_reset(&grown), "a lower count");
+        let in_bucket = exponential(0, 5.0, 6.0, (0.0, 0.0), &[1.0, 1.0, 3.0], &[]);
+        assert!(in_bucket.detect_reset(&base), "one bucket decreased");
+        let gone = exponential(0, 5.0, 6.0, (0.0, 0.0), &[1.0, 4.0], &[]);
+        assert!(gone.detect_reset(&base), "a populated bucket is gone");
+        let mut emptied = base.clone();
+        emptied.positive.insert(5, 0.0);
+        assert!(
+            !base.detect_reset(&emptied),
+            "an empty bucket gone is no reset"
+        );
+        let mut finer = grown.clone();
+        finer.schema = 1;
+        assert!(finer.detect_reset(&base), "a finer schema");
+        let mut coarser = exponential(-1, 6.0, 7.0, (0.0, 0.0), &[1.0, 5.0], &[]);
+        assert!(
+            !coarser.detect_reset(&base),
+            "buckets 1 and 2 of schema 0 merge into bucket 1 of schema -1"
+        );
+        coarser.positive.insert(1, 2.0);
+        assert!(coarser.detect_reset(&base));
+        let mut narrower = grown.clone();
+        narrower.zero_threshold = 0.0;
+        let mut wider = base.clone();
+        wider.zero_threshold = 0.25;
+        assert!(narrower.detect_reset(&wider), "a narrower zero bucket");
+        let mut widened = grown.clone();
+        widened.zero_threshold = 1.0;
+        widened.zero_count = 1.0;
+        widened.positive = BTreeMap::from([(1, 2.0), (2, 3.0)]);
+        assert!(
+            !widened.detect_reset(&base),
+            "bucket 0 moved into the zero bucket"
+        );
+        let mut inside = widened.clone();
+        inside.zero_threshold = 0.75;
+        assert!(
+            inside.detect_reset(&base),
+            "a threshold inside a populated bucket"
+        );
+        let mut fewer_zero = widened.clone();
+        fewer_zero.zero_count = 0.5;
+        assert!(fewer_zero.detect_reset(&base));
+        let mut hinted = base.clone();
+        hinted.hint = ResetHint::Reset;
+        assert!(hinted.detect_reset(&grown));
+        hinted.hint = ResetHint::NoReset;
+        assert!(!hinted.detect_reset(&grown));
+        let custom = with_bounds(4.0, 5.0, &[5.0, 10.0], &[1.0, 2.0, 1.0]);
+        assert!(custom.detect_reset(&base), "custom after exponential");
+        let more = with_bounds(5.0, 5.0, &[5.0, 10.0], &[1.0, 3.0, 1.0]);
+        assert!(!more.detect_reset(&custom));
+        let other_bounds = with_bounds(5.0, 5.0, &[5.0], &[1.0, 4.0]);
+        assert!(!other_bounds.detect_reset(&custom), "3 + 1 past 5 became 4");
+        let fewer_past = with_bounds(5.0, 5.0, &[5.0], &[3.0, 2.0]);
+        assert!(fewer_past.detect_reset(&custom), "fewer past 5 than before");
+        let mut negative = exponential(0, 4.0, -5.0, (0.0, 0.0), &[], &[1.0, 2.0, 1.0]);
+        let negative_more = exponential(0, 5.0, -6.0, (0.0, 0.0), &[], &[1.0, 2.0, 2.0]);
+        assert!(!negative_more.detect_reset(&negative));
+        negative.negative.insert(1, 3.0);
+        assert!(negative_more.detect_reset(&negative));
     }
 }
