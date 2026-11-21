@@ -33,12 +33,12 @@ jobs:
       - run: cargo run --release -p tessera-sim -- --seeds 1000 --nodes 5 --steps 40 --fail-before 0.15 --fail-after 0.15
 
   image:
-    name: container image builds
+    name: image and chart on a kind cluster
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t tessera:ci .
-      - run: docker run --rm tessera:ci --help
+      - run: helm lint deploy/helm/tessera
+      - run: IMAGE=tessera:ci deploy/kind/smoke.sh
 
   licenses:
     name: dependency licenses

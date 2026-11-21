@@ -474,12 +474,11 @@ metadata files are written by the project's own Avro container writer,
 checked against an Avro library in tests and read back with
 `pyiceberg` once by hand.
 
-Gaps left in M10: the scale envelope of 17.2 has not been run, and the
-rolling restart under load is a three-node test in `tessera-node`
-rather than a run of a real upgrade; the image builds on this
-machine and a node in it, on its distroless base and non-root user,
-takes a push and answers a query, and the chart lints and renders,
-but neither has run on a cluster.
+Gaps left in M10: the scale envelope of 17.2 has not been run; the
+image and the chart run on a kind cluster against MinIO, where
+`deploy/kind/smoke.sh` replaces every node under writes without
+losing an acknowledged one, but not yet on a provider's cluster and
+bucket, nor across two releases of the format.
 
 ## Layout
 
@@ -512,6 +511,7 @@ crates/
   tessera           the binary: the command line over tessera-node
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
 deploy/helm/tessera/ Helm chart: node groups by role over one shared root pool
+deploy/kind/        the chart's smoke test on a kind cluster against MinIO
 Dockerfile          the container image
 compat/sql/         SQL differential tests against SQLite
 compat/logql/       LogQL differential tests against a Loki instance
@@ -578,10 +578,17 @@ cargo run -p tessera -- run --data-dir /shared/tessera --roles compact     --lis
 Adding a node is starting it; removing one is stopping it.
 
 The same binary runs in a container built from the `Dockerfile`, and the
-Helm chart in `deploy/helm/tessera` runs node groups by role over one
-`ReadWriteMany` volume as the root pool, since the binary reads a local
-directory. Neither has been exercised on a cluster yet; the CI builds
-the image.
+Helm chart in `deploy/helm/tessera` runs node groups by role over a
+bucket as the root pool (`rootPool.url`, with the client's
+environment in `rootPool.env` and its credentials in a secret or the
+pods' service account), or over one `ReadWriteMany` volume when no
+bucket is named. A pod writes nothing outside its volumes, and one
+being replaced keeps serving for `drainSeconds` before it is told to
+stop, so a rolling upgrade refuses no request. `deploy/kind/smoke.sh`
+builds the image, installs MinIO and the chart on a kind cluster and
+checks that rows pushed through the service are read back, that no
+acknowledged write is lost while every node is replaced under writes,
+and that the rows outlive the pods; the CI runs it.
 
 ```
 curl -X POST localhost:8080/api/v1/tenants \
