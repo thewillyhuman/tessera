@@ -53,16 +53,17 @@ pub fn split_qualifier(path: &str) -> Option<(&str, &str)> {
     scoped.then_some((name, rest))
 }
 
-/// The overflow column a path reads: that of the side the path is
-/// qualified by, every side of it under a join of joins.
-fn overflow_of(path: &str) -> String {
-    let mut unqualified = path;
-    while let Some((_, rest)) = split_qualifier(unqualified) {
-        unqualified = rest;
+/// The join sides a path is qualified by, each with its dot, and the
+/// path as its own table's rows name it: `("j.a.", "attr.n")` for
+/// `j.a.attr.n`, no sides for a path that is not qualified. The sides
+/// before `_overflow` name the overflow column the path reads.
+#[must_use]
+pub fn split_sides(path: &str) -> (&str, &str) {
+    let mut own = path;
+    while let Some((_, rest)) = split_qualifier(own) {
+        own = rest;
     }
-    // What was split off ends in the dot before the path.
-    let sides = &path[..path.len() - unqualified.len()];
-    format!("{sides}{OVERFLOW}")
+    path.split_at(path.len() - own.len())
 }
 
 /// A constant.
@@ -485,7 +486,7 @@ impl Expr {
             }
             Expr::Path { path, .. } => {
                 // A qualified path reads its own side's overflow.
-                into.insert(overflow_of(path));
+                into.insert(format!("{}{OVERFLOW}", split_sides(path).0));
             }
             Expr::Label { .. } => {
                 into.insert(EXTRACTED.to_owned());
@@ -642,6 +643,8 @@ mod tests {
             "the outer side"
         );
         assert_eq!(split_qualifier("j.a.x"), None, "a column, not a path");
+        assert_eq!(split_sides("j.a.attr.n"), ("j.a.", "attr.n"));
+        assert_eq!(split_sides("attr.n"), ("", "attr.n"));
         let nested = Expr::Path {
             path: "j.a.attr.n".into(),
             data_type: DataType::Utf8,

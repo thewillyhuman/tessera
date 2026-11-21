@@ -116,7 +116,8 @@ pub fn extract_class(
 /// `path` of `rows` read as `data_type` (AD-4, DM-5): from its
 /// dedicated column, read under the typed rules when the types differ;
 /// from its sub-columns when it is stored per type class; else from
-/// `_overflow`. None when the rows have none of these.
+/// `_overflow`, that of its own side when the rows are a join's and
+/// the path is qualified. None when the rows have none of these.
 ///
 /// # Errors
 ///
@@ -149,9 +150,10 @@ pub fn path_column(
     if !stored.is_empty() {
         return Ok(Some(merge_columns(&stored, data_type, rows.num_rows())?));
     }
-    rows.column_by_name(OVERFLOW)
+    let (sides, own) = tessera_ir::split_sides(path);
+    rows.column_by_name(&format!("{sides}{OVERFLOW}"))
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .map(|overflow| extract(overflow, path, data_type))
+        .map(|overflow| extract(overflow, own, data_type))
         .transpose()
 }
 
@@ -436,6 +438,39 @@ mod tests {
             None,
             Some("not json"),
         ])
+    }
+
+    /// Over the rows of a join a path is qualified by its side, and
+    /// so is the overflow column it falls back on.
+    #[test]
+    fn a_qualified_path_reads_its_own_sides_overflow() {
+        let column = |name: &str| arrow::datatypes::Field::new(name, DataType::Utf8, true);
+        let other = StringArray::from(vec![Some(r#"{"attr.method":"PUT"}"#); 4]);
+        let rows = RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![
+                column("a._overflow"),
+                column("b._overflow"),
+            ])),
+            vec![Arc::new(overflow()), Arc::new(other)],
+        )
+        .unwrap();
+        let read = |path: &str| {
+            let array = path_column(&rows, path, &DataType::Utf8).unwrap().unwrap();
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_owned()
+        };
+        assert_eq!(read("a.attr.method"), "GET");
+        assert_eq!(read("b.attr.method"), "PUT");
+        assert!(
+            path_column(&rows, "attr.method", &DataType::Utf8)
+                .unwrap()
+                .is_none(),
+            "no side, no overflow of its own"
+        );
     }
 
     #[test]

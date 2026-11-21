@@ -26,7 +26,7 @@ pub mod system;
 pub mod trace;
 pub mod typing;
 
-pub use expr::{BinaryOp, Expr, Literal, qualify, split_qualifier, unqualify};
+pub use expr::{BinaryOp, Expr, Literal, qualify, split_qualifier, split_sides, unqualify};
 pub use frontend::{
     AlertDefinition, BindContext, ControlStatement, Diagnostic, Frontend, PRICE_SETTINGS,
     RollupDefinition, Span, Statement,
