@@ -25,13 +25,20 @@ spec:
         tessera.dev/serves: "true"
         {{- end }}
     spec:
+      {{- with $root.Values.serviceAccountName }}
+      serviceAccountName: {{ . }}
+      {{- end }}
       containers:
         - name: tessera
           image: {{ include "tessera.image" $root }}
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
           args:
             - run
+            {{- if $root.Values.rootPool.url }}
+            - --root-pool={{ $root.Values.rootPool.url }}
+            {{- else }}
             - --data-dir=/var/lib/tessera
+            {{- end }}
             - --listen=0.0.0.0:8080
             - --pg-listen=0.0.0.0:5432
             - --roles={{ join "," $group.roles }}
@@ -44,6 +51,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            {{- range $key, $value := $root.Values.rootPool.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- with $root.Values.rootPool.credentialsSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080
@@ -67,16 +83,20 @@ spec:
           volumeMounts:
             - name: scratch
               mountPath: /tmp
+            {{- if not $root.Values.rootPool.url }}
             - name: root-pool
               mountPath: /var/lib/tessera
+            {{- end }}
           resources:
             {{- toYaml $root.Values.resources | nindent 12 }}
       volumes:
         - name: scratch
           emptyDir: {}
+        {{- if not $root.Values.rootPool.url }}
         - name: root-pool
           persistentVolumeClaim:
             claimName: {{ include "tessera.fullname" $root }}-root-pool
+        {{- end }}
       {{- with $root.Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

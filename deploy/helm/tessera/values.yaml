@@ -1,7 +1,6 @@
 # Tessera on Kubernetes. Every node is the same image with different
 # roles (OP-11); nodes find each other through the root pool, which is
-# a ReadWriteMany volume here since the binary reads a local directory.
-# An object-store root pool replaces the volume once the binary takes one.
+# a bucket or, without one, a ReadWriteMany volume.
 
 image:
   repository: ghcr.io/thewillyhuman/tessera
@@ -23,8 +22,27 @@ groups:
 allowAnonymous: false
 
 rootPool:
+  # The root pool as a bucket, or a prefix in one: s3://<bucket> or
+  # s3://<bucket>/<prefix>, in a store that refuses a PUT with
+  # If-None-Match: * on a key that exists (Amazon S3, MinIO, Ceph, R2).
+  # Empty, the root pool is the volume below.
+  url: ""
+  # The environment of the store's client, as the AWS tools read it:
+  # AWS_REGION, and for a store other than Amazon's AWS_ENDPOINT_URL,
+  # with AWS_ALLOW_HTTP: "true" when it speaks plain HTTP.
+  env: {}
+  # A secret whose entries become environment variables as well, for
+  # AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. Empty where the pods
+  # get their credentials from the service account below.
+  credentialsSecret: ""
+  # The volume used when no bucket is named.
   storageClassName: ""      # must support ReadWriteMany
   size: 100Gi
+
+# The service account the pods run as, for clusters that hand a
+# bucket's credentials to a service account; the namespace's default
+# when empty.
+serviceAccountName: ""
 
 service:
   type: ClusterIP
