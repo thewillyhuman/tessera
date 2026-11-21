@@ -35,8 +35,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
 use tessera_ir::{
-    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
-    SortKey,
+    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, RangeFunction,
+    Registry, SortKey,
 };
 use tessera_kernels::Grouper;
 use tessera_kernels::promql::Params;
@@ -1704,6 +1704,53 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
                 keys: (!names.is_empty()).then_some(names),
             })
         }
+        Plan::RangeVector {
+            input,
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+            grouping,
+        } => {
+            let (part, whole) = range_in_parts(*function)?;
+            let width = part_width(*range, *step, start == end)?;
+            // The parts end where the steps do, the first one a part
+            // into the first window.
+            let first = start
+                .as_nanos()
+                .checked_sub(i64::try_from(range.as_nanos()).ok()?)?
+                .checked_add(i64::try_from(width.as_nanos()).ok()?)?;
+            let partial = Plan::RangeVector {
+                input: input.clone(),
+                function: part,
+                value: value.clone(),
+                range: width,
+                step: width,
+                start: Timestamp::from_nanos(first),
+                end: *end,
+                grouping: grouping.clone(),
+            };
+            // A part is a row of its series, at the time the part ends,
+            // with what the part holds as its value.
+            let final_plan = Plan::RangeVector {
+                input: Box::new(partial.clone()),
+                function: whole,
+                value: Some(Expr::column(tessera_ir::VALUE)),
+                range: *range,
+                step: *step,
+                start: *start,
+                end: *end,
+                grouping: None,
+            };
+            Some(Stage {
+                kind: "range",
+                partial,
+                final_plan,
+                keys: None,
+            })
+        }
         Plan::Sort { .. } => Some(Stage {
             kind: "sort",
             partial: plan.clone(),
@@ -1728,6 +1775,54 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
         }),
         _ => None,
     }
+}
+
+/// How a range function is put together from parts of its windows,
+/// when it can be exactly: the function each node that scans runs over
+/// the parts, and the one that merges the parts of a window. Counts
+/// and bytes add up, as whole numbers do without error; an extreme of
+/// extremes and the first or last of the parts' are the window's. A
+/// sum of values that are not whole numbers would depend on how the
+/// window was cut, and a mean, a deviation or a quantile are not made
+/// of their parts' at all: those run over the rows.
+fn range_in_parts(function: RangeFunction) -> Option<(RangeFunction, RangeFunction)> {
+    use RangeFunction::{
+        BytesOverTime, BytesRate, CountOverTime, FirstOverTime, LastOverTime, MaxOverTime,
+        MinOverTime, Rate, SumOverTime,
+    };
+    Some(match function {
+        CountOverTime => (CountOverTime, SumOverTime),
+        Rate => (CountOverTime, Rate),
+        BytesOverTime => (BytesOverTime, SumOverTime),
+        BytesRate => (BytesOverTime, Rate),
+        MinOverTime | MaxOverTime | FirstOverTime | LastOverTime => (function, function),
+        _ => return None,
+    })
+}
+
+/// The most parts a step is cut into: finer, and a node would go over
+/// more parts than the rows are worth.
+const MOST_PARTS_A_STEP: u128 = 8;
+
+/// How long the parts of a range vector's windows are: the longest
+/// time that divides both the window and the step, so that every
+/// window is a whole number of parts and the parts of one step's
+/// window are parts of the next's; for a single step, the window
+/// itself. None when a step would be cut into too many.
+fn part_width(range: Duration, step: Duration, single_step: bool) -> Option<Duration> {
+    if single_step {
+        return (!range.is_zero()).then_some(range);
+    }
+    let (mut a, mut b) = (range.as_nanos(), step.as_nanos());
+    if a == 0 || b == 0 {
+        return None;
+    }
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    (step.as_nanos() / a <= MOST_PARTS_A_STEP)
+        .then(|| u64::try_from(a).ok().map(Duration::from_nanos))
+        .flatten()
 }
 
 /// The scan a stage's partial half reads, when the half is one node

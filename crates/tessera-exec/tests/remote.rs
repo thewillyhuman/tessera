@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
@@ -20,8 +21,8 @@ use tessera_exec::{
 };
 use tessera_format::ParquetFormat;
 use tessera_ir::{
-    AggregateExpr, BinaryOp, Expr, JoinKind, JoinSide, NamedExpr, Plan, Registry, Relation, Scan,
-    SortKey, Spanset, Structural,
+    AggregateExpr, BinaryOp, Expr, JoinKind, JoinSide, NamedExpr, Plan, RangeFunction, Registry,
+    Relation, Scan, SeriesGrouping, SortKey, Spanset, Structural,
 };
 use tessera_manifest::{intake, registry};
 use tessera_object::{MemoryStore, Pools};
@@ -506,6 +507,145 @@ async fn an_aggregate_runs_its_partial_stage_on_the_peers() {
         tessera_exec::explain_text(&grouped_plan(), Some(&output.analysis))
             .contains("Stage aggregate: partial on 1 peers, 0 run here after a failure")
     );
+}
+
+/// A range function over the single series of all rows, or over one
+/// series per row, on the first day's rows (0 to 14 microseconds).
+fn ranged(function: RangeFunction, range: u64, step: u64, one_series: bool) -> Plan {
+    let takes_value = !matches!(
+        function,
+        RangeFunction::CountOverTime
+            | RangeFunction::Rate
+            | RangeFunction::BytesOverTime
+            | RangeFunction::BytesRate
+    );
+    let plan = Plan::RangeVector {
+        input: Box::new(Plan::Scan(Scan::all(
+            TenantId::DEFAULT,
+            dataset(),
+            Kind::Log,
+        ))),
+        function,
+        value: takes_value.then(|| Expr::Label {
+            name: "n".into(),
+            data_type: DataType::Float64,
+        }),
+        range: Duration::from_nanos(range),
+        step: Duration::from_nanos(step),
+        start: Timestamp::from_nanos(4_000),
+        end: Timestamp::from_nanos(4_000 + 3 * i64::try_from(step).unwrap()),
+        grouping: one_series.then(|| SeriesGrouping {
+            by: true,
+            labels: Vec::new(),
+        }),
+    };
+    optimize(plan, &Registry::builtin()).unwrap()
+}
+
+/// QE-14: a range function whose windows can be put together from
+/// parts is computed in parts where the rows are scanned: each node
+/// answers with one row per series and slice of time that has any,
+/// not with its rows, and the windows are merged here. On a cluster, a
+/// rate over a quarter of an hour of a million and a half lines took
+/// twelve seconds for want of it. The answer is the one node's.
+#[tokio::test]
+async fn a_range_function_is_computed_in_parts_on_the_peers() {
+    let (store, env) = populate().await;
+    let alone = engine(&store, &env);
+    let functions = [
+        RangeFunction::CountOverTime,
+        RangeFunction::Rate,
+        RangeFunction::BytesOverTime,
+        RangeFunction::BytesRate,
+        RangeFunction::MinOverTime,
+        RangeFunction::MaxOverTime,
+        RangeFunction::FirstOverTime,
+        RangeFunction::LastOverTime,
+    ];
+    // Windows of one step, of several, and of a step and a half, whose
+    // parts are half a step long.
+    for (range, step) in [(4_000, 4_000), (12_000, 4_000), (6_000, 4_000)] {
+        for function in functions {
+            for one_series in [true, false] {
+                let plan = ranged(function, range, step, one_series);
+                let expected = alone.run(&plan).await.unwrap();
+                assert!(expected.num_rows() > 0, "{plan}");
+                let remote = PeerEngine::new(engine(&store, &env), false);
+                let engine = engine(&store, &env).with_peers(
+                    Arc::new(HalfToPeer { peer: peer() }),
+                    Arc::clone(&remote) as Arc<dyn RemoteScan>,
+                );
+                let output = engine.run(&plan).await.unwrap();
+                assert_eq!(
+                    sorted_rows(&output.batches),
+                    sorted_rows(&expected.batches),
+                    "{plan}"
+                );
+                assert_eq!(
+                    output.analysis.stages,
+                    vec![StageAnalysis {
+                        kind: "range",
+                        remote: 1,
+                        failed: 0,
+                        ..StageAnalysis::default()
+                    }],
+                    "{plan}"
+                );
+                let stages = remote.stages.lock().unwrap();
+                assert!(
+                    matches!(&stages[0].plan, Plan::RangeVector { range: part, step: every, .. } if part == every),
+                    "{}",
+                    stages[0].plan
+                );
+                assert!(remote.tasks.lock().unwrap().is_empty(), "no rows shipped");
+            }
+        }
+    }
+}
+
+/// What cannot be put together from parts exactly, a sum of values
+/// that are not whole numbers, a mean, a quantile, and what would take
+/// parts far smaller than a step, runs over the rows as before.
+#[tokio::test]
+async fn a_range_function_that_does_not_split_runs_over_the_rows() {
+    let (store, env) = populate().await;
+    let whole = [
+        ranged(RangeFunction::SumOverTime, 4_000, 4_000, true),
+        ranged(RangeFunction::AvgOverTime, 4_000, 4_000, true),
+        ranged(RangeFunction::QuantileOverTime(0.5), 4_000, 4_000, true),
+        ranged(RangeFunction::CountOverTime, 4_001, 4_000, true),
+    ];
+    for plan in whole {
+        let expected = engine(&store, &env).run(&plan).await.unwrap();
+        let remote = PeerEngine::new(engine(&store, &env), false);
+        let engine = engine(&store, &env).with_peers(
+            Arc::new(HalfToPeer { peer: peer() }),
+            Arc::clone(&remote) as Arc<dyn RemoteScan>,
+        );
+        let output = engine.run(&plan).await.unwrap();
+        assert_eq!(
+            sorted_rows(&output.batches),
+            sorted_rows(&expected.batches),
+            "{plan}"
+        );
+        assert!(output.analysis.stages.is_empty(), "{plan}");
+    }
+}
+
+/// QE-17: a peer that cannot compute its parts has them computed here.
+#[tokio::test]
+async fn a_failing_peer_has_its_parts_of_a_range_computed_here() {
+    let (store, env) = populate().await;
+    let plan = ranged(RangeFunction::Rate, 12_000, 4_000, false);
+    let expected = engine(&store, &env).run(&plan).await.unwrap();
+    let remote = PeerEngine::new(engine(&store, &env), true);
+    let engine = engine(&store, &env).with_peers(
+        Arc::new(HalfToPeer { peer: peer() }),
+        Arc::clone(&remote) as Arc<dyn RemoteScan>,
+    );
+    let output = engine.run(&plan).await.unwrap();
+    assert_eq!(sorted_rows(&output.batches), sorted_rows(&expected.batches));
+    assert_eq!(output.analysis.stages[0].failed, 1);
 }
 
 /// QE-14, QE-17: a peer that cannot run its stage has its share run on
