@@ -458,11 +458,18 @@ Prometheus and Tempo paths alike (SE-1).
 A node given `--keyring`, a file of `name = <64 hex digits>` lines,
 seals the data of every tenant whose `encryption_key` setting names
 one of its keys: writer-log blocks under AES-256-GCM, files with
-Parquet modular encryption, sidecar indexes whole. Each names its
-key, so a tenant moved to a new key keeps reading what the old one
-sealed while that key stays in the keyring, and a tenant naming a key
-the node lacks is refused rather than stored plain (SE-2, SE-3). Key
-material never enters the object store; the catalog holds names only.
+Parquet modular encryption, sidecar indexes whole, and so every other
+object under the tenant's prefix, which a store over the node's own
+seals as it is written (`tessera-object/src/sealed.rs`): manifests,
+which carry the bounds of every column, the dataset log, the control
+store, the state of the rules. Each names its key, so a tenant moved
+to a new key keeps reading what the old one sealed while that key
+stays in the keyring, and a tenant naming a key the node lacks is
+refused rather than stored plain (SE-2, SE-3). Key material never
+enters the object store; the catalog holds names only. What stays
+readable is what places the data, not the data: object names, the
+catalog, the header of a writer-log entry (whose blocks, how many
+rows, over what time) and a dataset's Iceberg export.
 
 A node given `--export-location`, the URI external engines read the
 data directory at, publishes Apache Iceberg metadata for every dataset

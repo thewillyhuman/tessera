@@ -163,9 +163,16 @@ closed by another node's recovery.
   without it they are open to whoever reaches the port.
 - **Encryption at rest.** Use the store's own. On top of it,
   `--keyring` names a file of `name = <64 hex digits>` lines, and a
-  tenant whose `encryption_key` setting names one has its writer-log
-  blocks, data files and indexes sealed under it. Metadata, such as
-  manifests and the state of alert rules, is not sealed.
+  tenant whose `encryption_key` setting names one has everything
+  under its prefix sealed under it: data files, indexes, manifests,
+  the dataset and control logs, the state of its rules, and its
+  blocks in the writer logs. What was written before the setting
+  stays as it was until compaction rewrites it. Not sealed, since
+  they place the data and do not hold it: object names (tenant ids,
+  dataset and rule group names), the catalog, the headers of
+  writer-log entries and the Iceberg export. Keep every key a tenant
+  ever used in the keyring for as long as objects sealed under it
+  remain.
 - **Audit.** Administrative actions and control statements are rows
   of the `_system` tenant's `audit` dataset.
 
