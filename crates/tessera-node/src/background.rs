@@ -13,7 +13,7 @@
 //! quiet for a long time. Writers of this process are never recovered;
 //! the ingester ends or rotates its own logs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,8 +33,8 @@ use tessera_manifest::{
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
-    DatasetName, Env, Held, Kind, Level, Meter, PartitionId, PoolId, RetentionPolicy, TenantId,
-    Timestamp, Windows, WorkKind, WriterId,
+    DatasetName, Env, Held, Kind, Level, Meter, PartitionId, PoolId, RetentionPolicy, Seq,
+    TenantId, Timestamp, Windows, WorkKind, WriterId,
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
@@ -97,6 +97,11 @@ pub struct Background {
     pub export_interval: Duration,
 }
 
+/// Where intake stopped in each writer's log, per dataset: a round
+/// reads on from there (IT-2 lets one start over, so nothing is lost
+/// with this memory but the reading it saves).
+type Positions = BTreeMap<(TenantId, DatasetName, WriterId), Seq>;
+
 /// What a round left undone or had to repair.
 #[derive(Clone, Copy, Debug, Default)]
 struct Backlog {
@@ -121,6 +126,7 @@ pub async fn run(background: Background) {
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_held: Option<Timestamp> = None;
     let mut last_export: Option<Timestamp> = None;
+    let mut positions = Positions::new();
     loop {
         ticks.tick().await;
         let tenants: Vec<TenantId> = background
@@ -132,11 +138,21 @@ pub async fn run(background: Background) {
             .collect();
         let mut backlog = Backlog::default();
         let mut held = Vec::new();
+        positions.retain(|(tenant, _, _), _| tenants.contains(tenant));
         for tenant in &tenants {
-            match round(&background, &compactor, tenant, &mut held).await {
+            let mut cursors = Cursors {
+                positions: &mut positions,
+                met: BTreeSet::new(),
+            };
+            match round(&background, &compactor, tenant, &mut held, &mut cursors).await {
                 Ok(left) => {
                     backlog.deferred += left.deferred;
                     backlog.recoveries += left.recoveries;
+                    // A writer a whole round did not meet has left its
+                    // registry or this node's care: its position goes
+                    // with it. A round that failed met only some.
+                    let met = cursors.met;
+                    positions.retain(|at, _| at.0 != *tenant || met.contains(at));
                 }
                 Err(error) => {
                     tracing::warn!(tenant = %tenant, error = %error, "background round failed");
@@ -212,11 +228,20 @@ async fn export_round(background: &Background, exporter: &Exporter, tenants: &[T
     tables
 }
 
+/// What intake carries through a tenant's round.
+struct Cursors<'a> {
+    /// Where each log was left, read and moved on by the round.
+    positions: &'a mut Positions,
+    /// The logs the round ran intake for.
+    met: BTreeSet<(TenantId, DatasetName, WriterId)>,
+}
+
 async fn round(
     background: &Background,
     compactor: &Compactor,
     tenant: &TenantId,
     held: &mut Vec<Held>,
+    cursors: &mut Cursors<'_>,
 ) -> Result<Backlog, Failure> {
     let mut backlog = Backlog::default();
     for dataset in registry::datasets(&*background.store, tenant).await? {
@@ -225,14 +250,21 @@ async fn round(
             let key = writer.to_string();
             let mut ended = false;
             if background.owned.owns(WorkKind::Intake, key.as_bytes()) {
-                let outcome = intake::run(
+                let at = (tenant.clone(), dataset.clone(), writer);
+                let after = cursors.positions.get(&at).copied().unwrap_or(Seq::ZERO);
+                cursors.met.insert(at.clone());
+                // A run that fails leaves the position where it was, to
+                // be repeated from there.
+                let outcome = intake::run_after(
                     Arc::clone(&background.store),
                     &background.env,
                     tenant,
                     &dataset,
                     writer,
+                    after,
                 )
                 .await?;
+                cursors.positions.insert(at, outcome.through);
                 if outcome.adoptions > 0 || outcome.removed {
                     tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
                 }

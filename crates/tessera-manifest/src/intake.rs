@@ -32,9 +32,13 @@ pub struct IntakeOutcome {
     pub ended: bool,
     /// Whether the writer was removed from the registry.
     pub removed: bool,
+    /// The position of the last entry read: every entry up to it has
+    /// been dealt with for this dataset, so a later run may start
+    /// after it ([`run_after`]).
+    pub through: Seq,
 }
 
-/// Runs intake for `writer` and one dataset.
+/// Runs intake for `writer` and one dataset over the whole log.
 ///
 /// # Errors
 ///
@@ -46,9 +50,38 @@ pub async fn run(
     dataset: &DatasetName,
     writer: WriterId,
 ) -> Result<IntakeOutcome, ManifestError> {
-    let mut outcome = IntakeOutcome::default();
-    let mut entries = reader::entries(Arc::clone(&store), writer, Seq::ZERO, Arc::clone(&env.keys));
+    run_after(store, env, tenant, dataset, writer, Seq::ZERO).await
+}
+
+/// Runs intake for `writer` and one dataset over the entries after
+/// `after`: the `through` of an earlier run for the same writer and
+/// dataset, or [`Seq::ZERO`] for the whole log.
+///
+/// Resuming is what keeps a round's work to what the writer appended
+/// since the last one; a log is otherwise read whole every time, and
+/// it holds an hour of segments (GC-2). Starting over is always
+/// allowed (IT-2), so a position that was lost costs one full read and
+/// nothing else.
+///
+/// # Errors
+///
+/// If the log cannot be read or a manifest cannot be committed; the
+/// run can then be repeated from the same position.
+pub async fn run_after(
+    store: Arc<dyn ObjectStore>,
+    env: &Env,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    writer: WriterId,
+    after: Seq,
+) -> Result<IntakeOutcome, ManifestError> {
+    let mut outcome = IntakeOutcome {
+        through: after,
+        ..IntakeOutcome::default()
+    };
+    let mut entries = reader::entries(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
     while let Some(entry) = entries.try_next().await? {
+        outcome.through = entry.seq();
         match entry.body() {
             EntryBody::Flush {
                 tenant: t,
@@ -193,7 +226,8 @@ mod tests {
                 flushes: 1,
                 adoptions: 2,
                 ended: false,
-                removed: false
+                removed: false,
+                through: Seq::new(4),
             }
         );
         let partitions = list_partitions(&store, &TenantId::DEFAULT, &dataset(), Kind::Log)
@@ -248,6 +282,68 @@ mod tests {
         assert_eq!(again.flushes, 1);
     }
 
+    /// A run that resumes where the one before stopped reads what the
+    /// writer appended since and nothing else: the work of a round
+    /// follows what is new, not what the log holds.
+    #[tokio::test]
+    async fn a_resumed_run_reads_only_what_came_after() {
+        let store = MemoryStore::new();
+        let mut log = writer_with_flushes(&store).await;
+        let writer = log.writer_id();
+        let resume = async |after: Seq| {
+            run_after(
+                Arc::new(store.clone()),
+                &env(),
+                &TenantId::DEFAULT,
+                &dataset(),
+                writer,
+                after,
+            )
+            .await
+            .unwrap()
+        };
+        let first = resume(Seq::ZERO).await;
+        assert_eq!((first.flushes, first.through), (1, Seq::new(4)));
+        let idle = resume(first.through).await;
+        assert_eq!((idle.flushes, idle.through), (0, Seq::new(4)));
+
+        let target = FlushTarget {
+            store: Arc::new(store.clone()),
+            pool: PoolId::new("root").unwrap(),
+            format: Arc::new(ParquetFormat::default()),
+        };
+        log.append_segment(&[batch("prod", 2, 1)]).await.unwrap();
+        let files = write_l1_files(
+            &target,
+            &env(),
+            log.writer_id(),
+            Seq::new(4),
+            Seq::new(5),
+            WINDOW,
+            vec![batch("prod", 2, 1)],
+        )
+        .await
+        .unwrap();
+        log.append(EntryBody::Flush {
+            tenant: TenantId::DEFAULT,
+            dataset: dataset(),
+            after: Seq::new(4),
+            through: Seq::new(5),
+            files,
+        })
+        .await
+        .unwrap();
+        let later = resume(first.through).await;
+        assert_eq!(
+            (later.flushes, later.adoptions, later.through),
+            (1, 1, Seq::new(6))
+        );
+        let partitions = list_partitions(&store, &TenantId::DEFAULT, &dataset(), Kind::Log)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 3);
+    }
+
     #[tokio::test]
     async fn an_ended_log_leaves_the_registry_once_adopted() {
         let store = MemoryStore::new();
@@ -294,7 +390,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome, IntakeOutcome::default());
+        assert_eq!(
+            outcome,
+            IntakeOutcome {
+                through: Seq::new(1),
+                ..IntakeOutcome::default()
+            }
+        );
         assert_eq!(
             registry::list(&store, &TenantId::DEFAULT, &dataset())
                 .await
