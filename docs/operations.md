@@ -168,6 +168,8 @@ closed by another node's recovery.
   the dataset and control logs, the state of its rules, and its
   blocks and flush records in the writer logs. What was written
   before the setting stays as it was until compaction rewrites it.
+  With the chart, `keyringSecret` names the secret whose entry
+  `keyring` is that file, mounted read-only into every node.
   Not sealed, since they place the data and do not hold it: object
   names (tenant ids, dataset and rule group names), the catalog, the
   headers of writer-log entries and the Iceberg export. What the

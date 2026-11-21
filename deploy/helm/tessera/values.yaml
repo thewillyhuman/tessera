@@ -29,6 +29,16 @@ allowAnonymous: false
 #       --from-literal=secret="$(openssl rand -hex 32)"
 clusterSecret: ""
 
+# A secret whose entry `keyring` holds the tenants' keys, one
+# `name = <64 hex digits>` per line (SE-2): a tenant whose
+# `encryption_key` setting names one has its data sealed under it.
+# Every node gets the same file, read-only. Empty, no tenant can be
+# given a key. Keep every key a tenant ever used in it for as long as
+# objects sealed under that key remain.
+#   kubectl create secret generic tessera-keyring \
+#       --from-literal=keyring="k1 = $(openssl rand -hex 32)"
+keyringSecret: ""
+
 rootPool:
   # The root pool as a bucket, or a prefix in one: s3://<bucket> or
   # s3://<bucket>/<prefix>, in a store that refuses a PUT with

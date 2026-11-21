@@ -50,6 +50,9 @@ spec:
             {{- if not $root.Values.allowAnonymous }}
             - --no-anonymous
             {{- end }}
+            {{- if $root.Values.keyringSecret }}
+            - --keyring=/etc/tessera/keys/keyring
+            {{- end }}
           env:
             - name: POD_IP
               valueFrom:
@@ -109,6 +112,11 @@ spec:
             - name: root-pool
               mountPath: /var/lib/tessera
             {{- end }}
+            {{- if $root.Values.keyringSecret }}
+            - name: keys
+              mountPath: /etc/tessera/keys
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml $root.Values.resources | nindent 12 }}
       volumes:
@@ -122,6 +130,14 @@ spec:
         - name: root-pool
           persistentVolumeClaim:
             claimName: {{ include "tessera.fullname" $root }}-root-pool
+        {{- end }}
+        {{- with $root.Values.keyringSecret }}
+        - name: keys
+          secret:
+            secretName: {{ . }}
+            items:
+              - key: keyring
+                path: keyring
         {{- end }}
       {{- with $root.Values.nodeSelector }}
       nodeSelector:
