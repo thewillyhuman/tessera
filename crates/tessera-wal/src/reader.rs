@@ -131,6 +131,36 @@ pub fn entries(
     }))
 }
 
+/// The entries that follow `after`, read by their positions one after
+/// the other until the first that is missing, with no listing: what a
+/// reader that comes back to a log every few seconds asks, a request
+/// that finds nothing when nothing is new. Where the entries after
+/// `after` were collected the reader finds nothing either, though the
+/// log goes on further; [`entries`] finds where it goes on, and a
+/// reader that only ever follows must ask it from time to time.
+pub fn entries_following(
+    store: Arc<dyn ObjectStore>,
+    writer: WriterId,
+    after: Seq,
+    keys: Arc<Keys>,
+) -> BoxStream<'static, Result<Entry, WalError>> {
+    Box::pin(stream::try_unfold(after, move |seq| {
+        let store = Arc::clone(&store);
+        let keys = Arc::clone(&keys);
+        async move {
+            let next = seq.next();
+            match read(&*store, writer, next).await {
+                Ok(mut entry) => {
+                    entry.unlock(&keys)?;
+                    Ok(Some((entry, next)))
+                }
+                Err(WalError::Store(ObjectError::NotFound { .. })) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -205,6 +235,55 @@ mod tests {
         assert_eq!(after(0).await, [Seq::new(3), Seq::new(4)]);
         assert_eq!(after(3).await, [Seq::new(4)]);
         assert!(after(4).await.is_empty());
+    }
+
+    /// Following a log costs a read of the next position and no
+    /// listing, and finds nothing past entries that were collected.
+    #[tokio::test]
+    async fn following_a_log_reads_the_next_positions_and_lists_nothing() {
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(
+            MemoryStore::new(),
+        )));
+        let store: Arc<dyn ObjectStore> = metered.clone();
+        let mut log =
+            WriterLog::start(Arc::clone(&store), Env::simulated(1, Timestamp::UNIX_EPOCH));
+        for _ in 0..4 {
+            log.append(EntryBody::End).await.unwrap();
+        }
+        let writer = log.writer_id();
+        let before = metered.requests().by_operation();
+        let following = async |after: u64| {
+            entries_following(
+                Arc::clone(&store),
+                writer,
+                Seq::new(after),
+                Arc::new(Keys::none()),
+            )
+            .map_ok(|e| e.seq())
+            .try_collect::<Vec<Seq>>()
+            .await
+            .unwrap()
+        };
+        assert_eq!(following(2).await, [Seq::new(3), Seq::new(4)]);
+        assert!(following(4).await.is_empty());
+        let made: Vec<(&str, u64)> = metered
+            .requests()
+            .by_operation()
+            .into_iter()
+            .zip(before)
+            .map(|((operation, now), (_, then))| (operation, now - then))
+            .filter(|(_, made)| *made > 0)
+            .collect();
+        assert_eq!(made, [("get", 4)], "two entries, and the end twice");
+
+        store
+            .delete(&layout::writer_log_entry(writer, Seq::new(1)))
+            .await
+            .unwrap();
+        assert!(
+            following(0).await.is_empty(),
+            "nothing past a collected entry"
+        );
     }
 
     #[tokio::test]
