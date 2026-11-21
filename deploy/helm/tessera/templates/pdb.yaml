@@ -1,0 +1,26 @@
+{{- /*
+A group of several nodes keeps all but one of them through a voluntary
+disruption, such as the drain of a machine: the cluster's own
+maintenance then replaces Tessera's nodes one at a time, as an upgrade
+does. A group of one has nothing to keep.
+*/ -}}
+{{- $root := . -}}
+{{- range $name, $group := .Values.groups }}
+{{- if gt (int $group.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tessera.fullname" $root }}-{{ $name }}
+  labels:
+    {{- include "tessera.labels" $root | nindent 4 }}
+    tessera.dev/group: {{ $name | quote }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tessera.name" $root }}
+      app.kubernetes.io/instance: {{ $root.Release.Name }}
+      tessera.dev/group: {{ $name | quote }}
+{{- end }}
+{{- end }}
