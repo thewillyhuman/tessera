@@ -243,7 +243,7 @@ and the outputs of sort, top-k, limit and keyless aggregate stages
 go through the coordinator; the cache of object reads
 on local disk keeps whole ranges as they were asked, so two reads
 that overlap share nothing; a node left idle asks its root pool
-about twenty times a second with five datasets and seven partitions,
+about eighteen times a second with five datasets and seven partitions,
 and more with each it looks after, because a round of the background
 work, every five seconds, lists every dataset's writers and
 partitions again and reads the head of every partition's manifest

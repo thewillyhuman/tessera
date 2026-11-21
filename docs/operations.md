@@ -281,7 +281,7 @@ every route and over gRPC.
 
 ## Requests against the store
 
-A bucket bills per request. A node left idle makes about twenty a
+A bucket bills per request. A node left idle makes about eighteen a
 second, measured against MinIO on one node with every role, a cache
 directory, five datasets and seven partitions: four in ten are
 listings and four in ten are reads of log heads that find nothing
@@ -289,9 +289,9 @@ new, both mostly by the background work, which every five seconds
 goes over every dataset's writers and partitions again; the rest are
 heartbeats, leases and the node's own metrics. The number grows with
 what the cluster holds: about eighty requests a minute for each
-dataset and sixty for each partition, one a day by default, so a
-dataset kept thirty days costs about thirty requests a second while
-nothing is written or asked. Without `--cache-dir` the node's own
+dataset and thirty-five for each partition, one a day by default, so
+a dataset kept thirty days costs about eighteen requests a second
+while nothing is written or asked. Without `--cache-dir` the node's own
 health rules add the writer-log entries they read, a fifth more.
 Budget for it where requests are billed, and see the known limits.
 
