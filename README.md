@@ -13,7 +13,8 @@ messages.
 Pre-alpha. Work follows the milestones in spec section 19.
 
 **M0, foundations: done.** Object-store abstraction with a local
-directory implementation, fault injection and storage pools; commit logs
+directory and an S3-compatible bucket as implementations, fault
+injection and storage pools; commit logs
 over create-if-absent writes with checkpoints; slots and leases; the
 cluster catalog with runtime tenant lifecycle; a deterministic
 simulation harness; `tessera run` serving an HTTP administration API.
@@ -233,8 +234,8 @@ Gaps left in M6: PromQL evaluation and joins over other inputs
 still run on the coordinator over the rows the leaf tasks return,
 and the outputs of sort, top-k, limit and keyless aggregate stages
 go through the coordinator; there is no object byte
-range cache on local disk because the only stores are a local
-directory and memory; the scale envelope of section 17.2 has not been
+range cache on local disk, so every read of a bucket is a request;
+the scale envelope of section 17.2 has not been
 run.
 
 **M7, control store, continuous queries and alerting: done, with
@@ -547,8 +548,24 @@ others with the datasets they may read and write. Over the PostgreSQL
 protocol the key is the password. `GET /metrics` and `GET /healthz`
 need no key.
 
-A cluster is several nodes on one root pool: a shared directory for
-now. Each node announces itself in the pool's registry and finds the
+The root pool is a directory or a bucket (ST-1, G2): `--root-pool
+s3://<bucket>` or `s3://<bucket>/<prefix>` in place of `--data-dir`
+keeps everything durable in an S3-compatible store, which must refuse
+a `PUT` with `If-None-Match: *` on a key that exists, as Amazon S3,
+MinIO, Ceph and R2 do. The region, the credentials (keys, a web
+identity, a container's or an instance's) and, for a store other than
+Amazon's, the endpoint come from the `AWS_*` variables as the AWS
+tools read them:
+
+```
+AWS_REGION=eu-west-1 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+    cargo run -p tessera -- run --root-pool s3://my-bucket/tessera
+AWS_ENDPOINT_URL=http://minio:9000 AWS_ALLOW_HTTP=true AWS_REGION=us-east-1 ... \
+    cargo run -p tessera -- run --root-pool s3://my-bucket
+```
+
+A cluster is several nodes on one root pool: the same bucket, or a
+shared directory. Each node announces itself in the pool's registry and finds the
 others there, so the whole start-up configuration is the root pool,
 the roles, the listen addresses and the address peers reach the node
 at (OP-11):

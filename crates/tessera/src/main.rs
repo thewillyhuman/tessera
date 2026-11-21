@@ -2,8 +2,8 @@
 
 //! The `tessera` binary (AR-1): one executable for every role.
 //!
-//! `tessera run` starts a node against a local directory, by default
-//! with every role: the catalog and its administration API, OTLP
+//! `tessera run` starts a node against a local directory or an
+//! S3-compatible bucket, by default with every role: the catalog and its administration API, OTLP
 //! ingest, the query engine with SQL over HTTP and the `PostgreSQL` wire
 //! protocol, intake and compaction. The start-up configuration is what
 //! OP-11 allows: the root pool, the roles, the listen addresses and the
@@ -40,6 +40,13 @@ struct RunArgs {
     /// The directory that acts as the root pool.
     #[arg(long, default_value = "./tessera-data")]
     data_dir: PathBuf,
+    /// The root pool as a bucket, or a prefix in one, in place of a
+    /// directory: `s3://<bucket>` or `s3://<bucket>/<prefix>`. The
+    /// region, the credentials and, for a store other than Amazon's,
+    /// the endpoint are read from the `AWS_*` variables as the AWS
+    /// tools read them.
+    #[arg(long, conflicts_with = "data_dir")]
+    root_pool: Option<String>,
     /// Where queries spill when a memory grant runs out; the system's
     /// temporary directory by default.
     #[arg(long, default_value_os_t = std::env::temp_dir().join("tessera-spill"))]
@@ -200,6 +207,7 @@ async fn main() -> ExitCode {
                 },
                 keyring,
                 spill_dir: args.spill_dir,
+                root_pool: args.root_pool,
                 ..tessera_node::Config::single_node(args.data_dir)
             })
             .await
@@ -278,6 +286,22 @@ mod tests {
         let Command::Run(args) = cli.command;
         assert_eq!(args.listen.port(), 9000);
         assert_eq!(args.data_dir, PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn the_root_pool_is_a_directory_or_a_bucket() {
+        let bucket = ["tessera", "run", "--root-pool", "s3://logs/prod"];
+        let Command::Run(args) = Cli::try_parse_from(bucket).unwrap().command;
+        assert_eq!(args.root_pool.as_deref(), Some("s3://logs/prod"));
+        let both = [
+            "tessera",
+            "run",
+            "--root-pool",
+            "s3://logs",
+            "--data-dir",
+            "/tmp/x",
+        ];
+        assert!(Cli::try_parse_from(both).is_err());
     }
 
     #[test]

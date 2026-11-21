@@ -42,7 +42,7 @@ use tessera_format::{FileFormat, ParquetFormat};
 use tessera_iceberg::Exporter;
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::DatasetLogs;
-use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, layout};
+use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, RemoteStore, layout};
 use tessera_server::{
     AppState, Auth, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows,
 };
@@ -74,8 +74,13 @@ const PREFERRED_INGESTERS: usize = 8;
 /// What a node needs to start (OP-11).
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The directory that acts as the root pool.
+    /// The directory that acts as the root pool when `root_pool` names
+    /// none.
     pub data_dir: PathBuf,
+    /// The root pool as a URL, `s3://<bucket>` or
+    /// `s3://<bucket>/<prefix>` (ST-1), reached as the `AWS_*`
+    /// variables say; none, and the data directory is the root pool.
+    pub root_pool: Option<String>,
     /// Where queries spill when a memory grant runs out (QE-11).
     pub spill_dir: PathBuf,
     /// Where the HTTP API listens; port zero picks a free one.
@@ -147,6 +152,7 @@ impl Config {
         let loopback = |port| SocketAddr::from(([127, 0, 0, 1], port));
         Config {
             data_dir,
+            root_pool: None,
             spill_dir: std::env::temp_dir().join("tessera-spill"),
             listen: loopback(8080),
             pg_listen: loopback(5432),
@@ -185,6 +191,9 @@ pub enum RunError {
         #[source]
         source: std::io::Error,
     },
+    /// The root pool's URL names no store this build opens.
+    #[error("cannot open the root pool: {0}")]
+    RootPool(#[from] tessera_object::OpenError),
     /// The catalog cannot be opened.
     #[error("cannot open the catalog: {0}")]
     Catalog(#[from] tessera_catalog::CatalogError),
@@ -470,34 +479,39 @@ async fn open(
     config: &Config,
     env: &Env,
 ) -> Result<(Arc<dyn ObjectStore>, Arc<Catalog>, PoolId), RunError> {
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&config.data_dir).await.map_err(
-        |source| RunError::DataDir {
-            path: config.data_dir.clone(),
-            source,
-        },
-    )?);
+    let (store, url) = root_store(config).await?;
     let pool = PoolId::new("root").unwrap_or_else(|_| unreachable!("a literal valid pool id"));
     let root_pool = PoolConfig {
         id: pool.clone(),
-        url: format!(
-            "file://{}",
-            config
-                .data_dir
-                .canonicalize()
-                .unwrap_or(config.data_dir.clone())
-                .display()
-        ),
+        url: url.clone(),
         weight: 1,
         state: PoolState::Active,
     };
     let catalog = Arc::new(Catalog::open(Arc::clone(&store), root_pool, env.clone()).await?);
     tracing::info!(
         node = %env.node,
-        data_dir = %config.data_dir.display(),
+        root_pool = %url,
         version = %catalog.cached().version(),
         "catalog open"
     );
     Ok((store, catalog, pool))
+}
+
+/// The store of the root pool and the URL the catalog records it
+/// under: the bucket `root_pool` names, or the data directory.
+async fn root_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String), RunError> {
+    if let Some(url) = &config.root_pool {
+        return Ok((Arc::new(RemoteStore::s3(url)?), url.clone()));
+    }
+    let directory = &config.data_dir;
+    let store = LocalStore::open(directory)
+        .await
+        .map_err(|source| RunError::DataDir {
+            path: directory.clone(),
+            source,
+        })?;
+    let path = directory.canonicalize().unwrap_or(directory.clone());
+    Ok((Arc::new(store), format!("file://{}", path.display())))
 }
 
 /// What the node's loops share.

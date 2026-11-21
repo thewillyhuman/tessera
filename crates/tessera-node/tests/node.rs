@@ -61,6 +61,60 @@ async fn a_node_starts_serves_and_stops() {
     node.stop().await;
 }
 
+/// ST-1, G2: with a bucket as the root pool nothing durable is on the
+/// node, so a second node on the same bucket, with a data directory of
+/// its own, answers with what the first one stored. Runs when
+/// `TESSERA_S3_TEST_URL` names a bucket or a prefix to use.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_on_a_bucket_keeps_nothing_durable_to_itself() {
+    let Ok(url) = std::env::var("TESSERA_S3_TEST_URL") else {
+        eprintln!("TESSERA_S3_TEST_URL is not set; skipping");
+        return;
+    };
+    let nanos = Env::system().clock.now().as_nanos();
+    let root_pool = format!("{}/node-{nanos}", url.trim_end_matches('/'));
+    let on_bucket = |dir: &std::path::Path| Config {
+        root_pool: Some(root_pool.clone()),
+        ..config(dir)
+    };
+    let count = |node: &Node| {
+        let url = format!("http://{}/api/v1/query", node.http_address());
+        let body = serde_json::json!({ "dataset": "prod", "query": "SELECT count(*) FROM logs" });
+        async move {
+            let (status, text) = common::post(url, vec![], body).await;
+            assert_eq!(status, 200, "{text}");
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["rows"][0][0].clone()
+        }
+    };
+
+    let first_dir = tempfile::tempdir().unwrap();
+    let first = Node::start(on_bucket(first_dir.path()), Env::system())
+        .await
+        .unwrap();
+    let now = first.env().clock.now().as_nanos();
+    let values: Vec<serde_json::Value> = (0..20)
+        .map(|i| serde_json::json!([(now + i).to_string(), format!("line {i}")]))
+        .collect();
+    let push = serde_json::json!({ "streams": [{ "stream": { "app": "web" }, "values": values }] });
+    let headers = vec![("x-tessera-dataset".to_owned(), "prod".to_owned())];
+    let url = format!("http://{}/loki/api/v1/push", first.http_address());
+    let (status, text) = common::post(url, headers, push).await;
+    assert_eq!(status, 204, "{text}");
+    assert_eq!(count(&first).await, 20.0);
+    first.stop().await;
+    assert!(
+        walkdir(first_dir.path()).is_empty(),
+        "the data directory is not used"
+    );
+
+    let second_dir = tempfile::tempdir().unwrap();
+    let second = Node::start(on_bucket(second_dir.path()), Env::system())
+        .await
+        .unwrap();
+    assert_eq!(count(&second).await, 20.0, "read back from the bucket");
+    second.stop().await;
+}
+
 /// IN-1: a collector's gRPC exporter reaches the logs service on the
 /// node's one port, and the rows come back over HTTP.
 #[tokio::test(flavor = "multi_thread")]
