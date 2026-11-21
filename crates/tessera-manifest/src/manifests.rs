@@ -9,10 +9,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use futures::{StreamExt, TryStreamExt};
 use tessera_object::ObjectStore;
 use tessera_types::{DatasetName, Env, Kind, PartitionId, TenantId, TimeRange, Timestamp, Version};
 
 use crate::manifest::{Manifest, ManifestError, list_partitions};
+
+/// How many manifests' versions are read at once.
+const VERSIONS_AT_ONCE: usize = 16;
 
 /// Partitions whose manifests stay open at once by default.
 pub const DEFAULT_CAPACITY: usize = 4096;
@@ -108,16 +112,26 @@ impl Manifests {
         kind: Kind,
         time_range: TimeRange,
     ) -> Result<Vec<(PartitionId, Version)>, ManifestError> {
-        let mut versions = Vec::new();
+        let mut in_range = Vec::new();
         for partition in list_partitions(&*self.store, tenant, dataset, kind).await? {
             let w = partition.window;
             let last = Timestamp::from_nanos(w.end().as_nanos().saturating_sub(1));
-            if !time_range.overlaps_closed(w.start(), last) {
-                continue;
+            if time_range.overlaps_closed(w.start(), last) {
+                in_range.push((self.open(&partition), partition));
             }
-            let version = self.open(&partition).snapshot().await?.version();
-            versions.push((partition, version));
         }
+        // Each version is a read of a manifest's head: made together,
+        // and returned in the order of the partitions.
+        let reads = in_range
+            .into_iter()
+            .map(|(manifest, partition)| async move {
+                let version = manifest.snapshot().await?.version();
+                Ok::<_, ManifestError>((partition, version))
+            });
+        let versions = futures::stream::iter(reads)
+            .buffered(VERSIONS_AT_ONCE)
+            .try_collect()
+            .await?;
         Ok(versions)
     }
 }
@@ -149,6 +163,35 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    /// The key of a cached result is the versions of the manifests it
+    /// read: asked for on every query that can be answered from the
+    /// cache, over a bucket where each is a request.
+    #[tokio::test]
+    async fn the_versions_of_a_range_are_read_at_once() {
+        use tessera_types::{Seq, WriterId};
+
+        use crate::Manifest;
+        use crate::busy::Busy;
+
+        let env = Env::simulated(1, Timestamp::from_nanos(0));
+        let store = MemoryStore::new();
+        for day in 0..4 {
+            let manifest = Manifest::open(Arc::new(store.clone()), partition(day), env.clone());
+            let adopted = manifest.adopt(WriterId::from_u128(1), Seq::new(1), &[]);
+            adopted.await.unwrap();
+        }
+        let busy = Arc::new(Busy::over(store));
+        let manifests = Manifests::new(busy.clone(), env, 8);
+        let dataset = DatasetName::new("prod").unwrap();
+        let versions = manifests
+            .versions(&TenantId::DEFAULT, &dataset, Kind::Log, TimeRange::ALL)
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 4);
+        let most = busy.most();
+        assert!(most > 1, "at most {most} read at a time");
     }
 
     #[test]

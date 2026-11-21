@@ -304,12 +304,13 @@ mod tests {
     use arrow::array::{Array, FixedSizeBinaryArray};
     use std::time::Duration;
     use tessera_format::ParquetFormat;
-    use tessera_object::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
+    use tessera_object::MemoryStore;
     use tessera_types::event::EVENT_ID;
     use tessera_types::{EventBatch, LogRow, PoolId};
     use tessera_wal::{FlushTarget, WriterLog, write_l1_files};
 
     use super::*;
+    use crate::busy::Busy;
     use crate::intake;
 
     const WINDOW: Duration = Duration::from_secs(86_400);
@@ -583,61 +584,6 @@ mod tests {
         assert!(read_view(&store).await.is_empty());
     }
 
-    /// A store that says how many reads were in flight at once.
-    #[derive(Debug, Default)]
-    struct Busy {
-        inner: MemoryStore,
-        reading: std::sync::atomic::AtomicUsize,
-        most: std::sync::atomic::AtomicUsize,
-    }
-
-    impl Busy {
-        /// Counts a read as in flight while the caller's turn passes
-        /// to whatever else is ready to read.
-        async fn read(&self) {
-            use std::sync::atomic::Ordering;
-
-            let now = self.reading.fetch_add(1, Ordering::SeqCst) + 1;
-            self.most.fetch_max(now, Ordering::SeqCst);
-            tokio::task::yield_now().await;
-            self.reading.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for Busy {
-        async fn get(&self, key: &Key) -> Result<bytes::Bytes, ObjectError> {
-            self.read().await;
-            self.inner.get(key).await
-        }
-        async fn get_range(
-            &self,
-            key: &Key,
-            range: std::ops::Range<u64>,
-        ) -> Result<bytes::Bytes, ObjectError> {
-            self.read().await;
-            self.inner.get_range(key, range).await
-        }
-        async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
-            self.inner.head(key).await
-        }
-        async fn put(&self, key: &Key, body: bytes::Bytes) -> Result<(), ObjectError> {
-            self.inner.put(key, body).await
-        }
-        async fn put_if_absent(&self, key: &Key, body: bytes::Bytes) -> Result<(), ObjectError> {
-            self.inner.put_if_absent(key, body).await
-        }
-        fn list(
-            &self,
-            prefix: &Key,
-        ) -> futures::stream::BoxStream<'_, Result<ObjectMeta, ObjectError>> {
-            self.inner.list(prefix)
-        }
-        async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
-            self.inner.delete(key).await
-        }
-    }
-
     /// A query needs the manifest of every partition of its dataset,
     /// for the positions if not for the files. Over a bucket each is a
     /// request or a few: one after another they are the query's
@@ -661,10 +607,7 @@ mod tests {
         flush(&store, &env, &mut log, 0, 1, days).await;
         adopt(&store, &log).await;
 
-        let busy = Arc::new(Busy {
-            inner: store,
-            ..Busy::default()
-        });
+        let busy = Arc::new(Busy::over(store));
         let manifests = Manifests::new(busy.clone(), env, 8);
         let found = sources(
             &manifests,
@@ -677,7 +620,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(found.partitions.len(), 4);
-        let most = busy.most.load(std::sync::atomic::Ordering::SeqCst);
+        let most = busy.most();
         assert!(most > 1, "at most {most} read at a time");
     }
 
