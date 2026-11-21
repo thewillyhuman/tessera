@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
 use tessera_ir::trace::TRACE_FIELDS;
-use tessera_ir::{Expr, JoinSide, PathColumn, Plan, split_qualifier};
+use tessera_ir::{Expr, JoinSide, PathColumn, Plan, qualify, split_qualifier};
 
 use crate::rewrite::rebuild_inputs;
 
@@ -139,20 +139,48 @@ fn collect_plan(plan: &Plan, into: &mut BTreeMap<String, DataType>) {
             collect_plan(input, into);
         }
         Plan::Join {
-            left, right, on, ..
+            left,
+            right,
+            on,
+            asof,
+            ..
         } => {
-            for (l, r) in on {
-                collect_expr(l, into);
-                collect_expr(r, into);
-            }
-            collect_plan(&left.plan, into);
-            collect_plan(&right.plan, into);
+            let left_keys = on.iter().map(|(l, _)| l);
+            let right_keys = on.iter().map(|(_, r)| r);
+            collect_side(left, left_keys.chain(asof.iter().map(|a| &a.left)), into);
+            collect_side(right, right_keys.chain(asof.iter().map(|a| &a.right)), into);
         }
         other => {
             for input in other.inputs() {
                 collect_plan(input, into);
             }
         }
+    }
+}
+
+/// Collects what one side of a join reads, in its keys and below it,
+/// under the side's name: the paths are that side's rows', and the
+/// other side, which may be the same table, is not to read them too.
+fn collect_side<'a>(
+    side: &JoinSide,
+    keys: impl Iterator<Item = &'a Expr>,
+    into: &mut BTreeMap<String, DataType>,
+) {
+    let mut own = BTreeMap::new();
+    for key in keys {
+        collect_expr(key, &mut own);
+    }
+    collect_plan(&side.plan, &mut own);
+    for (path, data_type) in own {
+        let qualified = qualify(&side.name, &path);
+        // What does not read as a path of the side goes to both, as
+        // it is: the stored shape of a trace, which is no attribute.
+        let name = if split_qualifier(&qualified).is_some() {
+            qualified
+        } else {
+            path
+        };
+        into.entry(name).or_insert(data_type);
     }
 }
 
@@ -226,7 +254,55 @@ mod tests {
             other => panic!("scan: {other}"),
         };
         assert_eq!(paths(&left), ["attr.request"]);
-        assert_eq!(paths(&right), ["attr.request", "attr.db.statement"]);
+        assert_eq!(paths(&right), ["attr.db.statement", "attr.request"]);
+    }
+
+    /// A path one side reads below the join, in a predicate pushed to
+    /// its scan, is that side's alone: the other, though the same
+    /// table, reads its own, as the type its own reader asks for.
+    #[test]
+    fn a_path_read_below_a_join_stays_on_its_side() {
+        let logs = || {
+            Scan::all(
+                TenantId::DEFAULT,
+                DatasetName::new("prod").unwrap(),
+                Kind::Log,
+            )
+        };
+        let path = |p: &str, data_type| Expr::Path {
+            path: p.into(),
+            data_type,
+        };
+        let mut filtered = logs();
+        filtered
+            .predicates
+            .push(path("attr.n", DataType::Int64).binary(BinaryOp::Gt, Expr::literal(15_i64)));
+        let plan = Plan::Join {
+            left: JoinSide::new(Plan::Scan(logs()), "a"),
+            right: JoinSide::new(Plan::Scan(filtered), "b"),
+            on: vec![(Expr::column("body"), Expr::column("body"))],
+            kind: JoinKind::Inner,
+            asof: None,
+        }
+        .project(vec![NamedExpr::new(path("a.attr.n", DataType::Utf8), "n")]);
+        let Plan::Project { input, .. } = promote_paths(plan) else {
+            panic!("project")
+        };
+        let Plan::Join { left, right, .. } = *input else {
+            panic!("join")
+        };
+        let paths = |side: &JoinSide| match side.plan.as_ref() {
+            Plan::Scan(scan) => scan.paths.clone(),
+            other => panic!("scan: {other}"),
+        };
+        let asked = |data_type| {
+            vec![PathColumn {
+                path: "attr.n".into(),
+                data_type,
+            }]
+        };
+        assert_eq!(paths(&left), asked(DataType::Utf8));
+        assert_eq!(paths(&right), asked(DataType::Int64));
     }
 
     #[test]

@@ -91,6 +91,13 @@ const CASES: &[Case] = &[
         sqlite: "SELECT coalesce(body, '-') FROM logs ORDER BY timestamp LIMIT 30",
     },
     Case {
+        // The table joined with itself, one attribute read as text on
+        // one side and as a number on the other.
+        name: "join",
+        tessera: "SELECT a.timestamp, b.timestamp, a.attr.n FROM logs a JOIN logs b ON a.body = b.body WHERE a.severity_number = 17 AND b.attr.n > 15 ORDER BY a.timestamp, b.timestamp",
+        sqlite: "SELECT a.timestamp, b.timestamp, CAST(a.n AS TEXT) FROM logs a JOIN logs b ON a.body = b.body WHERE a.severity_number = 17 AND b.n > 15 ORDER BY a.timestamp, b.timestamp",
+    },
+    Case {
         name: "max timestamp per host",
         tessera: "SELECT attr.host AS host, max(timestamp), min(timestamp) FROM logs WHERE attr.host IS NOT NULL GROUP BY attr.host ORDER BY host",
         sqlite: "SELECT host, max(timestamp), min(timestamp) FROM logs WHERE host IS NOT NULL GROUP BY host ORDER BY host",
