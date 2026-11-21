@@ -32,13 +32,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --release -p tessera-sim -- --seeds 1000 --nodes 5 --steps 40 --fail-before 0.15 --fail-after 0.15
 
+  # Builds the image, proves it on a cluster and, on main, publishes it
+  # under its commit: the image a release of that commit is made of
+  # (release.yml builds nothing), and one to run before any release
+  # with `--set image.tag=sha-<commit>`.
   image:
     name: image and chart on a kind cluster
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - run: helm lint deploy/helm/tessera
-      - run: IMAGE=tessera:ci deploy/kind/smoke.sh
+      - uses: docker/setup-buildx-action@v3
+      - name: build the image, its dependencies from the cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: tessera:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: IMAGE=tessera:ci SKIP_BUILD=1 deploy/kind/smoke.sh
+      - name: publish the image under its commit
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:sha-$GITHUB_SHA"
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker tag tessera:ci "$image"
+          docker push "$image"
 
   licenses:
     name: dependency licenses
