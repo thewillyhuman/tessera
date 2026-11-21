@@ -538,6 +538,25 @@ impl std::fmt::Debug for Manifest {
 /// partitions are looked for.
 const LISTINGS_AT_ONCE: usize = 16;
 
+/// The kinds a dataset has anything stored of, in the order of
+/// [`Kind::ALL`]: one listing, so that a caller going through the kinds
+/// asks about the partitions of those only.
+///
+/// # Errors
+///
+/// If the store cannot be listed.
+pub async fn list_kinds(
+    store: &dyn ObjectStore,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+) -> Result<Vec<Kind>, ManifestError> {
+    let names = store.list_names(&layout::kinds(tenant, dataset)).await?;
+    Ok(Kind::ALL
+        .into_iter()
+        .filter(|kind| names.iter().any(|name| name == kind.as_str()))
+        .collect())
+}
+
 /// The partitions of one dataset and kind that exist (MF-3): those whose
 /// manifest log has at least one commit, in window order.
 ///
@@ -762,6 +781,29 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// What a dataset holds is asked once, not once per kind: most hold
+    /// one kind or two of the five.
+    #[tokio::test]
+    async fn the_kinds_a_dataset_holds_are_found_in_one_listing() {
+        let store = MemoryStore::new();
+        let writer = WriterId::from_u128(1);
+        let manifest = Manifest::open(Arc::new(store.clone()), partition(0), env(1));
+        let files = [file(1, &partition(0), writer, 1)];
+        manifest.adopt(writer, Seq::new(1), &files).await.unwrap();
+
+        let shallow = tessera_object::ShallowStore(store);
+        let prod = DatasetName::new("prod").unwrap();
+        let found = list_kinds(&shallow, &TenantId::DEFAULT, &prod)
+            .await
+            .unwrap();
+        assert_eq!(found, [Kind::Log]);
+        let other = DatasetName::new("other").unwrap();
+        let none = list_kinds(&shallow, &TenantId::DEFAULT, &other)
+            .await
+            .unwrap();
         assert!(none.is_empty());
     }
 

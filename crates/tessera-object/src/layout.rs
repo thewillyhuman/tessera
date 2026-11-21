@@ -238,6 +238,13 @@ pub fn writer_registration(tenant: &TenantId, dataset: &DatasetName, writer: Wri
     ])
 }
 
+/// Prefix under which a dataset's partitions live, by kind; the names
+/// under it are the kinds the dataset holds.
+#[must_use]
+pub fn kinds(tenant: &TenantId, dataset: &DatasetName) -> Key {
+    key(&[tenant.as_str(), dataset.as_str(), "p"])
+}
+
 /// Prefix under which a dataset's partitions of one kind live; listing it
 /// discovers the partitions (MF-3).
 #[must_use]

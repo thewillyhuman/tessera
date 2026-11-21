@@ -29,7 +29,7 @@ use tessera_format::FileFormat;
 use tessera_iceberg::{Exporter, Outcome as Export};
 use tessera_manifest::{
     DatasetLog, DatasetLogs, DatasetState, Manifest, ManifestState, Registration, intake,
-    list_partitions, registry,
+    list_kinds, list_partitions, registry,
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
@@ -290,7 +290,14 @@ async fn round(
         // Read once for the five kinds: each asks for its layout, its
         // tombstones and its value score.
         let settings = background.datasets.open(tenant, &dataset).state().await?;
+        let held_kinds = list_kinds(&*background.store, tenant, &dataset).await?;
         for kind in Kind::ALL {
+            // A kind the dataset holds nothing of has no partition to
+            // look for; only its tombstones, if it has any, still have
+            // to be seen through.
+            if !held_kinds.contains(&kind) && settings.tombstones(kind)?.is_empty() {
+                continue;
+            }
             backlog.deferred += compact_and_collect(
                 background,
                 compactor,
