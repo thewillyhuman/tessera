@@ -18,12 +18,12 @@
 //!    dropped, so that `events WHERE kind = 'log'` reads the logs alone
 //!    (DM-1).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tessera_ir::trace::SPAN_COLUMNS;
 use tessera_ir::{
-    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, Plan, Scan, SortKey, Spanset,
-    VALUE as VALUE_COLUMN, WindowExpr, unqualify,
+    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, Scan, SortKey, Spanset,
+    VALUE as VALUE_COLUMN, WindowExpr, split_sides, unqualify,
 };
 use tessera_types::event::{BODY, EXTRACTED, KIND, OVERFLOW, SAMPLE_RATE, TIMESTAMP, TRACE_ID};
 use tessera_types::{Kind, TimeRange, Timestamp};
@@ -126,17 +126,23 @@ fn push_predicates(plan: Plan, mut pending: Vec<Expr>) -> Plan {
         }
         Plan::Project { input, exprs } => {
             // A predicate may pass through if every column it reads is
-            // output unchanged under its own name.
-            let passthrough: BTreeSet<&str> = exprs
+            // a column of the input, output under whatever name: below
+            // the projection it reads the input's names.
+            let sources: BTreeMap<&str, &str> = exprs
                 .iter()
-                .filter(|e| matches!(&e.expr, Expr::Column(c) if *c == e.name))
-                .map(|e| e.name.as_str())
+                .filter_map(|e| match &e.expr {
+                    Expr::Column(source) => Some((e.name.as_str(), source.as_str())),
+                    _ => None,
+                })
                 .collect();
-            let (below, above): (Vec<Expr>, Vec<Expr>) = pending.into_iter().partition(|p| {
-                p.references()
-                    .iter()
-                    .all(|c| passthrough.contains(c.as_str()))
-            });
+            let mut below = Vec::new();
+            let mut above = Vec::new();
+            for predicate in pending {
+                match below_projection(&predicate, &sources) {
+                    Some(moved) => below.push(moved),
+                    None => above.push(predicate),
+                }
+            }
             let input = push_predicates(*input, below);
             wrap_filter(input.project(exprs), above)
         }
@@ -204,6 +210,38 @@ fn push_predicates(plan: Plan, mut pending: Vec<Expr>) -> Plan {
             wrap_filter(rebuilt, pending)
         }
     }
+}
+
+/// `predicate`, read above a projection, as it reads below it, where
+/// `sources` gives the input column each output column is; none when
+/// it reads anything the projection computes. A path is renamed with
+/// the overflow column it reads: under the sides that column is
+/// under below.
+fn below_projection(predicate: &Expr, sources: &BTreeMap<&str, &str>) -> Option<Expr> {
+    let source_of = |name: &str| -> Option<String> {
+        if let Some(source) = sources.get(name) {
+            return Some((*source).to_owned());
+        }
+        let (sides, path) = split_sides(name);
+        let overflow = sources.get(format!("{sides}{OVERFLOW}").as_str())?;
+        let sides_below = overflow.strip_suffix(OVERFLOW)?;
+        Some(format!("{sides_below}{path}"))
+    };
+    let names = predicate.names();
+    if !names.iter().all(|name| source_of(name).is_some()) {
+        return None;
+    }
+    let moved = predicate
+        .clone()
+        .rename(&|name| source_of(&name).unwrap_or(name));
+    // What reads columns by names of its own, as a label does, was not
+    // renamed, and stays above unless the projection renames nothing.
+    let expected: Option<BTreeSet<String>> = predicate
+        .references()
+        .iter()
+        .map(|c| sources.get(c.as_str()).map(|s| (*s).to_owned()))
+        .collect();
+    (expected == Some(moved.references())).then_some(moved)
 }
 
 fn wrap_filter(plan: Plan, predicates: Vec<Expr>) -> Plan {
@@ -580,11 +618,15 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
             push_projection(*input, needed, whole).filter(predicate)
         }
         Plan::Project { input, exprs } => {
-            let needed = exprs
-                .iter()
-                .fold(BTreeSet::new(), |set, e| add(set, &e.expr));
-            let whole = whole || exprs.iter().any(|e| e.expr.needs_overflow_whole());
-            push_projection(*input, Some(needed), whole).project(exprs)
+            // What nothing above reads is not computed, nor read below;
+            // one column stays, so that the rows still count.
+            let read = |e: &NamedExpr| needed.as_ref().is_none_or(|n| n.contains(&e.name));
+            let exprs: Vec<NamedExpr> = if exprs.iter().any(read) {
+                exprs.into_iter().filter(read).collect()
+            } else {
+                exprs.into_iter().take(1).collect()
+            };
+            push_projection_under(*input, exprs, whole)
         }
         Plan::Aggregate {
             input,
@@ -641,7 +683,7 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
         Plan::Union { inputs } => Plan::Union {
             inputs: inputs
                 .into_iter()
-                .map(|i| push_projection(i, needed.clone(), whole))
+                .map(|i| push_projection_whole(i, needed.clone(), whole))
                 .collect(),
         },
         Plan::Join {
@@ -657,6 +699,37 @@ fn push_projection(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) ->
             spanset,
         } => push_projection_trace(candidates, *spans, spanset),
         other => push_projection_text(other, needed),
+    }
+}
+
+/// The projection `exprs` over `input` narrowed to what they read.
+fn push_projection_under(input: Plan, exprs: Vec<NamedExpr>, whole: bool) -> Plan {
+    let needed = exprs.iter().fold(BTreeSet::new(), |mut set, e| {
+        set.extend(e.expr.references());
+        set
+    });
+    let whole = whole || exprs.iter().any(|e| e.expr.needs_overflow_whole());
+    push_projection(input, Some(needed), whole).project(exprs)
+}
+
+/// [`push_projection`] for the input of a node that does not say all
+/// it reads of it: a union takes its branches' columns by position,
+/// and the text, series and trace nodes read columns by names of
+/// their own. `needed` narrows the scans below as it always did; a
+/// projection, under the filters that may sit above it, outputs every
+/// column whatever `needed` says.
+fn push_projection_whole(plan: Plan, needed: Option<BTreeSet<String>>, whole: bool) -> Plan {
+    match plan {
+        Plan::Project { input, exprs } => push_projection_under(*input, exprs, whole),
+        Plan::Filter { input, predicate } => {
+            let needed = needed.map(|mut n| {
+                n.extend(predicate.references());
+                n
+            });
+            let whole = whole || predicate.needs_overflow_whole();
+            push_projection_whole(*input, needed, whole).filter(predicate)
+        }
+        other => push_projection(other, needed, whole),
     }
 }
 
@@ -693,8 +766,8 @@ fn push_projection_trace(candidates: Option<Box<Plan>>, spans: Plan, spanset: Sp
     needed.insert(OVERFLOW.to_owned());
     needed.extend(spanset.references());
     Plan::TraceGroup {
-        candidates: candidates.map(|c| Box::new(push_projection(*c, Some(ids), false))),
-        spans: Box::new(push_projection(spans, Some(needed), true)),
+        candidates: candidates.map(|c| Box::new(push_projection_whole(*c, Some(ids), false))),
+        spans: Box::new(push_projection_whole(spans, Some(needed), true)),
         spanset,
     }
 }
@@ -720,7 +793,7 @@ fn push_projection_text(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
                 n
             });
             Plan::Extract {
-                input: Box::new(push_projection(*input, needed, true)),
+                input: Box::new(push_projection_whole(*input, needed, true)),
                 source,
                 stage,
             }
@@ -747,7 +820,7 @@ fn push_projection_text(plan: Plan, needed: Option<BTreeSet<String>>) -> Plan {
                 n
             });
             Plan::Format {
-                input: Box::new(push_projection(*input, needed, true)),
+                input: Box::new(push_projection_whole(*input, needed, true)),
                 line,
                 labels,
                 drop,
@@ -792,7 +865,7 @@ fn push_projection_series(plan: Plan) -> Plan {
                 needed = add(needed, value);
             }
             Plan::RangeVector {
-                input: Box::new(push_projection(*input, Some(needed), true)),
+                input: Box::new(push_projection_whole(*input, Some(needed), true)),
                 function,
                 value,
                 range,
@@ -816,7 +889,7 @@ fn push_projection_series(plan: Plan) -> Plan {
             Plan::PromQL {
                 inputs: inputs
                     .into_iter()
-                    .map(|i| push_projection(i, Some(needed.clone()), true))
+                    .map(|i| push_projection_whole(i, Some(needed.clone()), true))
                     .collect(),
                 expr,
                 start,
@@ -831,7 +904,7 @@ fn push_projection_series(plan: Plan) -> Plan {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
-    use tessera_ir::{AggregateExpr, NamedExpr, Registry};
+    use tessera_ir::{AggregateExpr, Registry};
     use tessera_types::event::{BODY, OVERFLOW, SEVERITY_NUMBER};
     use tessera_types::{DatasetName, Kind, TenantId};
 
@@ -1019,6 +1092,92 @@ mod tests {
         );
     }
 
+    /// `WHERE ... AND trace_id IN (SELECT ...)` lowers to a join of the
+    /// rows with the subquery's keys under hidden names and a
+    /// projection back to the rows' own: the other conditions and the
+    /// columns read above cross that projection to the scan.
+    #[test]
+    fn predicates_and_columns_cross_a_projection_that_renames() {
+        let dataset = DatasetName::new("prod").unwrap();
+        let scan = |k| Plan::Scan(Scan::all(TenantId::DEFAULT, dataset.clone(), k));
+        let own = [TIMESTAMP, TRACE_ID, SEVERITY_NUMBER, BODY, OVERFLOW];
+        let back = own
+            .iter()
+            .map(|c| NamedExpr::new(Expr::column(format!("rows.{c}")), *c))
+            .collect();
+        let host = Expr::Path {
+            path: "attr.host".into(),
+            data_type: DataType::Utf8,
+        };
+        let since = Timestamp::from_nanos(5_000);
+        let plan = Plan::Join {
+            left: JoinSide::new(scan(Kind::Log), "rows"),
+            right: JoinSide::new(scan(Kind::Span), "in"),
+            on: vec![(Expr::column(TRACE_ID), Expr::column(TRACE_ID))],
+            kind: JoinKind::Inner,
+            asof: None,
+        }
+        .project(back)
+        .filter(
+            Expr::column(TIMESTAMP)
+                .binary(BinaryOp::GtEq, Expr::Literal(Literal::Timestamp(since)))
+                .and(host.binary(BinaryOp::Eq, Expr::literal("h1"))),
+        )
+        .project(vec![NamedExpr::new(Expr::column(BODY), "body")]);
+
+        let Plan::Project { input, .. } = rewrite(plan) else {
+            panic!("project")
+        };
+        let Plan::Project { input, exprs } = *input else {
+            panic!("nothing stays above the projection back")
+        };
+        let kept: Vec<&str> = exprs.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(kept, [BODY], "what nothing above reads is not output");
+        let Plan::Join { left, .. } = *input else {
+            panic!("join")
+        };
+        let rows = scan_of(&left.plan);
+        assert_eq!(rows.time_range.start, since, "the scan starts at the bound");
+        let predicates: Vec<String> = rows.predicates.iter().map(ToString::to_string).collect();
+        assert!(
+            predicates.contains(&"(attr.host = 'h1')".to_owned()),
+            "{predicates:?}"
+        );
+        assert_eq!(
+            rows.projection.as_deref(),
+            Some(
+                &[
+                    TIMESTAMP.to_owned(),
+                    TRACE_ID.into(),
+                    BODY.into(),
+                    OVERFLOW.into()
+                ][..]
+            )
+        );
+    }
+
+    /// A label may come from any attribute, read by fixed names: it
+    /// does not cross a projection that renames them.
+    #[test]
+    fn a_label_stays_above_a_projection_that_renames() {
+        let scan = Plan::Scan(Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Log,
+        ));
+        let back = [OVERFLOW, EXTRACTED, tessera_types::event::SEVERITY_TEXT]
+            .iter()
+            .map(|c| NamedExpr::new(Expr::column(*c), format!("t.{c}")))
+            .collect();
+        let label = Expr::Label {
+            name: "host".into(),
+            data_type: DataType::Utf8,
+        }
+        .binary(BinaryOp::Eq, Expr::literal("h1"));
+        let rewritten = rewrite(scan.project(back).filter(label));
+        assert!(matches!(rewritten, Plan::Filter { .. }), "{rewritten}");
+    }
+
     #[test]
     fn a_left_join_keeps_its_right_predicates_above() {
         let Plan::Project { input, .. } = rewrite(joined(JoinKind::Left)) else {
@@ -1122,13 +1281,55 @@ mod tests {
     }
 
     #[test]
-    fn a_renaming_projection_keeps_the_predicate_above_it() {
-        let plan = scan()
+    fn a_predicate_crosses_a_rename_and_stays_above_what_is_computed() {
+        let renamed = scan()
             .project(vec![NamedExpr::new(Expr::column(BODY), "text")])
             .filter(Expr::column("text").binary(BinaryOp::Eq, Expr::literal("x")));
-        let rewritten = rewrite(plan);
-        assert!(matches!(rewritten, Plan::Filter { .. }));
+        let rewritten = rewrite(renamed);
+        assert!(matches!(rewritten, Plan::Project { .. }), "{rewritten}");
+        assert_eq!(
+            only_scan(&rewritten).predicates[0].to_string(),
+            "(body = 'x')"
+        );
+
+        let computed = scan()
+            .project(vec![NamedExpr::new(
+                Expr::column(BODY).binary(BinaryOp::Eq, Expr::literal("x")),
+                "matches",
+            )])
+            .filter(Expr::column("matches"));
+        let rewritten = rewrite(computed);
+        assert!(matches!(rewritten, Plan::Filter { .. }), "{rewritten}");
         assert!(only_scan(&rewritten).predicates.is_empty());
+    }
+
+    /// A union takes its branches by position: a branch keeps the
+    /// columns nothing above reads, and its scan still narrows.
+    #[test]
+    fn a_branch_of_a_union_keeps_every_column() {
+        let branch = || {
+            scan().project(vec![
+                NamedExpr::new(
+                    Expr::column(BODY).binary(BinaryOp::Eq, Expr::literal("x")),
+                    "text",
+                ),
+                NamedExpr::new(Expr::column(TIMESTAMP), "at"),
+            ])
+        };
+        let plan = Plan::Union {
+            inputs: vec![branch(), branch().filter(Expr::column("text"))],
+        }
+        .project(vec![NamedExpr::new(Expr::column("at"), "at")]);
+        let rewritten = rewrite(plan);
+        assert!(
+            rewritten.schema(&Registry::builtin()).is_ok(),
+            "{rewritten}"
+        );
+        assert_eq!(
+            rewritten.to_string().matches("AS text").count(),
+            2,
+            "{rewritten}"
+        );
     }
 
     #[test]

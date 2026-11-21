@@ -112,6 +112,30 @@ const CASES: &[Case] = &[
         sqlite: "SELECT a.timestamp, count(b.timestamp), count(c.timestamp) FROM logs a LEFT JOIN logs b ON b.body = a.body AND b.host = a.host LEFT JOIN logs c ON c.timestamp = b.timestamp AND c.n = a.n WHERE a.n = 3 GROUP BY a.timestamp ORDER BY a.timestamp",
     },
     Case {
+        // The other conditions of WHERE and the attribute selected
+        // cross the join the subquery becomes.
+        name: "in subquery among other conditions",
+        tessera: "SELECT timestamp, attr.host FROM logs WHERE severity_number = 13 AND timestamp >= TIMESTAMP '1970-01-01T06:00:00Z' AND attr.n IN (SELECT attr.n FROM logs WHERE severity_number = 17 AND attr.host = 'h1') ORDER BY timestamp",
+        sqlite: "SELECT timestamp, host FROM logs WHERE severity_number = 13 AND timestamp >= 21600000000000 AND n IN (SELECT n FROM logs WHERE severity_number = 17 AND host = 'h1') ORDER BY timestamp",
+    },
+    Case {
+        name: "correlated exists",
+        tessera: "SELECT timestamp FROM logs a WHERE a.severity_number = 17 AND EXISTS (SELECT 1 FROM logs b WHERE b.body = a.body AND b.attr.n > 17) ORDER BY timestamp",
+        sqlite: "SELECT timestamp FROM logs a WHERE a.severity_number = 17 AND EXISTS (SELECT 1 FROM logs b WHERE b.body = a.body AND b.n > 17) ORDER BY timestamp",
+    },
+    Case {
+        name: "scalar subquery",
+        tessera: "SELECT timestamp, attr.host FROM logs WHERE severity_number = 9 AND attr.n::int > (SELECT max(severity_number) FROM logs) ORDER BY timestamp",
+        sqlite: "SELECT timestamp, host FROM logs WHERE severity_number = 9 AND n > (SELECT max(severity_number) FROM logs) ORDER BY timestamp",
+    },
+    Case {
+        // The condition reads an attribute and one subquery's value
+        // between the joins the two subqueries become.
+        name: "scalar subqueries in select and where",
+        tessera: "SELECT body, (SELECT count_raw(*) FROM logs) AS total FROM logs WHERE attr.n::int >= (SELECT max(severity_number) FROM logs) ORDER BY timestamp",
+        sqlite: "SELECT body, (SELECT count(*) FROM logs) AS total FROM logs WHERE n >= (SELECT max(severity_number) FROM logs) ORDER BY timestamp",
+    },
+    Case {
         name: "max timestamp per host",
         tessera: "SELECT attr.host AS host, max(timestamp), min(timestamp) FROM logs WHERE attr.host IS NOT NULL GROUP BY attr.host ORDER BY host",
         sqlite: "SELECT host, max(timestamp), min(timestamp) FROM logs WHERE host IS NOT NULL GROUP BY host ORDER BY host",
