@@ -14,8 +14,6 @@ pub mod intake;
 pub mod manifest;
 pub mod manifests;
 pub mod registry;
-#[cfg(test)]
-mod shallow;
 pub mod view;
 
 pub use dataset::{

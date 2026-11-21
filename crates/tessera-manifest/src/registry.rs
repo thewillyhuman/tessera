@@ -165,7 +165,7 @@ mod tests {
         let commit = unwritten.join("_log").unwrap().join("1").unwrap();
         store.put(&commit, Bytes::from_static(b"{}")).await.unwrap();
 
-        let shallow = crate::shallow::Shallow(store);
+        let shallow = tessera_object::ShallowStore(store);
         let found = datasets(&shallow, &TenantId::DEFAULT).await.unwrap();
         assert_eq!(found, [dataset(), other]);
     }

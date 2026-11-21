@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! A store for tests of what must be found without walking objects.
+//!
+//! What lies one level under a prefix, the datasets of a tenant or
+//! the partitions of a dataset, is asked of a store by name
+//! ([`ObjectStore::list_names`]). Code that lists the objects instead
+//! works on a small store and costs a request per thousand objects on
+//! a bucket; over this store it fails.
 
 use std::ops::Range;
 
@@ -8,15 +14,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
-use tessera_object::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
+
+use crate::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
 
 /// A store that answers for the names under a prefix and refuses to
 /// list the objects under one: a bucket too large to walk.
 #[derive(Debug, Default)]
-pub struct Shallow(pub MemoryStore);
+pub struct ShallowStore(pub MemoryStore);
 
 #[async_trait]
-impl ObjectStore for Shallow {
+impl ObjectStore for ShallowStore {
     async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
         self.0.get(key).await
     }

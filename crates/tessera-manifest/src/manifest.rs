@@ -781,7 +781,7 @@ mod tests {
         store.put(&unadopted, "rows".into()).await.unwrap();
 
         let dataset = DatasetName::new("prod").unwrap();
-        let shallow = crate::shallow::Shallow(store);
+        let shallow = tessera_object::ShallowStore(store);
         let found = list_partitions(&shallow, &TenantId::DEFAULT, &dataset, Kind::Log)
             .await
             .unwrap();
