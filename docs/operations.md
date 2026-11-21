@@ -271,12 +271,14 @@ every route and over gRPC.
 
 ## Requests against the store
 
-A bucket bills per request. An idle node makes about twenty a
-second, measured against MinIO on one node with every role: roughly
-half are reads of log heads that find nothing new, a third are
-listings by the background work, and the rest heartbeats, leases and
-the node's own metrics. Budget for it per node, and prefer few larger
-nodes to many small ones where that matters.
+A bucket bills per request. An idle node makes about fifteen a
+second, measured against MinIO on one node with every role and no
+cache: a third are listings by the background work, a third are reads
+of log heads that find nothing new, a fifth are reads of writer-log
+entries by the node's own health rules, which `--cache-dir` serves
+from disk, and the rest are heartbeats, leases and the node's own
+metrics. Budget for it per node, and prefer few larger nodes to many
+small ones where that matters.
 
 ## Known limits
 

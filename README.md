@@ -236,9 +236,10 @@ and the outputs of sort, top-k, limit and keyless aggregate stages
 go through the coordinator; the cache of object reads
 on local disk keeps whole ranges as they were asked, so two reads
 that overlap share nothing; an idle node asks its root pool about
-twenty times a second, since every round of rule evaluation and of
-background work reads again, once per rule or dataset, the heads of
-the logs it needs; the scale envelope of section 17.2 has not been
+fifteen times a second, a third of it listings by the background
+work, a third reads of the heads of the logs it follows and a fifth
+the writer-log entries its own health rules read, which a cache
+directory keeps; the scale envelope of section 17.2 has not been
 run.
 
 **M7, control store, continuous queries and alerting: done, with
