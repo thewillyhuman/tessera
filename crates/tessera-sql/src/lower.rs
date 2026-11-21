@@ -1887,7 +1887,9 @@ impl Lowerer<'_> {
     /// rows without one, then a projection back to `plan`'s own columns
     /// so that the rest of the query sees the same names. `index`
     /// numbers the hidden sides. A null key on the right never matches,
-    /// as `NOT EXISTS` behaves.
+    /// as `NOT EXISTS` behaves; `NOT IN` leaves out the rows whose own
+    /// value is null, as SQL has it, but a null among the subquery's
+    /// values does not make it unknown for every row.
     fn semi_join(
         &self,
         plan: Plan,
@@ -1928,6 +1930,17 @@ impl Lowerer<'_> {
                     "expected IN (SELECT ...) or EXISTS (SELECT ...)",
                 ));
             }
+        };
+        // NOT IN of a value that is null is unknown, not true: such a
+        // row is left out, where NOT EXISTS keeps it.
+        let plan = match (&condition.kind, keys.first()) {
+            (ast::ExprKind::InSubquery { negated: true, .. }, Some((tested, _))) => {
+                plan.filter(Expr::IsNull {
+                    expr: Box::new(tested.clone()),
+                    negated: true,
+                })
+            }
+            _ => plan,
         };
         let distinct = Plan::Aggregate {
             input: Box::new(right),
@@ -3524,6 +3537,18 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Filter: __in0.trace_id IS NULL"), "{text}");
+        assert!(
+            text.contains("Filter: trace_id IS NOT NULL\n          Scan: prod/log"),
+            "NOT IN is unknown of a null value: {text}"
+        );
+        let exists = lowered(
+            "SELECT body FROM logs l WHERE NOT EXISTS \
+             (SELECT 1 FROM spans s WHERE s.trace_id = l.trace_id)",
+        );
+        assert!(
+            !exists.to_string().contains("IS NOT NULL"),
+            "NOT EXISTS keeps the rows whose key is null: {exists}"
+        );
     }
 
     #[test]

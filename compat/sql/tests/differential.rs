@@ -119,6 +119,13 @@ const CASES: &[Case] = &[
         sqlite: "SELECT timestamp, host FROM logs WHERE severity_number = 13 AND timestamp >= 21600000000000 AND n IN (SELECT n FROM logs WHERE severity_number = 17 AND host = 'h1') ORDER BY timestamp",
     },
     Case {
+        // A row whose value is null is left out: NOT IN of it is
+        // unknown, not true.
+        name: "not in subquery",
+        tessera: "SELECT timestamp FROM logs WHERE attr.host IS NOT NULL AND body NOT IN (SELECT body FROM logs WHERE attr.n > 3 AND body IS NOT NULL) ORDER BY timestamp",
+        sqlite: "SELECT timestamp FROM logs WHERE host IS NOT NULL AND body NOT IN (SELECT body FROM logs WHERE n > 3 AND body IS NOT NULL) ORDER BY timestamp",
+    },
+    Case {
         name: "correlated exists",
         tessera: "SELECT timestamp FROM logs a WHERE a.severity_number = 17 AND EXISTS (SELECT 1 FROM logs b WHERE b.body = a.body AND b.attr.n > 17) ORDER BY timestamp",
         sqlite: "SELECT timestamp FROM logs a WHERE a.severity_number = 17 AND EXISTS (SELECT 1 FROM logs b WHERE b.body = a.body AND b.n > 17) ORDER BY timestamp",

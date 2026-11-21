@@ -63,7 +63,9 @@ for (section 9.2), by binary search over the right rows of each key,
 but there are no merge or lookup variants; a subquery
 is a derived table in `FROM`, or an `IN (SELECT ...)` or `EXISTS
 (SELECT ...)` condition of `WHERE` lowered to a join on its distinct
-keys, an `EXISTS` correlated by equalities with the query's columns,
+keys, `NOT IN` leaving out the rows whose own value is null but not
+every row when the subquery yields a null, an `EXISTS` correlated by
+equalities with the query's columns,
 and a scalar subquery, an aggregate without `GROUP BY` in
 parentheses, is joined to every row on a constant key; window
 functions (QE-20) are
