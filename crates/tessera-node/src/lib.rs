@@ -42,7 +42,7 @@ use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::{FileFormat, ParquetFormat};
 use tessera_iceberg::Exporter;
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
-use tessera_manifest::DatasetLogs;
+use tessera_manifest::{DatasetLogs, Manifests};
 use tessera_object::{
     CachedStore, LocalStore, ObjectStore, PoolState, Pools, RemoteStore, SealedStore, layout,
 };
@@ -693,6 +693,11 @@ impl Shared {
                 membership: Arc::clone(&self.membership),
                 interval: config.background,
                 datasets: Arc::new(DatasetLogs::new(Arc::clone(&self.store), self.env.clone())),
+                manifests: Arc::new(Manifests::new(
+                    Arc::clone(&self.store),
+                    self.env.clone(),
+                    tessera_manifest::manifests::DEFAULT_CAPACITY,
+                )),
                 meter,
                 controls: Arc::new(ControlStores::new(
                     Arc::clone(&self.store),

@@ -28,7 +28,7 @@ use tessera_eval::rule::decode_rows;
 use tessera_format::FileFormat;
 use tessera_iceberg::{Exporter, Outcome as Export};
 use tessera_manifest::{
-    DatasetLog, DatasetLogs, DatasetState, Manifest, ManifestState, Registration, intake,
+    DatasetLog, DatasetLogs, DatasetState, ManifestState, Manifests, Registration, intake,
     list_kinds, list_partitions, registry,
 };
 use tessera_object::{ObjectStore, Pools};
@@ -90,6 +90,10 @@ pub struct Background {
     pub interval: Duration,
     /// The dataset logs, for each dataset's layout.
     pub datasets: Arc<DatasetLogs>,
+    /// The partitions' manifests, kept open from one round to the next
+    /// so that a round reads what a partition committed since the last
+    /// and not its history again.
+    pub manifests: Arc<Manifests>,
     /// Where compaction reports what it stores (CO-2).
     pub meter: Arc<dyn Meter>,
     /// The control stores, for retention policies (section 13.3).
@@ -362,11 +366,7 @@ async fn compact_and_collect(
         {
             continue;
         }
-        let manifest = Manifest::open(
-            Arc::clone(&background.store),
-            partition.clone(),
-            background.env.clone(),
-        );
+        let manifest = background.manifests.open(&partition);
         let snapshot = manifest.snapshot().await?;
         held.push(held_of(&partition, snapshot.state()));
         let age = now
@@ -468,11 +468,7 @@ async fn collect_tombstones(
 ) -> Result<usize, Failure> {
     let mut oldest_epoch = u64::MAX;
     for partition in list_partitions(&*background.store, tenant, dataset, kind).await? {
-        let manifest = Manifest::open(
-            Arc::clone(&background.store),
-            partition,
-            background.env.clone(),
-        );
+        let manifest = background.manifests.open(&partition);
         let snapshot = manifest.snapshot().await?;
         for file in snapshot.state().files().filter(|f| f.level != Level::L1) {
             oldest_epoch = oldest_epoch.min(file.layout_epoch);
