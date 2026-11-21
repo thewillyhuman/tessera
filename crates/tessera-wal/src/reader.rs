@@ -39,17 +39,13 @@ pub async fn list(store: &dyn ObjectStore, writer: WriterId) -> Result<Vec<Seq>,
 pub async fn writers(store: &dyn ObjectStore) -> Result<Vec<WriterId>, WalError> {
     let prefix = tessera_object::Key::new("_wal")
         .unwrap_or_else(|e| unreachable!("a literal valid key: {e}"));
-    let mut writers: Vec<WriterId> = Vec::new();
-    let mut listing = store.list(&prefix);
-    while let Some(meta) = listing.try_next().await? {
-        let mut components = meta.key.as_str().split('/');
-        if let (Some("_wal"), Some(writer)) = (components.next(), components.next())
-            && let Ok(writer) = writer.parse::<WriterId>()
-            && !writers.contains(&writer)
-        {
-            writers.push(writer);
-        }
-    }
+    // The names under the prefix are the writers: asked for as names,
+    // they cost the same however many entries the logs hold.
+    let names = store.list_names(&prefix).await?;
+    let mut writers: Vec<WriterId> = names
+        .iter()
+        .filter_map(|name| name.parse::<WriterId>().ok())
+        .collect();
     writers.sort();
     Ok(writers)
 }
@@ -246,5 +242,9 @@ mod tests {
         let mut expected = vec![a.writer_id(), b.writer_id()];
         expected.sort();
         assert_eq!(writers(&store).await.unwrap(), expected);
+        // The background work asks every round: by name, not by
+        // walking every entry of every log.
+        let shallow = tessera_object::ShallowStore(store);
+        assert_eq!(writers(&shallow).await.unwrap(), expected);
     }
 }
