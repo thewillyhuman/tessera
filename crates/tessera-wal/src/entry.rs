@@ -14,7 +14,10 @@
 //! and kind, compressed with LZ4, and sealed under the tenant's key
 //! where the tenant has one (SE-2): the block's metadata names the key,
 //! and a reader unlocks the entry with its keyring before reading the
-//! block.
+//! block. A flush record names files with the bounds of their columns,
+//! which are the tenant's data as much as the rows: for a tenant with
+//! a key the files are the entry's one block, sealed, and the header
+//! says only whose flush it is and what it covers.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -116,6 +119,22 @@ pub enum EntryBody {
         /// The files, each tagged by its partition.
         files: Vec<FileMeta>,
     },
+    /// A flush record as it is stored for a tenant with a key (SE-2):
+    /// its files are the entry's block, sealed under `key`.
+    /// [`Entry::unlock`] makes it the [`EntryBody::Flush`] it is.
+    #[serde(rename = "sealed_flush")]
+    SealedFlush {
+        /// The dataset's tenant.
+        tenant: TenantId,
+        /// The dataset.
+        dataset: DatasetName,
+        /// The last segment before the covered range.
+        after: Seq,
+        /// The last covered segment.
+        through: Seq,
+        /// The name of the key the files are sealed under.
+        key: String,
+    },
     /// The writer is declared dead; only recovery appends after this.
     Seal {
         /// The node that sealed the log.
@@ -151,6 +170,10 @@ pub struct Entry {
     /// Sealed blocks that were opened, by index: by the writer that
     /// sealed them, or by [`Entry::unlock`].
     opened: BTreeMap<usize, Bytes>,
+    /// The key the files of a flush record are sealed under in
+    /// `blocks`, when the header holds them opened: the entry is
+    /// stored as a [`EntryBody::SealedFlush`].
+    flush_key: Option<String>,
 }
 
 impl Entry {
@@ -174,7 +197,39 @@ impl Entry {
             },
             blocks: Bytes::new(),
             opened: BTreeMap::new(),
+            flush_key: None,
         }
+    }
+
+    /// An entry without rows, as a writer appends it: a flush record
+    /// has its files sealed under its tenant's key from `keys` where
+    /// the tenant has one (SE-2); anything else is as [`Entry::new`]
+    /// makes it.
+    ///
+    /// # Errors
+    ///
+    /// `Keys` if the tenant names a key the keyring lacks.
+    pub fn record(
+        writer: WriterId,
+        seq: Seq,
+        id: EntryId,
+        written_at: Timestamp,
+        body: EntryBody,
+        keys: &Keys,
+    ) -> Result<Self, WalError> {
+        let mut entry = Entry::new(writer, seq, id, written_at, body);
+        let EntryBody::Flush { tenant, files, .. } = &entry.header.body else {
+            return Ok(entry);
+        };
+        let Some(named) = keys.for_tenant(tenant)? else {
+            return Ok(entry);
+        };
+        let files = serde_json::to_vec(files)
+            .unwrap_or_else(|e| unreachable!("file metadata always serializes: {e}"));
+        entry.blocks = Bytes::from(named.key.seal(&block_aad(writer, seq, 0), &files));
+        entry.flush_key = Some(named.name);
+        entry.header.format = SEALED_FORMAT;
+        Ok(entry)
     }
 
     /// A segment holding `batches`, one block per tenant, dataset and kind,
@@ -263,17 +318,43 @@ impl Entry {
             },
             blocks: bytes.freeze(),
             opened,
+            flush_key: None,
         })
     }
 
     /// Opens every sealed block with `keys`, so that the blocks can be
-    /// read; nothing to do for an entry without sealed blocks.
+    /// read, and the files of a sealed flush record, which becomes the
+    /// flush record it is; nothing to do for an entry with nothing
+    /// sealed.
     ///
     /// # Errors
     ///
     /// `Keys` when a block's key is not in the keyring or does not open
-    /// the block.
+    /// the block; `Unreadable` when what a flush record sealed is not
+    /// its files.
     pub fn unlock(&mut self, keys: &Keys) -> Result<(), WalError> {
+        if let EntryBody::SealedFlush {
+            tenant,
+            dataset,
+            after,
+            through,
+            key,
+        } = &self.header.body
+        {
+            let aad = block_aad(self.header.writer, self.header.seq, 0);
+            let plain = keys.open(key, &aad, &self.blocks)?;
+            let files = serde_json::from_slice(&plain)
+                .map_err(|e| WalError::Unreadable(format!("sealed flush record: {e}")))?;
+            self.flush_key = Some(key.clone());
+            self.header.body = EntryBody::Flush {
+                tenant: tenant.clone(),
+                dataset: dataset.clone(),
+                after: *after,
+                through: *through,
+                files,
+            };
+            return Ok(());
+        }
         let sealed: Vec<(usize, String)> = self
             .block_metas()
             .iter()
@@ -386,10 +467,38 @@ impl Entry {
             .collect()
     }
 
+    /// The header as it is stored: a flush record whose files are
+    /// sealed says so and leaves them to its block.
+    fn stored_header(&self) -> EntryHeader {
+        let body = match (&self.flush_key, &self.header.body) {
+            (
+                Some(key),
+                EntryBody::Flush {
+                    tenant,
+                    dataset,
+                    after,
+                    through,
+                    ..
+                },
+            ) => EntryBody::SealedFlush {
+                tenant: tenant.clone(),
+                dataset: dataset.clone(),
+                after: *after,
+                through: *through,
+                key: key.clone(),
+            },
+            (_, body) => body.clone(),
+        };
+        EntryHeader {
+            body,
+            ..self.header.clone()
+        }
+    }
+
     /// The bytes written to the object store.
     #[must_use]
     pub fn encode(&self) -> Bytes {
-        let header = serde_json::to_vec(&self.header)
+        let header = serde_json::to_vec(&self.stored_header())
             .unwrap_or_else(|e| unreachable!("an entry header always serializes: {e}"));
         let mut bytes = BytesMut::with_capacity(self.blocks.len() + header.len() + TRAILER_LEN);
         bytes.extend_from_slice(&self.blocks);
@@ -434,6 +543,7 @@ impl Entry {
             header,
             blocks: bytes.slice(..header_start),
             opened: BTreeMap::new(),
+            flush_key: None,
         })
     }
 }
@@ -515,11 +625,22 @@ mod tests {
             &Keys::none(),
         )
         .unwrap();
-        let seeds = [end.encode(), segment.encode()];
+        let sealed_flush = Entry::record(
+            WriterId::from_u128(1),
+            Seq::new(3),
+            id(),
+            Timestamp::UNIX_EPOCH,
+            flush("a"),
+            &keys_for("a"),
+        )
+        .unwrap();
+        let seeds = [end.encode(), segment.encode(), sealed_flush.encode()];
         let mut random = tessera_types::SeededRandom::new(5);
         for round in 0..1_500 {
             let input = tessera_types::mutated(&seeds[round % seeds.len()], &mut random);
-            let _ = Entry::decode(&Bytes::from(input));
+            if let Ok(mut entry) = Entry::decode(&Bytes::from(input)) {
+                let _ = entry.unlock(&keys_for("a"));
+            }
         }
     }
 
@@ -537,6 +658,157 @@ mod tests {
             Keyring::default().with("k", TenantKey::from_bytes([1; KEY_LEN])),
             Arc::new(Only(tenant)),
         )
+    }
+
+    /// A flush record of `tenant` naming one file whose body column
+    /// runs from one confidential line to another.
+    fn flush(tenant: &str) -> EntryBody {
+        let partition = tessera_types::PartitionId {
+            tenant: TenantId::new(tenant).unwrap(),
+            dataset: DatasetName::new("prod").unwrap(),
+            kind: Kind::Log,
+            window: tessera_types::Window::containing(
+                Timestamp::UNIX_EPOCH,
+                tessera_types::Window::DEFAULT_LENGTH,
+            )
+            .unwrap(),
+        };
+        let text = |value: &str| Some(tessera_types::event::Scalar::Text(value.into()));
+        let file = FileMeta {
+            file_id: tessera_types::FileId::from_u128(7),
+            partition,
+            pool: tessera_types::PoolId::new("root").unwrap(),
+            level: tessera_types::Level::L1,
+            source: tessera_types::FileSource::Writer {
+                writer: WriterId::from_u128(1),
+                after: Seq::ZERO,
+                through: Seq::new(2),
+            },
+            min_timestamp: Timestamp::from_nanos(1),
+            max_timestamp: Timestamp::from_nanos(9),
+            row_count: 9,
+            size_bytes: 100,
+            layout_epoch: 0,
+            sort_key: vec!["timestamp".into()],
+            columns: vec![tessera_types::ColumnStats {
+                name: "body".into(),
+                min: text("confidential a"),
+                max: text("confidential z"),
+                null_count: 0,
+                distinct: None,
+                quantiles: Vec::new(),
+            }],
+            indexes: Vec::new(),
+            ingested_at: None,
+        };
+        EntryBody::Flush {
+            tenant: TenantId::new(tenant).unwrap(),
+            dataset: DatasetName::new("prod").unwrap(),
+            after: Seq::ZERO,
+            through: Seq::new(2),
+            files: vec![file],
+        }
+    }
+
+    fn holds(bytes: &[u8], needle: &str) -> bool {
+        bytes.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    /// SE-2: the bounds of a file's columns are the tenant's data. A
+    /// keyed tenant's flush record is stored with its files sealed and
+    /// says only whose it is and what it covers; unlocked with the key
+    /// it is the record that was written, and it does not unlock
+    /// without. Another tenant's is stored plain, as before.
+    #[test]
+    fn the_files_of_a_keyed_tenants_flush_record_are_sealed() {
+        let keys = keys_for("a");
+        let record = |tenant| {
+            Entry::record(
+                WriterId::from_u128(1),
+                Seq::new(3),
+                id(),
+                Timestamp::UNIX_EPOCH,
+                flush(tenant),
+                &keys,
+            )
+            .unwrap()
+        };
+        let written = record("a");
+        assert_eq!(
+            written.body(),
+            &flush("a"),
+            "the writer reads what it wrote"
+        );
+        let stored = written.encode();
+        assert!(!holds(&stored, "confidential"), "no bound is readable");
+        assert!(holds(&stored, "\"kind\":\"sealed_flush\""));
+        assert!(holds(&stored, "\"key\":\"k\""));
+
+        let mut read = Entry::decode(&stored).unwrap();
+        assert!(
+            matches!(
+                read.body(),
+                EntryBody::SealedFlush { through, key, .. } if *through == Seq::new(2) && key == "k"
+            ),
+            "{:?}",
+            read.body()
+        );
+        let mut without = read.clone();
+        assert!(matches!(
+            without.unlock(&Keys::none()),
+            Err(WalError::Keys(KeyError::Missing { .. }))
+        ));
+        read.unlock(&keys).unwrap();
+        assert_eq!(read, written);
+        assert_eq!(read.encode(), stored, "stored again as it was");
+
+        let plain = record("b");
+        assert!(holds(&plain.encode(), "confidential"));
+        let mut read = Entry::decode(&plain.encode()).unwrap();
+        read.unlock(&keys).unwrap();
+        assert_eq!(read.body(), &flush("b"));
+    }
+
+    /// A flush record is not stored plain when its tenant's key is
+    /// missing, and a sealed one moved to another place does not open.
+    #[test]
+    fn a_flush_record_fails_rather_than_go_plain_or_open_elsewhere() {
+        let lost = Keys::new(Keyring::default(), Arc::new(Only("a")));
+        let refused = Entry::record(
+            WriterId::from_u128(1),
+            Seq::new(3),
+            id(),
+            Timestamp::UNIX_EPOCH,
+            flush("a"),
+            &lost,
+        );
+        assert!(matches!(
+            refused,
+            Err(WalError::Keys(KeyError::Missing { .. }))
+        ));
+
+        let keys = keys_for("a");
+        let at = |seq| {
+            Entry::record(
+                WriterId::from_u128(1),
+                Seq::new(seq),
+                id(),
+                Timestamp::UNIX_EPOCH,
+                flush("a"),
+                &keys,
+            )
+            .unwrap()
+        };
+        // The block of entry 3 under the header of entry 4.
+        let moved = Entry {
+            blocks: at(3).blocks,
+            ..at(4)
+        };
+        let mut read = Entry::decode(&moved.encode()).unwrap();
+        assert!(matches!(
+            read.unlock(&keys),
+            Err(WalError::Keys(KeyError::Sealed { .. }))
+        ));
     }
 
     /// SE-2: a keyed tenant's block is sealed under its key and named
@@ -595,6 +867,7 @@ mod tests {
             header: make(2).header,
             blocks: make(1).blocks,
             opened: BTreeMap::new(),
+            flush_key: None,
         };
         let mut moved = Entry::decode(&moved.encode()).unwrap();
         assert!(matches!(

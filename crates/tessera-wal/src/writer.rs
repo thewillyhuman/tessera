@@ -118,13 +118,15 @@ impl WriterLog {
         .await
     }
 
-    /// Appends a flush record (section 6.3).
+    /// Appends a flush record (section 6.3), its files sealed under
+    /// the tenant's key where the tenant has one (SE-2).
     ///
     /// # Errors
     ///
     /// As for [`append_segment`](Self::append_segment).
     pub async fn append(&mut self, body: EntryBody) -> Result<Seq, WalError> {
-        self.append_with(|writer, seq, id, now| Ok(Entry::new(writer, seq, id, now, body)))
+        let keys = Arc::clone(&self.env.keys);
+        self.append_with(|writer, seq, id, now| Entry::record(writer, seq, id, now, body, &keys))
             .await
     }
 

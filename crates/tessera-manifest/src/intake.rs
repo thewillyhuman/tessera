@@ -66,7 +66,11 @@ pub async fn run(
                 }
             }
             EntryBody::End => outcome.ended = true,
-            EntryBody::Flush { .. } | EntryBody::Segment { .. } | EntryBody::Seal { .. } => {}
+            // The entries come unlocked: none is a flush still sealed.
+            EntryBody::Flush { .. }
+            | EntryBody::SealedFlush { .. }
+            | EntryBody::Segment { .. }
+            | EntryBody::Seal { .. } => {}
         }
     }
     if outcome.ended {

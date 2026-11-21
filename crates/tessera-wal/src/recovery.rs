@@ -116,7 +116,9 @@ async fn seal(
             match reader::read(&**store, writer, seq).await?.body() {
                 EntryBody::End => return Ok(Sealed::Ended),
                 EntryBody::Seal { .. } => return Ok(Sealed::At(seq)),
-                EntryBody::Segment { .. } | EntryBody::Flush { .. } => {}
+                EntryBody::Segment { .. }
+                | EntryBody::Flush { .. }
+                | EntryBody::SealedFlush { .. } => {}
             }
         }
         let next = last.map_or(Seq::new(1), Seq::next);
@@ -156,6 +158,12 @@ async fn unflushed(
         match entry.body() {
             EntryBody::Segment { .. } => segments.push(entry),
             EntryBody::Flush {
+                tenant,
+                dataset,
+                through,
+                ..
+            }
+            | EntryBody::SealedFlush {
                 tenant,
                 dataset,
                 through,
@@ -254,6 +262,7 @@ mod tests {
                         files.len()
                     )
                 }
+                EntryBody::SealedFlush { dataset, .. } => format!("sealed flush {dataset}"),
                 EntryBody::Seal { .. } => "seal".to_owned(),
                 EntryBody::End => "end".to_owned(),
             })

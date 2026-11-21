@@ -160,7 +160,9 @@ pub async fn collect_log(
                 }
                 deletable.push(*seq);
             }
-            EntryBody::Flush { .. } | EntryBody::Seal { .. } => deletable.push(*seq),
+            EntryBody::Flush { .. } | EntryBody::SealedFlush { .. } | EntryBody::Seal { .. } => {
+                deletable.push(*seq);
+            }
             EntryBody::End => {
                 ended = true;
                 deletable.push(*seq);

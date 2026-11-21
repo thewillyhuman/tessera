@@ -607,7 +607,7 @@ mod tests {
                 .iter()
                 .map(|e| match e.body() {
                     EntryBody::Segment { .. } => "segment",
-                    EntryBody::Flush { .. } => "flush",
+                    EntryBody::Flush { .. } | EntryBody::SealedFlush { .. } => "flush",
                     EntryBody::Seal { .. } => "seal",
                     EntryBody::End => "end",
                 })
@@ -912,7 +912,7 @@ mod tests {
             .iter()
             .map(|e| match e.body() {
                 EntryBody::Segment { .. } => "segment",
-                EntryBody::Flush { .. } => "flush",
+                EntryBody::Flush { .. } | EntryBody::SealedFlush { .. } => "flush",
                 EntryBody::Seal { .. } => "seal",
                 EntryBody::End => "end",
             })

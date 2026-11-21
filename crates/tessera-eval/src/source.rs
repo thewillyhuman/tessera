@@ -243,7 +243,7 @@ impl SourceTask<'_> {
                     partials.ended = true;
                 }
             }
-            EntryBody::Flush { .. } | EntryBody::Seal { .. } => {}
+            EntryBody::Flush { .. } | EntryBody::SealedFlush { .. } | EntryBody::Seal { .. } => {}
         }
         Ok(each)
     }

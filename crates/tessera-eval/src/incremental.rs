@@ -775,7 +775,9 @@ async fn read_entry(
             ingested.ended.insert(name);
             return Ok(true);
         }
-        EntryBody::Flush { .. } | EntryBody::Seal { .. } => return Ok(true),
+        EntryBody::Flush { .. } | EntryBody::SealedFlush { .. } | EntryBody::Seal { .. } => {
+            return Ok(true);
+        }
     };
     if let Some(newest) = blocks.iter().map(|b| b.max_observed).max() {
         let seen = ingested.watermarks.entry(name).or_insert(newest);

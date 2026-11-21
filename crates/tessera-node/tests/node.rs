@@ -455,6 +455,7 @@ fn assert_sealed_at_rest(root: &std::path::Path, id: &str) {
     let mut sealed_entries = 0;
     let mut encrypted_files = 0;
     let mut sealed_whole = 0;
+    let mut sealed_flushes = 0;
     for path in walkdir(root) {
         let text = path.to_string_lossy().into_owned();
         // The node keeps running: an object may be gone, or half written,
@@ -464,6 +465,14 @@ fn assert_sealed_at_rest(root: &std::path::Path, id: &str) {
         };
         let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
         let extension = path.extension().and_then(|e| e.to_str());
+        // A flush record names its files with the bounds of their
+        // columns, a segment its blocks: neither shows a line.
+        if text.contains("/_wal/") {
+            assert!(!has("confidential line"), "{text}: nothing readable");
+        }
+        if text.contains("/_wal/") && has("\"kind\":\"sealed_flush\"") {
+            sealed_flushes += 1;
+        }
         if text.contains("/_wal/")
             && has("\"kind\":\"segment\"")
             && has(&format!("\"tenant\":\"{id}\""))
@@ -498,6 +507,7 @@ fn assert_sealed_at_rest(root: &std::path::Path, id: &str) {
     assert!(sealed_entries > 0, "acme's segments were found");
     assert!(encrypted_files > 0, "acme's files were found");
     assert!(sealed_whole > 0, "acme's logs were found");
+    assert!(sealed_flushes > 0, "acme's flush records were found");
 }
 
 /// Every file under `root`, recursively.
