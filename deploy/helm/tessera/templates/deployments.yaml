@@ -73,6 +73,13 @@ spec:
             httpGet:
               path: /healthz
               port: http
+          # A pod told to stop keeps serving for a moment, until the
+          # service has stopped sending to it, and only then gets the
+          # signal: a rolling upgrade refuses no request.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ $root.Values.drainSeconds }}
           # Nothing is written outside the volumes: queries spill
           # under /tmp, and what is durable goes to the root pool.
           securityContext:

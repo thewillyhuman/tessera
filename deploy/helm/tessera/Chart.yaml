@@ -2,5 +2,8 @@ apiVersion: v2
 name: tessera
 description: Tessera, the observability database, on one shared root pool (OP-10).
 type: application
+# A pod's preStop hook is the sleep action, which a cluster has from
+# this version on.
+kubeVersion: ">=1.30.0-0"
 version: 0.1.0
 appVersion: "0.1.0"

@@ -44,6 +44,10 @@ rootPool:
 # when empty.
 serviceAccountName: ""
 
+# How long a pod that is being replaced keeps serving before it is
+# told to stop, the time the service takes to stop sending to it.
+drainSeconds: 5
+
 service:
   type: ClusterIP
   httpPort: 8080
