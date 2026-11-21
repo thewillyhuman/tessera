@@ -62,9 +62,10 @@ fn apply(function: RangeFunction, window: &[Sample], range: i64) -> Option<f64> 
     let seconds = range as f64 / 1e9;
     Some(match function {
         RangeFunction::CountOverTime => n,
-        RangeFunction::Rate => n / seconds,
         RangeFunction::BytesOverTime | RangeFunction::SumOverTime => values().sum(),
-        RangeFunction::BytesRate => values().sum::<f64>() / seconds,
+        // What the samples carry, per second: one each where the caller
+        // counts rows, which sums to their number exactly.
+        RangeFunction::Rate | RangeFunction::BytesRate => values().sum::<f64>() / seconds,
         RangeFunction::AvgOverTime => values().sum::<f64>() / n,
         RangeFunction::MinOverTime => values().fold(f64::INFINITY, f64::min),
         RangeFunction::MaxOverTime => values().fold(f64::NEG_INFINITY, f64::max),
@@ -136,8 +137,18 @@ mod tests {
             out,
             vec![(2 * S, 2.0), (4 * S, 2.0), (6 * S, 1.0), (10 * S, 1.0)]
         );
+        let ones: Vec<Sample> = samples().iter().map(|(t, _)| (*t, 1.0)).collect();
+        let rate = evaluate(RangeFunction::Rate, &ones, 4 * S, 4 * S, S, 4 * S);
+        assert_eq!(rate, vec![(4 * S, 3.0 / 4.0)], "rows counted as one each");
+    }
+
+    /// A rate is the sum of what the samples carry, per second: one
+    /// each where rows are counted, and where the samples are counts
+    /// already, of the parts a window was split into, their total.
+    #[test]
+    fn a_rate_is_the_sum_of_the_values_per_second() {
         let rate = evaluate(RangeFunction::Rate, &samples(), 4 * S, 4 * S, S, 4 * S);
-        assert_eq!(rate, vec![(4 * S, 3.0 / 4.0)]);
+        assert_eq!(rate, vec![(4 * S, 12.0 / 4.0)]);
     }
 
     #[test]

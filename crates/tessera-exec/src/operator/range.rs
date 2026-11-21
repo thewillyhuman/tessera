@@ -102,14 +102,18 @@ impl RangeVector {
     }
 
     /// The value each row contributes: 1 for counting functions, the
-    /// line's bytes for the byte functions, the unwrapped value otherwise.
+    /// line's bytes for the byte functions, the unwrapped value
+    /// otherwise, and for a rate that was given one.
     #[allow(clippy::cast_precision_loss)]
     fn values(&self, rows: &RecordBatch) -> Result<Vec<Option<f64>>, ExecError> {
         let n = rows.num_rows();
+        let counts = match self.function {
+            RangeFunction::CountOverTime | RangeFunction::AbsentOverTime => true,
+            RangeFunction::Rate => self.value.is_none(),
+            _ => false,
+        };
         Ok(match self.function {
-            RangeFunction::CountOverTime | RangeFunction::Rate | RangeFunction::AbsentOverTime => {
-                vec![Some(1.0); n]
-            }
+            _ if counts => vec![Some(1.0); n],
             RangeFunction::BytesOverTime | RangeFunction::BytesRate => {
                 let body = text(rows, BODY);
                 (0..n)
@@ -359,6 +363,44 @@ mod tests {
         );
         let out = series(&run(&mut absent, vec![input]));
         assert_eq!(out, vec![(3 * S, None, 1000), (4 * S, None, 1000)]);
+    }
+
+    /// A rate given a value sums it per second, as `LogQL`'s rate over
+    /// an unwrapped range does; without one it counts the rows.
+    #[test]
+    fn a_rate_with_a_value_sums_it_per_second() {
+        let input = rows(&[
+            (S, "a", r#"{"attr.n":"3"}"#),
+            (2 * S, "b", r#"{"attr.n":"5"}"#),
+        ]);
+        let rate = |value: Option<Expr>| {
+            let mut op = RangeVector::new(
+                RangeFunction::Rate,
+                value,
+                Steps {
+                    range: Duration::from_secs(4),
+                    step: Duration::from_secs(4),
+                    start: Timestamp::from_nanos(4 * S),
+                    end: Timestamp::from_nanos(4 * S),
+                },
+                Some(SeriesGrouping {
+                    by: true,
+                    labels: Vec::new(),
+                }),
+                MemoryPool::unbounded(),
+            );
+            series(&run(&mut op, vec![input.clone()]))
+        };
+        assert_eq!(
+            rate(None),
+            vec![(4 * S, None, 500)],
+            "two rows in four seconds"
+        );
+        let summed = rate(Some(Expr::Label {
+            name: "n".into(),
+            data_type: DataType::Float64,
+        }));
+        assert_eq!(summed, vec![(4 * S, None, 2000)], "eight in four seconds");
     }
 
     #[test]

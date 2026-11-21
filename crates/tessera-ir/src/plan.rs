@@ -547,7 +547,7 @@ impl fmt::Display for ExtractStage {
 pub enum RangeFunction {
     /// Samples in the window.
     CountOverTime,
-    /// Samples per second.
+    /// Samples per second; given a value, its sum per second.
     Rate,
     /// Bytes of the lines in the window.
     BytesOverTime,
