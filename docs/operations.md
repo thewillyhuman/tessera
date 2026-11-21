@@ -231,6 +231,7 @@ every route and over gRPC.
   | `tessera_alert_latency_seconds` | From the last row to the notification sent |
   | `tessera_slots_owned{kind}` | Slots this node holds |
   | `tessera_object_cache_hits_total`, `_misses_total`, `_bytes` | The use of `--cache-dir` |
+  | `tessera_object_store_requests_total{operation}` | What the node asks of its store, by operation; its rate while idle is what the store bills for nothing |
 
 - Every node writes the same signals to the `_system` tenant's
   `metrics` dataset and its own log events to `logs`, so they can be

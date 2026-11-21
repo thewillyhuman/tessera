@@ -44,7 +44,8 @@ use tessera_iceberg::Exporter;
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::{DatasetLogs, Manifests};
 use tessera_object::{
-    CachedStore, LocalStore, ObjectStore, PoolState, Pools, RemoteStore, SealedStore, layout,
+    CachedStore, LocalStore, MeteredStore, ObjectStore, PoolState, Pools, RemoteStore, SealedStore,
+    StoreRequests, layout,
 };
 use tessera_server::{
     AppState, Auth, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows,
@@ -284,7 +285,7 @@ impl Node {
     ///
     /// If the data directory, the catalog or a listener cannot be opened.
     pub async fn start(config: Config, env: Env) -> Result<Node, RunError> {
-        let (store, catalog, pool, cache) = open(&config, &env).await?;
+        let (store, catalog, pool, cache, requests) = open(&config, &env).await?;
         let (env, store) = keyed(&config, env, &catalog, store);
         let mut loops = vec![tokio::spawn(keep_fresh(Arc::clone(&catalog)))];
 
@@ -337,6 +338,10 @@ impl Node {
         };
         loops
             .extend(cache.map(|cache| tokio::spawn(report_cache(cache, Arc::clone(&shared.load)))));
+        loops.push(tokio::spawn(report_requests(
+            requests,
+            Arc::clone(&shared.load),
+        )));
         let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
         let (state, engine, controls) =
@@ -572,6 +577,16 @@ async fn cached(
     Ok(((store, url), Some(cache)))
 }
 
+/// Copies what the root pool's store was asked into the node's load
+/// signals every second.
+async fn report_requests(requests: Arc<StoreRequests>, load: Arc<Load>) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        ticks.tick().await;
+        load.set_store_requests(requests.by_operation());
+    }
+}
+
 /// Copies the cache's use into the node's load signals every second.
 async fn report_cache(cache: Arc<CachedStore>, load: Arc<Load>) {
     let mut ticks = tokio::time::interval(Duration::from_secs(1));
@@ -590,18 +605,25 @@ async fn report_cache(cache: Arc<CachedStore>, load: Arc<Load>) {
 type RootStore = (Arc<dyn ObjectStore>, String);
 
 /// What a node opens first: the root pool's store, the catalog in
-/// it, the pool's id and the cache in front of the store, if any.
+/// it, the pool's id, the cache in front of the store, if any, and
+/// the count of what the store is asked.
 type Opened = (
     Arc<dyn ObjectStore>,
     Arc<Catalog>,
     PoolId,
     Option<Arc<CachedStore>>,
+    Arc<StoreRequests>,
 );
 
 /// Opens the root pool, behind the node's cache when it has one, and
 /// the catalog in it.
 async fn open(config: &Config, env: &Env) -> Result<Opened, RunError> {
-    let ((store, url), cache) = cached(config, root_store(config).await?).await?;
+    // Counted on the store itself, under the cache: what the cache
+    // serves is not a request.
+    let (store, url) = root_store(config).await?;
+    let metered = MeteredStore::new(store);
+    let requests = metered.requests();
+    let ((store, url), cache) = cached(config, (Arc::new(metered), url)).await?;
     // Before anything is written: a store that creates an object
     // twice would let two nodes win the same commit (ST-3).
     tessera_object::probe::create_if_absent(&*store, &layout::probe(env.node)).await?;
@@ -619,7 +641,7 @@ async fn open(config: &Config, env: &Env) -> Result<Opened, RunError> {
         version = %catalog.cached().version(),
         "catalog open"
     );
-    Ok((store, catalog, pool, cache))
+    Ok((store, catalog, pool, cache, requests))
 }
 
 /// The store of the root pool and the URL the catalog records it

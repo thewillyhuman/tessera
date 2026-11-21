@@ -17,7 +17,8 @@
 //! and, for a node that keeps object reads on local disk (section
 //! 10.8), the counters `tessera_object_cache_hits_total` and
 //! `tessera_object_cache_misses_total` with the gauge
-//! `tessera_object_cache_bytes`.
+//! `tessera_object_cache_bytes`. What the node asks of its root pool's
+//! store is the counter `tessera_object_store_requests_total{operation}`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -39,6 +40,7 @@ pub struct Load {
     degraded_rules: AtomicU64,
     alert_latency_nanos: AtomicU64,
     object_cache: Mutex<ObjectCache>,
+    store_requests: Mutex<Vec<(&'static str, u64)>>,
     slots: Mutex<BTreeMap<WorkKind, u64>>,
 }
 
@@ -87,6 +89,9 @@ pub struct Snapshot {
     pub alert_latency: Duration,
     /// The use of the cache of object reads on local disk.
     pub object_cache: ObjectCache,
+    /// Calls to the root pool's store since the node started, by
+    /// operation.
+    pub store_requests: Vec<(&'static str, u64)>,
     /// Slots held per kind of work.
     pub slots: BTreeMap<WorkKind, u64>,
 }
@@ -170,6 +175,15 @@ impl Load {
             .unwrap_or_else(PoisonError::into_inner) = used;
     }
 
+    /// Sets the calls made to the root pool's store since the node
+    /// started, by operation.
+    pub fn set_store_requests(&self, calls: Vec<(&'static str, u64)>) {
+        *self
+            .store_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = calls;
+    }
+
     /// Sets the slots held of `kind`.
     pub fn set_slots(&self, kind: WorkKind, held: u64) {
         self.slots
@@ -194,6 +208,11 @@ impl Load {
                 .object_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
+            store_requests: self
+                .store_requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
             slots: self
                 .slots
                 .lock()
@@ -280,6 +299,17 @@ impl Snapshot {
         );
         let _ = writeln!(
             out,
+            "# HELP tessera_object_store_requests_total Calls to the root pool's store, by operation; a listing counts once however many pages it takes."
+        );
+        let _ = writeln!(out, "# TYPE tessera_object_store_requests_total counter");
+        for (operation, calls) in &self.store_requests {
+            let _ = writeln!(
+                out,
+                "tessera_object_store_requests_total{{operation=\"{operation}\"}} {calls}"
+            );
+        }
+        let _ = writeln!(
+            out,
             "# HELP tessera_slots_owned Slots this node holds, per kind of work."
         );
         let _ = writeln!(out, "# TYPE tessera_slots_owned gauge");
@@ -349,7 +379,16 @@ mod tests {
             misses: 2,
             bytes: 4096,
         });
+        load.set_store_requests(vec![("get", 12), ("list", 3)]);
         let text = load.snapshot().prometheus_text();
+        assert!(
+            text.contains("tessera_object_store_requests_total{operation=\"get\"} 12\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tessera_object_store_requests_total{operation=\"list\"} 3\n"),
+            "{text}"
+        );
         assert!(
             text.contains("tessera_object_cache_hits_total 7\n"),
             "{text}"

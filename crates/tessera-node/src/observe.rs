@@ -320,6 +320,7 @@ mod tests {
             evaluator_lag: Duration::from_secs(3),
             degraded_rules: 0,
             object_cache: tessera_cluster::ObjectCache::default(),
+            store_requests: Vec::new(),
             slots: BTreeMap::from([(WorkKind::Partition, 4), (WorkKind::Intake, 1)]),
             alert_latency: Duration::from_millis(1_200),
         };
