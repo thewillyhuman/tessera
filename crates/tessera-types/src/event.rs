@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampNanosecondArray, UInt64Array,
+    RecordBatch, StringArray, StringBuilder, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
@@ -989,7 +989,13 @@ pub fn attributes_column(rows: &RecordBatch) -> Option<StringArray> {
         .filter(|(field, _)| SCOPES.iter().any(|scope| field.name().starts_with(scope)))
         .map(|(field, column)| (logical_path(field.name()), column))
         .collect();
-    if dedicated.is_empty() {
+    // Columns that hold nothing on these rows add nothing: the stored
+    // text is the whole of it, as it is without such columns. A file
+    // has the service's column whether any row names a service or not.
+    if dedicated
+        .iter()
+        .all(|(_, column)| column.null_count() == column.len())
+    {
         return overflow.cloned();
     }
     // The stored text is already a JSON object: the dedicated values are
@@ -998,70 +1004,114 @@ pub fn attributes_column(rows: &RecordBatch) -> Option<StringArray> {
     // twice with the same value, and a parser keeps the last. The
     // sub-columns of one path (DM-5) are null but for one per row, so
     // the path appears once under its own name.
-    let merged: StringArray = (0..rows.num_rows())
-        .map(|i| {
-            let stored = overflow
-                .filter(|o| !o.is_null(i))
-                .map(|o| o.value(i).trim())
-                .filter(|text| text.len() >= 2 && text.starts_with('{') && text.ends_with('}'));
-            let mut out = String::new();
-            match stored {
-                Some(text) => out.push_str(&text[..text.len() - 1]),
-                None => out.push('{'),
-            }
-            let mut empty = stored.is_none_or(|text| text.len() == 2);
-            for (path, column) in &dedicated {
-                let Some(value) = cell_value(column, i) else {
-                    continue;
-                };
-                if !empty {
-                    out.push(',');
-                }
-                empty = false;
-                out.push_str(&Value::String((*path).to_owned()).to_string());
-                out.push(':');
-                out.push_str(&value.to_string());
-            }
-            if empty {
-                return None;
-            }
-            out.push('}');
-            Some(out)
-        })
+    let names: Vec<String> = dedicated
+        .iter()
+        .map(|(path, _)| Value::String((*path).to_owned()).to_string())
         .collect();
-    Some(merged)
+    let stored = |i: usize| overflow.filter(|o| !o.is_null(i)).map(|o| o.value(i));
+    let mut merged = StringBuilder::with_capacity(rows.num_rows(), 0);
+    // The object of the row at hand, written into one buffer for every
+    // row, and whether it holds any attribute. Rows of one stream that
+    // follow each other have the same cells: their object is written
+    // once.
+    let mut object: Vec<u8> = Vec::new();
+    let mut any = false;
+    for i in 0..rows.num_rows() {
+        let repeats = i > 0
+            && stored(i) == stored(i - 1)
+            && dedicated.iter().all(|(_, column)| repeats(column, i));
+        if !repeats {
+            let text = stored(i)
+                .map(str::trim)
+                .filter(|text| text.len() >= 2 && text.starts_with('{') && text.ends_with('}'));
+            object.clear();
+            match text {
+                Some(text) => object.extend_from_slice(&text.as_bytes()[..text.len() - 1]),
+                None => object.push(b'{'),
+            }
+            any = text.is_some_and(|text| text.len() > 2);
+            for (name, (_, column)) in names.iter().zip(&dedicated) {
+                let before = object.len();
+                if any {
+                    object.push(b',');
+                }
+                object.extend_from_slice(name.as_bytes());
+                object.push(b':');
+                if write_cell(&mut object, column, i) {
+                    any = true;
+                } else {
+                    object.truncate(before);
+                }
+            }
+            object.push(b'}');
+        }
+        // Whole pieces of text and JSON that serde wrote: UTF-8.
+        match std::str::from_utf8(&object) {
+            Ok(text) if any => merged.append_value(text),
+            _ => merged.append_null(),
+        }
+    }
+    Some(merged.finish())
 }
 
-/// The value at `row` of a dedicated attribute column, as JSON.
-fn cell_value(column: &ArrayRef, row: usize) -> Option<Value> {
+/// Writes the value at `row` of a dedicated attribute column to `out`
+/// as JSON; false, with nothing written, where the cell is null, a
+/// number JSON has no way to write, or of a type attributes do not
+/// have.
+fn write_cell(out: &mut Vec<u8>, column: &ArrayRef, row: usize) -> bool {
     if column.is_null(row) {
-        return None;
+        return false;
     }
     let any = column.as_any();
+    macro_rules! written {
+        ($array:ty) => {
+            any.downcast_ref::<$array>()
+                .is_some_and(|a| serde_json::to_writer(&mut *out, &a.value(row)).is_ok())
+        };
+    }
     match column.data_type() {
-        DataType::Utf8 => any
-            .downcast_ref::<StringArray>()
-            .map(|a| Value::String(a.value(row).to_owned())),
-        DataType::Int64 => any
-            .downcast_ref::<Int64Array>()
-            .map(|a| Value::from(a.value(row))),
-        DataType::Int32 => any
-            .downcast_ref::<Int32Array>()
-            .map(|a| Value::from(a.value(row))),
-        DataType::UInt64 => any
-            .downcast_ref::<UInt64Array>()
-            .map(|a| Value::from(a.value(row))),
+        DataType::Utf8 => written!(StringArray),
+        DataType::Int64 => written!(Int64Array),
+        DataType::Int32 => written!(Int32Array),
+        DataType::UInt64 => written!(UInt64Array),
         DataType::Float64 => any
             .downcast_ref::<Float64Array>()
-            .and_then(|a| serde_json::Number::from_f64(a.value(row)))
-            .map(Value::Number),
-        DataType::Boolean => any
-            .downcast_ref::<BooleanArray>()
-            .map(|a| Value::Bool(a.value(row))),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => any
-            .downcast_ref::<TimestampNanosecondArray>()
-            .map(|a| Value::from(a.value(row))),
-        _ => None,
+            .map(|a| a.value(row))
+            .filter(|value| value.is_finite())
+            .is_some_and(|value| serde_json::to_writer(&mut *out, &value).is_ok()),
+        DataType::Boolean => written!(BooleanArray),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => written!(TimestampNanosecondArray),
+        _ => false,
+    }
+}
+
+/// Whether the cell of `column` at `row` is the one of the row before,
+/// as far as [`write_cell`] tells cells apart: a column of a type it
+/// writes nothing for is the same on every row.
+fn repeats(column: &ArrayRef, row: usize) -> bool {
+    match (column.is_null(row), column.is_null(row - 1)) {
+        (true, true) => return true,
+        (false, false) => {}
+        _ => return false,
+    }
+    let any = column.as_any();
+    macro_rules! same {
+        ($array:ty) => {
+            any.downcast_ref::<$array>()
+                .is_none_or(|a| a.value(row) == a.value(row - 1))
+        };
+    }
+    match column.data_type() {
+        DataType::Utf8 => same!(StringArray),
+        DataType::Int64 => same!(Int64Array),
+        DataType::Int32 => same!(Int32Array),
+        DataType::UInt64 => same!(UInt64Array),
+        DataType::Float64 => any
+            .downcast_ref::<Float64Array>()
+            .is_none_or(|a| a.value(row).to_bits() == a.value(row - 1).to_bits()),
+        DataType::Boolean => same!(BooleanArray),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => same!(TimestampNanosecondArray),
+        _ => true,
     }
 }
 
@@ -1121,6 +1171,68 @@ mod tests {
         );
     }
 
+    /// Rows of one stream follow each other with the same attributes,
+    /// and the object of such a row is the one of the row before: built
+    /// once, not once a row. A change in any cell, a value, a null or
+    /// the stored text, starts another.
+    #[test]
+    fn a_row_with_the_cells_of_the_one_before_has_its_attributes() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(OVERFLOW, DataType::Utf8, true),
+            Field::new("attr.host", DataType::Utf8, true),
+            Field::new("attr.n", DataType::Int64, true),
+        ]));
+        let rare = Some(r#"{"attr.rare":true}"#);
+        let cells: Vec<(Option<&str>, Option<&str>, Option<i64>)> = vec![
+            (None, Some("h1"), Some(7)),
+            (None, Some("h1"), Some(7)),
+            (None, Some("h1"), Some(8)),
+            (None, Some("h2"), Some(8)),
+            (None, None, Some(8)),
+            (None, None, Some(8)),
+            (rare, None, Some(8)),
+            (rare, None, Some(8)),
+            (rare, None, None),
+            (None, None, None),
+            (None, None, None),
+            (None, Some("h1"), None),
+        ];
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    cells.iter().map(|c| c.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    cells.iter().map(|c| c.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    cells.iter().map(|c| c.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let merged = attributes_column(&rows).unwrap();
+        for (i, (stored, host, n)) in cells.iter().enumerate() {
+            let mut expected = serde_json::Map::new();
+            if stored.is_some() {
+                expected.insert("attr.rare".into(), true.into());
+            }
+            if let Some(host) = host {
+                expected.insert("attr.host".into(), (*host).into());
+            }
+            if let Some(n) = n {
+                expected.insert("attr.n".into(), (*n).into());
+            }
+            if expected.is_empty() {
+                assert!(merged.is_null(i), "row {i}");
+                continue;
+            }
+            let found: serde_json::Value = serde_json::from_str(merged.value(i)).unwrap();
+            assert_eq!(found, serde_json::Value::Object(expected), "row {i}");
+        }
+    }
+
     #[test]
     fn dedicated_attribute_columns_merge_back_into_the_overflow_view() {
         let schema = Arc::new(Schema::new(vec![
@@ -1140,6 +1252,28 @@ mod tests {
         )
         .unwrap();
         let merged = attributes_column(&rows).unwrap();
+        let unset = rows
+            .project(&[0, 3])
+            .unwrap()
+            .columns()
+            .iter()
+            .cloned()
+            .chain([arrow::array::new_null_array(&DataType::Utf8, 2)])
+            .collect::<Vec<_>>();
+        let unset = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(OVERFLOW, DataType::Utf8, true),
+                Field::new("body", DataType::Utf8, true),
+                Field::new("resource.service.name", DataType::Utf8, true),
+            ])),
+            unset,
+        )
+        .unwrap();
+        assert_eq!(
+            attributes_column(&unset).unwrap().value(0),
+            r#"{"attr.rare":true}"#,
+            "a dedicated column no row has a value in adds nothing"
+        );
         let first: serde_json::Value = serde_json::from_str(merged.value(0)).unwrap();
         assert_eq!(first["attr.rare"], true);
         assert_eq!(first["attr.host"], "h1");
