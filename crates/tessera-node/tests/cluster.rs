@@ -21,7 +21,12 @@ use tessera_types::{
     DatasetName, Env, ManualClock, NodeId, OsRandom, SharedRandom, TenantId, Timestamp, WorkKind,
 };
 
-const PATIENCE: Duration = Duration::from_secs(10);
+/// How long a step of the cluster may take before the test gives up.
+/// Each is waited for only until it happens, a second or two with the
+/// intervals these tests set; the rest is for a machine that runs several
+/// clusters at once, as CI's does: ten seconds were not always enough
+/// there, and a release waits on these tests.
+const PATIENCE: Duration = Duration::from_secs(30);
 /// Enough partition slots that rendezvous hashing leaves no node of
 /// three without one, with overwhelming probability.
 const SLOTS: usize = 32;
