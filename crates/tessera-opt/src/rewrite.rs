@@ -114,7 +114,7 @@ fn contradicts_kind(predicate: &Expr, kind: Kind) -> bool {
 fn push_predicates(plan: Plan, mut pending: Vec<Expr>) -> Plan {
     match plan {
         Plan::Filter { input, predicate } => {
-            pending.extend(predicate.conjuncts());
+            pending.extend(predicate.conjuncts().into_iter().map(with_times_worked_out));
             push_predicates(*input, pending)
         }
         Plan::Scan(mut scan) => {
@@ -487,6 +487,47 @@ fn push_projection_join(
         on,
         kind,
         asof,
+    }
+}
+
+/// `expr` with every point in time it computes from a time and a
+/// duration alone worked out. `now() - INTERVAL '5 minutes'` reaches
+/// here as a timestamp minus a duration: compared with `timestamp` as
+/// it stands it bounds neither the scan's time range nor what the
+/// files' statistics can rule out, and the scan reads all time. A sum
+/// past the range of time is left as it is, for the kernel to refuse.
+fn with_times_worked_out(expr: Expr) -> Expr {
+    let Expr::Binary { op, left, right } = expr else {
+        return expr;
+    };
+    let left = with_times_worked_out(*left);
+    let right = with_times_worked_out(*right);
+    let nanos = |d: &std::time::Duration| i64::try_from(d.as_nanos()).ok();
+    let moved = match (op, &left, &right) {
+        (
+            BinaryOp::Add,
+            Expr::Literal(Literal::Timestamp(t)),
+            Expr::Literal(Literal::Duration(d)),
+        )
+        | (
+            BinaryOp::Add,
+            Expr::Literal(Literal::Duration(d)),
+            Expr::Literal(Literal::Timestamp(t)),
+        ) => nanos(d).and_then(|d| t.as_nanos().checked_add(d)),
+        (
+            BinaryOp::Sub,
+            Expr::Literal(Literal::Timestamp(t)),
+            Expr::Literal(Literal::Duration(d)),
+        ) => nanos(d).and_then(|d| t.as_nanos().checked_sub(d)),
+        _ => None,
+    };
+    match moved {
+        Some(at) => Expr::Literal(Literal::Timestamp(Timestamp::from_nanos(at))),
+        None => Expr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        },
     }
 }
 
@@ -1277,6 +1318,41 @@ mod tests {
         assert_eq!(
             scan.projection.as_deref(),
             Some(&[TIMESTAMP.to_owned(), BODY.to_owned()][..])
+        );
+    }
+
+    /// `timestamp > now() - INTERVAL '5 minutes'` reaches the optimizer
+    /// as a timestamp minus a duration. Left as it stood it bounded
+    /// nothing: on a cluster the scan read every file of the dataset
+    /// to return the rows of five minutes.
+    #[test]
+    fn a_bound_worked_out_from_a_time_and_a_duration_narrows_the_time_range() {
+        let now = Timestamp::from_nanos(1_000);
+        let ago = Expr::literal(now).binary(
+            BinaryOp::Sub,
+            Expr::Literal(Literal::Duration(std::time::Duration::from_nanos(300))),
+        );
+        let ahead = Expr::Literal(Literal::Duration(std::time::Duration::from_nanos(50)))
+            .binary(BinaryOp::Add, Expr::literal(now));
+        let plan = scan().filter(
+            Expr::column(TIMESTAMP)
+                .binary(BinaryOp::GtEq, ago)
+                .and(Expr::column(TIMESTAMP).binary(BinaryOp::Lt, ahead)),
+        );
+        let rewritten = rewrite(plan);
+        let scan = only_scan(&rewritten);
+        assert_eq!(
+            scan.time_range,
+            TimeRange::new(Timestamp::from_nanos(700), Timestamp::from_nanos(1_050))
+        );
+        assert!(
+            matches!(
+                &scan.predicates[0],
+                Expr::Binary { right, .. }
+                    if **right == Expr::literal(Timestamp::from_nanos(700))
+            ),
+            "{}",
+            scan.predicates[0]
         );
     }
 
