@@ -5,8 +5,10 @@
 //! A group's alert instances are spread over `parts` partitions by the
 //! hash of their fingerprint; each partition is a slot of its own
 //! (section 5.3), evaluates every rule and keeps the instances and
-//! windows that hash to it. The count comes from the tenant setting
-//! `rule_partitions`; when it changes, partition 0 merges the states
+//! windows that hash to it, and reads the writer logs that hash to it
+//! for all of them ([`crate::source`]). The count comes from the
+//! tenant setting `rule_partitions`; when it changes, partition 0
+//! merges the states
 //! of the partitions the group had, writes the merged state as a split
 //! checkpoint and keeps its own keys, and each other partition takes
 //! its keys from that checkpoint. The windows of incremental rules are

@@ -3345,6 +3345,8 @@ name = "tessera-eval"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
+ "bytes",
  "futures",
  "lettre",
  "serde",

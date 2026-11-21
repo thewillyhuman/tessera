@@ -470,8 +470,10 @@ async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
         let groups: BTreeSet<String> = rules.into_iter().map(|r| r.group).collect();
         let settings = background.catalog.settings_of(&tenant);
         for group in groups {
-            // Every partition of the group reads the logs (CQ-6): the
-            // slowest holds the segments.
+            // Every partition of the group follows the logs (CQ-6),
+            // its own or through the partials their sources leave
+            // (CQ-4), which go with the entries: the slowest holds the
+            // segments.
             for part in 0..settings.rule_partitions_of(&group) {
                 let log = tessera_eval::state::open(
                     Arc::clone(&background.store),

@@ -3,18 +3,27 @@
 //! Several state partitions per rule group (CQ-6): each partition keeps
 //! the instances whose fingerprint hashes to it, and a change of the
 //! count re-splits the group's state from a checkpoint partition 0
-//! writes, without losing or repeating an instance.
+//! writes, without losing or repeating an instance. With several
+//! partitions each writer log is read by one of them, its source,
+//! which leaves partial windows for the others (CQ-4).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
-use tessera_eval::{AlertRule, Language, RuleGroup, partition_of};
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use tessera_eval::incremental::WindowState;
+use tessera_eval::partition::window_partition;
+use tessera_eval::{AlertRule, Language, RuleGroup, partition_of, state};
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::ParquetFormat;
 use tessera_manifest::registry;
-use tessera_object::{MemoryStore, Pools};
+use tessera_object::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore, Pools, layout};
 use tessera_types::event::Scalar;
-use tessera_types::{DatasetName, Env, EventBatch, LogRow, PoolId, TenantId, Timestamp};
+use tessera_types::{DatasetName, Env, EventBatch, LogRow, PoolId, Seq, TenantId, Timestamp};
 use tessera_wal::WriterLog;
 
 const SECOND: i64 = 1_000_000_000;
@@ -97,8 +106,13 @@ async fn fixture(segments: &[EventBatch]) -> Fixture {
 
 impl Fixture {
     fn partition(&self, part: u32, parts: u32) -> RuleGroup {
+        self.partition_over(self.store.clone(), part, parts)
+    }
+
+    /// Partition `part` of `parts`, reading and writing through `store`.
+    fn partition_over(&self, store: Arc<dyn ObjectStore>, part: u32, parts: u32) -> RuleGroup {
         RuleGroup::open_partition(
-            self.store.clone(),
+            store,
             TenantId::DEFAULT,
             "g",
             vec![self.rule.clone()],
@@ -240,4 +254,241 @@ async fn an_incremental_rule_fires_every_instance_once_between_partitions() {
         fired, expected,
         "the window of a key is where its instance is"
     );
+}
+
+/// A store that remembers the writer-log entries fetched through it.
+#[derive(Debug)]
+struct Fetches {
+    inner: Arc<MemoryStore>,
+    entries: Mutex<Vec<String>>,
+}
+
+impl Fetches {
+    fn over(inner: Arc<MemoryStore>) -> Arc<Self> {
+        Arc::new(Fetches {
+            inner,
+            entries: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn note(&self, key: &Key) {
+        if key.as_str().starts_with("_wal/") {
+            self.entries.lock().unwrap().push(key.as_str().to_owned());
+        }
+    }
+
+    /// The entries fetched since the last call.
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.entries.lock().unwrap())
+    }
+}
+
+#[async_trait]
+impl ObjectStore for Fetches {
+    async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
+        self.note(key);
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
+        self.note(key);
+        self.inner.get_range(key, range).await
+    }
+
+    async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
+        self.inner.head(key).await
+    }
+
+    async fn put(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+        self.inner.put(key, body).await
+    }
+
+    async fn put_if_absent(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+        self.inner.put_if_absent(key, body).await
+    }
+
+    fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+        self.inner.list(prefix)
+    }
+
+    async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
+        self.inner.delete(key).await
+    }
+}
+
+const SERVICES: [&str; 6] = ["checkout", "search", "cart", "login", "billing", "mail"];
+
+/// Two partitions of the windowed rule over two writer logs, each
+/// partition the source of one of them (CQ-4): `logs[p]` hashes to
+/// partition `p`, which reads through `stores[p]`. Both logs hold one
+/// segment and both partitions have evaluated once, which re-split the
+/// group and rebuilt the windows from the view.
+struct Divided {
+    fx: Fixture,
+    logs: Vec<WriterLog>,
+    stores: Vec<Arc<Fetches>>,
+    parts: Vec<RuleGroup>,
+}
+
+impl Divided {
+    async fn start() -> Self {
+        let mut fx = fixture(&[]).await;
+        fx.rule = windowed();
+        let mut found: [Option<WriterLog>; 2] = [None, None];
+        while found.iter().any(Option::is_none) {
+            let log = WriterLog::start(fx.store.clone(), fx.env.clone());
+            let part = partition_of(&log.writer_id().to_string(), 2);
+            found[usize::try_from(part).unwrap()].get_or_insert(log);
+        }
+        let logs: Vec<WriterLog> = found.into_iter().flatten().collect();
+        for log in &logs {
+            registry::register(
+                &*fx.store,
+                &fx.env,
+                &TenantId::DEFAULT,
+                &DatasetName::new("prod").unwrap(),
+                log.writer_id(),
+            )
+            .await
+            .unwrap();
+        }
+        let stores = vec![
+            Fetches::over(fx.store.clone()),
+            Fetches::over(fx.store.clone()),
+        ];
+        let parts = (0..2u32)
+            .zip(&stores)
+            .map(|(part, store)| fx.partition_over(store.clone(), part, 2))
+            .collect();
+        let mut divided = Divided {
+            fx,
+            logs,
+            stores,
+            parts,
+        };
+        divided.write(at(1_000)).await;
+        divided.evaluate(0, 1_005).await;
+        divided.evaluate(1, 1_005).await;
+        divided
+    }
+
+    /// One more segment in each log: two errors of every service in
+    /// the first, three in the second.
+    async fn write(&mut self, when: Timestamp) {
+        for (log, count) in self.logs.iter_mut().zip([2, 3]) {
+            let batches: Vec<EventBatch> = SERVICES
+                .iter()
+                .map(|service| errors(when, count, service))
+                .collect();
+            log.append_segment(&batches).await.unwrap();
+        }
+    }
+
+    async fn evaluate(&self, part: usize, seconds: i64) {
+        self.parts[part]
+            .evaluate(&self.fx.engine, at(seconds))
+            .await
+            .unwrap();
+    }
+
+    /// The windows partition `part` holds.
+    async fn windows(&self, part: u32) -> Vec<WindowState> {
+        let store: Arc<dyn ObjectStore> = self.fx.store.clone();
+        let log = state::open(store, &TenantId::DEFAULT, "g", part, self.fx.env.clone());
+        let snapshot = log.snapshot().await.unwrap();
+        snapshot.state().windows.values().cloned().collect()
+    }
+
+    /// The entries of `logs[writer]` whose partial windows are left
+    /// for partition `part`.
+    async fn partials(&self, part: u32, writer: usize) -> Vec<String> {
+        let prefix = layout::eval_partials(
+            &TenantId::DEFAULT,
+            "g",
+            2,
+            part,
+            self.logs[writer].writer_id(),
+        );
+        self.fx
+            .store
+            .list(&prefix)
+            .map_ok(|meta| meta.key.name().to_owned())
+            .try_collect()
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn partitions_read_each_log_once_between_them() {
+    let mut divided = Divided::start().await;
+    for store in &divided.stores {
+        store.take();
+    }
+    divided.write(at(1_001)).await;
+    divided.evaluate(0, 1_008).await;
+    divided.evaluate(1, 1_008).await;
+    divided.evaluate(0, 1_009).await;
+
+    for (part, store) in divided.stores.iter().enumerate() {
+        let entry = layout::writer_log_entry(divided.logs[part].writer_id(), Seq::new(2));
+        assert_eq!(
+            store.take(),
+            [entry.as_str().to_owned()],
+            "partition {part} reads the new entry of its own log, once, and no other"
+        );
+    }
+    let mut services = BTreeSet::new();
+    for part in 0..2 {
+        for window in divided.windows(part).await {
+            let service = window.keys["service"].clone();
+            assert_eq!(
+                window.partials[0].count, 10,
+                "{service}: two and three errors, written twice"
+            );
+            assert_eq!(window_partition(&divided.fx.rule, &window.keys, 2), part);
+            assert!(services.insert(service), "a service is in one partition");
+        }
+    }
+    assert_eq!(services.len(), SERVICES.len(), "{services:?}");
+}
+
+#[tokio::test]
+async fn a_source_trims_the_partials_of_collected_entries() {
+    let mut divided = Divided::start().await;
+    divided.write(at(1_001)).await;
+    divided.evaluate(0, 1_008).await;
+    let (first, second) = (Seq::new(1).to_string(), Seq::new(2).to_string());
+    for part in 0..2 {
+        assert_eq!(
+            divided.partials(part, 0).await,
+            [first.as_str(), second.as_str()],
+            "one object per entry and partition"
+        );
+    }
+
+    // Garbage collection removes the first entry of the log (GC-2).
+    let collected = layout::writer_log_entry(divided.logs[0].writer_id(), Seq::new(1));
+    divided.fx.store.delete(&collected).await.unwrap();
+    divided.evaluate(0, 1_009).await;
+    for part in 0..2 {
+        assert_eq!(divided.partials(part, 0).await, [second.as_str()]);
+    }
+}
+
+#[tokio::test]
+async fn a_re_split_clears_the_partials_of_the_old_count() {
+    let divided = Divided::start().await;
+    assert!(!divided.partials(1, 0).await.is_empty());
+
+    let whole = divided.fx.partition(0, 1);
+    whole.evaluate(&divided.fx.engine, at(1_008)).await.unwrap();
+    let left: Vec<ObjectMeta> = divided
+        .fx
+        .store
+        .list(&layout::eval_partials_of(&TenantId::DEFAULT, "g", 2))
+        .try_collect()
+        .await
+        .unwrap();
+    assert!(left.is_empty(), "{left:?}");
 }

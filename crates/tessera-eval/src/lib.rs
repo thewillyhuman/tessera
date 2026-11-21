@@ -18,6 +18,7 @@ pub mod partition;
 pub mod rollup;
 pub mod rule;
 pub mod sink;
+pub mod source;
 pub mod state;
 
 pub use evaluate::{EvalError, RuleRun, observe};

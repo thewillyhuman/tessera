@@ -13,6 +13,9 @@
 //!   _wal/{writer_id}/{seq:012}                   writer log entries
 //!   {tenant}/_control/_log/{version:020}         tenant control store
 //!   {tenant}/_eval/{group}/{part}/_log/{version:020}    rule state log
+//!   {tenant}/_eval/{group}/_split/{name}                re-split checkpoint
+//!   {tenant}/_eval/{group}/_partials/{parts}/{part}/{writer_id}/{seq:012}
+//!                                                partial windows of a log entry
 //!   {tenant}/{dataset}/_log/{version:020}        dataset log
 //!   {tenant}/{dataset}/_writers/{writer_id}      writer registry
 //!   {tenant}/{dataset}/p/{kind}/{window}/_log/{version:020}       partition manifest log
@@ -102,6 +105,63 @@ pub fn eval_log(tenant: &TenantId, group: &str, part: u32) -> Key {
 #[must_use]
 pub fn eval_split(tenant: &TenantId, group: &str, name: &str) -> Key {
     key(&[tenant.as_str(), "_eval", group, "_split", name])
+}
+
+/// Prefix of every partial window left for a rule group while it had
+/// `parts` state partitions, so that a re-split can clear them.
+#[must_use]
+pub fn eval_partials_of(tenant: &TenantId, group: &str, parts: u32) -> Key {
+    key(&[
+        tenant.as_str(),
+        "_eval",
+        group,
+        "_partials",
+        &parts.to_string(),
+    ])
+}
+
+/// Prefix of the partial windows the source of `writer`'s log leaves
+/// for state partition `part` of the `parts` of a rule group (CQ-4).
+#[must_use]
+pub fn eval_partials(
+    tenant: &TenantId,
+    group: &str,
+    parts: u32,
+    part: u32,
+    writer: WriterId,
+) -> Key {
+    key(&[
+        tenant.as_str(),
+        "_eval",
+        group,
+        "_partials",
+        &parts.to_string(),
+        &part.to_string(),
+        &writer.to_string(),
+    ])
+}
+
+/// The partial windows of entry `seq` of `writer`'s log for state
+/// partition `part` of the `parts` of a rule group (CQ-4).
+#[must_use]
+pub fn eval_partial(
+    tenant: &TenantId,
+    group: &str,
+    parts: u32,
+    part: u32,
+    writer: WriterId,
+    seq: Seq,
+) -> Key {
+    key(&[
+        tenant.as_str(),
+        "_eval",
+        group,
+        "_partials",
+        &parts.to_string(),
+        &part.to_string(),
+        &writer.to_string(),
+        &seq.to_string(),
+    ])
 }
 
 /// Prefix of a dataset's log.
@@ -209,6 +269,27 @@ mod tests {
             writer_log_entry(writer, Seq::new(7)).as_str(),
             "_wal/000000000000000000000000000000ab/000000000007"
         );
+    }
+
+    #[test]
+    fn rule_group_keys_keep_the_partials_of_a_partition_count_together() {
+        let tenant = TenantId::new("acme").unwrap();
+        let writer = WriterId::from_u128(0xab);
+        assert_eq!(eval_log(&tenant, "g", 1).as_str(), "acme/_eval/g/1");
+        assert_eq!(
+            eval_split(&tenant, "g", "2-7").as_str(),
+            "acme/_eval/g/_split/2-7"
+        );
+        let all = eval_partials_of(&tenant, "g", 2);
+        let of_writer = eval_partials(&tenant, "g", 2, 1, writer);
+        let one = eval_partial(&tenant, "g", 2, 1, writer, Seq::new(7));
+        assert_eq!(all.as_str(), "acme/_eval/g/_partials/2");
+        assert_eq!(
+            one.as_str(),
+            "acme/_eval/g/_partials/2/1/000000000000000000000000000000ab/000000000007"
+        );
+        assert!(one.is_under(&of_writer) && of_writer.is_under(&all));
+        assert!(!one.is_under(&eval_partials_of(&tenant, "g", 3)));
     }
 
     #[test]

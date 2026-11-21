@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: LicenseRef-Tessera-Pending
 
 //! A rule group: the rules one slot owner evaluates together, with one
-//! state log (section 11.3; one state partition per group for now). An
+//! state log per state partition (section 11.3). A partition of
+//! several is also the source of the writer logs that hash to it
+//! (CQ-4): it leaves their partial windows for every partition before
+//! it evaluates. An
 //! evaluation observes every due rule through the engine, then commits
 //! in one go the instances, the transitions into the outbox and the
 //! evaluation times (CQ-12); delivery drains the outbox: the alert
@@ -14,11 +17,12 @@ use std::time::Duration;
 
 use tessera_commit::{Action, ApplyError, KvMutation, Snapshot, UpdateError};
 use tessera_exec::Engine;
-use tessera_object::ObjectStore;
+use tessera_manifest::registry;
+use tessera_object::{ObjectStore, layout};
 use tessera_types::event::{MetricType, Scalar, Temporality};
 use tessera_types::{
     Attributes, DatasetName, Env, EventBatch, EventRow, Keys, MetricRow, Seq, TenantId, Timestamp,
-    stable_hash,
+    WriterId, stable_hash,
 };
 
 use crate::evaluate::{EvalError, RuleRun, instance_labels, observe};
@@ -28,6 +32,7 @@ use crate::notify::{Notification, Notifier};
 use crate::partition;
 use crate::rule::{Acknowledgment, AlertRule, Inhibition, NotificationRoute, Silence};
 use crate::sink::AlertSink;
+use crate::source::{self, SourceTask};
 use crate::state::{EvalState, StateLog};
 
 /// One rule group of one tenant.
@@ -163,6 +168,18 @@ impl RuleGroup {
                 );
             }
             let whole = partition::merge(states);
+            // Every partition rebuilds its windows after a re-split, so
+            // the partials left under the old count serve no one, nor
+            // do those a stale source left when the group last had the
+            // new count.
+            for parts in [snapshot.state().parts, self.parts] {
+                if parts > 1 {
+                    let all = layout::eval_partials_of(&self.tenant, &self.name, parts);
+                    source::clear(&*self.store, &all)
+                        .await
+                        .map_err(|e| state_error(&e))?;
+                }
+            }
             let split = format!("{}-{}", self.parts, self.env.clock.now().as_nanos());
             partition::save_split(&*self.store, &self.tenant, &self.name, &split, &whole).await?;
             (whole, Some(split))
@@ -271,15 +288,21 @@ impl RuleGroup {
         let Some(snapshot) = self.aligned().await? else {
             return Ok(Evaluated::default());
         };
+        // A recording rule runs through the engine at its interval.
+        let shapes: Vec<Option<incremental::Shape>> = self
+            .rules
+            .iter()
+            .map(|rule| match rule.record {
+                Some(_) => None,
+                None => incremental::shape_of(rule, &self.tenant).ok(),
+            })
+            .collect();
+        if self.parts > 1 {
+            self.run_sources(&shapes, snapshot.state()).await;
+        }
         let mut observed: Vec<Observed<'_>> = Vec::new();
         let mut recorded = Vec::new();
-        for rule in &self.rules {
-            // A recording rule runs through the engine at its interval.
-            let incremental = if rule.record.is_some() {
-                None
-            } else {
-                incremental::shape_of(rule, &self.tenant).ok()
-            };
+        for (rule, incremental) in self.rules.iter().zip(&shapes) {
             let due =
                 incremental.is_some()
                     || snapshot.state().evaluated.get(&rule.name).is_none_or(|at| {
@@ -288,7 +311,7 @@ impl RuleGroup {
             if !due {
                 continue;
             }
-            let outcome = match &incremental {
+            let outcome = match incremental {
                 Some(shape) => self
                     .observe_incrementally(engine, rule, shape, snapshot.state(), now)
                     .await
@@ -357,6 +380,61 @@ impl RuleGroup {
         })
     }
 
+    /// Runs the group's source task (CQ-4) over the writer logs this
+    /// partition is the source of, the ones that hash to it: those of
+    /// the writers registered for the datasets of the incremental
+    /// rules, and those the state still holds a position of, whose
+    /// partials end or go with the log. A group without incremental
+    /// rules has nothing to leave. A log that cannot be read is logged
+    /// and tried again at the next evaluation; the partitions wait for
+    /// its partials meanwhile.
+    async fn run_sources(&self, shapes: &[Option<incremental::Shape>], state: &EvalState) {
+        let rules: Vec<(&AlertRule, incremental::Shape)> = self
+            .rules
+            .iter()
+            .zip(shapes)
+            .filter_map(|(rule, shape)| Some((rule, shape.clone()?)))
+            .collect();
+        if rules.is_empty() {
+            return;
+        }
+        let datasets: BTreeSet<&DatasetName> = rules.iter().map(|(_, s)| &s.dataset).collect();
+        let mut writers: BTreeSet<String> = state.positions.keys().cloned().collect();
+        for dataset in datasets {
+            match registry::list(&*self.store, &self.tenant, dataset).await {
+                Ok(registered) => {
+                    writers.extend(registered.into_iter().map(|r| r.writer.to_string()));
+                }
+                Err(error) => {
+                    tracing::warn!(tenant = %self.tenant, group = %self.name, %dataset, error = %error, "writer registry not read; its logs wait for the next evaluation");
+                }
+            }
+        }
+        let task = SourceTask {
+            store: &self.store,
+            keys: &self.keys,
+            tenant: &self.tenant,
+            group: &self.name,
+            parts: self.parts,
+            rules: &rules,
+        };
+        let mine = |name: &&String| partition::partition_of(name, self.parts) == self.part;
+        for name in writers.iter().filter(mine) {
+            let Ok(writer) = name.parse::<WriterId>() else {
+                continue;
+            };
+            let held = state.positions.get(name).copied().unwrap_or(Seq::ZERO);
+            match task.run(writer, held).await {
+                Ok(emitted) => {
+                    tracing::debug!(tenant = %self.tenant, group = %self.name, part = self.part, %writer, entries = emitted.entries, trimmed = emitted.trimmed, "source task ran");
+                }
+                Err(error) => {
+                    tracing::warn!(tenant = %self.tenant, group = %self.name, part = self.part, %writer, error = %error, "source task failed");
+                }
+            }
+        }
+    }
+
     /// Writes what the recording rules produced (`recorded` of
     /// [`Evaluated`]) as metrics of their datasets through `sink`, one
     /// batch per dataset. Returns how many samples were written.
@@ -409,6 +487,9 @@ impl RuleGroup {
             keys: &self.keys,
             engine,
             tenant: &self.tenant,
+            group: &self.name,
+            part: self.part,
+            parts: self.parts,
         };
         let mut ingested = incremental::ingest(&source, rule, shape, state, now).await?;
         // Another partition keeps the windows of the instances it owns.

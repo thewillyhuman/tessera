@@ -11,6 +11,9 @@
 //! are evaluated eagerly when the condition is monotone in arriving
 //! data (CQ-9), else once the watermark passes their end (CQ-10); rows
 //! older than the allowed lateness are counted and ignored (CQ-11).
+//! In a group with several state partitions the segments are read by
+//! the group's source tasks instead, and a partition folds the partial
+//! windows they leave for it ([`crate::source`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -28,7 +31,7 @@ use tessera_exec::Engine;
 use tessera_ir::{AggregateExpr, BinaryOp, BindContext, Expr, Frontend, Literal, Plan, Statement};
 use tessera_kernels::{evaluate, evaluate_predicate, row_weight};
 use tessera_manifest::registry;
-use tessera_object::{ObjectError, ObjectStore};
+use tessera_object::{ObjectError, ObjectStore, layout};
 use tessera_opt::optimize;
 use tessera_sql::SqlFrontend;
 use tessera_types::event::{OBSERVED_TIMESTAMP, SAMPLE_RATE, TIMESTAMP};
@@ -37,6 +40,7 @@ use tessera_wal::{EntryBody, WalError, reader};
 
 use crate::lifecycle::{Observation, fingerprint};
 use crate::rule::{AlertRule, Language};
+use crate::source;
 use crate::state::EvalState;
 
 /// How long a writer may be quiet before its watermark follows the
@@ -387,6 +391,23 @@ impl Partial {
         }
     }
 
+    /// Adds what `other` folded of the same aggregate from other rows.
+    fn merge(&mut self, other: &Partial) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = other.clone();
+            return;
+        }
+        self.weight = Some(self.weighted_count() + other.weighted_count());
+        self.count += other.count;
+        self.sum += other.sum;
+        self.sum_raw += other.sum_raw;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+    }
+
     /// The rows' weights added: the row count where none were kept.
     fn weighted_count(&self) -> f64 {
         #[allow(clippy::cast_precision_loss)]
@@ -435,6 +456,14 @@ impl WindowState {
     pub fn key(&self) -> String {
         window_key(&self.rule, self.start, &fingerprint(&self.keys))
     }
+
+    /// Adds what `other` folded of the same window from other rows.
+    fn merge(&mut self, other: &WindowState) {
+        for (mine, theirs) in self.partials.iter_mut().zip(&other.partials) {
+            mine.merge(theirs);
+        }
+        self.received = self.received.max(other.received);
+    }
 }
 
 fn window_key(rule: &str, start: Timestamp, fingerprint: &str) -> String {
@@ -473,6 +502,14 @@ pub struct Source<'a> {
     pub engine: &'a Engine,
     /// The tenant.
     pub tenant: &'a TenantId,
+    /// The rule group.
+    pub group: &'a str,
+    /// The state partition that reads.
+    pub part: u32,
+    /// How many state partitions the group has. With more than one,
+    /// what is read of a writer is the partials the group's source
+    /// tasks left for `part` (CQ-4), not the writer's log.
+    pub parts: u32,
 }
 
 /// Reads every writer's new segments for `rule` and folds them into
@@ -533,10 +570,8 @@ pub async fn ingest(
     let registered: BTreeSet<String> = writers.iter().map(|r| r.writer.to_string()).collect();
     for registration in writers {
         let writer = registration.writer;
-        let entries = reader::list(&**source.store, writer)
-            .await
-            .map_err(|e| e.to_string())?;
-        if read_log(&reading, &mut ingested, writer, entries).await? == Read::Gap {
+        let entries = available(source, writer).await?;
+        if read_new(&reading, &mut ingested, writer, entries).await? == Read::Gap {
             rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
             return Ok(ingested);
         }
@@ -553,9 +588,7 @@ pub async fn ingest(
         let Ok(writer) = name.parse::<WriterId>() else {
             continue;
         };
-        let entries = reader::list(&**source.store, writer)
-            .await
-            .map_err(|e| e.to_string())?;
+        let entries = available(source, writer).await?;
         if entries.is_empty() {
             tracing::warn!(
                 tenant = %source.tenant, rule = %rule.name, %writer,
@@ -566,12 +599,33 @@ pub async fn ingest(
             rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
             return Ok(ingested);
         }
-        if read_log(&reading, &mut ingested, writer, entries).await? == Read::Gap {
+        if read_new(&reading, &mut ingested, writer, entries).await? == Read::Gap {
             rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
             return Ok(ingested);
         }
     }
     Ok(ingested)
+}
+
+/// The positions `writer` can be read at: the entries of its log, or
+/// in a group with several partitions the entries whose partials are
+/// left for this one. The source task removes a log's partials with
+/// its entries, so either listing is trimmed and gone as the log is.
+async fn available(source: &Source<'_>, writer: WriterId) -> Result<Vec<Seq>, String> {
+    if source.parts > 1 {
+        let prefix = layout::eval_partials(
+            source.tenant,
+            source.group,
+            source.parts,
+            source.part,
+            writer,
+        );
+        source::list(&**source.store, &prefix).await
+    } else {
+        reader::list(&**source.store, writer)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// What a source task reads for: the rule and its shape, the state it
@@ -594,8 +648,8 @@ enum Read {
 }
 
 /// Reads the `entries` of `writer` past the position held, folding
-/// their segments into the windows and remembering the log's end.
-async fn read_log(
+/// them into the windows and remembering the log's end.
+async fn read_new(
     reading: &Reading<'_>,
     ingested: &mut Ingested,
     writer: WriterId,
@@ -604,9 +658,8 @@ async fn read_log(
     let Reading {
         source,
         rule,
-        shape,
         state,
-        horizon,
+        ..
     } = *reading;
     let name = writer.to_string();
     let from = state.positions.get(&name).copied().unwrap_or(Seq::ZERO);
@@ -621,33 +674,126 @@ async fn read_log(
     for seq in new {
         // An entry collected between the listing and the read is
         // found missing next time, as a gap.
-        let mut entry = match reader::read(&**source.store, writer, seq).await {
-            Ok(entry) => entry,
-            Err(WalError::Store(ObjectError::NotFound { .. })) => break,
-            Err(error) => return Err(error.to_string()),
+        let found = if source.parts > 1 {
+            read_partials(reading, ingested, writer, seq).await?
+        } else {
+            read_entry(reading, ingested, writer, seq).await?
         };
-        entry.unlock(source.keys).map_err(|e| e.to_string())?;
-        ingested.positions.insert(name.clone(), seq);
-        let blocks = match entry.body() {
-            EntryBody::Segment { blocks } => blocks,
-            EntryBody::End => {
-                ingested.ended.insert(name.clone());
-                continue;
-            }
-            EntryBody::Flush { .. } | EntryBody::Seal { .. } => continue,
-        };
-        if let Some(newest) = blocks.iter().map(|b| b.max_observed).max() {
-            let seen = ingested.watermarks.entry(name.clone()).or_insert(newest);
-            *seen = (*seen).max(newest);
-        }
-        for batch in entry
-            .blocks_for(source.tenant, &shape.dataset, shape.kind)
-            .map_err(|e| e.to_string())?
-        {
-            fold_batch(rule, shape, state, ingested, batch.rows(), horizon)?;
+        if !found {
+            break;
         }
     }
     Ok(Read::Caught)
+}
+
+/// Folds entry `seq` of `writer`'s log into the windows. False when
+/// the entry is gone.
+async fn read_entry(
+    reading: &Reading<'_>,
+    ingested: &mut Ingested,
+    writer: WriterId,
+    seq: Seq,
+) -> Result<bool, String> {
+    let Reading {
+        source,
+        rule,
+        shape,
+        state,
+        horizon,
+    } = *reading;
+    let mut entry = match reader::read(&**source.store, writer, seq).await {
+        Ok(entry) => entry,
+        Err(WalError::Store(ObjectError::NotFound { .. })) => return Ok(false),
+        Err(error) => return Err(error.to_string()),
+    };
+    entry.unlock(source.keys).map_err(|e| e.to_string())?;
+    let name = writer.to_string();
+    ingested.positions.insert(name.clone(), seq);
+    let blocks = match entry.body() {
+        EntryBody::Segment { blocks } => blocks,
+        EntryBody::End => {
+            ingested.ended.insert(name);
+            return Ok(true);
+        }
+        EntryBody::Flush { .. } | EntryBody::Seal { .. } => return Ok(true),
+    };
+    if let Some(newest) = blocks.iter().map(|b| b.max_observed).max() {
+        let seen = ingested.watermarks.entry(name).or_insert(newest);
+        *seen = (*seen).max(newest);
+    }
+    for batch in entry
+        .blocks_for(source.tenant, &shape.dataset, shape.kind)
+        .map_err(|e| e.to_string())?
+    {
+        fold_batch(rule, shape, state, ingested, batch.rows(), horizon)?;
+    }
+    Ok(true)
+}
+
+/// Folds the partials the source task left for this partition of
+/// entry `seq` of `writer`'s log into the windows. False when they are
+/// gone. The source keeps every row, so lateness is judged here and by
+/// the window: one the horizon has closed is late whole (CQ-11), and
+/// one still open keeps the rows a single partition would have found
+/// late one by one.
+async fn read_partials(
+    reading: &Reading<'_>,
+    ingested: &mut Ingested,
+    writer: WriterId,
+    seq: Seq,
+) -> Result<bool, String> {
+    let Reading {
+        source,
+        rule,
+        shape,
+        state,
+        horizon,
+    } = *reading;
+    let key = layout::eval_partial(
+        source.tenant,
+        source.group,
+        source.parts,
+        source.part,
+        writer,
+        seq,
+    );
+    let Some(partials) = source::read(&**source.store, &key).await? else {
+        return Ok(false);
+    };
+    let name = writer.to_string();
+    ingested.positions.insert(name.clone(), seq);
+    if partials.ended {
+        ingested.ended.insert(name.clone());
+    }
+    if let Some(newest) = partials.max_observed {
+        let seen = ingested.watermarks.entry(name).or_insert(newest);
+        *seen = (*seen).max(newest);
+    }
+    let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
+    for window in partials.windows.iter().filter(|w| w.rule == rule.name) {
+        if window.start.as_nanos().saturating_add(length) <= horizon.as_nanos() {
+            ingested.late_rows += window.partials.first().map_or(0, |p| p.count);
+            continue;
+        }
+        // The window as the state remembers it, or empty, the first
+        // time this read touches it.
+        ingested
+            .windows
+            .entry(window.key())
+            .or_insert_with_key(|key| {
+                state
+                    .windows
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| WindowState {
+                        partials: vec![Partial::default(); shape.aggregates.len()],
+                        received: None,
+                        ..window.clone()
+                    })
+            })
+            .merge(window);
+    }
+    Ok(true)
 }
 
 /// Rebuilds the windows of `rule` from the consistent view (section
@@ -736,7 +882,7 @@ pub fn watermark(state: &EvalState, writers: &[String], now: Timestamp) -> Times
 }
 
 /// Folds one block's rows into the windows.
-fn fold_batch(
+pub(crate) fn fold_batch(
     rule: &AlertRule,
     shape: &Shape,
     state: &EvalState,
@@ -1126,6 +1272,45 @@ mod tests {
         let mut grown = old;
         grown.fold(Some(1.0), 4.0);
         assert!((grown.value("count") - 7.0).abs() < f64::EPSILON);
+    }
+
+    /// CQ-4: the partials a source task folds from separate entries
+    /// merge into what one fold of all their rows gives.
+    #[test]
+    fn merged_partials_equal_the_rows_folded_together() {
+        let rows = [
+            (Some(4.0), 2.0),
+            (None, 1.0),
+            (Some(-1.5), 4.0),
+            (Some(9.0), 1.0),
+        ];
+        let fold = |rows: &[(Option<f64>, f64)]| {
+            let mut partial = Partial::default();
+            for (value, weight) in rows {
+                partial.fold(*value, *weight);
+            }
+            partial
+        };
+        let whole = fold(&rows);
+        for cut in 0..=rows.len() {
+            let mut merged = fold(&rows[..cut]);
+            merged.merge(&fold(&rows[cut..]));
+            assert_eq!(merged, whole, "cut at {cut}");
+        }
+        let mut window = WindowState {
+            rule: "r".into(),
+            start: Timestamp::from_nanos(0),
+            keys: BTreeMap::new(),
+            partials: vec![fold(&rows[..2])],
+            received: Some(Timestamp::from_nanos(7)),
+        };
+        window.merge(&WindowState {
+            partials: vec![fold(&rows[2..])],
+            received: Some(Timestamp::from_nanos(5)),
+            ..window.clone()
+        });
+        assert_eq!(window.partials, [whole]);
+        assert_eq!(window.received, Some(Timestamp::from_nanos(7)));
     }
 
     /// Section 17.1: a window remembers when the last of its rows was
