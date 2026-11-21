@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "tessera"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "tempfile",
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-advisor"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3554,7 +3554,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-bench"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "opentelemetry-proto",
@@ -3572,7 +3572,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-catalog"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -3587,7 +3587,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-cluster"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "futures",
  "serde",
@@ -3600,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-commit"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3615,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-compact"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "serde_json",
@@ -3635,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-compat-logql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "serde_json",
@@ -3646,7 +3646,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-compat-promql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "prost",
@@ -3660,7 +3660,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-compat-sql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "rusqlite",
@@ -3677,7 +3677,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-compat-traceql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3689,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-eval"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3721,7 +3721,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-exec"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3745,7 +3745,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-format"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3760,7 +3760,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-iceberg"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -3775,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-ingest"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "futures",
@@ -3795,7 +3795,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-ir"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -3807,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-kernels"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "regex",
@@ -3821,7 +3821,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-logql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "tessera-ir",
@@ -3830,7 +3830,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-manifest"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3849,7 +3849,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-node"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "axum",
@@ -3889,7 +3889,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-object"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3908,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-opt"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "tessera-format",
@@ -3920,7 +3920,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-promql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "regex",
@@ -3930,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-search"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "tessera-ir",
@@ -3939,7 +3939,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-server"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -3991,7 +3991,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-sim"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "clap",
@@ -4010,7 +4010,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-sql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "tessera-ir",
@@ -4023,7 +4023,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-traceql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "tessera-ir",
@@ -4032,7 +4032,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-types"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "getrandom 0.4.3",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "tessera-wal"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow",
  "async-trait",
