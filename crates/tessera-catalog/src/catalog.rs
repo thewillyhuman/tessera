@@ -8,14 +8,14 @@
 //! the latest state and re-derived if another node commits first, so two
 //! administrators cannot create the same tenant twice.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tessera_commit::{
     Action, CommitError, CommitLog, KvMutation, SlotCount, Snapshot, UpdateError,
 };
 use tessera_object::{Key, ObjectStore, PoolState};
-use tessera_types::{Env, KeyPolicy, PoolId, TenantId, WorkKind};
+use tessera_types::{Env, KeyPolicy, PoolId, TenantId, Timestamp, WorkKind};
 
 use crate::state::{pool_key, put_record, setting_key, slots_key, tenant_key};
 use crate::{
@@ -89,7 +89,15 @@ impl From<UpdateError<CatalogError>> for CatalogError {
 pub struct Catalog {
     log: CommitLog<CatalogState>,
     env: Env,
+    /// When the log was last read again for a tenant this node did not
+    /// know.
+    looked_again: Mutex<Option<Timestamp>>,
 }
+
+/// How long after reading the log for a tenant it did not know a node
+/// answers "unknown" without reading it again: names that do not exist
+/// must not cost a request to the store each.
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(200);
 
 impl Catalog {
     /// The setting that holds the grace period of CT-8, in seconds.
@@ -111,6 +119,7 @@ impl Catalog {
         let catalog = Catalog {
             log: CommitLog::new(root, Self::prefix(), env.clone()),
             env,
+            looked_again: Mutex::new(None),
         };
         catalog.bootstrap(root_pool).await?;
         Ok(catalog)
@@ -129,6 +138,36 @@ impl Catalog {
     /// If the log cannot be read.
     pub async fn snapshot(&self) -> Result<Arc<Snapshot<CatalogState>>, CatalogError> {
         Ok(self.log.snapshot().await?)
+    }
+
+    /// The tenant named `name`, dropped or not, as this node knows it;
+    /// when it knows none, as the log has it now. A node reads the log
+    /// every second, so a tenant created through another node a moment
+    /// ago is one it has not heard of: asked for it, it reads the log
+    /// again rather than answer that there is no such tenant. It does
+    /// so at most once in [`LOOK_AGAIN_AFTER`], and answers from what
+    /// it has when the log cannot be read.
+    pub async fn tenant_named(&self, name: &TenantName) -> Option<Tenant> {
+        if let Some(tenant) = self.cached().state().tenant_by_name(name) {
+            return Some(tenant.clone());
+        }
+        let now = self.env.clock.now();
+        {
+            let mut looked = self
+                .looked_again
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let lately = looked.is_some_and(|at| {
+                now.duration_since(at)
+                    .is_some_and(|since| since < LOOK_AGAIN_AFTER)
+            });
+            if lately {
+                return None;
+            }
+            *looked = Some(now);
+        }
+        let latest = self.snapshot().await.ok()?;
+        latest.state().tenant_by_name(name).cloned()
     }
 
     /// The latest state this node has seen, without touching the store.
@@ -721,6 +760,40 @@ mod tests {
         assert!(second.knows(&created.id));
         assert_eq!(second.key_name(&created.id).as_deref(), Some("k1"));
         assert!(second.knows(&TenantId::DEFAULT), "a built-in tenant");
+    }
+
+    /// A tenant created through one node is asked for on another the
+    /// moment after: the other reads the log again before it says there
+    /// is no such tenant, and does not read it for every unknown name.
+    #[tokio::test]
+    async fn a_tenant_another_node_just_created_is_found_by_name() {
+        let cluster = Cluster::new();
+        let (first, second) = (cluster.node(1).await, cluster.node(2).await);
+        first
+            .create_tenant(name("acme"), TenantSettings::default())
+            .await
+            .unwrap();
+        assert!(
+            second
+                .cached()
+                .state()
+                .tenant_by_name(&name("acme"))
+                .is_none()
+        );
+        let found = second.tenant_named(&name("acme")).await;
+        assert_eq!(found.map(|t| t.name), Some(name("acme")));
+
+        assert!(second.tenant_named(&name("nobody")).await.is_none());
+        first
+            .create_tenant(name("later"), TenantSettings::default())
+            .await
+            .unwrap();
+        assert!(
+            second.tenant_named(&name("later")).await.is_none(),
+            "the log was read a moment ago"
+        );
+        cluster.clock.advance(LOOK_AGAIN_AFTER);
+        assert!(second.tenant_named(&name("later")).await.is_some());
     }
 
     #[tokio::test]

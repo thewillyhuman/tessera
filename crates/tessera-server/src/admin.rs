@@ -141,14 +141,12 @@ struct IssuedView {
     view: KeyView,
 }
 
-fn tenant_of(state: &AppState, name: &str) -> Result<Tenant, ApiError> {
+async fn tenant_of(state: &AppState, name: &str) -> Result<Tenant, ApiError> {
     let name = self::name(name)?;
     state
         .catalog
-        .cached()
-        .state()
-        .tenant_by_name(&name)
-        .cloned()
+        .tenant_named(&name)
+        .await
         .ok_or_else(|| ApiError::not_found(format!("unknown tenant {name}")))
 }
 
@@ -158,7 +156,7 @@ async fn issue_key(
     Path(name): Path<String>,
     Body(request): Body<IssueKey>,
 ) -> Result<(StatusCode, Json<IssuedView>), ApiError> {
-    let tenant = tenant_of(&state, &name)?;
+    let tenant = tenant_of(&state, &name).await?;
     let now = state.env.clock.now();
     let expires_at = request
         .expires_in_seconds
@@ -199,7 +197,7 @@ async fn list_keys(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<KeyView>>, ApiError> {
-    let tenant = tenant_of(&state, &name)?;
+    let tenant = tenant_of(&state, &name).await?;
     let rows = state
         .controls
         .open(&tenant.id)
@@ -219,7 +217,7 @@ async fn revoke_key(
     Extension(principal): Extension<Principal>,
     Path((name, id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let tenant = tenant_of(&state, &name)?;
+    let tenant = tenant_of(&state, &name).await?;
     let control = state.controls.open(&tenant.id);
     if control
         .get(Table::ApiKeys, &id)

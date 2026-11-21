@@ -57,7 +57,7 @@ pub(crate) struct Scope {
 /// for the tenant or lacks what `need` asks; 400 for a bad name.
 pub(crate) async fn scope(state: &AppState, parts: &Parts, need: Need) -> Result<Scope, ApiError> {
     let principal = auth::principal(state, parts).await?;
-    let tenant = tenant(state, &parts.headers, &principal)?;
+    let tenant = tenant(state, &parts.headers, &principal).await?;
     let dataset = match parts
         .headers
         .get("x-tessera-dataset")
@@ -82,7 +82,7 @@ pub(crate) async fn scope(state: &AppState, parts: &Parts, need: Need) -> Result
 ///
 /// 400 for a bad or unknown name; 403 when the principal may not act
 /// for it.
-pub(crate) fn tenant(
+pub(crate) async fn tenant(
     state: &AppState,
     headers: &HeaderMap,
     principal: &Principal,
@@ -92,12 +92,13 @@ pub(crate) fn tenant(
         None | Some("") => principal.tenant.clone(),
         Some(name) => {
             let name = TenantName::new(name).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            // A tenant created through another node a moment ago is
+            // looked for in the catalog itself before it is unknown.
             state
                 .catalog
-                .cached()
-                .state()
-                .tenant_by_name(&name)
-                .map(|t| t.id.clone())
+                .tenant_named(&name)
+                .await
+                .map(|t| t.id)
                 .ok_or_else(|| ApiError::bad_request(format!("unknown tenant {name}")))?
         }
     };

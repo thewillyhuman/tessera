@@ -112,7 +112,7 @@ async fn run_native(
     };
     let principal = crate::auth::principal(state, parts).await?;
     let mut ctx = BindContext::new(
-        crate::params::tenant(state, &parts.headers, &principal)?,
+        crate::params::tenant(state, &parts.headers, &principal).await?,
         dataset,
         state.env.clock.now(),
     );

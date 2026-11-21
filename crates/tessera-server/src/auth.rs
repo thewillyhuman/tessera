@@ -221,10 +221,8 @@ async fn with_identity(
         .map_err(|e| ApiError::unauthorized(format!("tenant {}: {e}", identity.tenant)))?;
     let tenant = state
         .catalog
-        .cached()
-        .state()
-        .tenant_by_name(&name)
-        .cloned()
+        .tenant_named(&name)
+        .await
         .ok_or_else(|| ApiError::unauthorized(format!("unknown tenant {name}")))?;
     if tenant.status != TenantStatus::Active {
         return Err(ApiError::forbidden(format!(
@@ -274,10 +272,8 @@ pub async fn with_key(state: &AppState, text: &str) -> Result<Principal, ApiErro
     let parsed = keys::parse(text).ok_or_else(|| ApiError::unauthorized("not an API key"))?;
     let tenant = state
         .catalog
-        .cached()
-        .state()
-        .tenant_by_name(&parsed.tenant)
-        .cloned()
+        .tenant_named(&parsed.tenant)
+        .await
         .ok_or_else(unknown)?;
     if tenant.status != TenantStatus::Active {
         return Err(ApiError::forbidden(format!(
