@@ -211,6 +211,10 @@ pub struct Manifest {
     env: Env,
     /// What the last ranged read can hand the next.
     remembered: Mutex<Option<Remembered>>,
+    /// The version the log was at when it was last found to have no
+    /// checkpoint: until it has grown, the next read does not look
+    /// for one again and tails the log it holds whole.
+    unchecked_at: Mutex<Option<Version>>,
 }
 
 /// What a ranged read learnt that the next one starts from (section
@@ -248,6 +252,7 @@ impl Manifest {
             log,
             env,
             remembered: Mutex::new(None),
+            unchecked_at: Mutex::new(None),
         }
     }
 
@@ -433,16 +438,32 @@ impl Manifest {
                 return Ok(partial);
             }
         }
-        let Some(found) = self.find_checkpoint().await? else {
-            let snapshot = self.log.snapshot().await?;
-            return Ok(Partial::of(
-                snapshot.version(),
-                snapshot.state(),
-                range,
-                None,
-            ));
-        };
-        self.read_from(found, range).await
+        // A log without a checkpoint is folded whole and held: until
+        // it has grown by as many commits as would make a checkpoint
+        // worth looking for, the next read is its tail.
+        let unchecked_at = *self.unchecked_at();
+        let held_whole = unchecked_at
+            .zip(self.log.cached())
+            .is_some_and(|(at, held)| held.version().get() < at.get() + LOOK_AGAIN_AFTER as u64);
+        if !held_whole && let Some(found) = self.find_checkpoint().await? {
+            return self.read_from(found, range).await;
+        }
+        let snapshot = self.log.snapshot().await?;
+        if !held_whole {
+            *self.unchecked_at() = Some(snapshot.version());
+        }
+        Ok(Partial::of(
+            snapshot.version(),
+            snapshot.state(),
+            range,
+            None,
+        ))
+    }
+
+    fn unchecked_at(&self) -> std::sync::MutexGuard<'_, Option<Version>> {
+        self.unchecked_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// What the last ranged read remembered.
@@ -1007,6 +1028,51 @@ mod tests {
         let after = reader.read_in(all).await.unwrap();
         assert_eq!(after.files.len(), 5);
         assert_eq!(after.positions.get(&writer), Some(&Seq::new(5)));
+    }
+
+    /// A partition that was never compacted has no checkpoint. That is
+    /// not looked up again on every read: the log is held whole and
+    /// the next read is its tail.
+    #[tokio::test]
+    async fn a_log_without_a_checkpoint_is_tailed_not_searched_again() {
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(
+            MemoryStore::new(),
+        )));
+        let calls = || metered.requests().by_operation();
+        let store: Arc<dyn ObjectStore> = metered.clone();
+        let writer = WriterId::from_u128(1);
+        let committer = Manifest::open(Arc::clone(&store), partition(0), env(1));
+        let files = [file(1, &partition(0), writer, 1)];
+        committer.adopt(writer, Seq::new(1), &files).await.unwrap();
+
+        let all = TimeRange::new(Timestamp::MIN, Timestamp::MAX);
+        let reader = Manifest::open(Arc::clone(&store), partition(0), env(2));
+        assert_eq!(reader.read_in(all).await.unwrap().files.len(), 1);
+        let before = calls();
+        assert_eq!(reader.read_in(all).await.unwrap().files.len(), 1);
+        let made: Vec<(&str, u64)> = calls()
+            .into_iter()
+            .zip(before)
+            .map(|((operation, now), (_, then))| (operation, now - then))
+            .filter(|(_, made)| *made > 0)
+            .collect();
+        assert_eq!(made, [("get", 1)], "the head of the log");
+
+        // A checkpoint written since is found by the read after the one
+        // that sees how far the log has grown.
+        for sequence in 2..40u64 {
+            let files = [file(u128::from(sequence), &partition(0), writer, sequence)];
+            committer
+                .adopt(writer, Seq::new(sequence), &files)
+                .await
+                .unwrap();
+        }
+        committer.checkpoint().await.unwrap();
+        let tailed = reader.read_in(all).await.unwrap();
+        assert_eq!(tailed.files.len(), 39);
+        let grown = reader.read_in(all).await.unwrap();
+        assert_eq!(grown.files.len(), 39);
+        assert!(grown.read.is_some(), "read from the checkpoint");
     }
 
     #[tokio::test]
