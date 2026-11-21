@@ -36,7 +36,8 @@ pub struct Extracted {
 
 /// Runs `stage` over `text`, merging into `existing` labels; `stored`
 /// is the rows' `_overflow`, whose `body.*` attributes serve a `json`
-/// or `logfmt` stage instead of the line (QL-10).
+/// or `logfmt` stage instead of the line where they were parsed from
+/// it in that stage's format (QL-10).
 ///
 /// # Errors
 ///
@@ -48,7 +49,6 @@ pub fn extract(
     stored: Option<&StringArray>,
 ) -> Result<Extracted, KernelError> {
     let parser = Parser::new(stage)?;
-    let resolves_stored = matches!(stage, ExtractStage::Json | ExtractStage::Logfmt);
     let mut labels: Vec<Option<String>> = Vec::with_capacity(text.len());
     let mut lines: Vec<Option<String>> = Vec::with_capacity(text.len());
     for i in 0..text.len() {
@@ -63,7 +63,7 @@ pub fn extract(
             })
             .unwrap_or_default();
         let mut line = None;
-        let from_store = if resolves_stored {
+        let from_store = if !text.is_null(i) && reads_stored(stage, text.value(i)) {
             stored
                 .filter(|s| !s.is_null(i))
                 .map(|s| stored_labels(s.value(i)))
@@ -164,6 +164,28 @@ fn parser_error(kind: &str, details: impl std::fmt::Display) -> BTreeMap<String,
         (ERROR_LABEL.to_owned(), kind.to_owned()),
         (ERROR_DETAILS_LABEL.to_owned(), details.to_string()),
     ])
+}
+
+/// Whether `line` is one ingest reads as JSON: a line that opens an
+/// object is a JSON object or nothing, and any other is logfmt or
+/// nothing. The format a line's stored fields were parsed as therefore
+/// follows from the line alone, which is how a parser stage knows
+/// whether they are its own.
+pub(crate) fn opens_object(line: &str) -> bool {
+    line.trim_start().starts_with('{')
+}
+
+/// Whether the `body.*` fields stored for `line` are what `stage` would
+/// extract from it: those of a line ingest read as JSON for a `json`
+/// stage, those of any other line for a `logfmt` stage. The fields of
+/// the other format are not the stage's to take: `logfmt` finds no such
+/// pairs in a JSON line, and `json` fails on a logfmt one.
+fn reads_stored(stage: &ExtractStage, line: &str) -> bool {
+    match stage {
+        ExtractStage::Json => opens_object(line),
+        ExtractStage::Logfmt => !opens_object(line),
+        _ => false,
+    }
 }
 
 /// The labels the stored `body.*` attributes of a row give (QL-10),
@@ -373,6 +395,29 @@ mod tests {
             .iter()
             .map(|l| l.map(str::to_owned))
             .collect()
+    }
+
+    /// A stage takes stored fields only where its own parser would have
+    /// made them: Loki's `logfmt` finds no pair to take in a JSON line,
+    /// and its `json` fails on a logfmt one.
+    #[test]
+    fn a_stage_leaves_the_stored_fields_of_the_other_format() {
+        let text = StringArray::from(vec![Some("{\"path\": \"/web\"}"), Some("path=/web")]);
+        let stored = StringArray::from(vec![
+            Some("{\"body.path\":\"/web\"}"),
+            Some("{\"body.path\":\"/web\"}"),
+        ]);
+        let logfmt = extract(&ExtractStage::Logfmt, &text, None, Some(&stored)).unwrap();
+        let of_json: Value = serde_json::from_str(logfmt.labels.value(0)).unwrap();
+        assert!(of_json.get("path").is_none(), "{of_json}");
+        let of_logfmt: Value = serde_json::from_str(logfmt.labels.value(1)).unwrap();
+        assert_eq!(of_logfmt["path"], "/web");
+        let json = extract(&ExtractStage::Json, &text, None, Some(&stored)).unwrap();
+        let of_json: Value = serde_json::from_str(json.labels.value(0)).unwrap();
+        assert_eq!(of_json["path"], "/web");
+        let of_logfmt: Value = serde_json::from_str(json.labels.value(1)).unwrap();
+        assert!(of_logfmt.get("path").is_none(), "{of_logfmt}");
+        assert_eq!(of_logfmt[ERROR_LABEL], "JSONParserErr");
     }
 
     /// QL-10: a row with stored body fields is not parsed again; one

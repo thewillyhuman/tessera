@@ -647,9 +647,12 @@ named by a header (`default` when absent). A log body that is a JSON
 object has its fields stored under `body.*` next to the text, so
 `body.http.status` reads like any attribute (DM-10), and a LogQL
 `json` or `logfmt` stage takes its labels from the stored fields
-rather than parsing the line again (QL-10); the tenant settings
-`parse_json_bodies` (on by default) and `parse_logfmt_bodies` (off)
-choose what is parsed. The tenant setting `encryption_key` names the
+rather than parsing the line again (QL-10), each from the lines of
+its own format only: a line that opens an object is stored as JSON or
+not at all, any other as logfmt, and a stage given a line of the
+other format parses it and fails as it does in Loki; the tenant
+settings `parse_json_bodies` (on by default) and
+`parse_logfmt_bodies` (off) choose what is parsed. The tenant setting `encryption_key` names the
 key, in the nodes' keyring, the tenant's data is sealed under (SE-2),
 `storage_pool` the pool compaction places its files in,
 `rule_partitions` how many state partitions each rule group has, and

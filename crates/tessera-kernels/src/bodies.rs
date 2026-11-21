@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 use tessera_types::event::{BODY, OVERFLOW};
 
 use crate::KernelError;
-use crate::extract::{ERROR_LABEL, logfmt_labels};
+use crate::extract::{ERROR_LABEL, logfmt_labels, opens_object};
 
 /// Which bodies are parsed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -80,14 +80,14 @@ pub fn parse_bodies(rows: &RecordBatch, parsing: BodyParsing) -> Result<RecordBa
 /// nested ones flattened with dots and lists kept as their JSON text;
 /// or a logfmt line's pairs as text. Anything else has none.
 fn fields_of(line: &str, parsing: BodyParsing) -> Vec<(String, Value)> {
-    let trimmed = line.trim_start();
-    if parsing.json
-        && trimmed.starts_with('{')
-        && let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed)
-    {
+    if opens_object(line) {
         let mut fields = Vec::new();
-        for (key, value) in object {
-            flatten(&format!("body.{key}"), value, &mut fields);
+        if parsing.json
+            && let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line.trim_start())
+        {
+            for (key, value) in object {
+                flatten(&format!("body.{key}"), value, &mut fields);
+            }
         }
         return fields;
     }
@@ -176,6 +176,25 @@ mod tests {
         assert!(first.get("body.none").is_none());
         assert_eq!(overflow(&parsed, 1), None, "text is not structured");
         assert_eq!(overflow(&parsed, 2), None);
+    }
+
+    /// What a line's stored fields were parsed as follows from the line
+    /// alone, which is what lets a parser stage tell whether they are
+    /// its own: a line that opens an object is JSON or nothing.
+    #[test]
+    fn a_line_that_opens_an_object_is_never_read_as_logfmt() {
+        let rows = batch(&[Some("{\"a\": 1, broken=yes"), Some("a=1")], &[None, None]);
+        let parsed = parse_bodies(
+            &rows,
+            BodyParsing {
+                json: true,
+                logfmt: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(overflow(&parsed, 0), None);
+        let second: Value = serde_json::from_str(&overflow(&parsed, 1).unwrap()).unwrap();
+        assert_eq!(second["body.a"], "1");
     }
 
     #[test]
