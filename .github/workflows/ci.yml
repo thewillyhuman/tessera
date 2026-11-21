@@ -46,14 +46,23 @@ jobs:
       - uses: actions/checkout@v4
       - run: helm lint deploy/helm/tessera
       - uses: docker/setup-buildx-action@v3
-      - name: build the image, its dependencies from the cache
+      # Two builds, so that the cache between runs holds the stage of
+      # the dependencies and not Tessera's own build on top of it, a
+      # layer of gigabytes that the next commit cannot use.
+      - name: build the dependencies, or take them from the cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: deps
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: build the image on them
         uses: docker/build-push-action@v6
         with:
           context: .
           load: true
           tags: tessera:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
       - run: IMAGE=tessera:ci SKIP_BUILD=1 deploy/kind/smoke.sh
       - name: publish the image under its commit
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

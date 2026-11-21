@@ -25,9 +25,13 @@ FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM chef AS builder
+# The stage a builder keeps between builds (`--target deps`): what
+# comes after it changes with every commit and is not worth keeping.
+FROM chef AS deps
 COPY --from=planner /src/recipe.json recipe.json
 RUN cargo chef cook --release --locked -p tessera --recipe-path recipe.json
+
+FROM deps AS builder
 COPY . .
 RUN cargo build --release -p tessera --locked && mkdir -p /var/lib/tessera
 
