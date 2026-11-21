@@ -154,7 +154,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "centred average per partition",
-        tessera: "SELECT timestamp, avg_raw(attr.n::int) OVER (PARTITION BY severity_text ORDER BY timestamp ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM logs ORDER BY timestamp",
+        tessera: "SELECT timestamp, avg_raw(attr.n) OVER (PARTITION BY severity_text ORDER BY timestamp ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM logs ORDER BY timestamp",
         sqlite: "SELECT timestamp, avg(n) OVER (PARTITION BY severity_text ORDER BY timestamp ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM logs ORDER BY timestamp",
     },
     Case {

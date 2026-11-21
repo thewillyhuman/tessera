@@ -12,7 +12,7 @@
 use arrow::datatypes::DataType;
 use tessera_ir::{
     AggregateExpr, Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError,
-    Registry, SortKey, WindowExpr, expr_type,
+    Registry, SortKey, WindowExpr, WindowFunction, expr_type,
 };
 
 use crate::rewrite::rebuild_inputs;
@@ -204,9 +204,15 @@ fn bind_window(
         order_by.into_iter().map(bind_key).collect(),
         functions
             .into_iter()
-            .map(|window| WindowExpr {
-                args: window.args.into_iter().map(bind_expr).collect(),
-                ..window
+            .map(|window| {
+                let numeric = matches!(
+                    &window.function,
+                    WindowFunction::Aggregate(function) if sums_numbers(function)
+                );
+                WindowExpr {
+                    args: bind_args(window.args, numeric),
+                    ..window
+                }
             })
             .collect(),
     )
@@ -300,25 +306,32 @@ fn bind_aggregation(plan: Plan) -> Plan {
 }
 
 fn bind_aggregate(aggregate: AggregateExpr) -> AggregateExpr {
-    let numeric = matches!(
-        aggregate.function.as_str(),
-        "sum" | "sum_raw" | "avg" | "avg_raw"
-    );
+    let numeric = sums_numbers(&aggregate.function);
     AggregateExpr {
-        args: aggregate
-            .args
-            .into_iter()
-            .map(|arg| {
-                let bound = bind_expr(arg);
-                if numeric {
-                    retype(bound, Some(DataType::Float64))
-                } else {
-                    bound
-                }
-            })
-            .collect(),
+        args: bind_args(aggregate.args, numeric),
         ..aggregate
     }
+}
+
+/// Whether the aggregate `function` adds its argument up, and so
+/// reads an attribute, which has no type of its own, as a number.
+fn sums_numbers(function: &str) -> bool {
+    matches!(function, "sum" | "sum_raw" | "avg" | "avg_raw")
+}
+
+/// The arguments of an aggregate, of a group or of a window, bound:
+/// as numbers when the aggregate is `numeric`.
+fn bind_args(args: Vec<Expr>, numeric: bool) -> Vec<Expr> {
+    args.into_iter()
+        .map(|arg| {
+            let bound = bind_expr(arg);
+            if numeric {
+                retype(bound, Some(DataType::Float64))
+            } else {
+                bound
+            }
+        })
+        .collect()
 }
 
 fn bind_named(named: NamedExpr) -> NamedExpr {
@@ -545,6 +558,38 @@ mod tests {
             panic!()
         };
         assert_eq!(typed(&expr), &DataType::Int64);
+    }
+
+    /// A sum or an average over a window reads a path as the same
+    /// aggregate of a group does.
+    #[test]
+    fn numeric_window_aggregates_read_paths_as_numbers() {
+        let window = |function, name: &str| WindowExpr {
+            function,
+            args: vec![path("attr.n")],
+            frame: None,
+            name: name.into(),
+        };
+        let plan = Plan::Scan(Scan::all(
+            TenantId::DEFAULT,
+            DatasetName::new("prod").unwrap(),
+            Kind::Log,
+        ))
+        .window(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                window(WindowFunction::Aggregate("avg_raw".into()), "mean"),
+                window(WindowFunction::Aggregate("max".into()), "most"),
+                window(WindowFunction::LastValue, "last"),
+            ],
+        );
+        let Plan::Window { functions, .. } = bind(plan, &Registry::builtin()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(typed(&functions[0].args[0]), &DataType::Float64);
+        assert_eq!(typed(&functions[1].args[0]), &DataType::Utf8);
+        assert_eq!(typed(&functions[2].args[0]), &DataType::Utf8);
     }
 
     #[test]
