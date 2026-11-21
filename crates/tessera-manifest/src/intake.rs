@@ -79,6 +79,7 @@ pub async fn run_after(
         through: after,
         ..IntakeOutcome::default()
     };
+    let mut adopted = None;
     let mut entries = reader::entries(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
     while let Some(entry) = entries.try_next().await? {
         outcome.through = entry.seq();
@@ -97,6 +98,10 @@ pub async fn run_after(
                         outcome.adoptions += 1;
                     }
                 }
+                // Every partition the record touches has it now, and
+                // those of the records before it, which this run or an
+                // earlier one went through first.
+                adopted = Some(*through);
             }
             EntryBody::End => outcome.ended = true,
             // The entries come unlocked: none is a flush still sealed.
@@ -109,6 +114,10 @@ pub async fn run_after(
     if outcome.ended {
         registry::remove(&*store, tenant, dataset, writer).await?;
         outcome.removed = true;
+    } else if let Some(through) = adopted {
+        // Readers start after what is adopted (the registration says
+        // how far), in place of the log's first entry.
+        registry::advance(&*store, tenant, dataset, writer, through).await?;
     }
     Ok(outcome)
 }
@@ -242,6 +251,14 @@ mod tests {
             assert_eq!(state.state().files().count(), 1);
             assert_eq!(state.state().position(log.writer_id()), Seq::new(2));
         }
+        let registered = registry::list(&store, &TenantId::DEFAULT, &dataset())
+            .await
+            .unwrap();
+        assert_eq!(
+            registered[0].adopted,
+            Seq::new(2),
+            "the registration tells readers how far the flushes are adopted"
+        );
         assert!(
             list_partitions(
                 &store,

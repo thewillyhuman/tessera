@@ -12,7 +12,7 @@
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tessera_object::{ObjectError, ObjectStore, layout};
-use tessera_types::{DatasetName, Env, NodeId, TenantId, Timestamp, WriterId};
+use tessera_types::{DatasetName, Env, NodeId, Seq, TenantId, Timestamp, WriterId};
 
 use crate::ManifestError;
 
@@ -25,6 +25,14 @@ pub struct Registration {
     pub node: NodeId,
     /// When it registered, by that node's clock.
     pub registered_at: Timestamp,
+    /// How far the writer's flushes of this dataset are adopted: every
+    /// flush record up to this position has its files in the manifests
+    /// of all the partitions it touches, so no row of the dataset in a
+    /// segment at or before it is to be read from the log. Moved on by
+    /// intake ([`advance`]); a reader that starts after it skips
+    /// nothing it needs, and one that starts earlier only reads more.
+    #[serde(default)]
+    pub adopted: Seq,
 }
 
 /// Registers `writer` with a dataset. Registering a writer twice is
@@ -44,6 +52,7 @@ pub async fn register(
         writer,
         node: env.node,
         registered_at: env.clock.now(),
+        adopted: Seq::ZERO,
     };
     let body = serde_json::to_vec(&registration)
         .unwrap_or_else(|e| unreachable!("a registration serializes: {e}"));
@@ -118,6 +127,45 @@ pub async fn datasets(
     }
     datasets.sort();
     Ok(datasets)
+}
+
+/// Records that `writer`'s flushes of the dataset are adopted through
+/// `through`. The position only moves forward, and a writer that has
+/// left the registry is not brought back.
+///
+/// Two nodes running intake for one writer may write one after the
+/// other; the later write may then carry the earlier position, which
+/// costs readers some reading until the next flush and nothing else.
+///
+/// # Errors
+///
+/// `Store` if the registration cannot be read or written; `Corrupt` if
+/// it cannot be decoded.
+pub async fn advance(
+    store: &dyn ObjectStore,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    writer: WriterId,
+    through: Seq,
+) -> Result<(), ManifestError> {
+    let key = layout::writer_registration(tenant, dataset, writer);
+    let bytes = match store.get(&key).await {
+        Ok(bytes) => bytes,
+        Err(ObjectError::NotFound { .. }) => return Ok(()),
+        Err(error) => return Err(ManifestError::Store(error)),
+    };
+    let mut registration: Registration =
+        serde_json::from_slice(&bytes).map_err(|e| ManifestError::Corrupt {
+            key: key.clone(),
+            source: Box::new(e),
+        })?;
+    if registration.adopted >= through {
+        return Ok(());
+    }
+    registration.adopted = through;
+    let body = serde_json::to_vec(&registration)
+        .unwrap_or_else(|e| unreachable!("a registration serializes: {e}"));
+    Ok(store.put(&key, body.into()).await?)
 }
 
 /// Removes a writer from a dataset's registry (IT-3). Removing an absent
@@ -196,6 +244,62 @@ mod tests {
             .expect("removing twice is harmless");
         let listed = list(&store, &TenantId::DEFAULT, &dataset()).await.unwrap();
         assert_eq!(listed.iter().map(|r| r.writer).collect::<Vec<_>>(), [b]);
+    }
+
+    /// What a reader may skip of a writer's log is what intake has put
+    /// in the manifests: the registration says how far that is, moves
+    /// forward only, and is not brought back once the writer left.
+    #[tokio::test]
+    async fn a_registration_tells_how_far_the_writers_flushes_are_adopted() {
+        let store = MemoryStore::new();
+        let env = Env::simulated(1, Timestamp::from_nanos(5));
+        let writer = WriterId::from_u128(1);
+        let adopted = async || {
+            let listed = list(&store, &TenantId::DEFAULT, &dataset()).await.unwrap();
+            listed.first().map(|registration| registration.adopted)
+        };
+        register(&store, &env, &TenantId::DEFAULT, &dataset(), writer)
+            .await
+            .unwrap();
+        assert_eq!(adopted().await, Some(Seq::ZERO));
+        for (through, expected) in [(5, 5), (3, 5), (8, 8)] {
+            advance(
+                &store,
+                &TenantId::DEFAULT,
+                &dataset(),
+                writer,
+                Seq::new(through),
+            )
+            .await
+            .unwrap();
+            assert_eq!(adopted().await, Some(Seq::new(expected)));
+        }
+        let listed = list(&store, &TenantId::DEFAULT, &dataset()).await.unwrap();
+        assert_eq!(listed[0].registered_at, Timestamp::from_nanos(5));
+
+        remove(&store, &TenantId::DEFAULT, &dataset(), writer)
+            .await
+            .unwrap();
+        advance(&store, &TenantId::DEFAULT, &dataset(), writer, Seq::new(9))
+            .await
+            .expect("advancing a writer that left is harmless");
+        assert_eq!(adopted().await, None);
+    }
+
+    /// A registration written before the position was recorded reads as
+    /// one that has adopted nothing.
+    #[tokio::test]
+    async fn a_registration_without_a_position_has_adopted_nothing() {
+        let store = MemoryStore::new();
+        let writer = WriterId::from_u128(1);
+        let old = format!(
+            r#"{{"writer":"{writer}","node":"{}","registered_at":5}}"#,
+            Env::simulated(1, Timestamp::UNIX_EPOCH).node
+        );
+        let key = layout::writer_registration(&TenantId::DEFAULT, &dataset(), writer);
+        store.put(&key, Bytes::from(old)).await.unwrap();
+        let listed = list(&store, &TenantId::DEFAULT, &dataset()).await.unwrap();
+        assert_eq!(listed[0].adopted, Seq::ZERO);
     }
 
     #[tokio::test]
