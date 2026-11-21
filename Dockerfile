@@ -9,7 +9,8 @@
 # writable without a shell to fix it up. CI runs the image, which a
 # binary that still needed a C library could not do.
 
-FROM rust:1.89-alpine AS builder
+# The compiler is the one `rust-toolchain.toml` pins.
+FROM rust:1.96-alpine AS builder
 RUN apk add --no-cache build-base
 WORKDIR /src
 COPY . .

@@ -5,3 +5,5 @@ Dockerfile
 .dockerignore
 deploy/
 .github/
+# The builder image carries the pinned compiler already.
+rust-toolchain.toml

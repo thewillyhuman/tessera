@@ -1,0 +1,7 @@
+# The one compiler Tessera is built, linted and tested with: the same
+# on a developer's machine and in CI, where rustup reads this file.
+# The image's builder in the Dockerfile names the same version; change
+# both together.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
