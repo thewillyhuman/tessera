@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
 
 use crate::Key;
@@ -83,6 +84,15 @@ impl ObjectError {
     }
 }
 
+/// `names` in order, each once: what [`ObjectStore::list_names`]
+/// returns, whatever order a store found them in.
+#[must_use]
+pub fn in_order(mut names: Vec<String>) -> Vec<String> {
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// A store of immutable objects with the three properties Tessera relies on
 /// (ST-3): create-if-absent writes, read-after-write consistency and
 /// strongly consistent listing.
@@ -135,6 +145,31 @@ pub trait ObjectStore: Send + Sync + fmt::Debug {
     /// [`Key::is_under`]) in key order. The listing reflects every write
     /// that completed before the call.
     fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>>;
+
+    /// The names directly under `prefix`: the next component of every
+    /// key below it, each once, in order. It is what the listing of a
+    /// directory gives, and a store that can answer it without walking
+    /// every object below, as a bucket can, does so: the cost then
+    /// follows the number of names, not of objects.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` or `Failed` as the store reports them.
+    async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
+        let mut names = Vec::new();
+        let mut listing = self.list(prefix);
+        while let Some(meta) = listing.try_next().await? {
+            let below = meta
+                .key
+                .as_str()
+                .strip_prefix(prefix.as_str())
+                .and_then(|rest| rest.strip_prefix('/'));
+            if let Some(name) = below.and_then(|rest| rest.split('/').next()) {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(in_order(names))
+    }
 
     /// Deletes an object. Deleting a missing object succeeds, so that a
     /// retried delete is harmless.

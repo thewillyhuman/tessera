@@ -25,6 +25,7 @@ pub async fn run_all(store: Arc<dyn ObjectStore>) {
     get_range_outside_the_object_is_rejected(&*store).await;
     head_reports_the_size(&*store).await;
     list_returns_keys_under_the_prefix_in_order(&*store).await;
+    list_names_gives_each_name_under_the_prefix_once(&*store).await;
     delete_removes_the_object_and_is_idempotent(&*store).await;
     concurrent_put_if_absent_has_one_winner(Arc::clone(&store)).await;
 }
@@ -180,6 +181,28 @@ async fn list_returns_keys_under_the_prefix_in_order(store: &dyn ObjectStore) {
         .await
         .unwrap();
     assert!(none.is_empty(), "list under a missing prefix is empty");
+}
+
+async fn list_names_gives_each_name_under_the_prefix_once(store: &dyn ObjectStore) {
+    for name in [
+        "c11/b/2",
+        "c11/a/1",
+        "c11/a/x/3",
+        "c11/a-b/4",
+        "c11/c",
+        "c11x/d",
+    ] {
+        store
+            .put(&key(name), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    let names = store.list_names(&key("c11")).await.unwrap();
+    assert_eq!(names, ["a", "a-b", "b", "c"], "names under c11");
+    let nested = store.list_names(&key("c11/a")).await.unwrap();
+    assert_eq!(nested, ["1", "x"], "names under c11/a");
+    let none = store.list_names(&key("c11/missing")).await.unwrap();
+    assert!(none.is_empty(), "no names under a missing prefix");
 }
 
 async fn delete_removes_the_object_and_is_idempotent(store: &dyn ObjectStore) {

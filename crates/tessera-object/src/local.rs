@@ -250,6 +250,34 @@ impl ObjectStore for LocalStore {
         )
     }
 
+    async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
+        let mut entries = match fs::read_dir(self.path_for(prefix)).await {
+            Ok(entries) => entries,
+            // Nothing under the prefix, or the prefix is an object.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(io_error(prefix, e)),
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| io_error(prefix, e))?
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with('.') {
+                names.push(name);
+            }
+        }
+        Ok(crate::store::in_order(names))
+    }
+
     async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
         let path = self.path_for(key);
         match fs::remove_file(&path).await {

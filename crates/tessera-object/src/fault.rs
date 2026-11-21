@@ -159,6 +159,11 @@ impl ObjectStore for FaultyStore {
         }
     }
 
+    async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
+        self.fail_before(prefix)?;
+        self.inner.list_names(prefix).await
+    }
+
     async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
         self.fail_before(key)?;
         self.inner.delete(key).await?;
@@ -268,6 +273,13 @@ impl ObjectStore for LostResponseStore {
             return stream::once(async move { Err(error) }).boxed();
         }
         self.inner.list(prefix)
+    }
+
+    async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
+        if self.blind_to(prefix) || (self.blind() && self.lie_under.is_under(prefix)) {
+            return Err(Self::lost(prefix));
+        }
+        self.inner.list_names(prefix).await
     }
 
     async fn delete(&self, key: &Key) -> Result<(), ObjectError> {

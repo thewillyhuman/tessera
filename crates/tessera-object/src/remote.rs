@@ -264,6 +264,25 @@ impl ObjectStore for RemoteStore {
             .boxed()
     }
 
+    async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
+        // One listing with the separator as delimiter: the store rolls
+        // everything below a name up into the name.
+        let listed = match self.client.list_with_delimiter(Some(&path(prefix))).await {
+            Ok(listed) => listed,
+            Err(error) => return Err(failure(prefix, error)),
+        };
+        let below = listed.common_prefixes.iter();
+        let objects = listed.objects.iter().map(|meta| &meta.location);
+        let names = below
+            .chain(objects)
+            .filter_map(Path::filename)
+            // What is not a key component is not of Tessera's.
+            .filter(|name| Key::new(*name).is_ok())
+            .map(str::to_owned)
+            .collect();
+        Ok(crate::store::in_order(names))
+    }
+
     async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
         match self.client.delete(&path(key)).await {
             Ok(()) | Err(Error::NotFound { .. }) => Ok(()),
@@ -360,7 +379,10 @@ mod tests {
         );
         let store: Arc<dyn ObjectStore> = Arc::new(RemoteStore::s3(&run).unwrap());
         conformance::run_all(Arc::clone(&store)).await;
-        for prefix in (1..=10).map(|check| Key::new(format!("c{check}")).unwrap()) {
+        let prefixes = (1..=11)
+            .map(|check| format!("c{check}"))
+            .chain(["c11x".to_owned()]);
+        for prefix in prefixes.map(|name| Key::new(name).unwrap()) {
             let keys: Vec<_> = store
                 .list(&prefix)
                 .map(|meta| meta.unwrap().key)

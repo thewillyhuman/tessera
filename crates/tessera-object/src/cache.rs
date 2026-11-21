@@ -287,6 +287,10 @@ impl ObjectStore for CachedStore {
         self.inner.list(prefix)
     }
 
+    async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
+        self.inner.list_names(prefix).await
+    }
+
     async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
         let deleted = self.inner.delete(key).await;
         self.forget(key).await;
