@@ -525,7 +525,10 @@ fn greedy(
     let mut candidates: BTreeMap<String, f64> = BTreeMap::new();
     for w in weighted {
         for (column, op) in &w.observation.predicates {
-            if matches!(op.as_str(), "=" | "in" | "range") && column != TIMESTAMP {
+            if matches!(op.as_str(), "=" | "in" | "range")
+                && column != TIMESTAMP
+                && !is_label(column)
+            {
                 *candidates.entry(column.clone()).or_default() += w.weight;
             }
         }
@@ -586,6 +589,14 @@ fn greedy(
     } else {
         key
     }
+}
+
+/// Whether `column` is a label as the workload names one. A label is
+/// read from several places, an attribute of the record, of its
+/// resource or of its scope, so it names no column a file could be
+/// sorted by.
+fn is_label(column: &str) -> bool {
+    column.starts_with("label:")
 }
 
 fn is_path(column: &str) -> bool {
@@ -758,6 +769,29 @@ mod tests {
     /// AD-6: without a measured selectivity, an equality on a column
     /// keeps one value among the distinct ones the files counted, so
     /// the column with more of them leads the key.
+    /// A label names no column: it is read from an attribute of the
+    /// record, of its resource or of its scope. Proposed as a sort key
+    /// from the matchers of `LogQL` and `PromQL` queries, it was adopted
+    /// and no file could be sorted by it.
+    #[test]
+    fn a_label_is_never_proposed_as_a_sort_key() {
+        let workload: Vec<Observation> = (0..10)
+            .flat_map(|_| {
+                [
+                    query(9.5, "label:run", "=", 0.001),
+                    query(9.5, "attr.host", "=", 0.01),
+                ]
+            })
+            .collect();
+        let advised = advise(&inputs(workload, None));
+        let proposed = &advised.advice.proposed.sort_key;
+        assert!(
+            proposed.iter().all(|column| !column.starts_with("label:")),
+            "{proposed:?}"
+        );
+        assert_eq!(proposed[0], "attr.host");
+    }
+
     #[test]
     fn counted_distinct_values_set_the_selectivity_of_an_equality() {
         let unmeasured = |column: &str| Observation {
