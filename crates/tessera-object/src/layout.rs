@@ -73,6 +73,14 @@ pub fn budget_counts(node: NodeId) -> Key {
     key(&["_cluster", "budgets", &node.to_string()])
 }
 
+/// The object a node creates, tries to create again and removes when
+/// it starts, to check that the store refuses the second creation
+/// ([`crate::probe`]).
+#[must_use]
+pub fn probe(node: NodeId) -> Key {
+    key(&["_cluster", "probes", &node.to_string()])
+}
+
 /// Prefix of one writer's log.
 #[must_use]
 pub fn writer_log(writer: WriterId) -> Key {
@@ -280,6 +288,10 @@ mod tests {
         assert_eq!(
             node(NodeId::from_u128(1)).as_str(),
             "_cluster/nodes/00000000000000000000000000000001"
+        );
+        assert_eq!(
+            probe(NodeId::from_u128(1)).as_str(),
+            "_cluster/probes/00000000000000000000000000000001"
         );
     }
 

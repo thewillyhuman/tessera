@@ -219,6 +219,9 @@ pub enum RunError {
     /// The root pool's URL names no store this build opens.
     #[error("cannot open the root pool: {0}")]
     RootPool(#[from] tessera_object::OpenError),
+    /// The root pool's store is not one to be trusted with the data.
+    #[error("cannot use the root pool: {0}")]
+    Probe(#[from] tessera_object::ProbeError),
     /// The catalog cannot be opened.
     #[error("cannot open the catalog: {0}")]
     Catalog(#[from] tessera_catalog::CatalogError),
@@ -554,6 +557,9 @@ type Opened = (
 /// the catalog in it.
 async fn open(config: &Config, env: &Env) -> Result<Opened, RunError> {
     let ((store, url), cache) = cached(config, root_store(config).await?).await?;
+    // Before anything is written: a store that creates an object
+    // twice would let two nodes win the same commit (ST-3).
+    tessera_object::probe::create_if_absent(&*store, &layout::probe(env.node)).await?;
     let pool = PoolId::new("root").unwrap_or_else(|_| unreachable!("a literal valid pool id"));
     let root_pool = PoolConfig {
         id: pool.clone(),
