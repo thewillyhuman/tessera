@@ -8,8 +8,8 @@ use std::ops::Range;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::Key;
 
@@ -145,6 +145,27 @@ pub trait ObjectStore: Send + Sync + fmt::Debug {
     /// [`Key::is_under`]) in key order. The listing reflects every write
     /// that completed before the call.
     fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>>;
+
+    /// Lists the objects under `prefix` whose key sorts after `after`,
+    /// in key order: what is left to see of a prefix gone through up
+    /// to `after`, which need not exist. A store that can start a
+    /// listing at a key answers in the requests the remainder takes,
+    /// however much lies before it; by default the whole prefix is
+    /// listed and what comes first dropped.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` or `Failed` as the store reports them.
+    fn list_after(
+        &self,
+        prefix: &Key,
+        after: &Key,
+    ) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+        let after = after.clone();
+        self.list(prefix)
+            .try_filter(move |meta| std::future::ready(meta.key.as_str() > after.as_str()))
+            .boxed()
+    }
 
     /// The names directly under `prefix`: the next component of every
     /// key below it, each once, in order. It is what the listing of a

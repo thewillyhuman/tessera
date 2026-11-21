@@ -26,6 +26,7 @@ pub async fn run_all(store: Arc<dyn ObjectStore>) {
     head_reports_the_size(&*store).await;
     list_returns_keys_under_the_prefix_in_order(&*store).await;
     list_names_gives_each_name_under_the_prefix_once(&*store).await;
+    list_after_returns_the_keys_past_one_in_order(&*store).await;
     delete_removes_the_object_and_is_idempotent(&*store).await;
     concurrent_put_if_absent_has_one_winner(Arc::clone(&store)).await;
 }
@@ -181,6 +182,34 @@ async fn list_returns_keys_under_the_prefix_in_order(store: &dyn ObjectStore) {
         .await
         .unwrap();
     assert!(none.is_empty(), "list under a missing prefix is empty");
+}
+
+async fn list_after_returns_the_keys_past_one_in_order(store: &dyn ObjectStore) {
+    for name in ["c12/log/3", "c12/log/1", "c12/log/2", "c12/logs/9"] {
+        store
+            .put(&key(name), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    let after = |from: &'static str| async move {
+        store
+            .list_after(&key("c12/log"), &key(from))
+            .map_ok(|meta| meta.key)
+            .try_collect::<Vec<Key>>()
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        after("c12/log/1").await,
+        [key("c12/log/2"), key("c12/log/3")],
+        "past a key that exists"
+    );
+    assert_eq!(
+        after("c12/log/0").await,
+        [key("c12/log/1"), key("c12/log/2"), key("c12/log/3")],
+        "past a key that does not"
+    );
+    assert!(after("c12/log/3").await.is_empty(), "past the last key");
 }
 
 async fn list_names_gives_each_name_under_the_prefix_once(store: &dyn ObjectStore) {

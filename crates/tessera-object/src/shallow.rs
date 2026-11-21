@@ -46,6 +46,14 @@ impl ObjectStore for ShallowStore {
         };
         stream::once(async move { Err(refused) }).boxed()
     }
+    /// What is past a key is what a reader has left, not a walk.
+    fn list_after(
+        &self,
+        prefix: &Key,
+        after: &Key,
+    ) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+        self.0.list_after(prefix, after)
+    }
     async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
         self.0.list_names(prefix).await
     }

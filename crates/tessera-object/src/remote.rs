@@ -245,23 +245,20 @@ impl ObjectStore for RemoteStore {
     }
 
     fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
-        let prefix = prefix.clone();
-        self.client
-            .list(Some(&path(&prefix)))
-            .filter_map(move |listed| {
-                let item = match listed {
-                    // What is not a key is not an object of Tessera's.
-                    Ok(meta) => Key::new(meta.location.as_ref()).ok().map(|key| {
-                        Ok(ObjectMeta {
-                            key,
-                            size: meta.size,
-                        })
-                    }),
-                    Err(error) => Some(Err(failure(&prefix, error))),
-                };
-                std::future::ready(item)
-            })
-            .boxed()
+        listed_under(prefix.clone(), self.client.list(Some(&path(prefix))))
+    }
+
+    /// One listing started at `after`: the store skips what sorts
+    /// before it, so the answer costs what remains.
+    fn list_after(
+        &self,
+        prefix: &Key,
+        after: &Key,
+    ) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+        let listing = self
+            .client
+            .list_with_offset(Some(&path(prefix)), &path(after));
+        listed_under(prefix.clone(), listing)
     }
 
     async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
@@ -289,6 +286,28 @@ impl ObjectStore for RemoteStore {
             Err(error) => Err(failure(key, error)),
         }
     }
+}
+
+/// What the client listed under `prefix`, as Tessera's objects.
+fn listed_under(
+    prefix: Key,
+    listing: BoxStream<'_, object_store::Result<object_store::ObjectMeta>>,
+) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+    listing
+        .filter_map(move |listed| {
+            let item = match listed {
+                // What is not a key is not an object of Tessera's.
+                Ok(meta) => Key::new(meta.location.as_ref()).ok().map(|key| {
+                    Ok(ObjectMeta {
+                        key,
+                        size: meta.size,
+                    })
+                }),
+                Err(error) => Some(Err(failure(&prefix, error))),
+            };
+            std::future::ready(item)
+        })
+        .boxed()
 }
 
 #[cfg(test)]

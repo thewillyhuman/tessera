@@ -288,6 +288,14 @@ impl ObjectStore for CachedStore {
         self.inner.list(prefix)
     }
 
+    fn list_after(
+        &self,
+        prefix: &Key,
+        after: &Key,
+    ) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+        self.inner.list_after(prefix, after)
+    }
+
     async fn list_names(&self, prefix: &Key) -> Result<Vec<String>, ObjectError> {
         self.inner.list_names(prefix).await
     }
