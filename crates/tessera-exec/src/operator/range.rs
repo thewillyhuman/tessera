@@ -4,7 +4,8 @@
 //! range function per series at every step. Blocking; memory is
 //! proportional to the samples held, accounted against the pool.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,9 +53,25 @@ pub struct RangeVector {
     end: i64,
     memory: Arc<MemoryPool>,
     grouping: Option<SeriesGrouping>,
-    series: BTreeMap<String, Vec<Sample>>,
+    /// Each series' key, its labels as JSON, and its samples.
+    series: Vec<(String, Vec<Sample>)>,
+    /// Where each series is, by its key.
+    by_key: HashMap<String, usize>,
+    /// The series of the rows met so far, by the text of the cells
+    /// their labels come from: the rows of a stream carry the same
+    /// text, and a dataset of logs has few streams for its rows, so a
+    /// row's labels are worked out once for each text, not parsed from
+    /// it on every row.
+    known: HashMap<String, usize>,
+    /// The cells of the row at hand, written here to look them up.
+    cells: String,
     reserved: usize,
 }
+
+/// The most distinct label cells whose series are remembered: past
+/// it, as where an attribute differs on every row, a row's series is
+/// worked out from its cells each time.
+const MOST_KNOWN: usize = 65_536;
 
 impl RangeVector {
     /// Evaluates `function` over `(t - range, t]` at every step of `steps`.
@@ -76,9 +93,49 @@ impl RangeVector {
             end: steps.end.as_nanos(),
             memory,
             grouping,
-            series: BTreeMap::new(),
+            series: Vec::new(),
+            by_key: HashMap::new(),
+            known: HashMap::new(),
+            cells: String::new(),
             reserved: 0,
         }
+    }
+
+    /// Where the series of a row with these cells is: its attributes,
+    /// the labels a parser stage derived and its severity.
+    fn series_of(
+        &mut self,
+        overflow: Option<&str>,
+        extracted: Option<&str>,
+        severity: Option<&str>,
+    ) -> usize {
+        // Each cell with its length before it, so that no two rows'
+        // cells write the same text.
+        self.cells.clear();
+        for cell in [overflow, extracted, severity] {
+            match cell {
+                Some(text) => {
+                    let _ = write!(self.cells, "{}:{text}", text.len());
+                }
+                None => self.cells.push('-'),
+            }
+        }
+        if let Some(index) = self.known.get(self.cells.as_str()) {
+            return *index;
+        }
+        let labels = self.series_labels(row_labels(overflow, extracted, severity));
+        let key = serde_json::to_string(&labels).unwrap_or_default();
+        let index = if let Some(index) = self.by_key.get(&key) {
+            *index
+        } else {
+            self.series.push((key.clone(), Vec::new()));
+            self.by_key.insert(key, self.series.len() - 1);
+            self.series.len() - 1
+        };
+        if self.known.len() < MOST_KNOWN {
+            self.known.insert(self.cells.clone(), index);
+        }
+        index
     }
 
     /// The labels that identify a row's series.
@@ -173,16 +230,8 @@ impl Operator for RangeVector {
             let Some(value) = value else {
                 continue;
             };
-            let labels = self.series_labels(row_labels(
-                cell(overflow, i),
-                cell(extracted, i),
-                cell(severity, i),
-            ));
-            let key = serde_json::to_string(&labels).unwrap_or_default();
-            self.series
-                .entry(key)
-                .or_default()
-                .push((timestamps.value(i), value));
+            let series = self.series_of(cell(overflow, i), cell(extracted, i), cell(severity, i));
+            self.series[series].1.push((timestamps.value(i), value));
             added += 1;
         }
         let bytes = added * BYTES_PER_SAMPLE;
@@ -197,7 +246,12 @@ impl Operator for RangeVector {
         let mut values: Vec<f64> = Vec::new();
         if self.function == RangeFunction::AbsentOverTime {
             // Absence is a property of the whole selection, not of a series.
-            let mut all: Vec<Sample> = self.series.values().flatten().copied().collect();
+            let mut all: Vec<Sample> = self
+                .series
+                .iter()
+                .flat_map(|(_, samples)| samples)
+                .copied()
+                .collect();
             all.sort_by_key(|s| s.0);
             for (t, v) in evaluate_window(
                 self.function,
@@ -212,6 +266,8 @@ impl Operator for RangeVector {
                 values.push(v);
             }
         } else {
+            // In the order of the keys, whatever order the rows came in.
+            self.series.sort_by(|a, b| a.0.cmp(&b.0));
             for (key, samples) in &mut self.series {
                 samples.sort_by_key(|s| s.0);
                 for (t, v) in evaluate_window(
@@ -231,6 +287,8 @@ impl Operator for RangeVector {
         self.memory.release(self.reserved);
         self.reserved = 0;
         self.series.clear();
+        self.by_key.clear();
+        self.known.clear();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(TimestampNanosecondArray::from(times)),
             Arc::new(StringArray::from(labels)),
