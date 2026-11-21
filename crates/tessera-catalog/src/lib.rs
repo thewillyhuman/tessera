@@ -15,7 +15,7 @@ pub mod tenant;
 pub use auth::{ApiKey, IssuedKey, KeyText, Principal, Role as AccessRole};
 pub use catalog::{Catalog, CatalogError};
 pub use control::{
-    ControlError, ControlStore, ControlStores, Row, Table, Transaction, UnknownTable,
+    ControlError, ControlState, ControlStore, ControlStores, Row, Table, Transaction, UnknownTable,
 };
 pub use state::{CatalogState, PoolConfig};
 pub use tenant::{

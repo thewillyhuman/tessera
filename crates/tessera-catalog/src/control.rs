@@ -185,14 +185,23 @@ impl ControlStore {
         Ok(self.log.snapshot().await?)
     }
 
+    /// What the store holds now, read once: for a caller that reads
+    /// several tables, which `rows` would read the log for again.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be read.
+    pub async fn state(&self) -> Result<ControlState, ControlError> {
+        Ok(ControlState(self.snapshot().await?))
+    }
+
     /// Every row of `table`, in key order, as of the latest state.
     ///
     /// # Errors
     ///
     /// If the log cannot be read or a document is not JSON.
     pub async fn rows(&self, table: Table) -> Result<Vec<Row>, ControlError> {
-        let snapshot = self.snapshot().await?;
-        rows_of(snapshot.state(), table)
+        self.state().await?.rows(table)
     }
 
     /// The document at `key` in `table`, as of the latest state.
@@ -348,6 +357,22 @@ fn rows_of(state: &KvState, table: Table) -> Result<Vec<Row>, ControlError> {
         .collect()
 }
 
+/// What a tenant's control store held at one version: every table,
+/// from one read of the log.
+#[derive(Clone, Debug)]
+pub struct ControlState(Arc<Snapshot<KvState>>);
+
+impl ControlState {
+    /// Every row of `table`, in key order.
+    ///
+    /// # Errors
+    ///
+    /// If a document is not JSON.
+    pub fn rows(&self, table: Table) -> Result<Vec<Row>, ControlError> {
+        rows_of(self.0.state(), table)
+    }
+}
+
 /// The control stores a node has opened, one per tenant.
 pub struct ControlStores {
     store: Arc<dyn ObjectStore>,
@@ -449,6 +474,29 @@ mod tests {
         control.delete(Table::AlertRules, "a").await.unwrap();
         assert_eq!(control.get(Table::AlertRules, "a").await.unwrap(), None);
         assert_eq!(control.rows(Table::AlertRules).await.unwrap().len(), 1);
+    }
+
+    /// One read of the log answers for every table, and goes on
+    /// saying what the log said then.
+    #[tokio::test]
+    async fn a_state_is_the_store_as_it_was_read() {
+        let (store, env) = stores();
+        let control = ControlStore::open(store, TenantId::DEFAULT, env);
+        control
+            .put(Table::AlertRules, "a", json!({"expr": "a"}))
+            .await
+            .unwrap();
+        let state = control.state().await.unwrap();
+        control
+            .put(Table::Silences, "s", json!({"matchers": []}))
+            .await
+            .unwrap();
+        control.delete(Table::AlertRules, "a").await.unwrap();
+
+        assert_eq!(state.rows(Table::AlertRules).unwrap().len(), 1);
+        assert!(state.rows(Table::Silences).unwrap().is_empty());
+        assert!(control.rows(Table::AlertRules).await.unwrap().is_empty());
+        assert_eq!(control.rows(Table::Silences).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

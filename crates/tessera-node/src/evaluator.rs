@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tessera_catalog::{
-    Catalog, ControlStore, ControlStores, Table, TenantSettings, TenantSettingsSource, TenantStatus,
+    Catalog, ControlState, ControlStores, Table, TenantSettings, TenantSettingsSource, TenantStatus,
 };
 use tessera_cluster::Load;
 use tessera_eval::rule::decode_rows;
@@ -180,25 +180,23 @@ async fn firing_labels(
     Ok(firing)
 }
 
+/// What delivery reads of a tenant's control store.
+type DeliveryInputs = (
+    Vec<NotificationRoute>,
+    Vec<Silence>,
+    Vec<Acknowledgment>,
+    Vec<Inhibition>,
+);
+
 /// The tenant's routes, silences, acknowledgments and inhibition
 /// rules, as its control store holds them; rows that do not decode are
 /// skipped.
-async fn delivery_inputs(
-    control: &ControlStore,
-) -> Result<
-    (
-        Vec<NotificationRoute>,
-        Vec<Silence>,
-        Vec<Acknowledgment>,
-        Vec<Inhibition>,
-    ),
-    String,
-> {
-    let rows = |table: Table| async move { control.rows(table).await.map_err(|e| e.to_string()) };
-    let (routes, _) = decode_rows::<NotificationRoute>(&rows(Table::NotificationRoutes).await?);
-    let (silences, _) = decode_rows::<Silence>(&rows(Table::Silences).await?);
-    let (acknowledgments, _) = decode_rows::<Acknowledgment>(&rows(Table::Acknowledgments).await?);
-    let (inhibitions, _) = decode_rows::<Inhibition>(&rows(Table::Inhibitions).await?);
+fn delivery_inputs(control: &ControlState) -> Result<DeliveryInputs, String> {
+    let rows = |table: Table| control.rows(table).map_err(|e| e.to_string());
+    let (routes, _) = decode_rows::<NotificationRoute>(&rows(Table::NotificationRoutes)?);
+    let (silences, _) = decode_rows::<Silence>(&rows(Table::Silences)?);
+    let (acknowledgments, _) = decode_rows::<Acknowledgment>(&rows(Table::Acknowledgments)?);
+    let (inhibitions, _) = decode_rows::<Inhibition>(&rows(Table::Inhibitions)?);
     Ok((routes, silences, acknowledgments, inhibitions))
 }
 
@@ -208,11 +206,15 @@ async fn tenant_round(
     groups: &mut Groups,
     tenant: &TenantId,
 ) -> Result<Round, String> {
-    let control = evaluator.controls.open(tenant);
-    let rows = control
-        .rows(Table::AlertRules)
+    // Read once for the round: the rules, the rollups and what
+    // delivery needs are tables of the one store.
+    let control = evaluator
+        .controls
+        .open(tenant)
+        .state()
         .await
         .map_err(|e| e.to_string())?;
+    let rows = control.rows(Table::AlertRules).map_err(|e| e.to_string())?;
     let (rules, bad) = decode_rows::<AlertRule>(&rows);
     for problem in bad {
         tracing::warn!(%tenant, problem, "alert rule does not decode");
@@ -231,7 +233,7 @@ async fn tenant_round(
     if owned.is_empty() {
         return Ok(Round::default());
     }
-    let (routes, silences, acknowledgments, inhibitions) = delivery_inputs(&control).await?;
+    let (routes, silences, acknowledgments, inhibitions) = delivery_inputs(&control)?;
     let firing = if inhibitions.is_empty() {
         Vec::new()
     } else {
@@ -342,12 +344,9 @@ async fn settle(
 async fn rollups_round(
     evaluator: &Evaluator,
     tenant: &TenantId,
-    control: &ControlStore,
+    control: &ControlState,
 ) -> Result<(), String> {
-    let rows = control
-        .rows(Table::Rollups)
-        .await
-        .map_err(|e| e.to_string())?;
+    let rows = control.rows(Table::Rollups).map_err(|e| e.to_string())?;
     let (rollups, bad) = decode_rows::<Rollup>(&rows);
     for problem in bad {
         tracing::warn!(%tenant, problem, "rollup does not decode");
