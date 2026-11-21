@@ -292,19 +292,22 @@ every route and over gRPC.
 
 ## Requests against the store
 
-A bucket bills per request. A node left idle makes about eighteen a
-second, measured against MinIO on one node with every role, a cache
-directory, five datasets and seven partitions: four in ten are
-listings and four in ten are reads of log heads that find nothing
-new, both mostly by the background work, which every five seconds
-goes over every dataset's writers and partitions again; the rest are
-heartbeats, leases and the node's own metrics. The number grows with
-what the cluster holds: about eighty requests a minute for each
-dataset and thirty-five for each partition, one a day by default, so
-a dataset kept thirty days costs about eighteen requests a second
-while nothing is written or asked. Without `--cache-dir` the node's own
-health rules add the writer-log entries they read, a fifth more.
-Budget for it where requests are billed, and see the known limits.
+A bucket bills per request, and `tessera_object_store_requests_total`
+counts what each node asks, by operation. A node left idle makes
+about nine a second, measured against MinIO on one node with every
+role, a cache directory, five datasets and seven partitions: half
+are reads of log heads that find nothing new, a quarter listings,
+and the rest heartbeats, leases and the node's own metrics. The
+background work goes over every dataset, writer and partition once
+in six rounds, half a minute at the default interval, and what that
+round asks grows with what the cluster holds; the rounds between
+follow the logs of the writers it found, a read each, and go over a
+dataset only when a flush reached it. A new dataset, a writer that
+has just registered and a layout the advisor adopted are therefore
+acted on within half a minute, not within five seconds; rows are
+readable all the while. Without `--cache-dir` the node's own health
+rules add the writer-log entries they read. Budget for it where
+requests are billed.
 
 A query's requests grow with the partitions of its dataset, one a day
 by default, not with the files in them: it asks for the partitions'
@@ -323,6 +326,6 @@ operator meets first:
   used yet;
 - the cache keeps whole ranges as they were read, so it helps
   repeated queries more than new ones;
-- the background work goes over every dataset and partition every
-  five seconds whether or not anything changed, so the requests of an
-  idle cluster grow with what it holds (see above).
+- one round in six of the background work goes over every dataset
+  and partition whether or not anything changed, so the requests of
+  an idle cluster still grow with what it holds (see above).

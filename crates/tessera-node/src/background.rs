@@ -61,6 +61,22 @@ const HELD_EVERY: Duration = Duration::from_secs(3_600);
 /// is not felt.
 const COLLECT_EVERY: Duration = Duration::from_secs(60);
 
+/// How many rounds pass from one that goes over everything to the
+/// next. Such a round asks the store for every dataset of every
+/// tenant, their writers, their kinds and their partitions, and reads
+/// the head of every manifest: what it asks grows with what the
+/// cluster holds, whether or not anything changed. The rounds between
+/// follow the logs of the writers the last one found, a read each
+/// that finds nothing when nothing was flushed, and go over a dataset
+/// only when one of them brought it something. A new dataset, a new
+/// writer and what another node adopted wait for the next whole
+/// round, half a minute at the default interval.
+const WHOLE_EVERY: u64 = 6;
+
+/// What a tenant's last whole round found registered: its datasets
+/// and their writers.
+type Known = BTreeMap<TenantId, Vec<(DatasetName, Vec<Registration>)>>;
+
 /// How often the Iceberg metadata of the tables this node owns the
 /// export of is brought up to date (OP-9): a table whose files did not
 /// change costs its hint and metadata reads, nothing more.
@@ -138,8 +154,12 @@ pub async fn run(background: Background) {
     let mut last_export: Option<Timestamp> = None;
     let mut last_collection: Option<Timestamp> = None;
     let mut positions = Positions::new();
+    let mut known = Known::new();
+    let mut rounds: u64 = 0;
     loop {
         ticks.tick().await;
+        let whole_round = rounds.is_multiple_of(WHOLE_EVERY);
+        rounds += 1;
         let tenants: Vec<TenantId> = background
             .catalog
             .cached()
@@ -147,34 +167,24 @@ pub async fn run(background: Background) {
             .tenants()
             .map(|t| t.id.clone())
             .collect();
-        let mut backlog = Backlog::default();
         let mut held = Vec::new();
         positions.retain(|(tenant, _, _), _| tenants.contains(tenant));
-        for tenant in &tenants {
-            let mut cursors = Cursors {
-                positions: &mut positions,
-                met: BTreeSet::new(),
-                whole: true,
-            };
-            match round(&background, &compactor, tenant, &mut held, &mut cursors).await {
-                Ok(left) => {
-                    backlog.deferred += left.deferred;
-                    backlog.recoveries += left.recoveries;
-                    // A writer a whole round did not meet has left its
-                    // registry or this node's care: its position goes
-                    // with it. A round that failed in part met only some.
-                    let Cursors { met, whole, .. } = cursors;
-                    if whole {
-                        positions.retain(|at, _| at.0 != *tenant || met.contains(at));
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(tenant = %tenant, error = %error, "background round failed");
-                }
-            }
+        known.retain(|tenant, _| tenants.contains(tenant));
+        let backlog = tenants_round(
+            &background,
+            &compactor,
+            &tenants,
+            whole_round,
+            (&mut positions, &mut known),
+            &mut held,
+        )
+        .await;
+        // What a round between two whole ones left undone says nothing
+        // of the datasets it did not go over.
+        if whole_round {
+            background.load.set_compaction_backlog(backlog.deferred);
+            background.load.set_intake_backlog(backlog.recoveries);
         }
-        background.load.set_compaction_backlog(backlog.deferred);
-        background.load.set_intake_backlog(backlog.recoveries);
         // What the owned partitions hold, once an hour, the first round
         // included: each partition has one owner, so the cluster
         // records each once.
@@ -183,7 +193,9 @@ pub async fn run(background: Background) {
             now.duration_since(at)
                 .is_some_and(|since| since >= HELD_EVERY)
         });
-        if due && !held.is_empty() {
+        // Only a whole round has gone over every partition this node
+        // owns: one between holds those of the datasets it went over.
+        if whole_round && due && !held.is_empty() {
             background.meter.held(held);
             last_held = Some(now);
         }
@@ -207,6 +219,50 @@ pub async fn run(background: Background) {
             }
         }
     }
+}
+
+/// One round over `tenants`: a whole one, or one that follows what
+/// the last whole one found. A tenant whose round fails is logged and
+/// has its next.
+async fn tenants_round(
+    background: &Background,
+    compactor: &Compactor,
+    tenants: &[TenantId],
+    whole_round: bool,
+    (positions, known): (&mut Positions, &mut Known),
+    held: &mut Vec<Held>,
+) -> Backlog {
+    let mut backlog = Backlog::default();
+    for tenant in tenants {
+        let mut cursors = Cursors {
+            positions: &mut *positions,
+            met: BTreeSet::new(),
+            whole: whole_round,
+        };
+        let found = known.entry(tenant.clone()).or_default();
+        let done = if whole_round {
+            round(background, compactor, tenant, held, &mut cursors, found).await
+        } else {
+            follow(background, compactor, tenant, held, &mut cursors, found).await
+        };
+        match done {
+            Ok(left) => {
+                backlog.deferred += left.deferred;
+                backlog.recoveries += left.recoveries;
+                // A writer a whole round did not meet has left its
+                // registry or this node's care: its position goes
+                // with it. A round that failed in part met only some.
+                let Cursors { met, whole, .. } = cursors;
+                if whole {
+                    positions.retain(|at, _| at.0 != *tenant || met.contains(at));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(tenant = %tenant, error = %error, "background round failed");
+            }
+        }
+    }
+    backlog
 }
 
 /// Whether what was last done at `last`, if ever, is to be done again
@@ -263,21 +319,26 @@ struct Cursors<'a> {
     whole: bool,
 }
 
+/// A whole round of a tenant: every dataset it has, gone over; what
+/// it found registered is left in `found` for the rounds that follow.
 async fn round(
     background: &Background,
     compactor: &Compactor,
     tenant: &TenantId,
     held: &mut Vec<Held>,
     cursors: &mut Cursors<'_>,
+    found: &mut Vec<(DatasetName, Vec<Registration>)>,
 ) -> Result<Backlog, Failure> {
     let mut backlog = Backlog::default();
+    found.clear();
     for dataset in registry::datasets(&*background.store, tenant).await? {
         // A dataset's failure is its own: the tenant's other datasets
         // still get their round, and this one its next.
         match dataset_round(background, compactor, tenant, &dataset, held, cursors).await {
-            Ok(left) => {
+            Ok((left, registrations)) => {
                 backlog.deferred += left.deferred;
                 backlog.recoveries += left.recoveries;
+                found.push((dataset, registrations));
             }
             Err(error) => {
                 cursors.whole = false;
@@ -288,10 +349,76 @@ async fn round(
     Ok(backlog)
 }
 
+/// A round between two whole ones: the logs of the writers the last
+/// whole round found are followed, and a dataset one of them brought
+/// something to is gone over at once, so that what was flushed reaches
+/// its manifests and is compacted as soon as it would in a whole
+/// round. Nothing is listed where nothing was flushed.
+async fn follow(
+    background: &Background,
+    compactor: &Compactor,
+    tenant: &TenantId,
+    held: &mut Vec<Held>,
+    cursors: &mut Cursors<'_>,
+    found: &mut [(DatasetName, Vec<Registration>)],
+) -> Result<Backlog, Failure> {
+    let mut backlog = Backlog::default();
+    for (dataset, registrations) in found {
+        let mut changed = false;
+        for registration in registrations.iter() {
+            let writer = registration.writer;
+            if !background
+                .owned
+                .owns(WorkKind::Intake, writer.to_string().as_bytes())
+            {
+                continue;
+            }
+            let at = (tenant.clone(), dataset.clone(), writer);
+            let after = cursors.positions.get(&at).copied().unwrap_or(Seq::ZERO);
+            let followed = intake::run_following(
+                Arc::clone(&background.store),
+                &background.env,
+                tenant,
+                dataset,
+                writer,
+                after,
+            )
+            .await;
+            match followed {
+                Ok(outcome) => {
+                    cursors.positions.insert(at, outcome.through);
+                    if outcome.adoptions > 0 || outcome.removed {
+                        tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
+                        changed = true;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%tenant, %dataset, %writer, error = %error, "background round failed");
+                }
+            }
+        }
+        if !changed {
+            continue;
+        }
+        match dataset_round(background, compactor, tenant, dataset, held, cursors).await {
+            Ok((left, listed)) => {
+                backlog.deferred += left.deferred;
+                backlog.recoveries += left.recoveries;
+                *registrations = listed;
+            }
+            Err(error) => {
+                tracing::warn!(%tenant, %dataset, error = %error, "background round failed");
+            }
+        }
+    }
+    Ok(backlog)
+}
+
 /// One dataset's part of a tenant's round: intake and recovery for its
 /// writers, then compaction and collection of its partitions, kind by
 /// kind. A kind that fails is logged and left for the next round; the
-/// kinds after it are still gone through.
+/// kinds after it are still gone through. Returns the writers it found
+/// registered besides.
 async fn dataset_round(
     background: &Background,
     compactor: &Compactor,
@@ -299,9 +426,10 @@ async fn dataset_round(
     dataset: &DatasetName,
     held: &mut Vec<Held>,
     cursors: &mut Cursors<'_>,
-) -> Result<Backlog, Failure> {
+) -> Result<(Backlog, Vec<Registration>), Failure> {
     let mut backlog = Backlog::default();
-    for registration in registry::list(&*background.store, tenant, dataset).await? {
+    let registrations = registry::list(&*background.store, tenant, dataset).await?;
+    for registration in &registrations {
         let writer = registration.writer;
         let key = writer.to_string();
         let mut ended = false;
@@ -328,7 +456,7 @@ async fn dataset_round(
         }
         if !ended
             && background.owned.owns(WorkKind::Recovery, key.as_bytes())
-            && is_dead(background, &registration).await?
+            && is_dead(background, registration).await?
         {
             let target = FlushTarget {
                 store: Arc::clone(&background.store),
@@ -374,7 +502,7 @@ async fn dataset_round(
             }
         }
     }
-    Ok(backlog)
+    Ok((backlog, registrations))
 }
 
 /// Compacts every partition of a dataset and kind that is due, rewrites

@@ -252,12 +252,12 @@ and the outputs of sort, top-k, limit and keyless aggregate stages
 go through the coordinator; the cache of object reads
 on local disk keeps whole ranges as they were asked, so two reads
 that overlap share nothing; a node left idle asks its root pool
-about eighteen times a second with five datasets and seven partitions,
-and more with each it looks after, because a round of the background
-work, every five seconds, lists every dataset's writers and
-partitions again and reads the head of every partition's manifest
-where it should follow what changed; the scale envelope of section
-17.2 has not been run.
+about nine times a second with five datasets and seven partitions,
+and more with each it looks after, because one round in six of the
+background work lists every dataset's writers and partitions again
+and reads the head of every partition's manifest, where the rounds
+between follow the writers' logs and nothing else; the scale
+envelope of section 17.2 has not been run.
 
 **M7, control store, continuous queries and alerting: done, with
 gaps listed below.** A per-tenant control store over the control log

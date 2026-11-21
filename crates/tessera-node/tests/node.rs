@@ -25,6 +25,9 @@ fn config(dir: &std::path::Path) -> Config {
         renewal: Duration::from_millis(50),
         eval: Duration::from_millis(100),
         advise: Duration::from_millis(100),
+        // A round every half second: one in six goes over everything,
+        // which is when a new dataset or a new layout is seen.
+        background: Duration::from_millis(500),
         ingest: IngestConfig {
             linger: Duration::from_millis(1),
             flush_bytes: 1,
