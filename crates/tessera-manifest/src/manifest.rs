@@ -8,12 +8,12 @@
 //! can be retried or run by two owners at once without duplicating files.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tessera_commit::{
-    Action, ApplyError, CommitError, CommitLog, DecodeError, RemoveReason, Snapshot, State,
+    Action, ApplyError, Commit, CommitError, CommitLog, DecodeError, RemoveReason, Snapshot, State,
     UpdateError,
 };
 use tessera_format::{Bound, FileFormat, ParquetFormat, ScanRequest, ScanStats};
@@ -209,7 +209,33 @@ pub struct Manifest {
     id: PartitionId,
     log: CommitLog<ManifestState>,
     env: Env,
+    /// What the last ranged read can hand the next.
+    remembered: Mutex<Option<Remembered>>,
 }
+
+/// What a ranged read learnt that the next one starts from (section
+/// 10.8): the checkpoint it read, which does not change once written,
+/// and the commits after it. With these a read asks the store what
+/// was committed since and nothing else; without them it finds the
+/// checkpoint again, by its hint and its size, and fetches every
+/// commit after it, on every query, for every partition.
+#[derive(Clone)]
+struct Remembered {
+    /// The checkpoint the commits follow.
+    checkpoint: Version,
+    /// Its size, which a ranged read of it needs.
+    size: u64,
+    /// The commits after it, in order.
+    commits: Arc<Vec<Commit>>,
+    /// How many commits were held when a newer checkpoint was last
+    /// looked for.
+    looked_at: usize,
+}
+
+/// How many commits are remembered past a checkpoint before a newer
+/// one is looked for: a checkpoint is written after every rewrite, so
+/// a longer tail usually has one that makes it short again.
+const LOOK_AGAIN_AFTER: usize = 32;
 
 impl Manifest {
     /// A handle to the manifest of `id` in `store` (the pool of the
@@ -217,7 +243,12 @@ impl Manifest {
     #[must_use]
     pub fn open(store: Arc<dyn ObjectStore>, id: PartitionId, env: Env) -> Self {
         let log = CommitLog::new(store, layout::partition(&id), env.clone());
-        Manifest { id, log, env }
+        Manifest {
+            id,
+            log,
+            env,
+            remembered: Mutex::new(None),
+        }
     }
 
     /// The partition.
@@ -383,11 +414,26 @@ impl Manifest {
     /// the commits after the checkpoint applied. Without a checkpoint
     /// the log is folded whole.
     ///
+    /// A handle that stays open remembers the checkpoint and the
+    /// commits after it, and asks the store only for what was
+    /// committed since.
+    ///
     /// # Errors
     ///
     /// If the checkpoint, a commit or the store cannot be read.
     pub async fn read_in(&self, range: TimeRange) -> Result<Partial, ManifestError> {
-        let Some(version) = self.log.checkpoint_version().await? else {
+        let remembered = self.remembered();
+        let trusted = remembered
+            .as_ref()
+            .is_some_and(|held| held.commits.len() < held.looked_at + LOOK_AGAIN_AFTER);
+        if let Some(held) = remembered.filter(|_| trusted) {
+            // The checkpoint remembered may have been removed since,
+            // replaced by newer ones: what a cold read finds then.
+            if let Ok(partial) = self.read_from(held, range).await {
+                return Ok(partial);
+            }
+        }
+        let Some(found) = self.find_checkpoint().await? else {
             let snapshot = self.log.snapshot().await?;
             return Ok(Partial::of(
                 snapshot.version(),
@@ -396,10 +442,55 @@ impl Manifest {
                 None,
             ));
         };
+        self.read_from(found, range).await
+    }
+
+    /// What the last ranged read remembered.
+    fn remembered(&self) -> Option<Remembered> {
+        self.remembered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The newest checkpoint, with the commits already held when it is
+    /// the one remembered; none when the log has no checkpoint.
+    async fn find_checkpoint(&self) -> Result<Option<Remembered>, ManifestError> {
+        let Some(version) = self.log.checkpoint_version().await? else {
+            return Ok(None);
+        };
+        if let Some(held) = self.remembered().filter(|held| held.checkpoint == version) {
+            return Ok(Some(Remembered {
+                looked_at: held.commits.len(),
+                ..held
+            }));
+        }
+        let size = self
+            .log
+            .store()
+            .head(&self.log.checkpoint_key(version))
+            .await?
+            .size;
+        Ok(Some(Remembered {
+            checkpoint: version,
+            size,
+            commits: Arc::default(),
+            looked_at: 0,
+        }))
+    }
+
+    /// The partition in `range` as `held`'s checkpoint, the commits
+    /// held after it and those committed since give it; remembers the
+    /// longer tail.
+    async fn read_from(
+        &self,
+        held: Remembered,
+        range: TimeRange,
+    ) -> Result<Partial, ManifestError> {
+        let version = held.checkpoint;
         let key = self.log.checkpoint_key(version);
         let store = Arc::clone(self.log.store());
-        let size = store.head(&key).await?.size;
-        let reader = ParquetFormat::default().open(Arc::clone(&store), key.clone(), size);
+        let reader = ParquetFormat::default().open(Arc::clone(&store), key.clone(), held.size);
         let bounds = vec![
             Bound {
                 column: checkpoint::first_timestamp_column().to_owned(),
@@ -446,13 +537,28 @@ impl Manifest {
                 }
             }
         }
-        let mut tail = self.log.tail(version);
+        let last_held = held.commits.last().map_or(version, |commit| commit.version);
+        let mut since = Vec::new();
+        let mut tail = self.log.tail(last_held);
         while let Some(commit) = tail.try_next().await? {
+            since.push(commit);
+        }
+        drop(tail);
+        let commits = if since.is_empty() {
+            Arc::clone(&held.commits)
+        } else {
+            Arc::new(held.commits.iter().cloned().chain(since).collect())
+        };
+        for commit in commits.iter() {
             partial.version = commit.version;
             for action in &commit.actions {
                 partial.apply(action, range);
             }
         }
+        *self
+            .remembered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Remembered { commits, ..held });
         Ok(partial)
     }
 }
@@ -842,6 +948,65 @@ mod tests {
         manifest.checkpoint().await.unwrap();
         let cold = Manifest::open(Arc::new(store.clone()), partition(0), env(2));
         assert_eq!(cold.snapshot().await.unwrap().state().files().count(), 1);
+    }
+
+    /// A query reads the manifest of every partition of its dataset.
+    /// One that stays open asks the store what was committed since the
+    /// last read and nothing else: on a cluster, finding the checkpoint
+    /// again for every partition on every query was most of the second
+    /// a query took before it read any data.
+    #[tokio::test]
+    async fn a_ranged_read_asks_only_for_what_was_committed_since_the_last() {
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(
+            MemoryStore::new(),
+        )));
+        let calls = || metered.requests().by_operation();
+        let store: Arc<dyn ObjectStore> = metered.clone();
+        let writer = WriterId::from_u128(1);
+        let committer = Manifest::open(Arc::clone(&store), partition(0), env(1));
+        let files = [file(1, &partition(0), writer, 1)];
+        committer.adopt(writer, Seq::new(1), &files).await.unwrap();
+        committer.checkpoint().await.unwrap();
+        let files = [file(2, &partition(0), writer, 2)];
+        committer.adopt(writer, Seq::new(2), &files).await.unwrap();
+
+        let all = TimeRange::new(Timestamp::MIN, Timestamp::MAX);
+        let reader = Manifest::open(Arc::clone(&store), partition(0), env(2));
+        let cold = reader.read_in(all).await.unwrap();
+        assert_eq!(cold.files.len(), 2);
+
+        let before = calls();
+        let warm = reader.read_in(all).await.unwrap();
+        assert_eq!((warm.files.len(), warm.version), (2, cold.version));
+        let made: Vec<(&str, u64)> = calls()
+            .into_iter()
+            .zip(before)
+            .map(|((operation, now), (_, then))| (operation, now - then))
+            .filter(|(operation, made)| *made > 0 && *operation != "get_range")
+            .collect();
+        assert_eq!(
+            made,
+            [("get", 1)],
+            "the head of the log, which has nothing new; the checkpoint's \
+             row groups are ranges of an object a node's cache keeps"
+        );
+
+        // What is committed after is seen, and a checkpoint that replaces
+        // the one remembered, once that one is removed, is found.
+        let files = [file(3, &partition(0), writer, 3)];
+        committer.adopt(writer, Seq::new(3), &files).await.unwrap();
+        assert_eq!(reader.read_in(all).await.unwrap().files.len(), 3);
+        for sequence in 4..=5u64 {
+            let files = [file(u128::from(sequence), &partition(0), writer, sequence)];
+            committer
+                .adopt(writer, Seq::new(sequence), &files)
+                .await
+                .unwrap();
+            committer.checkpoint().await.unwrap();
+        }
+        let after = reader.read_in(all).await.unwrap();
+        assert_eq!(after.files.len(), 5);
+        assert_eq!(after.positions.get(&writer), Some(&Seq::new(5)));
     }
 
     #[tokio::test]
