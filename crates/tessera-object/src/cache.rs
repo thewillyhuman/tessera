@@ -133,8 +133,8 @@ impl std::fmt::Debug for CachedStore {
 
 impl CachedStore {
     /// A cache of `inner` in `dir`, holding at most `capacity` bytes.
-    /// The directory is created if needed and emptied of what an
-    /// earlier run left.
+    /// The directory is created if needed and emptied of whatever it
+    /// holds, what an earlier run left: it must be the cache's alone.
     ///
     /// # Errors
     ///
@@ -145,12 +145,17 @@ impl CachedStore {
         capacity: u64,
     ) -> io::Result<Self> {
         let dir = dir.into();
-        match fs::remove_dir_all(&dir).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
         fs::create_dir_all(&dir).await?;
+        // Emptied rather than removed and made again: the directory
+        // may be a volume's mount point.
+        let mut left = fs::read_dir(&dir).await?;
+        while let Some(entry) = left.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                fs::remove_dir_all(entry.path()).await?;
+            } else {
+                fs::remove_file(entry.path()).await?;
+            }
+        }
         Ok(CachedStore {
             inner,
             dir,
@@ -484,8 +489,24 @@ mod tests {
     async fn what_an_earlier_run_left_is_removed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("7"), b"stale").unwrap();
+        std::fs::create_dir(dir.path().join("lost+found")).unwrap();
         let inner: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
         CachedStore::open(inner, dir.path(), 1 << 20).await.unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// The directory may be a volume's mount point, which can be
+    /// emptied but not removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_directory_itself_is_kept() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("7"), b"stale").unwrap();
+        let before = std::fs::metadata(dir.path()).unwrap().ino();
+        let inner: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        CachedStore::open(inner, dir.path(), 1 << 20).await.unwrap();
+        assert_eq!(std::fs::metadata(dir.path()).unwrap().ino(), before);
     }
 }
