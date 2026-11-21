@@ -51,7 +51,7 @@ push() {
     local values="" second
     second=$(date +%s)
     for i in $(seq "$1" "$2"); do
-        values="$values[\"$second$(printf '%09d' "$i")\",\"line $i\"],"
+        values="${values}[\"$second$(printf '%09d' "$i")\",\"line $i\"],"
     done
     client "curl -s -o /dev/null -w '%{http_code}' -m 30 -X POST $API/loki/api/v1/push \
         -H 'content-type: application/json' -H 'x-tessera-dataset: prod' \
@@ -108,6 +108,9 @@ echo "ok: $cached reads through a cache"
 
 say "no acknowledged write is lost while every node is replaced"
 client 'rm -f /tmp/stop /tmp/sent /tmp/acked'
+# The loop runs in the pod's shell: only the service's address is put
+# in from here.
+# shellcheck disable=SC2016
 kubectl exec client -- sh -c '
     i=1000; sent=0; acked=0
     while [ ! -f /tmp/stop ]; do
