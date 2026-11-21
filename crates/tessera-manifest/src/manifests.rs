@@ -13,7 +13,7 @@ use futures::{StreamExt, TryStreamExt};
 use tessera_object::ObjectStore;
 use tessera_types::{DatasetName, Env, Kind, PartitionId, TenantId, TimeRange, Timestamp, Version};
 
-use crate::manifest::{Manifest, ManifestError, list_partitions};
+use crate::manifest::{Manifest, ManifestError, list_windows};
 
 /// How many manifests' versions are read at once.
 const VERSIONS_AT_ONCE: usize = 16;
@@ -113,7 +113,7 @@ impl Manifests {
         time_range: TimeRange,
     ) -> Result<Vec<(PartitionId, Version)>, ManifestError> {
         let mut in_range = Vec::new();
-        for partition in list_partitions(&*self.store, tenant, dataset, kind).await? {
+        for partition in list_windows(&*self.store, tenant, dataset, kind).await? {
             let w = partition.window;
             let last = Timestamp::from_nanos(w.end().as_nanos().saturating_sub(1));
             if time_range.overlaps_closed(w.start(), last) {
@@ -128,11 +128,15 @@ impl Manifests {
                 let version = manifest.snapshot().await?.version();
                 Ok::<_, ManifestError>((partition, version))
             });
-        let versions = futures::stream::iter(reads)
+        let versions: Vec<(PartitionId, Version)> = futures::stream::iter(reads)
             .buffered(VERSIONS_AT_ONCE)
             .try_collect()
             .await?;
-        Ok(versions)
+        // A window nothing was committed to is no partition yet.
+        Ok(versions
+            .into_iter()
+            .filter(|(_, version)| *version != Version::ZERO)
+            .collect())
     }
 }
 

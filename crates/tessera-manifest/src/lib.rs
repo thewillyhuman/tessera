@@ -22,7 +22,9 @@ pub use dataset::{
     Advice, Alternative, DatasetLog, DatasetLogError, DatasetLogs, DatasetState, LayoutRecord,
     Tombstone,
 };
-pub use manifest::{Manifest, ManifestError, ManifestState, Partial, list_kinds, list_partitions};
+pub use manifest::{
+    Manifest, ManifestError, ManifestState, Partial, list_kinds, list_partitions, list_windows,
+};
 pub use manifests::Manifests;
 pub use registry::Registration;
 pub use view::{Sources, View, ViewSources, read_sources};

@@ -684,6 +684,42 @@ pub async fn list_kinds(
         .collect())
 }
 
+/// The windows of one dataset and kind that hold anything, in window
+/// order: the partitions that exist and, between a flush and its
+/// adoption, windows that have files and no manifest yet. One listing.
+/// A caller that reads every manifest anyway tells the two apart by
+/// the manifest, which is at version zero where nothing was committed,
+/// and is spared the listing of each window that [`list_partitions`]
+/// makes to tell.
+///
+/// # Errors
+///
+/// If the store cannot be listed.
+pub async fn list_windows(
+    store: &dyn ObjectStore,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    kind: Kind,
+) -> Result<Vec<PartitionId>, ManifestError> {
+    let prefix = layout::partitions(tenant, dataset, kind);
+    let mut windows: Vec<Window> = store
+        .list_names(&prefix)
+        .await?
+        .iter()
+        .filter_map(|name| name.parse().ok())
+        .collect();
+    windows.sort_unstable();
+    Ok(windows
+        .into_iter()
+        .map(|window| PartitionId {
+            tenant: tenant.clone(),
+            dataset: dataset.clone(),
+            kind,
+            window,
+        })
+        .collect())
+}
+
 /// The partitions of one dataset and kind that exist (MF-3): those whose
 /// manifest log has at least one commit, in window order.
 ///
@@ -696,35 +732,20 @@ pub async fn list_partitions(
     dataset: &DatasetName,
     kind: Kind,
 ) -> Result<Vec<PartitionId>, ManifestError> {
-    let prefix = layout::partitions(tenant, dataset, kind);
-    // The names under the prefix are the windows that hold anything; a
-    // window has a manifest once `_log` is among the names under it.
-    // Neither walks the files, so the cost follows the windows.
-    let mut named: Vec<(Window, Key)> = Vec::new();
-    for name in store.list_names(&prefix).await? {
-        if let (Ok(window), Ok(under)) = (name.parse::<Window>(), prefix.join(&name)) {
-            named.push((window, under));
-        }
-    }
-    let committed = named.into_iter().map(|(window, under)| async move {
-        let below = store.list_names(&under).await?;
-        Ok::<_, ManifestError>(below.iter().any(|name| name == "_log").then_some(window))
-    });
-    let found: Vec<Option<Window>> = futures::stream::iter(committed)
+    // A window has a manifest once `_log` is among the names under it.
+    // Neither listing walks the files, so the cost follows the windows.
+    let committed = list_windows(store, tenant, dataset, kind)
+        .await?
+        .into_iter()
+        .map(|partition| async move {
+            let below = store.list_names(&layout::partition(&partition)).await?;
+            Ok::<_, ManifestError>(below.iter().any(|name| name == "_log").then_some(partition))
+        });
+    let found: Vec<Option<PartitionId>> = futures::stream::iter(committed)
         .buffered(LISTINGS_AT_ONCE)
         .try_collect()
         .await?;
-    let mut windows: Vec<Window> = found.into_iter().flatten().collect();
-    windows.sort_unstable();
-    Ok(windows
-        .into_iter()
-        .map(|window| PartitionId {
-            tenant: tenant.clone(),
-            dataset: dataset.clone(),
-            kind,
-            window,
-        })
-        .collect())
+    Ok(found.into_iter().flatten().collect())
 }
 
 #[cfg(test)]

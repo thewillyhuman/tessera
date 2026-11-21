@@ -29,7 +29,7 @@ use tessera_types::{
 };
 use tessera_wal::{EntryBody, reader};
 
-use crate::{ManifestError, Manifests, Partial, list_partitions, registry};
+use crate::{ManifestError, Manifests, Partial, list_windows, registry};
 
 /// How many of a dataset's manifests a query reads at once.
 const MANIFESTS_AT_ONCE: usize = 16;
@@ -110,14 +110,16 @@ pub async fn sources(
     let root = manifests.store();
     let writers = registry::list(&**root, tenant, dataset).await?;
     let mut sources = ViewSources::default();
-    let partitions = list_partitions(&**root, tenant, dataset, kind).await?;
+    // The windows that hold anything; which of them are partitions
+    // their manifests tell below.
+    let windows = list_windows(&**root, tenant, dataset, kind).await?;
     let mut files = Vec::new();
     let mut positions: BTreeMap<Window, BTreeMap<WriterId, Seq>> = BTreeMap::new();
     // Every partition's manifest is needed, for its positions if not
     // for its files, and each read is a request or a few to the store:
     // they are made together, not one after another.
-    let mut wanted = Vec::with_capacity(partitions.len());
-    for partition in &partitions {
+    let mut wanted = Vec::with_capacity(windows.len());
+    for partition in &windows {
         let w = partition.window;
         let in_range = time_range.overlaps_closed(
             w.start(),
@@ -142,7 +144,13 @@ pub async fn sources(
         .buffered(MANIFESTS_AT_ONCE)
         .try_collect()
         .await?;
-    for (partition, (in_range, partial)) in partitions.iter().zip(read) {
+    let mut partitions = Vec::with_capacity(windows.len());
+    for (partition, (in_range, partial)) in windows.into_iter().zip(read) {
+        // Nothing was ever committed to it: a window whose files no
+        // manifest has adopted yet, not a partition.
+        if partial.version == Version::ZERO {
+            continue;
+        }
         sources.manifests.insert(partition.clone(), partial.version);
         if let Some(read) = partial.read {
             sources.manifest_row_groups += read.row_groups;
@@ -152,6 +160,7 @@ pub async fn sources(
         if in_range {
             files.extend(partial.files.into_values());
         }
+        partitions.push(partition);
     }
     sources.files = files.len();
 
@@ -631,6 +640,70 @@ mod tests {
         assert_eq!(found.partitions.len(), 4);
         let most = busy.most();
         assert!(most > 1, "at most {most} read at a time");
+    }
+
+    /// A query finds its partitions on every run. Which windows hold
+    /// anything is one listing; whether each has a manifest is told by
+    /// the manifest, which is read anyway, and not by a listing of
+    /// every window besides.
+    #[tokio::test]
+    async fn partitions_are_told_from_their_manifests_not_listed_one_by_one() {
+        let store = MemoryStore::new();
+        let env = env();
+        let mut log = WriterLog::start(Arc::new(store.clone()), env.clone());
+        registry::register(
+            &store,
+            &env,
+            &TenantId::DEFAULT,
+            &dataset(),
+            log.writer_id(),
+        )
+        .await
+        .unwrap();
+        let days = vec![batch(0, 0, 1), batch(1, 10, 1), batch(2, 20, 1)];
+        log.append_segment(&days).await.unwrap();
+        flush(&store, &env, &mut log, 0, 1, days).await;
+        adopt(&store, &log).await;
+        // A window with a file and no manifest: a flush not adopted yet.
+        let unadopted = PartitionId {
+            tenant: TenantId::DEFAULT,
+            dataset: dataset(),
+            kind: Kind::Log,
+            window: Window::containing(Timestamp::from_nanos(9 * 86_400_000_000_000), WINDOW)
+                .unwrap(),
+        };
+        let stray = layout::data_file(&unadopted, tessera_types::FileId::from_u128(9));
+        tessera_object::ObjectStore::put(&store, &stray, "rows".into())
+            .await
+            .unwrap();
+
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(store)));
+        let manifests = Manifests::new(metered.clone(), env, 8);
+        let find = async || {
+            sources(
+                &manifests,
+                &TenantId::DEFAULT,
+                &dataset(),
+                Kind::Log,
+                WINDOW,
+                TimeRange::ALL,
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(find().await.partitions.len(), 3, "the stray window is none");
+        let before = metered.requests().by_operation();
+        let again = find().await;
+        assert_eq!((again.partitions.len(), again.files.len()), (3, 3));
+        let listed: u64 = metered
+            .requests()
+            .by_operation()
+            .into_iter()
+            .zip(before)
+            .filter(|((operation, _), _)| *operation == "list_names")
+            .map(|((_, now), (_, then))| now - then)
+            .sum();
+        assert_eq!(listed, 1, "the windows of the kind, once");
     }
 
     #[tokio::test]
