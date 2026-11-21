@@ -473,10 +473,15 @@ store, the state of the rules. Each names its key, so a tenant moved
 to a new key keeps reading what the old one sealed while that key
 stays in the keyring, and a tenant naming a key the node lacks is
 refused rather than stored plain (SE-2, SE-3). Key material never
-enters the object store; the catalog holds names only. What stays
-readable is what places the data, not the data: object names, the
-catalog, the header of a writer-log entry (whose blocks, how many
-rows, over what time) and a dataset's Iceberg export.
+enters the object store; the catalog holds names only. A flush
+record in a writer's log, which names files with the bounds of their
+columns, has those sealed in the entry. What stays readable is what
+places the data, not the data: object names, the catalog, the header
+of a writer-log entry (whose blocks or files, how many rows, over
+what time) and a dataset's Iceberg export. What the system keeps
+about a tenant, the bounds its queries asked for, its usage by
+service, the audit of its administration, is data of the `_system`
+tenant, sealed when that tenant has a key of its own.
 
 A node given `--export-location`, the URI external engines read the
 data directory at, publishes Apache Iceberg metadata for every dataset

@@ -166,13 +166,16 @@ closed by another node's recovery.
   tenant whose `encryption_key` setting names one has everything
   under its prefix sealed under it: data files, indexes, manifests,
   the dataset and control logs, the state of its rules, and its
-  blocks in the writer logs. What was written before the setting
-  stays as it was until compaction rewrites it. Not sealed, since
-  they place the data and do not hold it: object names (tenant ids,
-  dataset and rule group names), the catalog, the headers of
-  writer-log entries and the Iceberg export. Keep every key a tenant
-  ever used in the keyring for as long as objects sealed under it
-  remain.
+  blocks and flush records in the writer logs. What was written
+  before the setting stays as it was until compaction rewrites it.
+  Not sealed, since they place the data and do not hold it: object
+  names (tenant ids, dataset and rule group names), the catalog, the
+  headers of writer-log entries and the Iceberg export. What the
+  system records about every tenant, the bounds queries asked for,
+  usage by service and the audit trail, is the `_system` tenant's:
+  give that tenant an `encryption_key` too to seal it. Keep every key
+  a tenant ever used in the keyring for as long as objects sealed
+  under it remain.
 - **Audit.** Administrative actions and control statements are rows
   of the `_system` tenant's `audit` dataset.
 
