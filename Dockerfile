@@ -9,10 +9,25 @@
 # writable without a shell to fix it up. CI runs the image, which a
 # binary that still needed a C library could not do.
 
+# The dependencies are compiled in a layer of their own, keyed by a
+# recipe of the manifests and the lock file (cargo-chef): a build that
+# changes only Tessera's source finds that layer in the cache and
+# compiles Tessera alone, which is the smaller half of the work.
+
 # The compiler is the one `rust-toolchain.toml` pins.
-FROM rust:1.96-alpine AS builder
-RUN apk add --no-cache build-base
+FROM rust:1.96-alpine AS chef
+RUN apk add --no-cache build-base && cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /src
+
+# What the dependencies are: the same recipe for as long as no
+# manifest and no locked version changes, whatever the source does.
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked -p tessera --recipe-path recipe.json
 COPY . .
 RUN cargo build --release -p tessera --locked && mkdir -p /var/lib/tessera
 
