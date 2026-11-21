@@ -28,8 +28,8 @@ use tessera_eval::rule::decode_rows;
 use tessera_format::FileFormat;
 use tessera_iceberg::{Exporter, Outcome as Export};
 use tessera_manifest::{
-    DatasetLog, DatasetLogs, Manifest, ManifestState, Registration, intake, list_partitions,
-    registry,
+    DatasetLog, DatasetLogs, DatasetState, Manifest, ManifestState, Registration, intake,
+    list_partitions, registry,
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
@@ -255,12 +255,16 @@ async fn round(
         }
         let mut budget = RECLUSTER_BUDGET;
         let policies = policies_of(background, tenant).await;
+        // Read once for the five kinds: each asks for its layout, its
+        // tombstones and its value score.
+        let settings = background.datasets.open(tenant, &dataset).state().await?;
         for kind in Kind::ALL {
             backlog.deferred += compact_and_collect(
                 background,
                 compactor,
                 tenant,
                 &dataset,
+                &settings,
                 kind,
                 &mut budget,
                 &policies,
@@ -282,6 +286,7 @@ async fn compact_and_collect(
     compactor: &Compactor,
     tenant: &TenantId,
     dataset: &DatasetName,
+    settings: &DatasetState,
     kind: Kind,
     budget: &mut u64,
     policies: &[RetentionPolicy],
@@ -289,10 +294,9 @@ async fn compact_and_collect(
 ) -> Result<u64, Failure> {
     let mut deferred = 0;
     let now = background.env.clock.now();
-    let log = background.datasets.open(tenant, dataset);
-    let record = log.layout(kind).await?;
-    let value_score = log.value_score(kind).await?;
-    let tombstones = log.tombstones(kind).await?;
+    let record = settings.layout(kind)?;
+    let value_score = settings.value_score(kind);
+    let tombstones = settings.tombstones(kind)?;
     let mut partitions = list_partitions(&*background.store, tenant, dataset, kind).await?;
     partitions.sort_by_key(|p| std::cmp::Reverse(p.window.start()));
     for partition in partitions {
@@ -381,6 +385,7 @@ async fn compact_and_collect(
     if !tombstones.is_empty() {
         let key = format!("{tenant}/{dataset}/{kind}/tombstones");
         if background.owned.owns(WorkKind::Partition, key.as_bytes()) {
+            let log = background.datasets.open(tenant, dataset);
             let removed = collect_tombstones(background, &log, tenant, dataset, kind, now).await?;
             if removed > 0 {
                 tracing::info!(%tenant, %dataset, %kind, removed, "tombstones applied everywhere");

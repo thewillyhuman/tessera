@@ -205,6 +205,48 @@ fn window_schedule(state: &KvState) -> WindowSchedule {
         })
 }
 
+/// What a dataset's log said at one version: every kind's layout,
+/// tombstones and value score, from one read of the log.
+#[derive(Clone, Debug)]
+pub struct DatasetState(Arc<tessera_commit::Snapshot<KvState>>);
+
+impl DatasetState {
+    /// The layout of `kind`: the one set, else the default.
+    ///
+    /// # Errors
+    ///
+    /// If the record does not decode.
+    pub fn layout(&self, kind: Kind) -> Result<LayoutRecord, DatasetLogError> {
+        let key = layout_key(kind);
+        match self.0.state().get(&key) {
+            Some(text) => decode(&key, text),
+            None => Ok(LayoutRecord::default_for(kind)),
+        }
+    }
+
+    /// The tombstones of `kind` still to be applied everywhere.
+    ///
+    /// # Errors
+    ///
+    /// If the record does not decode.
+    pub fn tombstones(&self, kind: Kind) -> Result<Vec<Tombstone>, DatasetLogError> {
+        let key = tombstones_key(kind);
+        match self.0.state().get(&key) {
+            Some(text) => decode(&key, text),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The value score of `kind`, if one was recorded.
+    #[must_use]
+    pub fn value_score(&self, kind: Kind) -> Option<f64> {
+        self.0
+            .state()
+            .get(&format!("value_score/{kind}"))
+            .and_then(|s| s.parse::<f64>().ok())
+    }
+}
+
 impl DatasetLog {
     /// The log of `dataset` in `store`.
     #[must_use]
@@ -220,18 +262,24 @@ impl DatasetLog {
         }
     }
 
+    /// What the log says now, read once: for a caller that asks about
+    /// several kinds or settings of the dataset, which each of the
+    /// methods below would read the log for again.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be read.
+    pub async fn state(&self) -> Result<DatasetState, DatasetLogError> {
+        Ok(DatasetState(self.log.snapshot().await?))
+    }
+
     /// The layout of `kind`: the one set, else the default.
     ///
     /// # Errors
     ///
     /// If the log cannot be read or the record does not decode.
     pub async fn layout(&self, kind: Kind) -> Result<LayoutRecord, DatasetLogError> {
-        let snapshot = self.log.snapshot().await?;
-        let key = layout_key(kind);
-        match snapshot.state().get(&key) {
-            Some(text) => decode(&key, text),
-            None => Ok(LayoutRecord::default_for(kind)),
-        }
+        self.state().await?.layout(kind)
     }
 
     /// Sets the layout of `kind` as the next epoch (`SetLayout`, AD-9)
@@ -276,12 +324,7 @@ impl DatasetLog {
     ///
     /// If the log cannot be read or the record does not decode.
     pub async fn tombstones(&self, kind: Kind) -> Result<Vec<Tombstone>, DatasetLogError> {
-        let snapshot = self.log.snapshot().await?;
-        let key = tombstones_key(kind);
-        match snapshot.state().get(&key) {
-            Some(text) => decode(&key, text),
-            None => Ok(Vec::new()),
-        }
+        self.state().await?.tombstones(kind)
     }
 
     /// Adds `tombstone` for `kind` and opens the next layout epoch, so
@@ -418,11 +461,7 @@ impl DatasetLog {
     ///
     /// If the log cannot be read.
     pub async fn value_score(&self, kind: Kind) -> Result<Option<f64>, DatasetLogError> {
-        let snapshot = self.log.snapshot().await?;
-        Ok(snapshot
-            .state()
-            .get(&format!("value_score/{kind}"))
-            .and_then(|s| s.parse::<f64>().ok()))
+        Ok(self.state().await?.value_score(kind))
     }
 
     /// Records the value score of `kind`.
@@ -544,6 +583,33 @@ mod tests {
             &first,
             &logs.open(&TenantId::DEFAULT, &dataset)
         ));
+    }
+
+    /// One read of the log answers for every kind and setting, and
+    /// goes on saying what the log said then.
+    #[tokio::test]
+    async fn a_state_is_the_log_as_it_was_read() {
+        use std::sync::Arc;
+
+        use tessera_object::MemoryStore;
+
+        let log = DatasetLog::open(
+            Arc::new(MemoryStore::new()),
+            &TenantId::DEFAULT,
+            &DatasetName::new("prod").unwrap(),
+            Env::simulated(1, Timestamp::from_nanos(0)),
+        );
+        log.set_value_score(Kind::Log, 0.5).await.unwrap();
+        let state = log.state().await.unwrap();
+        log.set_value_score(Kind::Log, 0.75).await.unwrap();
+        let next = LayoutRecord::default_for(Kind::Span);
+        log.set_layout(Kind::Span, next).await.unwrap();
+
+        assert_eq!(state.value_score(Kind::Log), Some(0.5));
+        assert_eq!(state.layout(Kind::Span).unwrap().epoch, 0);
+        assert!(state.tombstones(Kind::Metric).unwrap().is_empty());
+        assert_eq!(log.value_score(Kind::Log).await.unwrap(), Some(0.75));
+        assert_eq!(log.layout(Kind::Span).await.unwrap().epoch, 1);
     }
 
     #[tokio::test]
