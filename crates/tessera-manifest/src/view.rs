@@ -90,6 +90,20 @@ pub struct Sources {
     pub sources: ViewSources,
 }
 
+/// How many writers' logs are read at once for the tail.
+const TAILS_AT_ONCE: usize = 16;
+
+/// What one writer's log gave of the tail.
+#[derive(Default)]
+struct Tail {
+    /// The last entry read.
+    last: Option<Seq>,
+    /// Segments read.
+    segments: usize,
+    /// The rows beyond the partitions' positions.
+    rows: Vec<RecordBatch>,
+}
+
 /// Lists the files and reads the tail rows of one dataset and kind for
 /// the partitions whose window overlaps `time_range` (pruning stage 1).
 /// `window` is the dataset's window schedule (MF-2), used to place
@@ -164,14 +178,17 @@ pub async fn sources(
     }
     sources.files = files.len();
 
-    let mut tail = Vec::new();
-    for registration in writers {
+    // What the writer flushed through the position its registration
+    // gives is in the manifests just read, whichever partitions it went
+    // to: a tail starts after it, not at the log's first entry, which
+    // is an hour of segments back (GC-2). The registration was read
+    // before the manifests, so they hold at least what it says. The
+    // logs do not depend on each other and are read together.
+    let positions = &positions;
+    let window = &window;
+    let tails = writers.into_iter().map(|registration| async move {
         let writer = registration.writer;
-        // What the writer flushed through this position is in the
-        // manifests just read, whichever partitions it went to: the
-        // tail starts after it, not at the log's first entry, which is
-        // an hour of segments back (GC-2). The registration was read
-        // before the manifests, so they hold at least what it says.
+        let mut read = Tail::default();
         let mut entries = reader::entries(
             Arc::clone(root),
             writer,
@@ -179,11 +196,11 @@ pub async fn sources(
             Arc::clone(&manifests.env().keys),
         );
         while let Some(entry) = entries.try_next().await? {
-            sources.positions.insert(writer, entry.seq());
+            read.last = Some(entry.seq());
             if !matches!(entry.body(), EntryBody::Segment { .. }) {
                 continue;
             }
-            sources.segments += 1;
+            read.segments += 1;
             for batch in entry.blocks_for(tenant, dataset, kind)? {
                 let position = |w: Window| {
                     positions
@@ -192,11 +209,24 @@ pub async fn sources(
                         .copied()
                         .unwrap_or(Seq::ZERO)
                 };
-                if let Some(rows) = beyond_position(batch.rows(), entry.seq(), &window, position)? {
-                    tail.push(rows);
+                if let Some(rows) = beyond_position(batch.rows(), entry.seq(), window, position)? {
+                    read.rows.push(rows);
                 }
             }
         }
+        Ok::<_, ManifestError>((writer, read))
+    });
+    let read: Vec<(WriterId, Tail)> = futures::stream::iter(tails)
+        .buffered(TAILS_AT_ONCE)
+        .try_collect()
+        .await?;
+    let mut tail = Vec::new();
+    for (writer, read) in read {
+        if let Some(last) = read.last {
+            sources.positions.insert(writer, last);
+        }
+        sources.segments += read.segments;
+        tail.extend(read.rows);
     }
     Ok(Sources {
         partitions,
@@ -704,6 +734,49 @@ mod tests {
             .map(|((_, now), (_, then))| now - then)
             .sum();
         assert_eq!(listed, 1, "the windows of the kind, once");
+    }
+
+    /// Rows not yet in files are read from the logs of every writer of
+    /// the dataset. One log after another is a round trip per entry
+    /// per writer; the logs do not depend on each other.
+    #[tokio::test]
+    async fn the_tails_of_several_writers_are_read_together() {
+        let store = MemoryStore::new();
+        let env = env();
+        for node in 1..=3u8 {
+            let mut log = WriterLog::start(
+                Arc::new(store.clone()),
+                Env::simulated(u64::from(node), Timestamp::UNIX_EPOCH),
+            );
+            registry::register(
+                &store,
+                &env,
+                &TenantId::DEFAULT,
+                &dataset(),
+                log.writer_id(),
+            )
+            .await
+            .unwrap();
+            log.append_segment(&[batch(0, node * 10, 2)]).await.unwrap();
+        }
+        let busy = Arc::new(Busy::watching(store, "_wal/"));
+        let manifests = Manifests::new(busy.clone(), env, 8);
+        let found = sources(
+            &manifests,
+            &TenantId::DEFAULT,
+            &dataset(),
+            Kind::Log,
+            WINDOW,
+            TimeRange::ALL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.sources.segments, 3);
+        assert_eq!(
+            found.tail.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            6
+        );
+        assert!(busy.most() > 1, "at most {} read at a time", busy.most());
     }
 
     #[tokio::test]

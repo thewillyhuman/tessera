@@ -9,12 +9,15 @@
 //! manifests (VW-2), so a writer that is missing was either fully adopted
 //! before the read or registered after it began.
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
-use tessera_object::{ObjectError, ObjectStore, layout};
+use tessera_object::{ObjectError, ObjectMeta, ObjectStore, layout};
 use tessera_types::{DatasetName, Env, NodeId, Seq, TenantId, Timestamp, WriterId};
 
 use crate::ManifestError;
+
+/// How many registrations are read at once.
+const REGISTRATIONS_AT_ONCE: usize = 16;
 
 /// One registered writer.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -79,23 +82,31 @@ pub async fn list(
     tenant: &TenantId,
     dataset: &DatasetName,
 ) -> Result<Vec<Registration>, ManifestError> {
-    let mut registrations = Vec::new();
-    let mut listing = store.list(&layout::writer_registry(tenant, dataset));
-    while let Some(meta) = listing.try_next().await? {
+    let listed: Vec<ObjectMeta> = store
+        .list(&layout::writer_registry(tenant, dataset))
+        .try_collect()
+        .await?;
+    // A read each, of one another independent: made together.
+    let reads = listed.into_iter().map(|meta| async move {
         let bytes = match store.get(&meta.key).await {
             Ok(bytes) => bytes,
             // Removed between listing and reading: fully adopted, so not a
             // writer the reader needs.
-            Err(ObjectError::NotFound { .. }) => continue,
+            Err(ObjectError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(ManifestError::Store(error)),
         };
-        let registration: Registration =
-            serde_json::from_slice(&bytes).map_err(|e| ManifestError::Corrupt {
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| ManifestError::Corrupt {
                 key: meta.key.clone(),
                 source: Box::new(e),
-            })?;
-        registrations.push(registration);
-    }
+            })
+    });
+    let read: Vec<Option<Registration>> = futures::stream::iter(reads)
+        .buffered(REGISTRATIONS_AT_ONCE)
+        .try_collect()
+        .await?;
+    let mut registrations: Vec<Registration> = read.into_iter().flatten().collect();
     registrations.sort_by_key(|r| r.writer);
     Ok(registrations)
 }
@@ -300,6 +311,27 @@ mod tests {
         store.put(&key, Bytes::from(old)).await.unwrap();
         let listed = list(&store, &TenantId::DEFAULT, &dataset()).await.unwrap();
         assert_eq!(listed[0].adopted, Seq::ZERO);
+    }
+
+    /// A query reads the registration of every writer of its dataset.
+    /// Over a bucket, one after another is a round trip each.
+    #[tokio::test]
+    async fn registrations_are_read_together() {
+        let store = MemoryStore::new();
+        let env = Env::simulated(1, Timestamp::from_nanos(5));
+        for writer in 1..=4 {
+            let writer = WriterId::from_u128(writer);
+            register(&store, &env, &TenantId::DEFAULT, &dataset(), writer)
+                .await
+                .unwrap();
+        }
+        let busy = crate::busy::Busy::over(store);
+        let listed = list(&busy, &TenantId::DEFAULT, &dataset()).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.writer).collect::<Vec<_>>(),
+            (1..=4).map(WriterId::from_u128).collect::<Vec<_>>()
+        );
+        assert!(busy.most() > 1, "at most {} read at a time", busy.most());
     }
 
     #[tokio::test]

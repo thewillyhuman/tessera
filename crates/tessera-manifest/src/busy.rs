@@ -15,6 +15,8 @@ use tessera_object::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
 #[derive(Debug, Default)]
 pub struct Busy {
     inner: MemoryStore,
+    /// The reads counted: those of keys that start with this.
+    under: String,
     reading: AtomicUsize,
     most: AtomicUsize,
 }
@@ -28,6 +30,16 @@ impl Busy {
         }
     }
 
+    /// A store over `inner` that counts only the reads of keys that
+    /// start with `under`.
+    pub fn watching(inner: MemoryStore, under: &str) -> Self {
+        Busy {
+            inner,
+            under: under.to_owned(),
+            ..Busy::default()
+        }
+    }
+
     /// The most reads that were in flight at once.
     pub fn most(&self) -> usize {
         self.most.load(Ordering::SeqCst)
@@ -35,7 +47,10 @@ impl Busy {
 
     /// Counts a read as in flight while the caller's turn passes to
     /// whatever else is ready to read.
-    async fn read(&self) {
+    async fn read(&self, key: &Key) {
+        if !key.as_str().starts_with(&self.under) {
+            return;
+        }
         let now = self.reading.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
         tokio::task::yield_now().await;
@@ -46,11 +61,11 @@ impl Busy {
 #[async_trait]
 impl ObjectStore for Busy {
     async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
-        self.read().await;
+        self.read(key).await;
         self.inner.get(key).await
     }
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
-        self.read().await;
+        self.read(key).await;
         self.inner.get_range(key, range).await
     }
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
