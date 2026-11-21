@@ -3,8 +3,13 @@ name: release
 # A tag `v<version>` publishes that version: the container image and
 # the Helm chart, both to the repository's registry, so that the
 # chart's default image is one that exists. The tag must name the
-# version the workspace and the chart carry, and the image is proved
-# on a kind cluster before anything is pushed.
+# version the workspace and the chart carry.
+#
+# Nothing is built here. The image is the one CI built from the tagged
+# commit, proved on a kind cluster and pushed under the commit
+# (ci.yml), published again under the version; a release therefore
+# needs CI to have passed on that commit, and waits for it when the
+# tag is pushed together with the commit.
 
 on:
   push:
@@ -13,6 +18,7 @@ on:
 permissions:
   contents: read
   packages: write
+  actions: read
 
 env:
   REGISTRY: ghcr.io
@@ -37,17 +43,39 @@ jobs:
           done
           {
             echo "VERSION=$version"
+            echo "COMMIT=$(git rev-parse HEAD)"
             echo "IMAGE=$REGISTRY/${GITHUB_REPOSITORY,,}"
             echo "CHARTS=oci://$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/charts"
           } >> "$GITHUB_ENV"
-      - name: build the image and prove it on a cluster
-        run: IMAGE="$IMAGE:$VERSION" deploy/kind/smoke.sh
-      - name: push the image
+      - name: wait for ci to have passed on the commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Every fifteen seconds for half an hour; three minutes for a
+          # run to appear at all, which none does for a commit that was
+          # never the head of a push to main.
+          for attempt in $(seq 1 120); do
+            run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci --commit "$COMMIT" \
+                --event push --limit 1 --json status,conclusion,url \
+                --jq '.[0] // empty | "\(.status) \(.conclusion) \(.url)"')
+            case "$run" in
+              "completed success "*) echo "ci passed: $run"; exit 0 ;;
+              "completed "*) echo "ci did not pass on $COMMIT: $run" >&2; exit 1 ;;
+              "") if [ "$attempt" -gt 12 ]; then
+                    echo "ci never ran on $COMMIT: tag a commit that was pushed to main as its head" >&2
+                    exit 1
+                  fi ;;
+            esac
+            sleep 15
+          done
+          echo "ci did not finish on $COMMIT within half an hour" >&2
+          exit 1
+      - name: publish the image ci proved under the version
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
-          docker push "$IMAGE:$VERSION"
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" "$IMAGE:sha-$COMMIT"
       - name: push the chart
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}

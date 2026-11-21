@@ -265,8 +265,12 @@ every route and over gRPC.
 - **Releases.** A tag `v<version>` on the repository publishes the
   image `ghcr.io/thewillyhuman/tessera:<version>`, which the chart
   uses by default, and the chart itself to
-  `oci://ghcr.io/thewillyhuman/charts`, after the smoke test has
-  passed on that image.
+  `oci://ghcr.io/thewillyhuman/charts`. The image is the one CI built
+  from the tagged commit and passed the smoke test on, so the tag
+  goes on a commit of main whose CI passed, or is pushed with it and
+  waits. Every such commit has its image before any release, as
+  `ghcr.io/thewillyhuman/tessera:sha-<commit>`: run one with
+  `--set image.tag=sha-<commit>`.
 - **Rolling back** to the previous version is safe while no node of
   the new version has written a newer format; the refusal above is
   what tells.
