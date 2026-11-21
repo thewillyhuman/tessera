@@ -315,6 +315,13 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// must not wait a whole request's time for it.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The most a peer's answer may hold. A leaf task answers with its
+/// share of a scan's rows, which the client library's own bound of ten
+/// megabytes soon refuses. Past this one the node that asked reads the
+/// files itself (QE-17), where the query's limits and spilling apply
+/// to what an answer held in memory would escape.
+const MAX_RESPONSE_BYTES: u64 = 256 << 20;
+
 /// The client of the internal routes, over HTTP with bounded timeouts.
 #[derive(Clone, Debug)]
 pub struct HttpRemote {
@@ -416,6 +423,8 @@ impl HttpRemote {
         let status = response.status();
         let bytes = response
             .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
             .read_to_vec()
             .map_err(|e| RemoteError(format!("{url}: unreadable response: {e}")))?;
         if !status.is_success() {
@@ -615,6 +624,35 @@ mod tests {
         assert_eq!(schema_of(&batches, schema.clone()), schema);
         assert!(batches.is_empty());
         assert!(decode(b"not arrow").is_err());
+    }
+
+    /// A leaf task answers with its share of a scan's rows, which is
+    /// soon more than the ten megabytes the client library reads by
+    /// default: refused, the share was read a second time by the node
+    /// that asked.
+    #[test]
+    fn a_peers_answer_past_ten_megabytes_is_read_whole() {
+        use std::io::{Read, Write};
+
+        const SIZE: usize = 12 << 20;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {SIZE}\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(&vec![7u8; SIZE]).unwrap();
+        });
+        let answer = HttpRemote::new()
+            .get(&format!("http://{address}/internal/v1/scan"))
+            .unwrap();
+        peer.join().unwrap();
+        assert_eq!(answer.len(), SIZE);
     }
 
     /// SE-3: with a cluster secret configured, the internal routes take
