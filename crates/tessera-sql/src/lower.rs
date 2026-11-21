@@ -556,11 +556,20 @@ impl TableScope {
 /// The keys of a join, and the time match of an `ASOF JOIN`.
 type JoinCondition = (Vec<(Expr, Expr)>, Option<Asof>);
 
-/// The tables an expression may refer to. With one table its columns
-/// go by their own names; with several, every column is qualified by
-/// its table's name, as a join outputs it (DM-2).
+/// The tables an expression may refer to, in the order the query
+/// names them. With one table its columns go by their own names; with
+/// several, every column is qualified as the joins output it (DM-2):
+/// by its table's name and, before it, by the hidden name of the left
+/// side of every join made after the one that brought the table in.
 struct Scope {
     tables: Vec<TableScope>,
+}
+
+/// The name the rows joined so far go by as the left side of the
+/// `join`th `JOIN` of a query, from the second on; the first has the
+/// first table on its left, under the table's own name.
+fn left_side(join: usize) -> String {
+    format!("__join{join}")
 }
 
 impl Scope {
@@ -582,10 +591,28 @@ impl Scope {
         self.tables.iter().find(|t| t.name == name)
     }
 
+    /// What qualifies the columns of `table` in the plan. The table at
+    /// `index` came in on the right of the `index`th join, or on the
+    /// left of the first, and is under the left side of each join
+    /// after that one, outermost first.
+    fn side(&self, table: &TableScope) -> String {
+        let index = self
+            .tables
+            .iter()
+            .position(|t| t.name == table.name)
+            .unwrap_or_default();
+        let hidden = (index.max(1) + 1..self.tables.len()).rev();
+        hidden
+            .map(left_side)
+            .chain([table.name.clone()])
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
     /// The name `column` of `table` goes by in the plan.
     fn output_name(&self, table: &TableScope, column: &str) -> String {
         if self.qualified() {
-            qualify(&table.name, column)
+            qualify(&self.side(table), column)
         } else {
             column.to_owned()
         }
@@ -596,8 +623,9 @@ impl Scope {
         let (table, column) = if let [table] = self.tables.as_slice() {
             (table, name)
         } else {
-            let (table, column) = name.split_once('.')?;
-            (self.table(table)?, column)
+            self.tables
+                .iter()
+                .find_map(|t| unqualify(&self.side(t), name).map(|column| (t, column)))?
         };
         table
             .schema
@@ -650,13 +678,7 @@ fn lower_query(
     };
     let (table, mut plan) = source(from, ctx, registry, parameters)?;
     let mut scope = Scope::single(table);
-    if let [_, second, ..] = query.joins.as_slice() {
-        return Err(Diagnostic::at(
-            second.table.span,
-            "one JOIN per query is supported",
-        ));
-    }
-    if let Some(join) = query.joins.first() {
+    for (made, join) in query.joins.iter().enumerate() {
         let (right, right_plan) = source(&join.table, ctx, registry, parameters)?;
         if scope.table(&right.name).is_some() {
             return Err(Diagnostic::at(
@@ -667,7 +689,13 @@ fn lower_query(
                 ),
             ));
         }
-        let left_name = scope.tables[0].name.clone();
+        // The rows so far are one side: the first table under its
+        // own name, the output of a join under a hidden one.
+        let left_name = if made == 0 {
+            scope.tables[0].name.clone()
+        } else {
+            left_side(made + 1)
+        };
         let right_name = right.name.clone();
         scope.tables.push(right);
         let lowerer = Lowerer {
@@ -1250,7 +1278,8 @@ impl Lowerer<'_> {
         let plan = self.window_plan(query, plan)?;
         let items = self.select_items(query)?;
         // `*` alone passes the rows through, unless a scalar subquery
-        // added a hidden column that must not come out.
+        // added a hidden column that must not come out, or a join of
+        // joins has the columns under hidden sides, to be renamed.
         let all_columns = query
             .items
             .iter()
@@ -1258,7 +1287,8 @@ impl Lowerer<'_> {
             && self
                 .substitution
                 .as_ref()
-                .is_none_or(|s| s.scalars.is_empty());
+                .is_none_or(|s| s.scalars.is_empty())
+            && self.scope.tables.len() <= 2;
         let mut plan = plan;
         if !query.order_by.is_empty() {
             // Sort over the input, resolving aliases to their expressions,
@@ -1640,8 +1670,15 @@ impl Lowerer<'_> {
                 ast::SelectItem::Wildcard => {
                     for table in &self.scope.tables {
                         for field in table.schema.fields() {
-                            let name = self.scope.output_name(table, field.name());
-                            items.push(NamedExpr::new(Expr::column(&name), name));
+                            let column = self.scope.output_name(table, field.name());
+                            // Shown by its table, whatever sides the
+                            // plan has it under.
+                            let name = if self.scope.qualified() {
+                                qualify(&table.name, field.name())
+                            } else {
+                                column.clone()
+                            };
+                            items.push(NamedExpr::new(Expr::column(&column), name));
                         }
                     }
                 }
@@ -1681,6 +1718,8 @@ impl Lowerer<'_> {
         asof: bool,
     ) -> Result<JoinCondition, Diagnostic> {
         let unsupported = || {
+            // In the query's own names: the left may be a hidden side.
+            let left = self.scope.tables.first().map_or(left, |t| t.name.as_str());
             let message = if asof {
                 format!(
                     "an ASOF JOIN condition is equalities between the two tables and one \
@@ -2915,6 +2954,56 @@ mod tests {
         assert!(message.contains("use one of its views"), "{message}");
     }
 
+    /// Each `JOIN` after the first joins the rows joined so far, as
+    /// one side under a hidden name, with its table; the names a
+    /// query writes stay those of the tables.
+    #[test]
+    fn joins_chain_left_to_right() {
+        let plan = lowered(
+            "SELECT l.body, s.name, e.attr.host FROM logs l \
+             JOIN spans s ON l.trace_id = s.trace_id \
+             LEFT JOIN events e ON e.trace_id = s.trace_id AND e.span_id = l.span_id \
+             WHERE s.duration_ns > 5 AND e.attr.host = 'h1'",
+        );
+        let text = plan.to_string();
+        assert!(
+            text.contains(
+                "Join left: __join2.s.trace_id = e.trace_id AND __join2.l.span_id = e.span_id"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Join inner: l.trace_id = s.trace_id"),
+            "{text}"
+        );
+        assert!(text.contains("__join2.s.duration_ns > 5"), "{text}");
+        assert!(text.contains("e.attr.host"), "{text}");
+        let names: Vec<String> = plan
+            .schema(&Registry::builtin())
+            .unwrap()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, ["body", "name", "attr.host"]);
+
+        let all = lowered(
+            "SELECT * FROM logs l JOIN spans s ON l.trace_id = s.trace_id \
+             JOIN events e ON e.trace_id = l.trace_id",
+        );
+        let names: Vec<String> = all
+            .schema(&Registry::builtin())
+            .unwrap()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(names.contains(&"l.body".to_owned()), "{names:?}");
+        assert!(names.contains(&"s.name".to_owned()), "{names:?}");
+        assert!(names.contains(&"e.trace_id".to_owned()), "{names:?}");
+        assert!(names.iter().all(|n| !n.starts_with("__")), "{names:?}");
+    }
+
     #[test]
     fn join_mistakes_are_diagnosed() {
         let contains = |sql: &str, text: &str| {
@@ -2934,8 +3023,12 @@ mod tests {
             "equalities between the two tables",
         );
         contains(
-            "SELECT * FROM logs l JOIN spans s ON l.trace_id = s.trace_id JOIN events e ON e.trace_id = s.trace_id",
-            "one JOIN per query",
+            "SELECT * FROM logs l JOIN spans s ON l.trace_id = s.trace_id JOIN spans s ON l.trace_id = s.trace_id",
+            "already in the query",
+        );
+        contains(
+            "SELECT * FROM logs l JOIN spans s ON l.trace_id = s.trace_id JOIN events e ON l.trace_id = s.trace_id",
+            "equalities between the two tables",
         );
         contains(
             "SELECT * FROM logs l JOIN spans s ON l.trace_id = s.trace_id WHERE attr.host = 'h1'",

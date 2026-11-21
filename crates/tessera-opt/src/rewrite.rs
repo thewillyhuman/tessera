@@ -952,6 +952,73 @@ mod tests {
         assert!(!right.overflow_whole, "a path reads one attribute");
     }
 
+    /// A query of three tables joins the first two and the result,
+    /// as one side, with the third: what is said of a table of the
+    /// inner join crosses both joins to its scan.
+    #[test]
+    fn predicates_and_columns_cross_a_join_of_joins() {
+        let dataset = DatasetName::new("prod").unwrap();
+        let scan = |k| Plan::Scan(Scan::all(TenantId::DEFAULT, dataset.clone(), k));
+        let keys = || vec![(Expr::column("trace_id"), Expr::column("trace_id"))];
+        let inner = Plan::Join {
+            left: JoinSide::new(scan(Kind::Log), "a"),
+            right: JoinSide::new(scan(Kind::Span), "b"),
+            on: keys(),
+            kind: JoinKind::Inner,
+            asof: None,
+        };
+        let outer = Plan::Join {
+            left: JoinSide::new(inner, "j"),
+            right: JoinSide::new(scan(Kind::Log), "c"),
+            on: vec![(Expr::column("b.trace_id"), Expr::column("trace_id"))],
+            kind: JoinKind::Inner,
+            asof: None,
+        };
+        let path = Expr::Path {
+            path: "j.b.attr.db.statement".into(),
+            data_type: DataType::Utf8,
+        };
+        let plan = outer
+            .filter(
+                Expr::column("j.a.severity_number")
+                    .binary(BinaryOp::GtEq, Expr::literal(17))
+                    .and(path.binary(BinaryOp::Eq, Expr::literal("select 1"))),
+            )
+            .project(vec![NamedExpr::new(Expr::column("c.body"), "body")]);
+        let Plan::Project { input, .. } = rewrite(plan) else {
+            panic!("project")
+        };
+        let Plan::Join { left, right, .. } = *input else {
+            panic!("nothing stays above the outer join")
+        };
+        let Plan::Join {
+            left: a, right: b, ..
+        } = *left.plan
+        else {
+            panic!("nothing stays above the inner join")
+        };
+        let a = scan_of(&a.plan);
+        assert_eq!(a.predicates[0].to_string(), "(severity_number >= 17)");
+        assert_eq!(
+            a.projection.as_deref(),
+            Some(&["trace_id".to_owned(), "severity_number".into()][..])
+        );
+        let b = scan_of(&b.plan);
+        assert_eq!(
+            b.predicates[0].to_string(),
+            "(attr.db.statement = 'select 1')"
+        );
+        assert_eq!(
+            b.projection.as_deref(),
+            Some(&["trace_id".to_owned(), OVERFLOW.into()][..])
+        );
+        let c = scan_of(&right.plan);
+        assert_eq!(
+            c.projection.as_deref(),
+            Some(&["trace_id".to_owned(), "body".into()][..])
+        );
+    }
+
     #[test]
     fn a_left_join_keeps_its_right_predicates_above() {
         let Plan::Project { input, .. } = rewrite(joined(JoinKind::Left)) else {

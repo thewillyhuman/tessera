@@ -55,7 +55,8 @@ lexer, parser and lowering; SQL over HTTP and over the PostgreSQL wire
 protocol; a differential suite against SQLite.
 
 Gaps left in M2: joins are hash joins on equality keys, inner or left,
-one `JOIN` per query, with the build side's keys as a runtime filter on
+any number in a query, each joining the rows so far with one more
+table, with the build side's keys as a runtime filter on
 the other side, and an `ASOF JOIN` pairs each left row with the one
 right row of its keys nearest in time on the side its inequality asks
 for (section 9.2), by binary search over the right rows of each key,

@@ -34,16 +34,35 @@ pub fn unqualify<'a>(name: &str, qualified: &'a str) -> Option<&'a str> {
 
 /// The join side and attribute path of a path written `name.attr.x`:
 /// the part before the scope prefix, or before the pattern id, names
-/// the side. A path with no side, or whose first part is itself a
-/// scope, is not qualified.
+/// the side. Under a join of joins the path has a side for each,
+/// `outer.name.attr.x`, and the outermost is split off: what is left
+/// is the path as that side's rows name it. A path with no side, or
+/// whose first part is itself a scope, is not qualified.
 #[must_use]
 pub fn split_qualifier(path: &str) -> Option<(&str, &str)> {
     let (name, rest) = path.split_once('.')?;
-    let scoped = rest == PATTERN_ID || SCOPES.iter().any(|scope| rest.starts_with(scope));
     let name_is_scope = SCOPES
         .iter()
         .any(|scope| scope.trim_end_matches('.') == name);
-    (scoped && !name_is_scope).then_some((name, rest))
+    if name_is_scope {
+        return None;
+    }
+    let scoped = rest == PATTERN_ID
+        || SCOPES.iter().any(|scope| rest.starts_with(scope))
+        || split_qualifier(rest).is_some();
+    scoped.then_some((name, rest))
+}
+
+/// The overflow column a path reads: that of the side the path is
+/// qualified by, every side of it under a join of joins.
+fn overflow_of(path: &str) -> String {
+    let mut unqualified = path;
+    while let Some((_, rest)) = split_qualifier(unqualified) {
+        unqualified = rest;
+    }
+    // What was split off ends in the dot before the path.
+    let sides = &path[..path.len() - unqualified.len()];
+    format!("{sides}{OVERFLOW}")
 }
 
 /// A constant.
@@ -466,10 +485,7 @@ impl Expr {
             }
             Expr::Path { path, .. } => {
                 // A qualified path reads its own side's overflow.
-                into.insert(match split_qualifier(path) {
-                    Some((side, _)) => qualify(side, OVERFLOW),
-                    None => OVERFLOW.to_owned(),
-                });
+                into.insert(overflow_of(path));
             }
             Expr::Label { .. } => {
                 into.insert(EXTRACTED.to_owned());
@@ -618,6 +634,22 @@ mod tests {
             "a scope is not a side"
         );
         assert_eq!(split_qualifier("attr.n"), None);
+        // A join over a join qualifies twice: the outer side is split
+        // off first, and the path reads the inner side's overflow.
+        assert_eq!(
+            split_qualifier("j.a.attr.n"),
+            Some(("j", "a.attr.n")),
+            "the outer side"
+        );
+        assert_eq!(split_qualifier("j.a.x"), None, "a column, not a path");
+        let nested = Expr::Path {
+            path: "j.a.attr.n".into(),
+            data_type: DataType::Utf8,
+        };
+        assert_eq!(
+            nested.references(),
+            BTreeSet::from(["j.a._overflow".to_owned()])
+        );
         assert_eq!(unqualify("a", "a.attr.n"), Some("attr.n"));
         assert_eq!(unqualify("a", "ab.x"), None);
         let stripped = expr.unqualify("a");

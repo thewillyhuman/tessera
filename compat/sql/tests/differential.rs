@@ -98,6 +98,20 @@ const CASES: &[Case] = &[
         sqlite: "SELECT a.timestamp, b.timestamp, CAST(a.n AS TEXT) FROM logs a JOIN logs b ON a.body = b.body WHERE a.severity_number = 17 AND b.n > 15 ORDER BY a.timestamp, b.timestamp",
     },
     Case {
+        // The third table's keys meet both of the tables before it, and
+        // each table's attributes are read through the joins over it.
+        name: "join of three tables",
+        tessera: "SELECT a.timestamp, b.timestamp, c.timestamp, a.attr.n, c.attr.host FROM logs a JOIN logs b ON a.body = b.body JOIN logs c ON c.body = b.body AND c.severity_number = a.severity_number WHERE a.severity_number = 17 AND b.attr.n > 15 AND c.attr.host = 'h1' ORDER BY a.timestamp, b.timestamp, c.timestamp",
+        sqlite: "SELECT a.timestamp, b.timestamp, c.timestamp, CAST(a.n AS TEXT), c.host FROM logs a JOIN logs b ON a.body = b.body JOIN logs c ON c.body = b.body AND c.severity_number = a.severity_number WHERE a.severity_number = 17 AND b.n > 15 AND c.host = 'h1' ORDER BY a.timestamp, b.timestamp, c.timestamp",
+    },
+    Case {
+        // A row of the first table without a match keeps going, null,
+        // through the join after.
+        name: "left joins in a chain",
+        tessera: "SELECT a.timestamp, count_raw(b.timestamp), count_raw(c.timestamp) FROM logs a LEFT JOIN logs b ON b.body = a.body AND b.attr.host = a.attr.host LEFT JOIN logs c ON c.timestamp = b.timestamp AND c.attr.n = a.attr.n WHERE a.attr.n = 3 GROUP BY a.timestamp ORDER BY a.timestamp",
+        sqlite: "SELECT a.timestamp, count(b.timestamp), count(c.timestamp) FROM logs a LEFT JOIN logs b ON b.body = a.body AND b.host = a.host LEFT JOIN logs c ON c.timestamp = b.timestamp AND c.n = a.n WHERE a.n = 3 GROUP BY a.timestamp ORDER BY a.timestamp",
+    },
+    Case {
         name: "max timestamp per host",
         tessera: "SELECT attr.host AS host, max(timestamp), min(timestamp) FROM logs WHERE attr.host IS NOT NULL GROUP BY attr.host ORDER BY host",
         sqlite: "SELECT host, max(timestamp), min(timestamp) FROM logs WHERE host IS NOT NULL GROUP BY host ORDER BY host",
