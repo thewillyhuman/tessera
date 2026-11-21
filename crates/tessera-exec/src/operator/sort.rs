@@ -303,6 +303,25 @@ impl Iterator for Merged {
     }
 }
 
+/// The rows of `runs`, each ordered on `keys` already, in one order:
+/// the final half of a sort whose shares were ordered where they were
+/// read (QE-14).
+///
+/// # Errors
+///
+/// If a key cannot be evaluated over a run.
+pub(crate) fn merge(
+    runs: Vec<Vec<RecordBatch>>,
+    keys: &[SortKey],
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>, ExecError> {
+    let runs: Vec<Run> = runs
+        .into_iter()
+        .map(|run| Box::new(run.into_iter().map(Ok)) as Run)
+        .collect();
+    Merged::new(runs, keys, schema)?.collect()
+}
+
 /// `rows` ordered by `keys`, at most `limit` of them.
 pub(crate) fn sorted(
     rows: &RecordBatch,

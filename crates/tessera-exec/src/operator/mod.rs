@@ -34,6 +34,7 @@ pub use limit::Limit;
 pub use project::Project;
 pub use range::{RangeVector, Steps};
 pub use sort::Sort;
+pub(crate) use sort::merge as merge_sorted;
 pub use topk::TopK;
 pub use trace::TraceGroup;
 pub use window::Window;

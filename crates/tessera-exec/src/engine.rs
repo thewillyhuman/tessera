@@ -36,6 +36,7 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
 use tessera_ir::{
     Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, Registry,
+    SortKey,
 };
 use tessera_kernels::Grouper;
 use tessera_kernels::promql::Params;
@@ -54,7 +55,8 @@ use crate::exchange::{self, Exchanges};
 use crate::memory::MemoryPool;
 use crate::operator::{
     BuildSide, CollectSink, Extract, Filter, Format, HashAggregate, HashJoin, JoinInput, Limit,
-    Operator, Project, RangeVector, Sort, Steps, TopK, TraceGroup, Window, partitioned,
+    Operator, Project, RangeVector, Sort, Steps, TopK, TraceGroup, Window, merge_sorted,
+    partitioned,
 };
 use crate::pipeline::Pipeline;
 use crate::promql;
@@ -122,8 +124,8 @@ pub struct Analysis {
 /// (QE-14), for `EXPLAIN ANALYZE`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StageAnalysis {
-    /// What was split: `aggregate`, `join`, `trace-group`, `top-k` or
-    /// `limit`.
+    /// What was split: `aggregate`, `join`, `trace-group`, `sort`,
+    /// `top-k` or `limit`.
     pub kind: &'static str,
     /// Partial stages sent to peers.
     pub remote: usize,
@@ -797,10 +799,11 @@ impl Engine {
     }
 
     /// Runs `plan` as a partial stage on the nodes that scan its files
-    /// and a final one here (QE-14), when it is an aggregate, a top-k
-    /// or a limit over one scan and this node has peers: each peer
-    /// returns its share's partial result, this node's share runs here
-    /// with the tail, and the final operator folds them. A peer that
+    /// and a final one here (QE-14), when it is an aggregate, a sort, a
+    /// top-k or a limit over one scan and this node has peers: each
+    /// peer returns its share's partial result, this node's share runs
+    /// here with the tail, and the final operator folds them, a sort's
+    /// by merging the shares each node ordered. A peer that
     /// fails has its share run here. `None` when the plan is not one
     /// to split.
     async fn staged(
@@ -856,7 +859,7 @@ impl Engine {
             kind: stage.kind,
             ..StageAnalysis::default()
         };
-        let (mut batches, producers, mine) = self
+        let (mut runs, producers, mine) = self
             .partial_stages(
                 &partial,
                 split,
@@ -887,19 +890,61 @@ impl Engine {
                 .await?
             }
             _ => {
-                batches.extend(mine);
-                let operator = self.operator(&stage.final_plan, &partial, &grant.memory)?;
-                self.pipe(operator, batches).await?
+                runs.push(mine);
+                if let Plan::Sort { keys, .. } = &stage.final_plan {
+                    self.merge_sorted(&stage.final_plan, &partial, keys, runs, grant)
+                        .await?
+                } else {
+                    let batches = runs.into_iter().flatten().collect();
+                    let operator = self.operator(&stage.final_plan, &partial, &grant.memory)?;
+                    self.pipe(operator, batches).await?
+                }
             }
         };
         analysis.stages.push(report);
         Ok(Some(output))
     }
 
+    /// The final half of a sort stage: `runs`, the shares each ordered
+    /// on `keys` by the node that read it, merged into one order. The
+    /// merge holds every row at once, so it reserves them in the grant
+    /// as the sort it stands for would; when the grant refuses, that
+    /// sort runs over the shares instead, and spills (QE-11).
+    async fn merge_sorted(
+        &self,
+        sort: &Plan,
+        input: &Plan,
+        keys: &[SortKey],
+        runs: Vec<Vec<RecordBatch>>,
+        grant: &Grant,
+    ) -> Result<Vec<RecordBatch>, EngineError> {
+        let Some(schema) = runs.iter().flatten().next().map(RecordBatch::schema) else {
+            return Ok(Vec::new());
+        };
+        let bytes: usize = runs
+            .iter()
+            .flatten()
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        if grant.memory.reserve(bytes).is_err() {
+            let operator = self.operator(sort, input, &grant.memory)?;
+            return self
+                .pipe(operator, runs.into_iter().flatten().collect())
+                .await;
+        }
+        let keys = keys.to_vec();
+        let merged = self
+            .cpu
+            .spawn(move || merge_sorted(runs, &keys, &schema))
+            .await;
+        grant.memory.release(bytes);
+        Ok(merged??)
+    }
+
     /// Runs a stage's partial half over `split`: on each peer over its
     /// share, kept under `exchange` when there is one, and here over
     /// this node's share and the tail; a peer that fails has its share
-    /// run here. Returns the rows the peers returned, the peers that
+    /// run here. Returns the rows each peer returned, the peers that
     /// kept their output with their files, and this node's own rows.
     #[allow(clippy::too_many_arguments)]
     async fn partial_stages(
@@ -916,7 +961,7 @@ impl Engine {
             return Err(unsupported("a partial stage needs peers"));
         };
         let mut local = split.local;
-        let mut batches = Vec::new();
+        let mut runs = Vec::new();
         let mut producers: Vec<(Peer, Vec<FileMeta>)> = Vec::new();
         for (peer, files) in split.remote {
             let task = StageTask {
@@ -932,7 +977,7 @@ impl Engine {
                     if exchange.is_some() {
                         producers.push((peer, task.files));
                     } else {
-                        batches.extend(rows);
+                        runs.push(rows);
                     }
                 }
                 Err(error) => {
@@ -951,7 +996,7 @@ impl Engine {
         let mine = self
             .execute_in(partial, grant, analysis, Some(&share))
             .await?;
-        Ok((batches, producers, mine))
+        Ok((runs, producers, mine))
     }
 
     /// A join whose two sides are fragments over scans runs on the
@@ -1590,11 +1635,11 @@ struct Stage {
     keys: Option<Vec<Expr>>,
 }
 
-/// What a stage's partial half yields: the rows the peers returned,
-/// the peers that kept their output with their files, and this node's
-/// own rows.
+/// What a stage's partial half yields: the rows each peer returned,
+/// one run per peer, the peers that kept their output with their
+/// files, and this node's own rows.
 type PartialOutputs = (
-    Vec<RecordBatch>,
+    Vec<Vec<RecordBatch>>,
     Vec<(Peer, Vec<FileMeta>)>,
     Vec<RecordBatch>,
 );
@@ -1610,8 +1655,9 @@ struct ExchangeInput {
 }
 
 /// How `plan` splits, if it does: an aggregate whose functions merge
-/// becomes a partial and a final aggregate; a top-k or a limit without
-/// an offset is run on every share and once more over the union.
+/// becomes a partial and a final aggregate; a sort is run on every
+/// share and the ordered shares merged; a top-k or a limit without an
+/// offset is run on every share and once more over the union.
 fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
     match plan {
         Plan::Aggregate {
@@ -1645,6 +1691,12 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
                 keys: (!names.is_empty()).then_some(names),
             })
         }
+        Plan::Sort { .. } => Some(Stage {
+            kind: "sort",
+            partial: plan.clone(),
+            final_plan: plan.clone(),
+            keys: None,
+        }),
         Plan::TopK { .. } => Some(Stage {
             kind: "top-k",
             partial: plan.clone(),
@@ -1732,6 +1784,10 @@ fn with_scan(plan: &Plan, scan: &tessera_ir::Scan) -> Plan {
             input: rebuilt(input),
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
+        },
+        Plan::Sort { input, keys } => Plan::Sort {
+            input: rebuilt(input),
+            keys: keys.clone(),
         },
         Plan::TopK {
             input,

@@ -200,8 +200,8 @@ versions (10.8). The three-node test starts a cluster, scales it up,
 loses a node without a word and scales it down, with zero manual
 steps (OP-4).
 
-An aggregate, a top-k or a limit over one scan runs in two stages
-(QE-14): the partial half on each query node that scans its share of
+An aggregate, a sort, a top-k or a limit over one scan runs in two
+stages (QE-14): the partial half on each query node that scans its share of
 the files, over its share alone, and the final half over the partial
 outputs. The partial aggregate ships each group's running state
 (counts and sums, an average's sum and weight, a variance's moments,
@@ -212,6 +212,9 @@ partition per node, and folds one partition fetched from the others
 over the internal routes, the coordinator folding the last, so that
 no node holds every partial output; a top-k, a limit or a keyless
 aggregate folds on the coordinator over one partial output per node.
+A sort orders each share on the node that scans it and the
+coordinator merges the ordered shares, within the query's memory, or
+sorts them through local disk when they do not fit.
 A peer that cannot run its stage has its share run on the
 coordinator, a partition a worker cannot fold is folded there, and a
 kept output that is gone is recomputed there from its files (QE-17);
@@ -226,10 +229,10 @@ are read on the coordinator, every span of those traces is kept by
 the nodes that own the files as an exchange split by trace id, and
 each worker groups the traces of its partition.
 
-Gaps left in M6: sorts without a limit, PromQL evaluation and joins
-over other inputs still run on the coordinator over the rows the leaf
-tasks return, and the outputs of top-k, limit and keyless aggregate
-stages go through the coordinator; there is no object byte
+Gaps left in M6: PromQL evaluation and joins over other inputs
+still run on the coordinator over the rows the leaf tasks return,
+and the outputs of sort, top-k, limit and keyless aggregate stages
+go through the coordinator; there is no object byte
 range cache on local disk because the only stores are a local
 directory and memory; the scale envelope of section 17.2 has not been
 run.

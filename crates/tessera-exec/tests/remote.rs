@@ -5,7 +5,8 @@
 //! are the same either way. A grouped aggregate, a join of two scans
 //! and a trace group fold on the workers over an exchange of their
 //! partial outputs (QE-14), and fold here when a worker or a kept
-//! output is lost.
+//! output is lost. A sort orders each share where it is read and the
+//! ordered shares are merged here.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -586,6 +587,129 @@ async fn top_k_and_limits_split_and_an_aggregate_over_a_limit_does_not() {
         output.analysis.stages
     );
     assert_eq!(remote.stages.lock().unwrap().len(), 2);
+}
+
+/// The rows of `batches` as text, in the order they came.
+fn rows_in_order(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows()).map(|i| {
+                b.columns()
+                    .iter()
+                    .map(|c| arrow::util::display::array_value_to_string(c, i).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+        })
+        .collect()
+}
+
+fn newest_first() -> Plan {
+    let scan = Plan::Scan(Scan::all(TenantId::DEFAULT, dataset(), Kind::Log));
+    let sorted = scan.sort(vec![SortKey::descending(Expr::column("timestamp"))]);
+    optimize(sorted, &Registry::builtin()).unwrap()
+}
+
+/// QE-14: a sort without a limit runs on every share, each node
+/// ordering the rows of its files, and the coordinator merges the
+/// ordered shares: the rows come in the order one node gives them.
+#[tokio::test]
+async fn a_sort_orders_each_share_on_its_node_and_merges_them_here() {
+    let (store, env) = populate().await;
+    let expected = engine(&store, &env).run(&newest_first()).await.unwrap();
+    assert_eq!(expected.num_rows(), 20);
+
+    let remote = PeerEngine::new(engine(&store, &env), false);
+    let engine = engine(&store, &env).with_peers(
+        Arc::new(HalfToPeer { peer: peer() }),
+        Arc::clone(&remote) as Arc<dyn RemoteScan>,
+    );
+    let output = engine.run(&newest_first()).await.unwrap();
+    assert_eq!(
+        rows_in_order(&output.batches),
+        rows_in_order(&expected.batches)
+    );
+    assert_eq!(
+        output.analysis.stages,
+        vec![StageAnalysis {
+            kind: "sort",
+            remote: 1,
+            failed: 0,
+            ..StageAnalysis::default()
+        }]
+    );
+    let stages = remote.stages.lock().unwrap();
+    assert_eq!(stages.len(), 1);
+    assert!(
+        matches!(stages[0].plan, Plan::Sort { .. }),
+        "{}",
+        stages[0].plan
+    );
+    assert!(
+        remote.tasks.lock().unwrap().is_empty(),
+        "no plain leaf task"
+    );
+}
+
+/// QE-14, QE-17: a peer that cannot sort its share has it sorted on
+/// the coordinator, and the order does not change.
+#[tokio::test]
+async fn a_failing_peer_has_its_share_sorted_here() {
+    let (store, env) = populate().await;
+    let expected = engine(&store, &env).run(&newest_first()).await.unwrap();
+    let remote = PeerEngine::new(engine(&store, &env), true);
+    let engine = engine(&store, &env).with_peers(
+        Arc::new(HalfToPeer { peer: peer() }),
+        Arc::clone(&remote) as Arc<dyn RemoteScan>,
+    );
+    let output = engine.run(&newest_first()).await.unwrap();
+    assert_eq!(
+        rows_in_order(&output.batches),
+        rows_in_order(&expected.batches)
+    );
+    assert_eq!(output.analysis.stages[0].failed, 1);
+}
+
+/// QE-11, QE-18: the merge of a sort's shares holds every row at once
+/// and counts them against the query's memory; past it the shares are
+/// sorted through the disk instead, in the same order.
+#[tokio::test]
+async fn a_sort_past_its_memory_merges_its_shares_through_the_disk() {
+    let (store, env) = populate().await;
+    let alone = engine(&store, &env);
+    let expected = alone.run(&newest_first()).await.unwrap();
+    // Room for every row in one batch, as one node returns them, but
+    // not for the two shares apart, each a batch of its own.
+    let whole: usize = expected
+        .batches
+        .iter()
+        .map(RecordBatch::get_array_memory_size)
+        .sum();
+
+    let dir = std::env::temp_dir().join(format!("tessera-remote-sort-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let remote = PeerEngine::new(engine(&store, &env), false);
+    let engine = engine(&store, &env).with_spill_dir(dir.clone()).with_peers(
+        Arc::new(HalfToPeer { peer: peer() }),
+        Arc::clone(&remote) as Arc<dyn RemoteScan>,
+    );
+    let limits = QueryLimits {
+        memory_bytes: whole,
+        ..QueryLimits::default()
+    };
+    let output = engine.run_with(&newest_first(), &limits).await.unwrap();
+    assert_eq!(
+        rows_in_order(&output.batches),
+        rows_in_order(&expected.batches)
+    );
+    assert_eq!(output.analysis.stages[0].kind, "sort");
+    assert!(output.analysis.spilled_bytes > 0, "the shares did not fit");
+    assert!(
+        std::fs::read_dir(&dir).unwrap().next().is_none(),
+        "spill files are removed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// QE-14: with a transport that keeps stage outputs, a grouped
