@@ -6,7 +6,7 @@
 //! predicates (`=`, `<>`, `<`, `<=`, `>`, `>=`, `LIKE`, `ILIKE`, `IN`,
 //! `BETWEEN`, `IS NULL`), `+ -`, `* / %`, unary `-`, `::` casts.
 
-use tessera_ir::{Diagnostic, Span};
+use tessera_ir::{Diagnostic, Frame, FrameBound, Span};
 
 use crate::ast::{
     BinaryOp, Count, CreateAlert, CreateRetentionPolicy, CreateRollup, Expr, ExprKind, Join,
@@ -1010,8 +1010,8 @@ impl Parser<'_> {
         })
     }
 
-    /// `OVER ([PARTITION BY exprs] [ORDER BY items])` after the call
-    /// of `function` on `args`, which it makes a window function.
+    /// `OVER ([PARTITION BY exprs] [ORDER BY items] [frame])` after the
+    /// call of `function` on `args`, which it makes a window function.
     fn over(
         &mut self,
         function: String,
@@ -1030,6 +1030,7 @@ impl Parser<'_> {
             }
         }
         let order_by = self.order_by()?;
+        let frame = self.frame()?;
         let end = self.expect_symbol(")")?;
         Ok(Expr {
             kind: ExprKind::Window {
@@ -1038,8 +1039,71 @@ impl Parser<'_> {
                 wildcard,
                 partition_by,
                 order_by,
+                frame,
             },
             span: Span::new(start.start, end.end),
+        })
+    }
+
+    /// The frame of a window: `ROWS BETWEEN bound AND bound`, or `ROWS
+    /// bound` for one that ends at the current row; none when the
+    /// window names no frame. A frame counts rows: `RANGE` and
+    /// `GROUPS`, which count peers, are refused.
+    fn frame(&mut self) -> Result<Option<Frame>, Diagnostic> {
+        let span = self.span_here();
+        if self.is_keyword("range") || self.is_keyword("groups") {
+            return Err(Diagnostic::at(
+                span,
+                "a frame counts ROWS: RANGE and GROUPS frames are not supported",
+            ));
+        }
+        if !self.eat_keyword("rows") {
+            return Ok(None);
+        }
+        let (start, end) = if self.eat_keyword("between") {
+            let start = self.frame_bound()?;
+            self.expect_keyword("and")?;
+            (start, self.frame_bound()?)
+        } else {
+            (self.frame_bound()?, FrameBound::CurrentRow)
+        };
+        Frame::new(start, end)
+            .map(Some)
+            .map_err(|e| Diagnostic::at(span, e.to_string()))
+    }
+
+    /// One end of a frame: `UNBOUNDED PRECEDING`, `n PRECEDING`,
+    /// `CURRENT ROW`, `n FOLLOWING` or `UNBOUNDED FOLLOWING`.
+    fn frame_bound(&mut self) -> Result<FrameBound, Diagnostic> {
+        if self.eat_keyword("current") {
+            self.expect_keyword("row")?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        let rows = if self.eat_keyword("unbounded") {
+            None
+        } else {
+            let Some(Spanned {
+                token: Token::Number(n),
+                span,
+            }) = self.peek()
+            else {
+                return Err(self.unexpected("expected UNBOUNDED, CURRENT ROW or a number of rows"));
+            };
+            let rows = n.parse::<u64>().map_err(|_| {
+                Diagnostic::at(*span, format!("expected a whole number of rows, found {n}"))
+            })?;
+            self.at += 1;
+            Some(rows)
+        };
+        let preceding = self.eat_keyword("preceding");
+        if !preceding {
+            self.expect_keyword("following")?;
+        }
+        Ok(match (rows, preceding) {
+            (None, true) => FrameBound::UnboundedPreceding,
+            (None, false) => FrameBound::UnboundedFollowing,
+            (Some(rows), true) => FrameBound::Preceding(rows),
+            (Some(rows), false) => FrameBound::Following(rows),
         })
     }
 
@@ -1640,6 +1704,7 @@ mod tests {
             wildcard,
             partition_by,
             order_by,
+            ..
         } = &expr.kind
         else {
             panic!("not a window: {expr:?}");
@@ -1663,6 +1728,62 @@ mod tests {
             } if partition_by.is_empty() && order_by.is_empty()
         ));
         assert!(parse("SELECT count(*) OVER FROM logs").is_err());
+    }
+
+    /// QE-20: a window may name its frame in rows, between two bounds
+    /// or from one bound to the current row.
+    #[test]
+    fn a_window_takes_a_frame_in_rows() {
+        let frame_of = |over: &str| {
+            let q = query(&format!(
+                "SELECT sum(severity_number) OVER ({over}) FROM logs"
+            ));
+            let SelectItem::Expr { expr, .. } = &q.items[0] else {
+                panic!("not an expression");
+            };
+            let ExprKind::Window { frame, .. } = &expr.kind else {
+                panic!("not a window: {expr:?}");
+            };
+            *frame
+        };
+        let frame = |start, end| Some(Frame::new(start, end).unwrap());
+        assert_eq!(frame_of("ORDER BY timestamp"), None);
+        assert_eq!(
+            frame_of("ORDER BY timestamp ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"),
+            frame(FrameBound::Preceding(2), FrameBound::CurrentRow)
+        );
+        assert_eq!(
+            frame_of("PARTITION BY body rows between unbounded preceding and 1 following"),
+            frame(FrameBound::UnboundedPreceding, FrameBound::Following(1))
+        );
+        assert_eq!(
+            frame_of("ORDER BY timestamp ROWS 3 PRECEDING"),
+            frame(FrameBound::Preceding(3), FrameBound::CurrentRow)
+        );
+        assert_eq!(
+            frame_of("ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"),
+            frame(FrameBound::CurrentRow, FrameBound::UnboundedFollowing)
+        );
+        let refused = |over: &str, text: &str| {
+            let sql = format!("SELECT sum(severity_number) OVER ({over}) FROM logs");
+            let message = parse(&sql).unwrap_err().to_string();
+            assert!(message.contains(text), "{message}");
+        };
+        refused(
+            "ORDER BY timestamp RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+            "RANGE and GROUPS frames are not supported",
+        );
+        refused(
+            "ROWS BETWEEN CURRENT ROW AND 1 PRECEDING",
+            "cannot start at",
+        );
+        refused("ROWS BETWEEN 1.5 PRECEDING AND CURRENT ROW", "whole number");
+        refused(
+            "ROWS BETWEEN PRECEDING AND CURRENT ROW",
+            "expected UNBOUNDED",
+        );
+        refused("ROWS BETWEEN 1 PRECEDING", "expected AND");
+        refused("ROWS 1", "expected FOLLOWING");
     }
 
     /// `(SELECT ...)` in an expression is a scalar subquery.

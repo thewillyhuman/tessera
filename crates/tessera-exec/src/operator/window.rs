@@ -10,9 +10,13 @@
 //! run is cut into partitions, each held whole while its columns are
 //! computed, since a lead or a last value looks ahead. With an order a
 //! row's frame is the rows up to its last peer, the default frame of
-//! SQL; without one it is the whole partition. An aggregate runs
-//! through the accumulator the group-by uses, fed one peer group at a
-//! time and read after each.
+//! SQL; without one it is the whole partition. A function may name
+//! its frame in rows instead, counted from the row whatever its
+//! peers. An aggregate runs through the accumulator the group-by
+//! uses: fed the rows as the frames reach them and read after each
+//! while the frames only grow, and with each row's frame as a group
+//! of its own when they move at both ends, which costs the frame's
+//! length per row.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -23,8 +27,8 @@ use arrow::array::{
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{concat, concat_batches, partition, take};
 use arrow::datatypes::SchemaRef;
-use tessera_ir::{Expr, Literal, Registry, SortKey, WindowExpr, WindowFunction};
-use tessera_kernels::{accumulator, evaluate};
+use tessera_ir::{Expr, Frame, FrameBound, Literal, Registry, SortKey, WindowExpr, WindowFunction};
+use tessera_kernels::{Accumulator, accumulator, evaluate};
 use tessera_types::event::SAMPLE_RATE;
 
 use crate::ExecError;
@@ -175,32 +179,36 @@ impl Window {
             WindowFunction::Lag => shifted(window, &value(0)?, false)?,
             WindowFunction::Lead => shifted(window, &value(0)?, true)?,
             WindowFunction::FirstValue => {
-                let indices = UInt32Array::from(vec![0; rows.num_rows()]);
-                take(&value(0)?, &indices, None)?
+                let frames = frames(window.frame.as_ref(), peers, rows.num_rows());
+                at_frames(&value(0)?, &frames, |rows| rows.start)?
             }
             WindowFunction::LastValue => {
-                let last_peer =
-                    |range: &Range<usize>| u32::try_from(range.end - 1).unwrap_or(u32::MAX);
-                let indices: UInt32Array = peers
-                    .iter()
-                    .flat_map(|range| std::iter::repeat_n(last_peer(range), range.len()))
-                    .collect();
-                take(&value(0)?, &indices, None)?
+                let frames = frames(window.frame.as_ref(), peers, rows.num_rows());
+                at_frames(&value(0)?, &frames, |rows| rows.end - 1)?
             }
-            WindowFunction::Aggregate(name) => self.aggregated(name, window, rows, peers)?,
+            WindowFunction::Aggregate(name) => {
+                let input = self.aggregate_input(name, window, rows)?;
+                let frames = frames(window.frame.as_ref(), peers, rows.num_rows());
+                let grows = window
+                    .frame
+                    .is_none_or(|frame| frame.start == FrameBound::UnboundedPreceding);
+                if grows {
+                    input.growing(&frames)?
+                } else {
+                    input.moving(&frames)?
+                }
+            }
         })
     }
 
-    /// The aggregate over every row's frame: the accumulator is fed one
-    /// peer group at a time and read after each, so that a row sees the
-    /// rows up to its last peer.
-    fn aggregated(
+    /// What the aggregate `name` of `window` reads of the partition
+    /// `rows`.
+    fn aggregate_input(
         &self,
         name: &str,
         window: &WindowExpr,
         rows: &RecordBatch,
-        peers: &[Range<usize>],
-    ) -> Result<ArrayRef, ExecError> {
+    ) -> Result<AggregateInput, ExecError> {
         let value = window
             .args
             .first()
@@ -215,7 +223,6 @@ impl Window {
                 _ => None,
             })
             .collect();
-        let mut accumulator = accumulator(name, value.as_ref().map(Array::data_type), &parameters)?;
         let weighted = self.weighted
             && Registry::builtin()
                 .aggregate(name)
@@ -226,24 +233,141 @@ impl Window {
         } else {
             None
         };
-        let mut pieces: Vec<ArrayRef> = Vec::with_capacity(peers.len());
-        for range in peers {
-            let groups = vec![0; range.len()];
-            let values = value.as_ref().map(|v| v.slice(range.start, range.len()));
-            let rates = sample_rates
+        Ok(AggregateInput {
+            name: name.to_owned(),
+            value,
+            parameters,
+            sample_rates,
+        })
+    }
+}
+
+/// What an aggregate window function reads of one partition: its
+/// argument over the partition's rows, its constant parameters and,
+/// when it is weighted, the rows' sample rates (QE-13).
+struct AggregateInput {
+    name: String,
+    value: Option<ArrayRef>,
+    parameters: Vec<Literal>,
+    sample_rates: Option<Float64Array>,
+}
+
+/// How many rows of frames one accumulator is fed at a time when
+/// each row's frame is its own group, which bounds what is held.
+const FRAME_ROWS: usize = 64 * 1024;
+
+impl AggregateInput {
+    /// A fresh accumulator of the function, the one the group-by uses.
+    fn accumulator(&self) -> Result<Box<dyn Accumulator>, ExecError> {
+        Ok(accumulator(
+            &self.name,
+            self.value.as_ref().map(Array::data_type),
+            &self.parameters,
+        )?)
+    }
+
+    /// The aggregate of every row over its frame, where the frames
+    /// start at the partition's first row and never shrink: one
+    /// accumulator is fed the rows as the frames reach them and read
+    /// whenever a frame has grown.
+    fn growing(&self, frames: &[Range<usize>]) -> Result<ArrayRef, ExecError> {
+        let mut accumulator = self.accumulator()?;
+        let mut fed = 0;
+        let mut results: Vec<ArrayRef> = Vec::new();
+        let mut result_of = Vec::with_capacity(frames.len());
+        for frame in frames {
+            if frame.end > fed || results.is_empty() {
+                let rows = fed..frame.end.max(fed);
+                let groups = vec![0; rows.len()];
+                let values = self.value.as_ref().map(|v| v.slice(rows.start, rows.len()));
+                let rates = self
+                    .sample_rates
+                    .as_ref()
+                    .map(|r| r.slice(rows.start, rows.len()));
+                accumulator.update(&groups, values.as_ref(), rates.as_ref())?;
+                fed = rows.end;
+                results.push(accumulator.finish(1)?);
+            }
+            result_of.push(u32::try_from(results.len() - 1).unwrap_or(u32::MAX));
+        }
+        let results: Vec<&dyn Array> = results.iter().map(AsRef::as_ref).collect();
+        if results.is_empty() {
+            return Ok(self.accumulator()?.finish(0)?);
+        }
+        Ok(take(
+            &concat(&results)?,
+            &UInt32Array::from(result_of),
+            None,
+        )?)
+    }
+
+    /// The aggregate of every row over its frame, where the frames
+    /// move at both ends: each row's frame is a group of its own, a
+    /// run of rows at a time.
+    fn moving(&self, frames: &[Range<usize>]) -> Result<ArrayRef, ExecError> {
+        let index = |row: usize| u32::try_from(row).unwrap_or(u32::MAX);
+        let mut pieces: Vec<ArrayRef> = Vec::new();
+        let mut row = 0;
+        while row < frames.len() {
+            let first = row;
+            let mut groups: Vec<u32> = Vec::new();
+            let mut rows: Vec<u32> = Vec::new();
+            while row < frames.len() && (rows.len() < FRAME_ROWS || row == first) {
+                let frame = frames[row].clone();
+                groups.extend(std::iter::repeat_n(index(row - first), frame.len()));
+                rows.extend(frame.map(index));
+                row += 1;
+            }
+            let rows = UInt32Array::from(rows);
+            let values = self
+                .value
                 .as_ref()
-                .map(|r| r.slice(range.start, range.len()));
+                .map(|v| take(v, &rows, None))
+                .transpose()?;
+            let rates = match &self.sample_rates {
+                Some(rates) => take(rates, &rows, None)?
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .cloned(),
+                None => None,
+            };
+            let mut accumulator = self.accumulator()?;
             accumulator.update(&groups, values.as_ref(), rates.as_ref())?;
-            let so_far = accumulator.finish(1)?;
-            pieces.push(take(
-                &so_far,
-                &UInt32Array::from(vec![0; range.len()]),
-                None,
-            )?);
+            pieces.push(accumulator.finish(row - first)?);
+        }
+        if pieces.is_empty() {
+            return Ok(self.accumulator()?.finish(0)?);
         }
         let pieces: Vec<&dyn Array> = pieces.iter().map(AsRef::as_ref).collect();
         Ok(concat(&pieces)?)
     }
+}
+
+/// The rows each row of a partition of `length` rows is computed
+/// over: its `frame` when the function names one, else the rows up to
+/// its last peer, which without an order is the whole partition.
+fn frames(frame: Option<&Frame>, peers: &[Range<usize>], length: usize) -> Vec<Range<usize>> {
+    match frame {
+        Some(frame) => (0..length).map(|row| frame.rows(row, length)).collect(),
+        None => peers
+            .iter()
+            .flat_map(|peers| std::iter::repeat_n(0..peers.end, peers.len()))
+            .collect(),
+    }
+}
+
+/// The value at one row of every row's frame, the row `pick` chooses
+/// of the frame's rows: null where the frame is empty.
+fn at_frames(
+    value: &ArrayRef,
+    frames: &[Range<usize>],
+    pick: impl Fn(&Range<usize>) -> usize,
+) -> Result<ArrayRef, ExecError> {
+    let indices: UInt32Array = frames
+        .iter()
+        .map(|rows| (!rows.is_empty()).then(|| u32::try_from(pick(rows)).unwrap_or(u32::MAX)))
+        .collect();
+    Ok(take(value, &indices, None)?)
 }
 
 /// Whether the one-row partition keys `a` and `b` are equal, nulls
@@ -341,7 +465,20 @@ mod tests {
         WindowExpr {
             function,
             args,
+            frame: None,
             name: name.into(),
+        }
+    }
+
+    fn framed(
+        function: WindowFunction,
+        args: Vec<Expr>,
+        (start, end): (FrameBound, FrameBound),
+        name: &str,
+    ) -> WindowExpr {
+        WindowExpr {
+            frame: Some(Frame::new(start, end).unwrap()),
+            ..self::function(function, args, name)
         }
     }
 
@@ -458,6 +595,151 @@ mod tests {
         );
         assert_eq!(
             floats(&out, "total"),
+            [1.0, 2.0, 1.0, 2.0, 1.0, 2.0].map(Some)
+        );
+    }
+
+    /// QE-20: a frame in rows moves with the row. Over times 1 to 6
+    /// with severities 0, 10, 20, 0, 10, 20: the sum of a row and the
+    /// one before, the count of the rows from two before to one
+    /// before, none for the first row, the running sum, the sum of
+    /// the whole partition, and the first and last rows of a frame of
+    /// three centred on the row.
+    #[test]
+    fn a_frame_in_rows_moves_with_the_row() {
+        use FrameBound::{
+            CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding,
+        };
+        let severity = || vec![Expr::column("severity_number")];
+        let sum = || WindowFunction::Aggregate("sum".into());
+        let timestamp = DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None);
+        let mut window = Window::new(
+            Vec::new(),
+            vec![SortKey::ascending(Expr::column("timestamp"))],
+            vec![
+                framed(sum(), severity(), (Preceding(1), CurrentRow), "moving"),
+                framed(
+                    WindowFunction::Aggregate("count".into()),
+                    Vec::new(),
+                    (Preceding(2), Preceding(1)),
+                    "before",
+                ),
+                framed(
+                    sum(),
+                    severity(),
+                    (UnboundedPreceding, CurrentRow),
+                    "running",
+                ),
+                framed(
+                    sum(),
+                    severity(),
+                    (UnboundedPreceding, UnboundedFollowing),
+                    "whole",
+                ),
+                framed(
+                    WindowFunction::FirstValue,
+                    vec![Expr::column("timestamp")],
+                    (Preceding(1), Following(1)),
+                    "first",
+                ),
+                framed(
+                    WindowFunction::LastValue,
+                    vec![Expr::column("timestamp")],
+                    (Preceding(1), Following(1)),
+                    "last",
+                ),
+                framed(
+                    WindowFunction::LastValue,
+                    vec![Expr::column("timestamp")],
+                    (Following(2), Following(3)),
+                    "ahead",
+                ),
+            ],
+            schema(),
+            output(&[
+                ("moving", DataType::Float64),
+                ("before", DataType::Float64),
+                ("running", DataType::Float64),
+                ("whole", DataType::Float64),
+                ("first", timestamp.clone()),
+                ("last", timestamp.clone()),
+                ("ahead", timestamp),
+            ]),
+            MemoryPool::unbounded(),
+        );
+        let out = run(&mut window, input());
+        assert_eq!(ints(&out, "timestamp"), [1, 2, 3, 4, 5, 6].map(Some));
+        assert_eq!(
+            floats(&out, "moving"),
+            [0.0, 10.0, 30.0, 20.0, 10.0, 30.0].map(Some)
+        );
+        assert_eq!(
+            floats(&out, "before"),
+            [0.0, 1.0, 2.0, 2.0, 2.0, 2.0].map(Some)
+        );
+        assert_eq!(
+            floats(&out, "running"),
+            [0.0, 10.0, 30.0, 30.0, 40.0, 60.0].map(Some)
+        );
+        assert_eq!(floats(&out, "whole"), [60.0; 6].map(Some));
+        assert_eq!(ints(&out, "first"), [1, 1, 2, 3, 4, 5].map(Some));
+        assert_eq!(ints(&out, "last"), [2, 3, 4, 5, 6, 6].map(Some));
+        assert_eq!(
+            ints(&out, "ahead"),
+            [Some(4), Some(5), Some(6), Some(6), None, None],
+            "a frame past the partition is empty"
+        );
+    }
+
+    /// A frame counts rows, not peers: two rows equal in the order
+    /// keys share the default frame and differ under `ROWS`. Frames
+    /// stay within their partition.
+    #[test]
+    fn a_frame_in_rows_tells_peers_apart_and_stays_in_its_partition() {
+        use FrameBound::{CurrentRow, Preceding, UnboundedPreceding};
+        let count = || WindowFunction::Aggregate("count".into());
+        let mut window = Window::new(
+            Vec::new(),
+            vec![SortKey::ascending(Expr::column("severity_number"))],
+            vec![
+                function(count(), Vec::new(), "peers"),
+                framed(
+                    count(),
+                    Vec::new(),
+                    (UnboundedPreceding, CurrentRow),
+                    "rows",
+                ),
+            ],
+            schema(),
+            output(&[("peers", DataType::Float64), ("rows", DataType::Float64)]),
+            MemoryPool::unbounded(),
+        );
+        let out = run(&mut window, input());
+        assert_eq!(
+            floats(&out, "peers"),
+            [2.0, 2.0, 4.0, 4.0, 6.0, 6.0].map(Some)
+        );
+        assert_eq!(
+            floats(&out, "rows"),
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0].map(Some)
+        );
+
+        let mut window = Window::new(
+            vec![Expr::column("severity_number")],
+            vec![SortKey::ascending(Expr::column("timestamp"))],
+            vec![framed(
+                count(),
+                Vec::new(),
+                (Preceding(5), CurrentRow),
+                "rows",
+            )],
+            schema(),
+            output(&[("rows", DataType::Float64)]),
+            MemoryPool::unbounded(),
+        );
+        let out = run(&mut window, input());
+        assert_eq!(
+            floats(&out, "rows"),
             [1.0, 2.0, 1.0, 2.0, 1.0, 2.0].map(Some)
         );
     }

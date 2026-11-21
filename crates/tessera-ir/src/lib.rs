@@ -33,9 +33,10 @@ pub use frontend::{
 };
 pub use function::{AggregateFunction, Registry, ScalarFunction};
 pub use plan::{
-    AggregateExpr, Asof, AsofMatch, ExtractStage, JoinKind, JoinSide, NamedExpr, PathColumn, Plan,
-    PlanError, RangeFunction, Scan, SeriesGrouping, SortKey, VALUE, WindowExpr, WindowFunction,
-    aggregate_state_types, promql_schema, range_vector_schema, state_column, window_type,
+    AggregateExpr, Asof, AsofMatch, ExtractStage, Frame, FrameBound, JoinKind, JoinSide, NamedExpr,
+    PathColumn, Plan, PlanError, RangeFunction, Scan, SeriesGrouping, SortKey, VALUE, WindowExpr,
+    WindowFunction, aggregate_state_types, promql_schema, range_vector_schema, state_column,
+    window_type,
 };
 pub use promql::{Group, LOOKBACK, Matching, PromAggregate, PromExpr, PromOp};
 pub use system::{log_patterns_schema, system_table_schema, usage_schema};

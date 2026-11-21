@@ -264,6 +264,16 @@ impl WindowFunction {
         })
     }
 
+    /// Whether the function is computed over a frame, and so may be
+    /// given one: the numbering functions and the offsets are not.
+    #[must_use]
+    pub fn takes_frame(&self) -> bool {
+        matches!(
+            self,
+            WindowFunction::FirstValue | WindowFunction::LastValue | WindowFunction::Aggregate(_)
+        )
+    }
+
     /// The function's name as written.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -280,6 +290,104 @@ impl WindowFunction {
     }
 }
 
+/// One end of a window frame: a row of the partition, counted from
+/// the row the frame is of in the window's order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum FrameBound {
+    /// `UNBOUNDED PRECEDING`: the partition's first row.
+    UnboundedPreceding,
+    /// `n PRECEDING`: the row `n` rows before.
+    Preceding(u64),
+    /// `CURRENT ROW`.
+    CurrentRow,
+    /// `n FOLLOWING`: the row `n` rows after.
+    Following(u64),
+    /// `UNBOUNDED FOLLOWING`: the partition's last row.
+    UnboundedFollowing,
+}
+
+impl FrameBound {
+    /// Where the bound stands among the five kinds, earliest first.
+    fn rank(self) -> u8 {
+        match self {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::Preceding(_) => 1,
+            FrameBound::CurrentRow => 2,
+            FrameBound::Following(_) => 3,
+            FrameBound::UnboundedFollowing => 4,
+        }
+    }
+}
+
+impl fmt::Display for FrameBound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrameBound::UnboundedPreceding => f.write_str("UNBOUNDED PRECEDING"),
+            FrameBound::Preceding(rows) => write!(f, "{rows} PRECEDING"),
+            FrameBound::CurrentRow => f.write_str("CURRENT ROW"),
+            FrameBound::Following(rows) => write!(f, "{rows} FOLLOWING"),
+            FrameBound::UnboundedFollowing => f.write_str("UNBOUNDED FOLLOWING"),
+        }
+    }
+}
+
+/// `ROWS BETWEEN start AND end`: the rows of its partition that a
+/// row's aggregate, first value or last value is taken over, counted
+/// by position in the window's order, whatever their peers (QE-20).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Frame {
+    /// The first row of the frame.
+    pub start: FrameBound,
+    /// The last row of the frame.
+    pub end: FrameBound,
+}
+
+impl Frame {
+    /// The frame from `start` to `end`.
+    ///
+    /// # Errors
+    ///
+    /// `Window` when the frame starts after it ends by the kind of its
+    /// bounds, as one from the current row to a row before it does.
+    pub fn new(start: FrameBound, end: FrameBound) -> Result<Self, PlanError> {
+        if start.rank() > end.rank() {
+            return Err(PlanError::Window(format!(
+                "a frame cannot start at {start} and end at {end}"
+            )));
+        }
+        Ok(Frame { start, end })
+    }
+
+    /// The rows the frame of row `row` holds, of a partition of
+    /// `length` rows; empty when the frame lies outside the partition.
+    #[must_use]
+    pub fn rows(&self, row: usize, length: usize) -> std::ops::Range<usize> {
+        let rows = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        let start = match self.start {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::Preceding(n) => row.saturating_sub(rows(n)),
+            FrameBound::CurrentRow => row,
+            FrameBound::Following(n) => row.saturating_add(rows(n)),
+            FrameBound::UnboundedFollowing => length,
+        };
+        let end = match self.end {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::Preceding(n) => (row + 1).saturating_sub(rows(n)),
+            FrameBound::CurrentRow => row + 1,
+            FrameBound::Following(n) => (row + 1).saturating_add(rows(n)),
+            FrameBound::UnboundedFollowing => length,
+        };
+        let end = end.min(length);
+        start.min(end)..end
+    }
+}
+
+impl fmt::Display for Frame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ROWS BETWEEN {} AND {}", self.start, self.end)
+    }
+}
+
 /// One window function of a `Window` node, with the column it outputs.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct WindowExpr {
@@ -290,6 +398,10 @@ pub struct WindowExpr {
     /// offset and the default, as literals; none for the numbering
     /// functions and `count(*)`.
     pub args: Vec<Expr>,
+    /// The frame an aggregate, `first_value` or `last_value` is taken
+    /// over; none for the default, the rows up to the row's last peer.
+    #[serde(default)]
+    pub frame: Option<Frame>,
     /// The output column name.
     pub name: String,
 }
@@ -297,13 +409,11 @@ pub struct WindowExpr {
 impl fmt::Display for WindowExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let args: Vec<String> = self.args.iter().map(ToString::to_string).collect();
-        write!(
-            f,
-            "{}({}) AS {}",
-            self.function.name(),
-            args.join(", "),
-            self.name
-        )
+        write!(f, "{}({})", self.function.name(), args.join(", "))?;
+        if let Some(frame) = &self.frame {
+            write!(f, " {frame}")?;
+        }
+        write!(f, " AS {}", self.name)
     }
 }
 
@@ -1500,6 +1610,9 @@ pub fn window_type(
     registry: &Registry,
 ) -> Result<DataType, PlanError> {
     let misuse = |message: &str| PlanError::Window(format!("{} {message}", window.function.name()));
+    if window.frame.is_some() && !window.function.takes_frame() {
+        return Err(misuse("takes no frame: it is not computed over one"));
+    }
     match &window.function {
         WindowFunction::RowNumber | WindowFunction::Rank | WindowFunction::DenseRank => {
             if window.args.is_empty() {
@@ -1787,6 +1900,69 @@ mod tests {
         assert_eq!(AsofMatch::Before.op(), BinaryOp::Gt);
     }
 
+    /// QE-20: a frame is the rows between its bounds, counted from
+    /// the row and cut at the partition's ends.
+    #[test]
+    fn a_frame_is_the_rows_between_its_bounds() {
+        use FrameBound::{
+            CurrentRow, Following, Preceding, UnboundedFollowing, UnboundedPreceding,
+        };
+        let rows = |start, end, row| Frame::new(start, end).unwrap().rows(row, 10);
+        assert_eq!(rows(Preceding(2), CurrentRow, 5), 3..6);
+        assert_eq!(rows(Preceding(2), CurrentRow, 1), 0..2, "cut at the start");
+        assert_eq!(rows(Preceding(1), Following(1), 9), 8..10, "cut at the end");
+        assert_eq!(rows(UnboundedPreceding, CurrentRow, 4), 0..5);
+        assert_eq!(rows(CurrentRow, UnboundedFollowing, 4), 4..10);
+        assert_eq!(rows(UnboundedPreceding, UnboundedFollowing, 4), 0..10);
+        assert!(
+            rows(Preceding(3), Preceding(1), 0).is_empty(),
+            "before the partition"
+        );
+        assert_eq!(rows(Preceding(3), Preceding(1), 5), 2..5);
+        assert!(
+            rows(Following(2), Following(4), 9).is_empty(),
+            "after the partition"
+        );
+        assert!(
+            rows(Preceding(1), Preceding(3), 5).is_empty(),
+            "ends before it starts"
+        );
+
+        let backwards = Frame::new(CurrentRow, Preceding(1)).unwrap_err();
+        assert!(backwards.to_string().contains("CURRENT ROW"), "{backwards}");
+        assert!(Frame::new(UnboundedFollowing, UnboundedFollowing).is_ok());
+        assert_eq!(
+            Frame::new(Preceding(2), CurrentRow).unwrap().to_string(),
+            "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW"
+        );
+    }
+
+    /// QE-20: only what is computed over a frame takes one.
+    #[test]
+    fn a_frame_is_refused_where_it_means_nothing() {
+        let frame = Frame::new(FrameBound::Preceding(1), FrameBound::CurrentRow).unwrap();
+        let framed = |function, args| WindowExpr {
+            function,
+            args,
+            frame: Some(frame),
+            name: "w".into(),
+        };
+        let input = Plan::Scan(scan()).schema(&registry()).unwrap();
+        let numbered = framed(WindowFunction::RowNumber, Vec::new());
+        let error = window_type(&numbered, &input, &registry()).unwrap_err();
+        assert!(error.to_string().contains("takes no frame"), "{error}");
+        let summed = framed(
+            WindowFunction::Aggregate("sum".into()),
+            vec![Expr::column(SEVERITY_NUMBER)],
+        );
+        assert!(window_type(&summed, &input, &registry()).is_ok());
+        assert!(
+            summed
+                .to_string()
+                .contains("ROWS BETWEEN 1 PRECEDING AND CURRENT ROW")
+        );
+    }
+
     /// QE-20: a window adds one typed column per function after the
     /// input's, shows its partition, order and functions, and refuses
     /// arguments that do not fit a function.
@@ -1795,6 +1971,7 @@ mod tests {
         let window = |function, args: Vec<Expr>| WindowExpr {
             function,
             args,
+            frame: None,
             name: "w".into(),
         };
         let plan = Plan::Scan(scan()).window(
@@ -1804,16 +1981,19 @@ mod tests {
                 WindowExpr {
                     function: WindowFunction::RowNumber,
                     args: Vec::new(),
+                    frame: None,
                     name: "n".into(),
                 },
                 WindowExpr {
                     function: WindowFunction::Lag,
                     args: vec![Expr::column(BODY), Expr::literal(1)],
+                    frame: None,
                     name: "previous".into(),
                 },
                 WindowExpr {
                     function: WindowFunction::Aggregate("count".into()),
                     args: Vec::new(),
+                    frame: None,
                     name: "so_far".into(),
                 },
             ],

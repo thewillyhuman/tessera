@@ -3,7 +3,7 @@
 //! The syntax tree of a statement, with the span of every node so that
 //! lowering can point at what it rejects.
 
-use tessera_ir::Span;
+use tessera_ir::{Frame, Span};
 
 /// A parsed statement.
 #[derive(Clone, PartialEq, Debug)]
@@ -444,8 +444,9 @@ pub enum ExprKind {
         /// `f(*)`.
         wildcard: bool,
     },
-    /// `function(args) OVER (PARTITION BY ... ORDER BY ...)`: a window
-    /// function (QE-20), a value per row from the rows of its partition.
+    /// `function(args) OVER (PARTITION BY ... ORDER BY ... ROWS ...)`:
+    /// a window function (QE-20), a value per row from the rows of
+    /// its partition.
     Window {
         /// The function name, lowercased.
         function: String,
@@ -457,6 +458,8 @@ pub enum ExprKind {
         partition_by: Vec<Expr>,
         /// `ORDER BY`.
         order_by: Vec<OrderItem>,
+        /// `ROWS BETWEEN ... AND ...`; none for the default frame.
+        frame: Option<Frame>,
     },
     /// `CAST(expr AS type)` or `expr::type`.
     Cast {

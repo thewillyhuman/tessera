@@ -1534,6 +1534,7 @@ impl Lowerer<'_> {
             wildcard,
             partition_by,
             order_by,
+            frame,
         } = &expr.kind
         else {
             for child in children(expr) {
@@ -1550,6 +1551,15 @@ impl Lowerer<'_> {
                 format!("unknown window function {function}"),
             ));
         };
+        if frame.is_some() && !function.takes_frame() {
+            return Err(Diagnostic::at(
+                expr.span,
+                format!(
+                    "{} takes no frame: it is not computed over one",
+                    function.name()
+                ),
+            ));
+        }
         // As for an aggregate of a group: the counts take `*`.
         if *wildcard && !function.name().starts_with("count") {
             return Err(Diagnostic::at(
@@ -1581,6 +1591,7 @@ impl Lowerer<'_> {
         let window = WindowExpr {
             function,
             args,
+            frame: *frame,
             name: name.clone(),
         };
         match specs
@@ -2638,6 +2649,26 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Filter: (severity_number >= 17)"), "{text}");
+        let moving = lowered(
+            "SELECT avg(severity_number) OVER (ORDER BY timestamp \
+             ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS smooth, \
+             row_number() OVER (ORDER BY timestamp) AS n FROM logs",
+        );
+        assert!(
+            moving.to_string().contains(
+                "functions=[avg(severity_number) ROWS BETWEEN 4 PRECEDING AND CURRENT ROW \
+                 AS smooth, row_number() AS n]"
+            ),
+            "a frame is the function's, not the window's: {moving}"
+        );
+        let message = lower(
+            &parse("SELECT row_number() OVER (ORDER BY timestamp ROWS 1 PRECEDING) FROM logs")
+                .unwrap(),
+            &ctx(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("row_number takes no frame"), "{message}");
         let unweighted = lowered("SELECT count_raw(*) OVER () AS total FROM logs");
         assert!(
             unweighted

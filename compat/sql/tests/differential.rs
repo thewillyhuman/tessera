@@ -148,6 +148,26 @@ const CASES: &[Case] = &[
         sqlite: "SELECT timestamp, row_number() OVER (PARTITION BY severity_text ORDER BY timestamp), lag(severity_number) OVER (ORDER BY timestamp), count(*) OVER (PARTITION BY severity_text ORDER BY timestamp) FROM logs ORDER BY timestamp",
     },
     Case {
+        name: "moving sum and count over a frame in rows",
+        tessera: "SELECT timestamp, sum_raw(severity_number) OVER (ORDER BY timestamp ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), count_raw(body) OVER (ORDER BY timestamp ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING) FROM logs ORDER BY timestamp",
+        sqlite: "SELECT timestamp, sum(severity_number) OVER (ORDER BY timestamp ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), count(body) OVER (ORDER BY timestamp ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING) FROM logs ORDER BY timestamp",
+    },
+    Case {
+        name: "centred average per partition",
+        tessera: "SELECT timestamp, avg_raw(attr.n::int) OVER (PARTITION BY severity_text ORDER BY timestamp ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM logs ORDER BY timestamp",
+        sqlite: "SELECT timestamp, avg(n) OVER (PARTITION BY severity_text ORDER BY timestamp ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM logs ORDER BY timestamp",
+    },
+    Case {
+        name: "running and whole-partition frames",
+        tessera: "SELECT timestamp, count_raw(*) OVER (ORDER BY timestamp ROWS UNBOUNDED PRECEDING), max(severity_number) OVER (PARTITION BY severity_text ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), min(attr.n::int) OVER (ORDER BY timestamp ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM logs ORDER BY timestamp",
+        sqlite: "SELECT timestamp, count(*) OVER (ORDER BY timestamp ROWS UNBOUNDED PRECEDING), max(severity_number) OVER (PARTITION BY severity_text ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), min(n) OVER (ORDER BY timestamp ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM logs ORDER BY timestamp",
+    },
+    Case {
+        name: "first and last value of a frame",
+        tessera: "SELECT timestamp, first_value(body) OVER (ORDER BY timestamp ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING), last_value(severity_number) OVER (ORDER BY timestamp ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM logs ORDER BY timestamp",
+        sqlite: "SELECT timestamp, first_value(body) OVER (ORDER BY timestamp ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING), last_value(severity_number) OVER (ORDER BY timestamp ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM logs ORDER BY timestamp",
+    },
+    Case {
         name: "max timestamp per host",
         tessera: "SELECT attr.host AS host, max(timestamp), min(timestamp) FROM logs WHERE attr.host IS NOT NULL GROUP BY attr.host ORDER BY host",
         sqlite: "SELECT host, max(timestamp), min(timestamp) FROM logs WHERE host IS NOT NULL GROUP BY host ORDER BY host",

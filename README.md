@@ -73,10 +73,14 @@ functions (QE-20) are
 `last_value` and any aggregate `OVER (PARTITION BY ... ORDER BY ...)`
 in a select item or `ORDER BY`, computed by one node per distinct
 partition and order over rows sorted through the sort operator's
-buffer, so that they spill past the grant, with the default frame
-only, up to the row's last peer, each partition held whole while its
-columns are computed, and an aggregate through the group-by's own
-accumulator; `$n` parameters bind over the PostgreSQL protocol with
+buffer, so that they spill past the grant, with the default frame,
+up to the row's last peer, or for an aggregate, `first_value` and
+`last_value` a frame in rows, `ROWS BETWEEN 2 PRECEDING AND CURRENT
+ROW`, but none counted in peers or by value (`RANGE`, `GROUPS`),
+each partition held whole while its columns are computed, and an
+aggregate through the group-by's own accumulator, at the cost of the
+frame's length per row when the frame moves at both ends; `$n`
+parameters bind over the PostgreSQL protocol with
 their types inferred from the columns they meet, as whole numbers in
 `LIMIT` and `OFFSET`;
 sorts and trace groups spill sorted runs to local disk when their
