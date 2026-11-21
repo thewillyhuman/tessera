@@ -590,6 +590,12 @@ impl KeyPolicy for Catalog {
             .tenant(tenant)
             .and_then(|t| t.settings.encryption_key.clone())
     }
+
+    /// A tenant this node's view of the catalog does not hold yet may
+    /// have been created with a key a moment ago.
+    fn knows(&self, tenant: &TenantId) -> bool {
+        self.cached().state().tenant(tenant).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -690,6 +696,31 @@ mod tests {
         cluster.node(1).await;
         let second = cluster.node(2).await;
         assert_eq!(second.cached().version(), Version::new(1));
+    }
+
+    /// SE-2: a node that has not read the commit that created a tenant
+    /// cannot say the tenant has no key. On a cluster, the first rows
+    /// of a tenant created with one were stored plain by such a node.
+    #[tokio::test]
+    async fn a_node_does_not_know_a_tenant_before_it_reads_its_creation() {
+        use tessera_types::KeyPolicy;
+
+        let cluster = Cluster::new();
+        let (first, second) = (cluster.node(1).await, cluster.node(2).await);
+        let settings = TenantSettings {
+            encryption_key: Some("k1".into()),
+            ..TenantSettings::default()
+        };
+        let created = first.create_tenant(name("acme"), settings).await.unwrap();
+
+        assert!(first.knows(&created.id));
+        assert_eq!(first.key_name(&created.id).as_deref(), Some("k1"));
+        assert!(!second.knows(&created.id), "not read yet");
+        assert_eq!(second.key_name(&created.id), None);
+        second.snapshot().await.unwrap();
+        assert!(second.knows(&created.id));
+        assert_eq!(second.key_name(&created.id).as_deref(), Some("k1"));
+        assert!(second.knows(&TenantId::DEFAULT), "a built-in tenant");
     }
 
     #[tokio::test]

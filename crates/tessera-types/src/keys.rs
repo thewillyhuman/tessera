@@ -64,6 +64,13 @@ pub enum KeyError {
         /// The key's name.
         name: String,
     },
+    /// This node does not know the tenant yet, so it cannot say
+    /// whether the tenant's data is to be sealed.
+    #[error("tenant {tenant} is not known to this node yet")]
+    UnknownTenant {
+        /// The tenant.
+        tenant: TenantId,
+    },
 }
 
 impl TenantKey {
@@ -216,6 +223,14 @@ impl Keyring {
 pub trait KeyPolicy: Send + Sync {
     /// The name of `tenant`'s key, or `None` for plain storage.
     fn key_name(&self, tenant: &TenantId) -> Option<String>;
+
+    /// Whether the policy knows `tenant` at all. A node hears of a new
+    /// tenant a moment after it is created; until then "no key" is not
+    /// an answer it can give, and nothing of the tenant's may be
+    /// written. A policy with no notion of tenants knows them all.
+    fn knows(&self, _tenant: &TenantId) -> bool {
+        true
+    }
 }
 
 /// The policy under which no tenant has a key.
@@ -284,11 +299,17 @@ impl Keys {
     ///
     /// # Errors
     ///
-    /// `Missing` when the policy names a key the keyring lacks: the
+    /// `Missing` when the policy names a key the keyring lacks, and
+    /// `UnknownTenant` when the policy does not know the tenant: the
     /// write must fail rather than store plain what was to be sealed.
     pub fn for_tenant(&self, tenant: &TenantId) -> Result<Option<NamedKey>, KeyError> {
         let Some(name) = self.policy.key_name(tenant) else {
-            return Ok(None);
+            if self.policy.knows(tenant) {
+                return Ok(None);
+            }
+            return Err(KeyError::UnknownTenant {
+                tenant: tenant.clone(),
+            });
         };
         let key = self
             .ring
@@ -408,5 +429,31 @@ mod tests {
             }
         );
         assert_eq!(Keys::none().for_tenant(&TenantId::DEFAULT).unwrap(), None);
+    }
+
+    /// A node learns of a tenant a moment after it is created. Until
+    /// then it cannot say whether the tenant has a key, and "none" is
+    /// the one answer that would store plain what was to be sealed.
+    #[test]
+    fn a_tenant_the_policy_does_not_know_is_not_taken_for_one_without_a_key() {
+        struct Stranger;
+
+        impl KeyPolicy for Stranger {
+            fn key_name(&self, _: &TenantId) -> Option<String> {
+                None
+            }
+
+            fn knows(&self, _: &TenantId) -> bool {
+                false
+            }
+        }
+
+        let keys = Keys::new(Keyring::default(), Arc::new(Stranger));
+        assert_eq!(
+            keys.for_tenant(&TenantId::DEFAULT).unwrap_err(),
+            KeyError::UnknownTenant {
+                tenant: TenantId::DEFAULT
+            }
+        );
     }
 }

@@ -213,6 +213,15 @@ impl Ingester {
             let _ = sender.send(Err(IngestError::Stopped));
             return Ack(receiver);
         }
+        // Whether the tenant's rows can be sealed as they must is
+        // settled before they join a segment. A tenant this node does
+        // not know yet, or whose key it lacks, has this write refused
+        // and no other: the segment would otherwise fail for every
+        // tenant waiting in it, or hold these rows plain (SE-2).
+        if let Err(error) = self.env.keys.for_tenant(batch.tenant()) {
+            let _ = sender.send(Err(IngestError::NotStored(error.to_string())));
+            return Ack(receiver);
+        }
         self.pending_bytes += batch.rows().get_array_memory_size();
         self.pending_since
             .get_or_insert_with(|| self.env.clock.now());
@@ -664,6 +673,62 @@ mod tests {
             "registered before the first acknowledgement"
         );
         assert_eq!(h.view_ids("prod").await, [0, 1]);
+    }
+
+    /// SE-2: on a cluster, a tenant created with a key had its first
+    /// rows stored plain by a node that had not heard of it yet. Such
+    /// a write is refused, alone: the rows of the tenants the node
+    /// knows, waiting with it for the same segment, are stored.
+    #[tokio::test]
+    async fn rows_of_a_tenant_the_node_does_not_know_are_refused_not_stored_plain() {
+        use tessera_types::{KeyPolicy, Keyring};
+
+        struct OnlyDefault;
+
+        impl KeyPolicy for OnlyDefault {
+            fn key_name(&self, _: &TenantId) -> Option<String> {
+                None
+            }
+
+            fn knows(&self, tenant: &TenantId) -> bool {
+                *tenant == TenantId::DEFAULT
+            }
+        }
+
+        let mut h = Harness::new();
+        h.env = h
+            .env
+            .clone()
+            .with_keys(Keys::new(Keyring::default(), Arc::new(OnlyDefault)));
+        let mut ingester = h.ingester(config());
+        let stranger = EventBatch::from_logs(
+            TenantId::new("acme").unwrap(),
+            DatasetName::new("prod").unwrap(),
+            &[LogRow {
+                timestamp: Timestamp::from_nanos(1),
+                body: Some("to be sealed".into()),
+                ..LogRow::default()
+            }],
+        )
+        .unwrap();
+        let mut known = ingester.write(batch("prod", 0..2)).await;
+        let mut refused = ingester.write(stranger).await;
+        let refusal = refused.try_now().unwrap().unwrap_err();
+        assert!(
+            matches!(&refusal, IngestError::NotStored(why) if why.contains("acme")),
+            "{refusal}"
+        );
+        h.clock.advance(Duration::from_secs(1));
+        ingester.tick().await;
+        assert_eq!(known.try_now().unwrap().unwrap(), Seq::new(1));
+        let stored = reader::read(&h.store, ingester.writer_id(), Seq::new(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.block_metas().len(),
+            1,
+            "the known tenant's block alone"
+        );
     }
 
     /// SE-2: with a key named for the tenant, the segments an ingester
