@@ -14,8 +14,8 @@ use arrow::array::{
 };
 use arrow::compute::{concat_batches, filter_record_batch};
 use tessera_catalog::{TenantSettings, TenantSettingsSource};
-use tessera_format::FileFormat;
 use tessera_format::layout::SERVICE;
+use tessera_format::{FileFormat, Layout};
 use tessera_manifest::{LayoutRecord, Manifest, Tombstone};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::event::{EVENT_ID, NAME, PATTERN_ID, SERIES_ID, TIMESTAMP};
@@ -53,6 +53,20 @@ pub enum Outcome {
 }
 
 /// Whether a column name is an attribute path.
+/// `layout` with its sort key kept to the columns `rows` have. A layout
+/// may name what rows have no column for: a label, which is read from
+/// several columns and so names none, yet may have been adopted as a
+/// sort key from the predicates of a workload. Such a key orders
+/// nothing. The file is sorted by the rest and records that as its
+/// sort key, at the layout's epoch, so it is not rewritten for the same
+/// layout again.
+fn sorted_by_its_columns(mut layout: Layout, rows: &RecordBatch) -> Layout {
+    layout
+        .sort_key
+        .retain(|name| rows.column_by_name(name).is_some());
+    layout
+}
+
 fn is_path(column: &str) -> bool {
     column.starts_with("attr.") || column.starts_with("resource.") || column.starts_with("scope.")
 }
@@ -271,6 +285,7 @@ impl Compactor {
                 (rows, Vec::new())
             };
             let key = keys.for_tenant(&partition.tenant)?;
+            let layout = sorted_by_its_columns(layout, &rows);
             let written = format.write(std::slice::from_ref(&rows), &layout, key.as_ref())?;
             let stored = stored_usage(&rows, &partition, written.bytes.len() as u64, &templates);
             Ok::<_, CompactError>((written, duplicates, stored))

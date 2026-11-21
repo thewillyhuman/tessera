@@ -345,6 +345,58 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
     );
 }
 
+/// A layout may name what the rows have no column for: a label, which
+/// is read from several columns and was adopted as a sort key from the
+/// predicates of a workload. Such a key orders nothing in the file;
+/// refused, it stopped the partition's compaction for good, and the
+/// tenant's round with it. A path no row carries is a column all the
+/// same, promoted empty, and stays in the key.
+#[tokio::test]
+async fn a_sort_key_the_rows_have_no_column_for_is_left_out() {
+    let node = node(&[&[1, 2], &[3], &[4], &[5]], Timestamp::UNIX_EPOCH).await;
+    let manifest = manifest(&node).await;
+    let before = manifest.snapshot().await.unwrap();
+    let job = plan(
+        manifest.id(),
+        before.state(),
+        node.env.clock.now(),
+        &Policy::default(),
+    )
+    .unwrap();
+    let record = LayoutRecord {
+        sort_key: vec![
+            "label:run".into(),
+            "attr.absent".into(),
+            "severity_number".into(),
+        ],
+        ..LayoutRecord::default_for(job.partition.kind)
+    };
+    let compactor = Compactor::new(
+        node.pools.clone(),
+        Arc::new(ParquetFormat::default()),
+        node.env.clone(),
+    );
+    let outcome = compactor
+        .run(&manifest, &job, &record, None, &[])
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Replaced { rows: 5, .. }),
+        "{outcome:?}"
+    );
+
+    let after = manifest.snapshot().await.unwrap();
+    let files: Vec<_> = after.state().files().collect();
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files[0].sort_key,
+        vec!["attr.absent", "severity_number", "timestamp"],
+        "the file says what it is sorted by"
+    );
+    assert_eq!(files[0].layout_epoch, record.epoch);
+    assert_eq!(event_ids(&node).await, vec![1, 2, 3, 4, 5]);
+}
+
 #[tokio::test]
 async fn a_superseded_job_leaves_the_manifest_alone() {
     let node = node(&[&[1], &[2], &[3], &[4]], Timestamp::UNIX_EPOCH).await;
