@@ -193,3 +193,51 @@ async fn partitions_keep_each_instance_once_across_a_split_and_a_merge() {
         "the instances keep their status through the merge"
     );
 }
+
+/// The fixture's rule over a one-minute tumbling window, which makes
+/// it incremental (CQ-7): its windows are kept in the partitions.
+fn windowed() -> AlertRule {
+    let mut rule = AlertRule::new(
+        "errors",
+        Language::Sql,
+        "SELECT attr.service AS service, count(*) AS n FROM logs \
+         WHERE severity_text = 'ERROR' \
+         GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute') \
+         HAVING count(*) >= 2",
+    );
+    rule.dataset = "prod".into();
+    rule
+}
+
+#[tokio::test]
+async fn an_incremental_rule_fires_every_instance_once_between_partitions() {
+    let services = ["checkout", "search", "cart", "login", "billing", "mail"];
+    let segments: Vec<EventBatch> = services
+        .iter()
+        .map(|service| errors(at(1_000), 3, service))
+        .collect();
+    let mut fx = fixture(&segments).await;
+    fx.rule = windowed();
+
+    let mut fired: Vec<String> = Vec::new();
+    for part in 0..2 {
+        let evaluated = fx
+            .partition(part, 2)
+            .evaluate(&fx.engine, at(1_005))
+            .await
+            .unwrap();
+        fired.extend(
+            evaluated
+                .transitions
+                .iter()
+                .map(|t| t.labels["service"].clone()),
+        );
+    }
+    fired.sort();
+    let mut expected: Vec<String> = services.iter().map(|s| (*s).to_owned()).collect();
+    expected.sort();
+    assert_eq!(
+        fired, expected,
+        "the window of a key is where its instance is"
+    );
+}

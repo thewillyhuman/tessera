@@ -411,10 +411,10 @@ impl RuleGroup {
             tenant: &self.tenant,
         };
         let mut ingested = incremental::ingest(&source, rule, shape, state, now).await?;
-        // Another partition keeps the windows of the keys it owns.
-        ingested
-            .windows
-            .retain(|_, window| self.owns(&fingerprint(&window.keys)));
+        // Another partition keeps the windows of the instances it owns.
+        ingested.windows.retain(|_, window| {
+            partition::window_partition(rule, &window.keys, self.parts) == self.part
+        });
         if ingested.late_rows > 0 {
             tracing::info!(tenant = %self.tenant, rule = %rule.name, late_rows = ingested.late_rows, "late rows ignored");
         }

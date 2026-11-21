@@ -19,8 +19,9 @@ use std::sync::Arc;
 use tessera_object::{ObjectError, ObjectStore, layout};
 use tessera_types::{Env, TenantId, hash::stable_hash};
 
-use crate::evaluate::EvalError;
+use crate::evaluate::{EvalError, instance_labels};
 use crate::lifecycle::fingerprint;
+use crate::rule::AlertRule;
 use crate::state::{self, EvalState};
 
 /// The partition of `parts` that `fingerprint` belongs to.
@@ -30,11 +31,19 @@ pub fn partition_of(fingerprint: &str, parts: u32) -> u32 {
     u32::try_from(stable_hash(fingerprint.as_bytes()) % parts).unwrap_or(0)
 }
 
+/// The partition of `parts` that keeps the window of `rule` for the
+/// group `keys`: the one the window's instance belongs to, whose
+/// fingerprint is of the instance's labels and not of the keys alone,
+/// so that the partition that judges a window holds its alert.
+#[must_use]
+pub fn window_partition(rule: &AlertRule, keys: &BTreeMap<String, String>, parts: u32) -> u32 {
+    partition_of(&fingerprint(&instance_labels(rule, keys)), parts)
+}
+
 /// The keys of `whole` that partition `part` of `parts` owns, with
 /// what every partition shares: positions, ended logs, watermarks,
-/// evaluation times, notification group times and degraded marks. The windows of
-/// the partition's keys come along as they were; a re-split asks for
-/// their rebuild.
+/// evaluation times, notification group times and degraded marks. The
+/// windows stay behind: a re-split asks for their rebuild.
 #[must_use]
 pub fn split(whole: &EvalState, part: u32, parts: u32) -> EvalState {
     let mine = |fp: &str| partition_of(fp, parts) == part;
@@ -54,12 +63,7 @@ pub fn split(whole: &EvalState, part: u32, parts: u32) -> EvalState {
             .collect(),
         evaluated: whole.evaluated.clone(),
         watermarks: whole.watermarks.clone(),
-        windows: whole
-            .windows
-            .iter()
-            .filter(|(_, w)| mine(&fingerprint(&w.keys)))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        windows: BTreeMap::new(),
         group_sent: whole.group_sent.clone(),
         degraded: whole.degraded.clone(),
         parts,
