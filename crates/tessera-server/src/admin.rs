@@ -94,8 +94,11 @@ async fn require_cluster_admin(
     Ok(next.run(request).await)
 }
 
-/// The body of `POST /api/v1/tenants/{name}/keys`.
+/// The body of `POST /api/v1/tenants/{name}/keys`. A field it does not
+/// know is refused: a misspelt `roles` would otherwise issue the key
+/// with the default role and say nothing.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IssueKey {
     name: String,
     #[serde(default = "reader")]

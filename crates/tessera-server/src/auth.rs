@@ -905,6 +905,35 @@ mod tests {
         );
     }
 
+    /// A key asked for with `role` in place of `roles` was issued with
+    /// the default role, a reader, and the caller told nothing: what
+    /// the body says of a key's rights is taken whole or refused.
+    #[tokio::test]
+    async fn a_key_asked_for_with_an_unknown_field_is_refused() {
+        let state = crate::testing::state().await;
+        let (status, refused) = call(
+            &state,
+            "POST",
+            "/api/v1/tenants/_system/keys",
+            None,
+            &[],
+            Some(json!({ "name": "ops", "role": "admin" })),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}: {refused}");
+        let (status, listed) = call(
+            &state,
+            "GET",
+            "/api/v1/tenants/_system/keys",
+            None,
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert_eq!(listed, json!([]), "no key was issued");
+    }
+
     #[tokio::test]
     async fn keys_are_listed_without_secrets_and_stop_working_when_deleted() {
         let mut key = String::new();
