@@ -377,11 +377,15 @@ pub struct Partial {
 }
 
 impl Partial {
+    /// Folds one row: its argument as a number, when the aggregate has
+    /// one and it is a number, with the row's weight. A row whose
+    /// argument is null is not folded at all.
     fn fold(&mut self, value: Option<f64>, weight: f64) {
+        let first = self.count == 0;
         self.weight = Some(self.weighted_count() + weight);
         self.count += 1;
         if let Some(v) = value {
-            if self.sum == 0.0 && self.min == 0.0 && self.max == 0.0 && self.count == 1 {
+            if first {
                 self.min = v;
                 self.max = v;
             } else {
@@ -416,21 +420,23 @@ impl Partial {
         self.weight.unwrap_or(self.count as f64)
     }
 
-    fn value(&self, function: &str) -> f64 {
+    /// What `function` gives over the rows folded. Over none, a count
+    /// is zero and every other aggregate unknown, as in SQL.
+    fn value(&self, function: &str) -> Option<f64> {
         #[allow(clippy::cast_precision_loss)]
         let count = self.count as f64;
         let weighted = self.weighted_count();
-        let average = |sum: f64, count: f64| if count == 0.0 { f64::NAN } else { sum / count };
         match function {
-            "count" => weighted,
-            "count_raw" => count,
-            "sum" => self.sum,
-            "sum_raw" => self.sum_raw,
-            "avg" => average(self.sum, weighted),
-            "avg_raw" => average(self.sum_raw, count),
-            "min" => self.min,
-            "max" => self.max,
-            _ => f64::NAN,
+            "count" => Some(weighted),
+            "count_raw" => Some(count),
+            _ if self.count == 0 => None,
+            "sum" => Some(self.sum),
+            "sum_raw" => Some(self.sum_raw),
+            "avg" => Some(self.sum / weighted),
+            "avg_raw" => Some(self.sum_raw / count),
+            "min" => Some(self.min),
+            "max" => Some(self.max),
+            _ => None,
         }
     }
 }
@@ -1085,7 +1091,13 @@ pub(crate) fn fold_batch(
                     })
             });
             for (partial, arg) in window.partials.iter_mut().zip(&args) {
-                partial.fold(arg.as_ref().and_then(|a| number(a, row)), weight);
+                match arg {
+                    // An aggregate over a column leaves out the rows
+                    // where it is null, as the batch ones do (QE-20).
+                    Some(array) if array.is_null(row) => {}
+                    Some(array) => partial.fold(number(array, row), weight),
+                    None => partial.fold(None, weight),
+                }
             }
             if let Some(observed) = observed
                 && !observed.is_null(row)
@@ -1201,7 +1213,7 @@ pub fn observe(
     }
     let mut observations = Vec::new();
     for window in &candidates {
-        let values: Vec<f64> = shape
+        let values: Vec<Option<f64>> = shape
             .aggregates
             .iter()
             .zip(&window.partials)
@@ -1218,7 +1230,9 @@ pub fn observe(
         if holds {
             observations.push(Observation {
                 labels: window.keys.clone(),
-                value: values.first().copied().unwrap_or(f64::NAN),
+                // One when the first aggregate is unknown or there is
+                // none, as for a rule run through the engine.
+                value: values.first().copied().flatten().unwrap_or(1.0),
                 received: window.received,
             });
         }
@@ -1226,11 +1240,12 @@ pub fn observe(
     Ok(observations)
 }
 
-/// One row with the keys and the aggregate values, for the condition.
+/// One row with the keys and the aggregate values, null where
+/// unknown, for the condition.
 fn condition_batch(
     shape: &Shape,
     window: &WindowState,
-    values: &[f64],
+    values: &[Option<f64>],
 ) -> Result<RecordBatch, String> {
     let mut fields = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
@@ -1385,7 +1400,11 @@ mod tests {
         )
         .unwrap();
         let window = ingested.windows.values().next().unwrap();
-        let value = |i: usize| window.partials[i].value(&shape.aggregates[i].function);
+        let value = |i: usize| {
+            window.partials[i]
+                .value(&shape.aggregates[i].function)
+                .unwrap()
+        };
         assert!((value(0) - 7.0).abs() < f64::EPSILON, "count: 2 + 4 + 1");
         assert!(
             (value(1) - 3.0).abs() < f64::EPSILON,
@@ -1406,12 +1425,79 @@ mod tests {
             max: 6.0,
         };
         assert!(
-            (old.value("count") - 3.0).abs() < f64::EPSILON,
+            (old.value("count").unwrap() - 3.0).abs() < f64::EPSILON,
             "an old state counts rows"
         );
         let mut grown = old;
         grown.fold(Some(1.0), 4.0);
-        assert!((grown.value("count") - 7.0).abs() < f64::EPSILON);
+        assert!((grown.value("count").unwrap() - 7.0).abs() < f64::EPSILON);
+    }
+
+    /// The windows of `sql` after one log row per severity, at one time.
+    fn folded(sql: &str, severities: &[Option<i32>]) -> (AlertRule, Shape, Ingested) {
+        let shape = shape_of_sql(sql, "prod", &TenantId::DEFAULT, None).unwrap();
+        let at = Timestamp::from_nanos(1_700_000_000_000_000_000);
+        let rows: Vec<LogRow> = (1u8..)
+            .zip(severities)
+            .map(|(i, severity)| LogRow {
+                timestamp: at,
+                observed_timestamp: at,
+                event_id: [i; 16],
+                severity_number: *severity,
+                ..LogRow::default()
+            })
+            .collect();
+        let batch =
+            EventBatch::from_logs(TenantId::DEFAULT, DatasetName::new("prod").unwrap(), &rows)
+                .unwrap();
+        let rule = AlertRule::new("r", Language::Sql, sql);
+        let mut ingested = Ingested::default();
+        fold_batch(
+            &rule,
+            &shape,
+            &EvalState::default(),
+            &mut ingested,
+            batch.rows(),
+            Timestamp::from_nanos(0),
+        )
+        .unwrap();
+        (rule, shape, ingested)
+    }
+
+    /// QE-20: an aggregate over a column leaves out the rows where the
+    /// column is null, as the batch aggregates do, so that a continuous
+    /// query equals the batch one.
+    #[test]
+    fn a_null_argument_is_left_out_of_its_aggregate() {
+        let sql = "SELECT count(*) AS n, count(severity_number) AS c, \
+                   avg(severity_number) AS a, min(severity_number) AS lo, \
+                   max(severity_number) AS hi, sum(severity_number) AS s FROM logs \
+                   GROUP BY tumble(timestamp, INTERVAL '1 minute')";
+        let (_, shape, ingested) = folded(sql, &[None, Some(2), Some(6)]);
+        let window = ingested.windows.values().next().unwrap();
+        let values: Vec<Option<f64>> = shape
+            .aggregates
+            .iter()
+            .zip(&window.partials)
+            .map(|(aggregate, partial)| partial.value(&aggregate.function))
+            .collect();
+        let expected = [3.0, 2.0, 4.0, 2.0, 6.0, 8.0].map(Some);
+        assert_eq!(values, expected, "n, c, a, lo, hi, s");
+    }
+
+    /// An aggregate over no values is unknown, as in SQL: only a count
+    /// is zero, and a condition on the others does not hold.
+    #[test]
+    fn an_aggregate_over_no_values_is_unknown() {
+        let sql = "SELECT count(severity_number) AS c, min(severity_number) AS lo FROM logs \
+                   GROUP BY tumble(timestamp, INTERVAL '1 minute') \
+                   HAVING min(severity_number) < 5";
+        let (rule, shape, ingested) = folded(sql, &[None, None]);
+        let window = ingested.windows.values().next().unwrap();
+        assert_eq!(window.partials[0].value("count"), Some(0.0));
+        assert_eq!(window.partials[1].value("min"), None);
+        let observed = observe(&rule, &shape, &ingested.windows, Timestamp::MAX).unwrap();
+        assert!(observed.is_empty(), "{observed:?}");
     }
 
     /// CQ-4: the partials a source task folds from separate entries

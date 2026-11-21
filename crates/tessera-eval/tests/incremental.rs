@@ -715,3 +715,26 @@ async fn a_group_fetches_each_entry_once_for_all_its_rules() {
     let both = BTreeMap::from([("first".to_owned(), 3), ("second".to_owned(), 3)]);
     assert_eq!(counted(&fx).await, both);
 }
+
+/// A rule that only groups has no aggregate to take its value from:
+/// its instances carry one, as those of a rule run through the engine
+/// do, and the state they are written to reads back.
+#[tokio::test]
+async fn a_rule_without_aggregates_gives_its_instances_the_value_one() {
+    let mut fx = fixture().await;
+    fx.log
+        .append_segment(&[errors(at(1_000), 3, "checkout", 17)])
+        .await
+        .unwrap();
+    let group = group(
+        &fx,
+        "seen",
+        "SELECT attr.service AS service FROM logs \
+         GROUP BY attr.service, tumble(timestamp, INTERVAL '1 minute')",
+    );
+    let first = group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert_eq!(first.transitions.len(), 1);
+    assert!((first.transitions[0].value - 1.0).abs() < f64::EPSILON);
+    group.evaluate(&fx.engine, at(1_006)).await.unwrap();
+    assert_eq!(group.instances().await.unwrap().len(), 1);
+}
