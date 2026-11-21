@@ -17,6 +17,8 @@ RUN cargo build --release -p tessera --locked && mkdir -p /var/lib/tessera
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /src/target/release/tessera /usr/local/bin/tessera
+# The license goes with the binary it covers (Apache 2.0, section 4).
+COPY --from=builder /src/LICENSE /src/NOTICE /licenses/
 COPY --from=builder --chown=nonroot:nonroot /var/lib/tessera /var/lib/tessera
 VOLUME ["/var/lib/tessera"]
 EXPOSE 8080 5432
