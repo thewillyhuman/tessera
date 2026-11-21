@@ -253,12 +253,35 @@ fn bad_json(rejection: &JsonRejection) -> ApiError {
     ApiError::bad_request(rejection.body_text())
 }
 
+/// Tenant settings as a request names them. Every name must be one a
+/// tenant has: a setting misspelt is refused, where the settings
+/// themselves, which a newer node may have written with names this
+/// one does not know, let it pass.
+#[derive(Default)]
+struct Settings(TenantSettings);
+
+impl<'de> Deserialize<'de> for Settings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        let given = serde_json::Map::deserialize(deserializer)?;
+        let known = serde_json::to_value(TenantSettings::default()).map_err(D::Error::custom)?;
+        if let Some(unknown) = given.keys().find(|name| known.get(*name).is_none()) {
+            return Err(D::Error::custom(format!("unknown setting `{unknown}`")));
+        }
+        serde_json::from_value(given.into())
+            .map(Settings)
+            .map_err(D::Error::custom)
+    }
+}
+
 /// The body of `POST /api/v1/tenants`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateTenant {
     name: TenantName,
     #[serde(default)]
-    settings: TenantSettings,
+    settings: Settings,
 }
 
 /// The body of `POST /api/v1/tenants/{name}/rename`.
@@ -283,7 +306,7 @@ async fn create_tenant(
 ) -> Result<(StatusCode, Json<Tenant>), ApiError> {
     let tenant = state
         .catalog
-        .create_tenant(request.name, request.settings)
+        .create_tenant(request.name, request.settings.0)
         .await?;
     audit::record(
         &state,
@@ -313,7 +336,7 @@ async fn alter_tenant(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     Path(text): Path<String>,
-    Body(patch): Body<TenantSettings>,
+    Body(Settings(patch)): Body<Settings>,
 ) -> Result<Json<Tenant>, ApiError> {
     let tenant = state.catalog.alter_tenant(&name(&text)?, patch).await?;
     audit::record(
@@ -604,6 +627,42 @@ mod tests {
     async fn an_unknown_tenant_is_not_found() {
         let (status, _) = call(&app().await, "GET", "/api/v1/tenants/nobody", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A setting misspelt in a request would otherwise be dropped in
+    /// silence, and the tenant left as it was with a 200.
+    #[tokio::test]
+    async fn a_setting_no_tenant_has_is_refused() {
+        let app = app().await;
+        call(&app, "POST", "/api/v1/tenants", Some(r#"{"name":"acme"}"#)).await;
+        let (status, error) = call(
+            &app,
+            "PATCH",
+            "/api/v1/tenants/acme",
+            Some(r#"{"retention_secs":60}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert!(error.to_string().contains("retention_secs"), "{error}");
+        let wrapped = r#"{"settings":{"retention_seconds":60}}"#;
+        let (status, error) = call(&app, "PATCH", "/api/v1/tenants/acme", Some(wrapped)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+
+        let misspelt = r#"{"name":"other","settings":{"query_concurency":2}}"#;
+        let (status, error) = call(&app, "POST", "/api/v1/tenants", Some(misspelt)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        let misplaced = r#"{"name":"other","retention_seconds":60}"#;
+        let (status, error) = call(&app, "POST", "/api/v1/tenants", Some(misplaced)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    }
+
+    #[tokio::test]
+    async fn every_setting_a_tenant_has_is_taken() {
+        let app = app().await;
+        call(&app, "POST", "/api/v1/tenants", Some(r#"{"name":"acme"}"#)).await;
+        let unset = serde_json::to_string(&TenantSettings::default()).unwrap();
+        let (status, altered) = call(&app, "PATCH", "/api/v1/tenants/acme", Some(&unset)).await;
+        assert_eq!(status, StatusCode::OK, "{altered}");
     }
 
     #[tokio::test]
