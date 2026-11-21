@@ -12,6 +12,7 @@ pub mod layout;
 pub mod local;
 pub mod memory;
 pub mod pool;
+pub mod remote;
 pub mod store;
 
 pub use fault::{FaultPolicy, FaultyStore, LostResponseStore};
@@ -19,4 +20,5 @@ pub use key::{InvalidKey, Key};
 pub use local::LocalStore;
 pub use memory::MemoryStore;
 pub use pool::{ObjectRef, Pool, PoolError, PoolState, Pools};
+pub use remote::{OpenError, RemoteStore};
 pub use store::{BoxError, ObjectError, ObjectMeta, ObjectStore};

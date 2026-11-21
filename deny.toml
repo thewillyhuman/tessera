@@ -31,6 +31,12 @@ confidence-threshold = 0.9
 crate = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
 
+# The same certificates as data, which the S3 client's certificate
+# verifier carries for the platforms that have no store of their own.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 # pgwire's TLS support and the server's client-certificate authentication
 # read certificates through x509-certificate, which is MPL-2.0: a file-level copyleft that binds only changes to that
 # crate, which Tessera does not make.

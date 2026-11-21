@@ -13,6 +13,13 @@ tessera-types.workspace = true
 async-trait = "0.1"
 bytes = "1"
 futures = "0.3"
+# The S3 client (spec section 18.3). Its request signing and the TLS
+# of its HTTP client both run on ring, as the rest of the workspace
+# does: reqwest is named here only to choose rustls without a bundled
+# provider, and rustls to install ring as that provider.
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util"] }

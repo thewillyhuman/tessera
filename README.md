@@ -485,7 +485,7 @@ but neither has run on a cluster.
 ```
 crates/
   tessera-types     identifiers, time, event schemas, injected clock and random source
-  tessera-object    ObjectStore trait, keys and layout, memory and local-directory stores, pools, fault injection
+  tessera-object    ObjectStore trait, keys and layout, memory, local-directory and S3 stores, pools, fault injection
   tessera-commit    commit logs, checkpoints, slots, leases
   tessera-catalog   cluster catalog: tenants, pools, slot counts
   tessera-format    FileFormat trait and the Parquet implementation
