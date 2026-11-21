@@ -49,7 +49,7 @@ tessera-cluster.workspace = true
 tessera-manifest.workspace = true
 tessera-object.workspace = true
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 ureq = { version = "3", features = ["json"] }
 
 [lints]

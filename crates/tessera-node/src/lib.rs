@@ -20,6 +20,7 @@ pub mod observe;
 mod peers;
 mod retention;
 pub mod tls;
+mod watch;
 
 pub use tessera_server::oidc::Oidc;
 pub use tessera_types::Keyring;
@@ -240,6 +241,9 @@ pub enum RunError {
         /// The newest format it reads.
         reads_through: u32,
     },
+    /// A task the node is made of ended while the node ran.
+    #[error("a task of the node ended before the node was stopped")]
+    Broken,
     /// TLS cannot be set up from the configured files.
     #[error("tls: {0}")]
     Tls(#[from] tls::TlsError),
@@ -451,6 +455,21 @@ impl Node {
         tracing::info!("stopped");
     }
 
+    /// Whether every task the node is made of is still running: the
+    /// servers, the ingesters, the lease loop and the loops of its
+    /// roles. None ends while the node is healthy.
+    #[must_use]
+    pub fn is_whole(&self) -> bool {
+        let lease_loop = self.lease_loop.as_ref().map(|(_, task)| task);
+        watch::all_running(
+            self.loops
+                .iter()
+                .chain(&self.servers)
+                .chain(&self.ingest_tasks)
+                .chain(lease_loop),
+        )
+    }
+
     /// Drops the node as a crash would: nothing is closed, released or
     /// withdrawn, so the rest of the cluster must notice by itself.
     pub fn abandon(self) {
@@ -492,17 +511,25 @@ fn ingesters(
     ingesters
 }
 
-/// Runs a node until the process is interrupted or terminated, then
-/// stops it as [`Node::stop`] does.
+/// Runs a node until the process is interrupted or terminated, or
+/// until one of the node's own tasks ends, then stops it as
+/// [`Node::stop`] does.
 ///
 /// # Errors
 ///
-/// If the data directory, the catalog or a listener cannot be opened.
+/// If the data directory, the catalog or a listener cannot be opened,
+/// or `Broken` if the node stopped because a task of its own ended.
 pub async fn run(config: Config) -> Result<(), RunError> {
     let shutdown = shutdown_signal();
     let node = Node::start(config, Env::system()).await?;
-    shutdown.await;
+    let broken = watch::broken_before(shutdown, || node.is_whole(), watch::EVERY).await;
+    if broken {
+        tracing::error!("a task of the node ended; stopping for the supervisor to start it again");
+    }
     node.stop().await;
+    if broken {
+        return Err(RunError::Broken);
+    }
     Ok(())
 }
 

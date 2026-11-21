@@ -46,6 +46,7 @@ async fn a_node_starts_serves_and_stops() {
         .await
         .unwrap();
     assert_ne!(node.http_address().port(), 0, "a free port was picked");
+    assert!(node.is_whole(), "every task of the node runs");
     assert_ne!(node.pg_address().port(), 0);
     let url = format!("http://{}/api/v1/query", node.http_address());
     let body = serde_json::json!({ "dataset": "prod", "query": "SELECT 42" });

@@ -261,6 +261,7 @@ every route and over gRPC.
 | The store throttles (503 Slow Down) | `tessera_write_ack_seconds` grows | Spread the load over more pools or prefixes; raise the store's limits |
 | A node cannot reach the others | Slower queries: it reads what its peers would have | Fix the network; correctness does not depend on it |
 | A node's disk fills | Spilling queries fail; the cache stops keeping reads | Free or enlarge the disk; nothing durable is there |
+| A task inside a node dies | The node logs it, stops in order and exits with an error | Nothing: the supervisor starts it again; report the log |
 | A tenant names a key the nodes lack | Its writes are refused rather than stored plain | Add the key to every node's keyring |
 
 ## Requests against the store
