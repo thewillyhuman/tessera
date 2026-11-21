@@ -208,6 +208,44 @@ async fn partitions_keep_each_instance_once_across_a_split_and_a_merge() {
     );
 }
 
+/// CQ-6: a partition the group did without for a while takes its keys
+/// from the checkpoint of the split that brings it back, not from the
+/// state it had when the group last counted it.
+#[tokio::test]
+async fn a_partition_that_sat_out_a_count_takes_the_new_split() {
+    let services = ["checkout", "search", "cart", "login", "billing", "mail"];
+    let segments: Vec<EventBatch> = services
+        .iter()
+        .map(|service| errors(at(1_000), 3, service))
+        .collect();
+    let fx = fixture(&segments).await;
+
+    // Two partitions, each with its instances pending.
+    fx.partition(0, 2)
+        .evaluate(&fx.engine, at(1_010))
+        .await
+        .unwrap();
+    let second = fx.partition(1, 2);
+    second.evaluate(&fx.engine, at(1_010)).await.unwrap();
+    assert!(!fx.fingerprints(&second).await.is_empty());
+
+    // One partition, in which every instance fires.
+    let whole = fx.partition(0, 1);
+    whole.evaluate(&fx.engine, at(1_020)).await.unwrap();
+    let fired = whole.evaluate(&fx.engine, at(1_071)).await.unwrap();
+    assert_eq!(fired.transitions.len(), services.len());
+
+    // Two again: the second partition's instances are the firing ones
+    // of the split, so nothing fires a second time.
+    let mut again = Vec::new();
+    for part in 0..2 {
+        let partition = fx.partition(part, 2);
+        let evaluated = partition.evaluate(&fx.engine, at(1_080)).await.unwrap();
+        again.extend(evaluated.transitions);
+    }
+    assert!(again.is_empty(), "{again:?}");
+}
+
 /// The fixture's rule over a one-minute tumbling window, which makes
 /// it incremental (CQ-7): its windows are kept in the partitions.
 fn windowed() -> AlertRule {

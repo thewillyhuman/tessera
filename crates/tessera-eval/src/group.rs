@@ -44,6 +44,9 @@ pub struct RuleGroup {
     keys: Arc<Keys>,
     env: Env,
     log: StateLog,
+    /// The state log of partition 0, which names the split the group
+    /// is at, for every other partition to follow; none in partition 0.
+    first: Option<StateLog>,
     /// Which partition this is (CQ-6).
     part: u32,
     /// How many partitions the group has.
@@ -109,6 +112,8 @@ impl RuleGroup {
         let name = name.into();
         let keys = Arc::clone(&env.keys);
         let log = crate::state::open(Arc::clone(&store), &tenant, &name, part, env.clone());
+        let first = (part > 0)
+            .then(|| crate::state::open(Arc::clone(&store), &tenant, &name, 0, env.clone()));
         RuleGroup {
             tenant,
             name,
@@ -117,6 +122,7 @@ impl RuleGroup {
             keys,
             env,
             log,
+            first,
             part,
             parts: parts.max(1),
         }
@@ -150,6 +156,10 @@ impl RuleGroup {
     /// merges the partitions the group had, writes the split checkpoint
     /// and keeps its keys; another partition takes its keys from that
     /// checkpoint, or waits, with nothing to evaluate, until it exists.
+    /// Partition 0's state names the split the group is at, and another
+    /// partition follows it at every evaluation: a state under the same
+    /// count but from an earlier split, as of a partition the group did
+    /// without in between, is replaced like one under another count.
     /// A partition past the count evaluates nothing.
     async fn aligned(&self) -> Result<Option<Arc<Snapshot<EvalState>>>, EvalError> {
         let state_error = |e: &dyn std::fmt::Display| EvalError::State(e.to_string());
@@ -157,49 +167,37 @@ impl RuleGroup {
         if self.part >= self.parts {
             return Ok(None);
         }
-        if snapshot.state().parts == self.parts {
-            return Ok(Some(snapshot));
-        }
-        let (whole, split) = if self.part == 0 {
-            let mut states = vec![snapshot.state().clone()];
-            for part in 1..snapshot.state().parts {
-                states.push(
-                    partition::load(&self.store, &self.tenant, &self.name, part, &self.env).await?,
-                );
-            }
-            let whole = partition::merge(states);
-            // Every partition rebuilds its windows after a re-split, so
-            // the partials left under the old count serve no one, nor
-            // do those a stale source left when the group last had the
-            // new count.
-            for parts in [snapshot.state().parts, self.parts] {
-                if parts > 1 {
-                    let all = layout::eval_partials_of(&self.tenant, &self.name, parts);
-                    source::clear(&*self.store, &all)
-                        .await
-                        .map_err(|e| state_error(&e))?;
+        let found = match &self.first {
+            None if snapshot.state().parts == self.parts => return Ok(Some(snapshot)),
+            None => Some(self.write_split(&snapshot).await?),
+            Some(first) => {
+                let first = first.snapshot().await.map_err(|e| state_error(&e))?;
+                let first = first.state();
+                let mine = snapshot.state();
+                match first.split.as_ref().filter(|_| first.parts == self.parts) {
+                    // A state written before partitions recorded their
+                    // split names none, and is taken to be of this one.
+                    Some(split)
+                        if mine.parts == self.parts
+                            && mine.split.as_ref().is_none_or(|taken| taken == split) =>
+                    {
+                        return Ok(Some(snapshot));
+                    }
+                    Some(split) => {
+                        partition::load_split(&*self.store, &self.tenant, &self.name, split)
+                            .await?
+                            .map(|whole| (whole, split.clone()))
+                    }
+                    None => None,
                 }
             }
-            let split = format!("{}-{}", self.parts, self.env.clock.now().as_nanos());
-            partition::save_split(&*self.store, &self.tenant, &self.name, &split, &whole).await?;
-            (whole, Some(split))
-        } else {
-            let first =
-                partition::load(&self.store, &self.tenant, &self.name, 0, &self.env).await?;
-            let checkpoint = match (first.parts == self.parts, &first.split) {
-                (true, Some(split)) => {
-                    partition::load_split(&*self.store, &self.tenant, &self.name, split).await?
-                }
-                _ => None,
-            };
-            let Some(whole) = checkpoint else {
-                tracing::info!(tenant = %self.tenant, group = %self.name, part = self.part, parts = self.parts, "waiting for partition 0 to write the split checkpoint");
-                return Ok(None);
-            };
-            (whole, None)
+        };
+        let Some((whole, split)) = found else {
+            tracing::info!(tenant = %self.tenant, group = %self.name, part = self.part, parts = self.parts, "waiting for partition 0 to write the split checkpoint");
+            return Ok(None);
         };
         let mut next = partition::split(&whole, self.part, self.parts);
-        next.split = split;
+        next.split = Some(split);
         next.rebuild = self
             .rules
             .iter()
@@ -213,6 +211,44 @@ impl RuleGroup {
             .map_err(|e: UpdateError<ApplyError>| state_error(&e))?;
         let snapshot = self.log.snapshot().await.map_err(|e| state_error(&e))?;
         Ok(Some(snapshot))
+    }
+
+    /// Partition 0's half of a re-split: the states of the partitions
+    /// the group had as one, written as the split checkpoint the other
+    /// partitions take their keys from, with the checkpoint's name.
+    async fn write_split(
+        &self,
+        snapshot: &Snapshot<EvalState>,
+    ) -> Result<(EvalState, String), EvalError> {
+        let mut states = vec![snapshot.state().clone()];
+        for part in 1..snapshot.state().parts {
+            states.push(
+                partition::load(&self.store, &self.tenant, &self.name, part, &self.env).await?,
+            );
+        }
+        let whole = partition::merge(states);
+        // Every partition rebuilds its windows after a re-split, so
+        // the partials left under the old count serve no one, nor do
+        // those a stale source left when the group last had the new
+        // count.
+        for parts in [snapshot.state().parts, self.parts] {
+            if parts > 1 {
+                let all = layout::eval_partials_of(&self.tenant, &self.name, parts);
+                source::clear(&*self.store, &all)
+                    .await
+                    .map_err(EvalError::State)?;
+            }
+        }
+        // The state log's version tells this split from every one
+        // before it, whatever the clock says.
+        let split = format!(
+            "{}-{}-{}",
+            self.parts,
+            snapshot.version(),
+            self.env.clock.now().as_nanos()
+        );
+        partition::save_split(&*self.store, &self.tenant, &self.name, &split, &whole).await?;
+        Ok((whole, split))
     }
 
     /// The rules.

@@ -11,7 +11,8 @@
 //! merges the states
 //! of the partitions the group had, writes the merged state as a split
 //! checkpoint and keeps its own keys, and each other partition takes
-//! its keys from that checkpoint. The windows of incremental rules are
+//! its keys from that checkpoint, whenever its own state is not of
+//! the split partition 0 names. The windows of incremental rules are
 //! rebuilt from the files afterwards (section 11.7), since the
 //! partitions had read the writer logs to different positions.
 

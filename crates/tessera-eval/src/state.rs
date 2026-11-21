@@ -53,8 +53,10 @@ pub struct EvalState {
     /// the partition must re-split before it evaluates.
     #[serde(default = "one_partition")]
     pub parts: u32,
-    /// The split checkpoint partition 0 wrote for `parts`, by name,
-    /// which the other partitions take their keys from (CQ-6).
+    /// The split checkpoint this partition's keys are of, by name
+    /// (CQ-6): the one partition 0 wrote for `parts`, which names the
+    /// split the group is at, or the one another partition took its
+    /// keys from; none in a state written before the others kept it.
     #[serde(default)]
     pub split: Option<String>,
     /// The rules whose windows the next ingest rebuilds from the files,
