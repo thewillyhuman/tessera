@@ -138,11 +138,26 @@ pub async fn share_budgets(state: &AppState) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let today = now.as_nanos().div_euclid(NANOS_PER_DAY);
+    let in_view = |node: &str| {
+        let node = node.parse::<tessera_types::NodeId>().ok();
+        node.zip(state.cluster.as_ref())
+            .is_some_and(|(node, cluster)| cluster.membership.is_live(node))
+    };
     let mut others = Vec::new();
     for meta in listed.into_iter().filter(|m| m.key != own) {
+        let node = meta.key.name();
+        // What a node that stopped published is final: kept, not read
+        // again on every heartbeat for the rest of the day.
+        if let Some(counts) = state.budgets.settled(node, today) {
+            others.push(counts);
+            continue;
+        }
         match store.get(&meta.key).await {
             Ok(bytes) => match serde_json::from_slice::<Counts>(&bytes) {
-                Ok(counts) if counts.day == today => others.push(counts),
+                Ok(counts) if counts.day == today => {
+                    state.budgets.published(node, &counts, in_view(node));
+                    others.push(counts);
+                }
                 Ok(_) => {
                     if let Err(error) = store.delete(&meta.key).await {
                         tracing::debug!(key = %meta.key, error = %error, "stale budget counts kept");

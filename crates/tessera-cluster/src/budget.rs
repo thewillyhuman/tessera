@@ -77,7 +77,26 @@ pub struct Ledger {
     entries: Mutex<HashMap<Account, Entry>>,
     /// What the other nodes counted today, summed per account.
     remote: Mutex<HashMap<Account, u64>>,
+    /// What each other node last published, by the node's name, and
+    /// for how many reads in a row it has been the same.
+    published: Mutex<HashMap<String, Published>>,
 }
+
+/// What another node published, as last read.
+struct Published {
+    counts: Counts,
+    /// Reads in a row that found these same counts.
+    unchanged: u32,
+    /// Whether the node is taken to have stopped: its counts are kept
+    /// and no longer read.
+    settled: bool,
+}
+
+/// How many reads in a row must find a node's counts the same, the
+/// node gone from the membership view, for the counts to be taken as
+/// final: a minute of heartbeats. A node that has only just started
+/// is not in the view yet either, and its counts do change.
+const SETTLED_AFTER: u32 = 12;
 
 impl Ledger {
     /// An empty ledger.
@@ -143,6 +162,50 @@ impl Ledger {
         Counts { day, bytes }
     }
 
+    /// The counts a node that has stopped published for `day`, when
+    /// they were found final ([`Ledger::published`]): a node's id is
+    /// new on every start, so what a stopped node published stays for
+    /// the day and does not change, and reading it again on every
+    /// heartbeat costs the store a request for each node that ran
+    /// today.
+    #[must_use]
+    pub fn settled(&self, node: &str, day: i64) -> Option<Counts> {
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        published.retain(|_, held| held.counts.day == day);
+        published
+            .get(node)
+            .filter(|held| held.settled)
+            .map(|held| held.counts.clone())
+    }
+
+    /// Notes what `node` was just read to have published and whether
+    /// it is in the membership view. Counts found the same
+    /// [`SETTLED_AFTER`] times in a row from a node that is not in the
+    /// view are final.
+    pub fn published(&self, node: &str, counts: &Counts, live: bool) {
+        let mut published = self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = published
+            .entry(node.to_owned())
+            .or_insert_with(|| Published {
+                counts: counts.clone(),
+                unchanged: 0,
+                settled: false,
+            });
+        if held.counts == *counts {
+            held.unchanged = held.unchanged.saturating_add(1);
+        } else {
+            held.counts = counts.clone();
+            held.unchanged = 1;
+        }
+        held.settled = !live && held.unchanged >= SETTLED_AFTER;
+    }
+
     /// Takes what the other nodes published as today's counts, replacing
     /// what was absorbed before; counts of another day are dropped.
     pub fn absorb(&self, others: &[Counts], now: Timestamp) {
@@ -196,6 +259,46 @@ mod tests {
     }
 
     const NOON: Timestamp = Timestamp::from_nanos(NANOS_PER_DAY / 2);
+
+    /// The counts of a node that stopped stay for the day and do not
+    /// change: once they have been the same for a minute of reads and
+    /// the node is gone from the view they are kept, not read again.
+    /// A node in the view, or one whose counts still move, is read.
+    #[test]
+    fn the_counts_of_a_node_that_stopped_are_read_once_they_are_final() {
+        let ledger = Ledger::new();
+        let counts = |bytes: u64| Counts {
+            day: 3,
+            bytes: vec![(account(), bytes)],
+        };
+        for _ in 0..SETTLED_AFTER - 1 {
+            ledger.published("gone", &counts(10), false);
+        }
+        assert_eq!(
+            ledger.settled("gone", 3),
+            None,
+            "not the same for long enough"
+        );
+        ledger.published("gone", &counts(10), false);
+        assert_eq!(ledger.settled("gone", 3), Some(counts(10)));
+
+        for _ in 0..SETTLED_AFTER * 2 {
+            ledger.published("live", &counts(10), true);
+        }
+        assert_eq!(
+            ledger.settled("live", 3),
+            None,
+            "a node in the view goes on"
+        );
+
+        for round in 0..SETTLED_AFTER * 2 {
+            ledger.published("busy", &counts(u64::from(round)), false);
+        }
+        assert_eq!(ledger.settled("busy", 3), None, "its counts still move");
+
+        assert_eq!(ledger.settled("gone", 4), None, "another day");
+        assert_eq!(ledger.settled("gone", 3), None, "and forgotten with it");
+    }
 
     #[test]
     fn the_request_that_goes_beyond_the_budget_gets_the_action_once() {
