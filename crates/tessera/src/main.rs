@@ -10,6 +10,7 @@
 //! address peers reach the node at; the root pool's registry is the
 //! membership seed.
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -165,6 +166,9 @@ fn read_keyring(path: Option<&std::path::Path>) -> Result<tessera_node::Keyring,
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
+        // Colours are for a person at a terminal; a supervisor's log
+        // store would keep the escapes as noise.
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("TESSERA_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
