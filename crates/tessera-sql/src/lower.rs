@@ -1550,7 +1550,8 @@ impl Lowerer<'_> {
                 format!("unknown window function {function}"),
             ));
         };
-        if *wildcard && function != WindowFunction::Aggregate("count".into()) {
+        // As for an aggregate of a group: the counts take `*`.
+        if *wildcard && !function.name().starts_with("count") {
             return Err(Diagnostic::at(
                 expr.span,
                 format!("{}(*) is not valid", function.name()),
@@ -2637,6 +2638,17 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Filter: (severity_number >= 17)"), "{text}");
+        let unweighted = lowered("SELECT count_raw(*) OVER () AS total FROM logs");
+        assert!(
+            unweighted
+                .to_string()
+                .contains("functions=[count_raw() AS total]"),
+            "every count takes *: {unweighted}"
+        );
+        let message = lower(&parse("SELECT sum(*) OVER () FROM logs").unwrap(), &ctx())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("sum(*) is not valid"), "{message}");
         let grouped = lowered(
             "SELECT attr.service AS service, count(*) AS n, \
              sum(count(*)) OVER (ORDER BY count(*) DESC) AS running FROM logs GROUP BY attr.service",

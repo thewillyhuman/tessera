@@ -143,6 +143,11 @@ const CASES: &[Case] = &[
         sqlite: "SELECT body, (SELECT count(*) FROM logs) AS total FROM logs WHERE n >= (SELECT max(severity_number) FROM logs) ORDER BY timestamp",
     },
     Case {
+        name: "window functions over the default frame",
+        tessera: "SELECT timestamp, row_number() OVER (PARTITION BY severity_text ORDER BY timestamp), lag(severity_number) OVER (ORDER BY timestamp), count_raw(*) OVER (PARTITION BY severity_text ORDER BY timestamp) FROM logs ORDER BY timestamp",
+        sqlite: "SELECT timestamp, row_number() OVER (PARTITION BY severity_text ORDER BY timestamp), lag(severity_number) OVER (ORDER BY timestamp), count(*) OVER (PARTITION BY severity_text ORDER BY timestamp) FROM logs ORDER BY timestamp",
+    },
+    Case {
         name: "max timestamp per host",
         tessera: "SELECT attr.host AS host, max(timestamp), min(timestamp) FROM logs WHERE attr.host IS NOT NULL GROUP BY attr.host ORDER BY host",
         sqlite: "SELECT host, max(timestamp), min(timestamp) FROM logs WHERE host IS NOT NULL GROUP BY host ORDER BY host",
