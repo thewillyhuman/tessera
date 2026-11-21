@@ -4,10 +4,12 @@
 # root pool, then checks, from a pod inside the cluster, that
 #
 #   1. rows pushed through the service are read back through it,
-#   2. no acknowledged write is lost when every node is replaced, one
+#   2. the nodes read the bucket through their cache (section 10.8),
+#   3. no acknowledged write is lost when every node is replaced, one
 #      at a time, while writes keep arriving (OP-4, section 14.6), and
-#   3. the rows are still there once every pod is a new one, since
+#   4. the rows are still there once every pod is a new one, since
 #      nothing durable lives on a node (G2).
+
 #
 # Needs docker, kind, kubectl and helm. The cluster gets a kubeconfig
 # of its own, so the caller's is never touched, and is deleted at the
@@ -88,6 +90,17 @@ code=$(push 1 100)
 held=$(count)
 [ "$held" = $((before + 100)) ] || fail "pushed 100 rows onto $before, the service counts $held"
 echo "ok: $held rows"
+
+say "the nodes read the bucket through their cache"
+cached=0
+for _ in 1 2 3 4 5 6; do
+    count >/dev/null
+    reads=$(client "curl -sf -m 10 $API/metrics" |
+        awk '/^tessera_object_cache_(hits|misses)_total/ { n += $2 } END { print n + 0 }')
+    [ "$reads" -gt "$cached" ] && cached=$reads
+done
+[ "$cached" -gt 0 ] || fail "no node read anything through its cache"
+echo "ok: $cached reads through a cache"
 
 say "no acknowledged write is lost while every node is replaced"
 client 'rm -f /tmp/stop /tmp/sent /tmp/acked'

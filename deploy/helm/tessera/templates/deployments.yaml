@@ -39,6 +39,10 @@ spec:
             {{- else }}
             - --data-dir=/var/lib/tessera
             {{- end }}
+            {{- if include "tessera.cached" $root }}
+            - --cache-dir=/var/cache/tessera
+            - --cache-bytes={{ int64 $root.Values.cache.bytes }}
+            {{- end }}
             - --listen=0.0.0.0:8080
             - --pg-listen=0.0.0.0:5432
             - --roles={{ join "," $group.roles }}
@@ -90,6 +94,10 @@ spec:
           volumeMounts:
             - name: scratch
               mountPath: /tmp
+            {{- if include "tessera.cached" $root }}
+            - name: cache
+              mountPath: /var/cache/tessera
+            {{- end }}
             {{- if not $root.Values.rootPool.url }}
             - name: root-pool
               mountPath: /var/lib/tessera
@@ -99,6 +107,10 @@ spec:
       volumes:
         - name: scratch
           emptyDir: {}
+        {{- if include "tessera.cached" $root }}
+        - name: cache
+          emptyDir: {}
+        {{- end }}
         {{- if not $root.Values.rootPool.url }}
         - name: root-pool
           persistentVolumeClaim:

@@ -39,6 +39,12 @@ rootPool:
   storageClassName: ""      # must support ReadWriteMany
   size: 100Gi
 
+# The cache of object reads on each pod's local disk, used when the
+# root pool is a bucket: the most bytes it keeps of data files, their
+# indexes and writer-log entries. Zero turns it off.
+cache:
+  bytes: 8589934592
+
 # The service account the pods run as, for clusters that hand a
 # bucket's credentials to a service account; the namespace's default
 # when empty.
