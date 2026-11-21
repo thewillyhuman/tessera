@@ -93,6 +93,7 @@ pub struct Instance {
     /// The labels.
     pub labels: BTreeMap<String, String>,
     /// The last observed value.
+    #[serde(with = "crate::float")]
     pub value: f64,
     /// Where it is.
     pub status: Status,
@@ -132,6 +133,7 @@ pub struct Transition {
     /// The instance's labels.
     pub labels: BTreeMap<String, String>,
     /// The instance's value at the time.
+    #[serde(with = "crate::float")]
     pub value: f64,
     /// When the last of the rows behind the value was received, for
     /// the alert latency of section 17.1; none when not known.

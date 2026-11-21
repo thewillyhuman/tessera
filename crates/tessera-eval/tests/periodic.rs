@@ -273,3 +273,26 @@ async fn a_promql_rule_fires_at_once_and_a_bad_rule_is_only_logged() {
         "since firing began"
     );
 }
+
+/// A `PromQL` alert may carry a value that is not a number, as in
+/// Prometheus, and the state log it is written to reads back.
+#[tokio::test]
+async fn an_instance_whose_value_is_not_a_number_reads_back() {
+    let fx = fixture(&[]).await;
+    let rule = AlertRule::new("undefined", Language::Promql, "vector(0) / vector(0)");
+    let group = RuleGroup::open(
+        fx.store.clone(),
+        TenantId::DEFAULT,
+        "nan",
+        vec![rule],
+        fx.env.clone(),
+    );
+    let first = group.evaluate(&fx.engine, at(1_000)).await.unwrap();
+    assert_eq!(first.transitions.len(), 1);
+    assert!(first.transitions[0].value.is_nan());
+
+    group.evaluate(&fx.engine, at(1_100)).await.unwrap();
+    let instances = group.instances().await.unwrap();
+    assert_eq!(instances.len(), 1);
+    assert!(instances[0].value.is_nan());
+}

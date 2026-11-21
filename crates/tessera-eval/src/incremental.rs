@@ -366,13 +366,16 @@ pub struct Partial {
     #[serde(default)]
     pub weight: Option<f64>,
     /// Sum of the argument, each row weighted.
+    #[serde(with = "crate::float")]
     pub sum: f64,
     /// Sum of the argument, rows as they are.
-    #[serde(default)]
+    #[serde(default, with = "crate::float")]
     pub sum_raw: f64,
     /// Smallest argument.
+    #[serde(with = "crate::float")]
     pub min: f64,
     /// Largest argument.
+    #[serde(with = "crate::float")]
     pub max: f64,
 }
 

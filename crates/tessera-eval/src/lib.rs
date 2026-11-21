@@ -8,6 +8,7 @@
 //! through the engine (CQ-8) with its alert events (CQ-14).
 
 pub mod evaluate;
+mod float;
 pub mod group;
 pub mod incremental;
 pub mod lifecycle;
