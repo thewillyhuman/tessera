@@ -35,8 +35,10 @@ use tessera_object::{ObjectError, ObjectStore, layout};
 use tessera_opt::optimize;
 use tessera_sql::SqlFrontend;
 use tessera_types::event::{OBSERVED_TIMESTAMP, SAMPLE_RATE, TIMESTAMP};
-use tessera_types::{DatasetName, Keys, Kind, Seq, TenantId, TimeRange, Timestamp, WriterId};
-use tessera_wal::{EntryBody, WalError, reader};
+use tessera_types::{
+    DatasetName, EventBatch, Keys, Kind, Seq, TenantId, TimeRange, Timestamp, WriterId,
+};
+use tessera_wal::{Entry, EntryBody, WalError, reader};
 
 use crate::lifecycle::{Observation, fingerprint};
 use crate::rule::{AlertRule, Language};
@@ -490,6 +492,9 @@ pub struct Ingested {
     /// When the windows were rebuilt from the files because a log had
     /// been trimmed past the position held (section 11.7), if they were.
     pub rebuilt: Option<Timestamp>,
+    /// The rules whose expressions could not be evaluated over the
+    /// rows read, with why. Their windows are left as they were.
+    pub failed: BTreeMap<String, String>,
 }
 
 /// Where a source task reads from.
@@ -512,23 +517,34 @@ pub struct Source<'a> {
     pub parts: u32,
 }
 
-/// Reads every writer's new segments for `rule` and folds them into
-/// the windows the state remembers. A log trimmed past the position
-/// held (GC-2) means segments were lost, and so does the log of a
-/// writer that left the registry gone whole before it was read to its
-/// end: the windows are then rebuilt from the consistent view instead
+/// One rule as a source task folds it: its shape, and the horizon its
+/// late rows are judged against.
+#[derive(Clone, Copy)]
+pub(crate) struct Folding<'a> {
+    pub(crate) rule: &'a AlertRule,
+    pub(crate) shape: &'a Shape,
+    pub(crate) horizon: Timestamp,
+}
+
+/// Reads every writer's new segments once for all of `rules`, the
+/// incremental rules of one group, and folds them into the windows the
+/// state remembers. The rules share the positions in the logs (CQ-5),
+/// so they are read together: an entry is behind the position for all
+/// of them or for none. A log trimmed past the position held (GC-2)
+/// means segments were lost, and so does the log of a writer that left
+/// the registry gone whole before it was read to its end: the windows
+/// of every rule are then rebuilt from the consistent view instead
 /// (section 11.7) and the positions move to where the view read, so
 /// the live logs resume there. A log read to its end is forgotten
-/// once its writer has left the registry.
+/// once its writer has left the registry. A rule whose expressions
+/// cannot be evaluated is reported in `failed` and holds no other back.
 ///
 /// # Errors
 ///
-/// If the registry, a segment or the view cannot be read, or an
-/// expression cannot be evaluated.
+/// If the registry, a segment or the view cannot be read.
 pub async fn ingest(
     source: &Source<'_>,
-    rule: &AlertRule,
-    shape: &Shape,
+    rules: &[(&AlertRule, &Shape)],
     state: &EvalState,
     now: Timestamp,
 ) -> Result<Ingested, String> {
@@ -540,71 +556,102 @@ pub async fn ingest(
         windows: BTreeMap::new(),
         late_rows: 0,
         rebuilt: None,
+        failed: BTreeMap::new(),
     };
-    let writers = registry::list(&**source.store, source.tenant, &shape.dataset)
-        .await
-        .map_err(|e| e.to_string())?;
-    let horizon = watermark(
-        state,
-        &writers
-            .iter()
-            .map(|r| r.writer.to_string())
-            .collect::<Vec<_>>(),
-        now,
-    );
-    if state.rebuild.contains(&rule.name) {
-        tracing::info!(
-            tenant = %source.tenant, rule = %rule.name,
-            "rebuilding the windows from the files after a re-split"
-        );
-        rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
-        return Ok(ingested);
+    // A dataset's horizon follows the writers registered for it.
+    let mut horizons: BTreeMap<&DatasetName, Timestamp> = BTreeMap::new();
+    let mut registered: BTreeSet<WriterId> = BTreeSet::new();
+    for (_, shape) in rules {
+        if horizons.contains_key(&shape.dataset) {
+            continue;
+        }
+        let writers = registry::list(&**source.store, source.tenant, &shape.dataset)
+            .await
+            .map_err(|e| e.to_string())?;
+        let names: Vec<String> = writers.iter().map(|r| r.writer.to_string()).collect();
+        horizons.insert(&shape.dataset, watermark(state, &names, now));
+        registered.extend(writers.into_iter().map(|r| r.writer));
     }
+    let foldings: Vec<Folding<'_>> = rules
+        .iter()
+        .map(|&(rule, shape)| Folding {
+            rule,
+            shape,
+            horizon: horizons[&shape.dataset],
+        })
+        .collect();
     let reading = Reading {
         source,
-        rule,
-        shape,
+        rules: &foldings,
         state,
-        horizon,
     };
-    let registered: BTreeSet<String> = writers.iter().map(|r| r.writer.to_string()).collect();
-    for registration in writers {
-        let writer = registration.writer;
-        let entries = available(source, writer).await?;
-        if read_new(&reading, &mut ingested, writer, entries).await? == Read::Gap {
-            rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
-            return Ok(ingested);
+    if read_logs(&reading, &registered, &mut ingested).await? == Read::Gap {
+        rebuild(&reading, now, &mut ingested).await?;
+    }
+    let Ingested {
+        windows, failed, ..
+    } = &mut ingested;
+    windows.retain(|_, window| !failed.contains_key(&window.rule));
+    Ok(ingested)
+}
+
+/// Reads what is new of every writer: the `registered` ones, then the
+/// ones the state holds a position of that left the registry. A gap is
+/// a re-split that asked for the windows' rebuild, a log trimmed past
+/// the position held, or one gone whole before its end was read.
+async fn read_logs(
+    reading: &Reading<'_>,
+    registered: &BTreeSet<WriterId>,
+    ingested: &mut Ingested,
+) -> Result<Read, String> {
+    let Reading {
+        source,
+        rules,
+        state,
+    } = *reading;
+    if rules.iter().any(|f| state.rebuild.contains(&f.rule.name)) {
+        tracing::info!(
+            tenant = %source.tenant, group = %source.group,
+            "rebuilding the windows from the files after a re-split"
+        );
+        return Ok(Read::Gap);
+    }
+    for writer in registered {
+        let entries = available(source, *writer).await?;
+        if read_new(reading, ingested, *writer, entries).await? == Read::Gap {
+            return Ok(Read::Gap);
         }
     }
     // A writer that left the registry wrote its log to the end: read
     // to it, the log is forgotten; gone before that, it is a gap.
-    for name in state.positions.keys().filter(|n| !registered.contains(*n)) {
+    for name in state.positions.keys() {
+        let Ok(writer) = name.parse::<WriterId>() else {
+            continue;
+        };
+        if registered.contains(&writer) {
+            continue;
+        }
         if state.ended.contains(name) {
             ingested.positions.remove(name);
             ingested.watermarks.remove(name);
             ingested.ended.remove(name);
             continue;
         }
-        let Ok(writer) = name.parse::<WriterId>() else {
-            continue;
-        };
         let entries = available(source, writer).await?;
         if entries.is_empty() {
             tracing::warn!(
-                tenant = %source.tenant, rule = %rule.name, %writer,
+                tenant = %source.tenant, group = %source.group, %writer,
                 "writer log gone whole before its end was read; rebuilding the windows from the files"
             );
             ingested.positions.remove(name);
             ingested.watermarks.remove(name);
-            rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
-            return Ok(ingested);
+            return Ok(Read::Gap);
         }
-        if read_new(&reading, &mut ingested, writer, entries).await? == Read::Gap {
-            rebuild(source, rule, shape, horizon, now, &mut ingested).await?;
-            return Ok(ingested);
+        if read_new(reading, ingested, writer, entries).await? == Read::Gap {
+            return Ok(Read::Gap);
         }
     }
-    Ok(ingested)
+    Ok(Read::Caught)
 }
 
 /// The positions `writer` can be read at: the entries of its log, or
@@ -628,22 +675,22 @@ async fn available(source: &Source<'_>, writer: WriterId) -> Result<Vec<Seq>, St
     }
 }
 
-/// What a source task reads for: the rule and its shape, the state it
-/// starts from and the horizon late rows are judged against.
+/// What a source task reads for: the rules, each with its horizon,
+/// and the state it starts from.
+#[derive(Clone, Copy)]
 struct Reading<'a> {
     source: &'a Source<'a>,
-    rule: &'a AlertRule,
-    shape: &'a Shape,
+    rules: &'a [Folding<'a>],
     state: &'a EvalState,
-    horizon: Timestamp,
 }
 
-/// What reading a writer's log found.
+/// What reading the writer logs found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Read {
     /// Everything new, or nothing new.
     Caught,
-    /// Entries past the position held are gone (GC-2).
+    /// Entries past a position held are gone (GC-2), or the windows
+    /// wait for a rebuild.
     Gap,
 }
 
@@ -655,18 +702,13 @@ async fn read_new(
     writer: WriterId,
     entries: Vec<Seq>,
 ) -> Result<Read, String> {
-    let Reading {
-        source,
-        rule,
-        state,
-        ..
-    } = *reading;
+    let Reading { source, state, .. } = *reading;
     let name = writer.to_string();
     let from = state.positions.get(&name).copied().unwrap_or(Seq::ZERO);
     let new: Vec<Seq> = entries.into_iter().filter(|seq| *seq > from).collect();
     if from != Seq::ZERO && new.first().is_some_and(|first| *first != from.next()) {
         tracing::warn!(
-            tenant = %source.tenant, rule = %rule.name, %writer, held = %from, first = %new[0],
+            tenant = %source.tenant, group = %source.group, %writer, held = %from, first = %new[0],
             "writer log trimmed past the position held; rebuilding the windows from the files"
         );
         return Ok(Read::Gap);
@@ -696,10 +738,8 @@ async fn read_entry(
 ) -> Result<bool, String> {
     let Reading {
         source,
-        rule,
-        shape,
+        rules,
         state,
-        horizon,
     } = *reading;
     let mut entry = match reader::read(&**source.store, writer, seq).await {
         Ok(entry) => entry,
@@ -721,13 +761,65 @@ async fn read_entry(
         let seen = ingested.watermarks.entry(name).or_insert(newest);
         *seen = (*seen).max(newest);
     }
-    for batch in entry
-        .blocks_for(source.tenant, &shape.dataset, shape.kind)
-        .map_err(|e| e.to_string())?
-    {
-        fold_batch(rule, shape, state, ingested, batch.rows(), horizon)?;
-    }
+    fold_entry(&entry, source.tenant, rules, state, ingested)?;
     Ok(true)
+}
+
+/// Folds the blocks `entry` holds for each of `rules` into the
+/// windows, the blocks of a dataset and kind decoded once for the
+/// rules that read them (CQ-2).
+///
+/// # Errors
+///
+/// If a block is corrupt.
+pub(crate) fn fold_entry(
+    entry: &Entry,
+    tenant: &TenantId,
+    rules: &[Folding<'_>],
+    state: &EvalState,
+    ingested: &mut Ingested,
+) -> Result<(), String> {
+    let mut decoded: Vec<(&DatasetName, Kind, Vec<EventBatch>)> = Vec::new();
+    for folding in rules {
+        let (dataset, kind) = (&folding.shape.dataset, folding.shape.kind);
+        let found = decoded
+            .iter()
+            .position(|(d, k, _)| *d == dataset && *k == kind);
+        let at = if let Some(at) = found {
+            at
+        } else {
+            let blocks = entry
+                .blocks_for(tenant, dataset, kind)
+                .map_err(|e| e.to_string())?;
+            decoded.push((dataset, kind, blocks));
+            decoded.len() - 1
+        };
+        let rows = decoded[at].2.iter().map(EventBatch::rows);
+        fold_rule(folding, folding.horizon, state, ingested, rows);
+    }
+    Ok(())
+}
+
+/// Folds `rows` into the windows of one rule, rows before `horizon`
+/// being late. A rule whose expressions cannot be evaluated is marked
+/// failed, and nothing more is folded for it.
+fn fold_rule<'r>(
+    folding: &Folding<'_>,
+    horizon: Timestamp,
+    state: &EvalState,
+    ingested: &mut Ingested,
+    rows: impl IntoIterator<Item = &'r RecordBatch>,
+) {
+    let Folding { rule, shape, .. } = *folding;
+    if ingested.failed.contains_key(&rule.name) {
+        return;
+    }
+    for batch in rows {
+        if let Err(error) = fold_batch(rule, shape, state, ingested, batch, horizon) {
+            ingested.failed.insert(rule.name.clone(), error);
+            return;
+        }
+    }
 }
 
 /// Folds the partials the source task left for this partition of
@@ -744,10 +836,8 @@ async fn read_partials(
 ) -> Result<bool, String> {
     let Reading {
         source,
-        rule,
-        shape,
+        rules,
         state,
-        horizon,
     } = *reading;
     let key = layout::eval_partial(
         source.tenant,
@@ -769,8 +859,13 @@ async fn read_partials(
         let seen = ingested.watermarks.entry(name).or_insert(newest);
         *seen = (*seen).max(newest);
     }
-    let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
-    for window in partials.windows.iter().filter(|w| w.rule == rule.name) {
+    for window in &partials.windows {
+        let Some(Folding { shape, horizon, .. }) =
+            rules.iter().find(|f| f.rule.name == window.rule)
+        else {
+            continue;
+        };
+        let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
         if window.start.as_nanos().saturating_add(length) <= horizon.as_nanos() {
             ingested.late_rows += window.partials.first().map_or(0, |p| p.count);
             continue;
@@ -796,40 +891,70 @@ async fn read_partials(
     Ok(true)
 }
 
-/// Rebuilds the windows of `rule` from the consistent view (section
-/// 11.7): every window still open at `horizon` is folded again from
-/// scratch out of the rows the files and the tail hold for it, and the
-/// positions move to where the view read each log to.
+/// Rebuilds the windows of every rule from the consistent view
+/// (section 11.7): every window still open at a rule's horizon is
+/// folded again from scratch out of the rows the files and the tail
+/// hold for it, and the positions move to where the view read each log
+/// to. The rules of one dataset and kind are folded from one view.
+/// Rules of different ones are not: where their views read a log to
+/// different entries the position is the earlier, so that no rule
+/// misses a row, and the later view's rules may count again what lies
+/// between until their windows close; the degraded mark covers it.
 async fn rebuild(
-    source: &Source<'_>,
-    rule: &AlertRule,
-    shape: &Shape,
-    horizon: Timestamp,
+    reading: &Reading<'_>,
     now: Timestamp,
     ingested: &mut Ingested,
 ) -> Result<(), String> {
-    let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);
-    // The oldest open window starts after this; rows before it belong
-    // to closed windows and are not late, just not needed.
-    let floor = Timestamp::from_nanos(horizon.as_nanos().saturating_sub(length));
-    let view = source
-        .engine
-        .view(
-            source.tenant,
-            &shape.dataset,
-            shape.kind,
-            TimeRange::new(floor, TimeRange::ALL.end),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let Reading { source, rules, .. } = *reading;
+    // The oldest open window of a rule starts after its floor; rows
+    // before it belong to closed windows and are not late, just not
+    // needed.
+    let floor = |folding: &Folding<'_>| {
+        let length = i64::try_from(folding.shape.window.as_nanos()).unwrap_or(i64::MAX);
+        Timestamp::from_nanos(folding.horizon.as_nanos().saturating_sub(length))
+    };
     let fresh = EvalState::default();
     let late_before = ingested.late_rows;
     ingested.windows.clear();
-    for rows in &view.rows {
-        fold_batch(rule, shape, &fresh, ingested, rows, floor)?;
+    let mut positions: BTreeMap<WriterId, Seq> = BTreeMap::new();
+    let mut seen: Vec<(&DatasetName, Kind)> = Vec::new();
+    for first in rules {
+        let (dataset, kind) = (&first.shape.dataset, first.shape.kind);
+        if seen.contains(&(dataset, kind)) {
+            continue;
+        }
+        seen.push((dataset, kind));
+        let together: Vec<&Folding<'_>> = rules
+            .iter()
+            .filter(|f| f.shape.dataset == *dataset && f.shape.kind == kind)
+            .collect();
+        let earliest = together
+            .iter()
+            .map(|f| floor(f))
+            .min()
+            .unwrap_or(floor(first));
+        let view = source
+            .engine
+            .view(
+                source.tenant,
+                dataset,
+                kind,
+                TimeRange::new(earliest, TimeRange::ALL.end),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        for folding in together {
+            fold_rule(folding, floor(folding), &fresh, ingested, &view.rows);
+        }
+        for (writer, seq) in view.sources.positions {
+            positions
+                .entry(writer)
+                .and_modify(|held| *held = (*held).min(seq))
+                .or_insert(seq);
+        }
     }
     ingested.late_rows = late_before;
-    for (writer, seq) in view.sources.positions {
+    for (writer, seq) in positions {
         ingested.positions.insert(writer.to_string(), seq);
     }
     ingested.rebuilt = Some(now);
@@ -1130,30 +1255,20 @@ fn condition_batch(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| e.to_string())
 }
 
-/// The actions that record what a source task read: positions,
-/// watermarks and windows, with windows older than two lengths before
-/// the horizon forgotten, every old window after a rebuild, and the
-/// rule's degraded mark set or cleared (section 11.7).
+/// The actions that record where a read left the logs, once for all
+/// the rules of a group: positions, watermarks and the logs read to
+/// their end, and after a rebuild every rebuild a re-split asked for
+/// done.
 #[must_use]
-pub fn actions(
-    rule: &AlertRule,
-    shape: &Shape,
-    ingested: &Ingested,
-    state: &EvalState,
-    horizon: Timestamp,
-) -> Vec<Action> {
+pub fn position_actions(ingested: &Ingested, state: &EvalState) -> Vec<Action> {
     let mut actions = Vec::new();
-    if ingested.rebuilt.is_some() && state.rebuild.contains(&rule.name) {
-        actions.push(EvalState::delete_rebuild(&rule.name));
-    }
-    match (
-        degraded_mark(rule, shape, ingested, state, horizon),
-        state.degraded.get(&rule.name),
-    ) {
-        (Some(at), Some(was)) if *was == at => {}
-        (Some(at), _) => actions.push(EvalState::put_degraded(&rule.name, at)),
-        (None, Some(_)) => actions.push(EvalState::delete_degraded(&rule.name)),
-        (None, None) => {}
+    if ingested.rebuilt.is_some() {
+        actions.extend(
+            state
+                .rebuild
+                .iter()
+                .map(|rule| EvalState::delete_rebuild(rule)),
+        );
     }
     for (writer, seq) in &ingested.positions {
         if state.positions.get(writer) != Some(seq) {
@@ -1181,7 +1296,32 @@ pub fn actions(
     for writer in state.ended.difference(&ingested.ended) {
         actions.push(EvalState::delete_ended(writer));
     }
-    for window in ingested.windows.values() {
+    actions
+}
+
+/// The actions that record what a read did to the windows of `rule`:
+/// the windows touched, with windows older than two lengths before the
+/// horizon forgotten, every old window after a rebuild, and the rule's
+/// degraded mark set or cleared (section 11.7).
+#[must_use]
+pub fn window_actions(
+    rule: &AlertRule,
+    shape: &Shape,
+    ingested: &Ingested,
+    state: &EvalState,
+    horizon: Timestamp,
+) -> Vec<Action> {
+    let mut actions = Vec::new();
+    match (
+        degraded_mark(rule, shape, ingested, state, horizon),
+        state.degraded.get(&rule.name),
+    ) {
+        (Some(at), Some(was)) if *was == at => {}
+        (Some(at), _) => actions.push(EvalState::put_degraded(&rule.name, at)),
+        (None, Some(_)) => actions.push(EvalState::delete_degraded(&rule.name)),
+        (None, None) => {}
+    }
+    for window in ingested.windows.values().filter(|w| w.rule == rule.name) {
         actions.push(EvalState::put_window(window));
     }
     let length = i64::try_from(shape.window.as_nanos()).unwrap_or(i64::MAX);

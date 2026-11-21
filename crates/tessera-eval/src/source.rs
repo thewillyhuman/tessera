@@ -29,7 +29,7 @@ use tessera_object::{Key, ObjectError, ObjectStore, layout};
 use tessera_types::{Keys, Seq, TenantId, Timestamp, WriterId};
 use tessera_wal::{Entry, EntryBody, WalError, reader};
 
-use crate::incremental::{self, Ingested, Shape, WindowState};
+use crate::incremental::{self, Folding, Ingested, Shape, WindowState};
 use crate::partition::window_partition;
 use crate::rule::AlertRule;
 use crate::state::EvalState;
@@ -96,7 +96,7 @@ pub struct SourceTask<'a> {
     /// How many state partitions the group has.
     pub parts: u32,
     /// The group's incremental rules with their shapes.
-    pub rules: &'a [(&'a AlertRule, Shape)],
+    pub rules: &'a [(&'a AlertRule, &'a Shape)],
 }
 
 /// What a run of a source task did with one writer's log.
@@ -118,8 +118,7 @@ impl SourceTask<'_> {
     ///
     /// # Errors
     ///
-    /// If the log or the partials cannot be listed, read or written,
-    /// or a rule's expression cannot be evaluated.
+    /// If the log or the partials cannot be listed, read or written.
     pub async fn run(&self, writer: WriterId, held: Seq) -> Result<Emitted, String> {
         let store = &**self.store;
         let log = reader::list(store, writer)
@@ -170,23 +169,31 @@ impl SourceTask<'_> {
                 }
                 // Nothing is late here: the partition that keeps a
                 // window judges it against its own horizon (CQ-11).
-                let fresh = EvalState::default();
-                for (rule, shape) in self.rules {
-                    let mut folded = Ingested::default();
-                    for batch in entry
-                        .blocks_for(self.tenant, &shape.dataset, shape.kind)
-                        .map_err(|e| e.to_string())?
+                let rules: Vec<Folding<'_>> = self
+                    .rules
+                    .iter()
+                    .map(|&(rule, shape)| Folding {
+                        rule,
+                        shape,
+                        horizon: Timestamp::MIN,
+                    })
+                    .collect();
+                let mut folded = Ingested::default();
+                incremental::fold_entry(
+                    entry,
+                    self.tenant,
+                    &rules,
+                    &EvalState::default(),
+                    &mut folded,
+                )?;
+                for (rule, error) in &folded.failed {
+                    tracing::warn!(tenant = %self.tenant, group = %self.group, %rule, seq = %entry.seq(), error = %error, "rule not folded over a log entry; its partials leave the entry out");
+                }
+                for window in folded.windows.into_values() {
+                    let rule = self.rules.iter().find(|(rule, _)| rule.name == window.rule);
+                    if let Some((rule, _)) = rule
+                        && !folded.failed.contains_key(&rule.name)
                     {
-                        incremental::fold_batch(
-                            rule,
-                            shape,
-                            &fresh,
-                            &mut folded,
-                            batch.rows(),
-                            Timestamp::MIN,
-                        )?;
-                    }
-                    for window in folded.windows.into_values() {
                         let part = window_partition(rule, &window.keys, self.parts);
                         each[part as usize].windows.push(window);
                     }

@@ -6,13 +6,18 @@
 //! watermark.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use tessera_eval::{AlertRule, Language, RuleGroup, Status, state};
 use tessera_exec::{CpuPool, Engine, QueryLimits};
 use tessera_format::ParquetFormat;
 use tessera_manifest::{intake, registry};
-use tessera_object::{MemoryStore, ObjectStore, Pools, layout};
+use tessera_object::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore, Pools, layout};
 use tessera_types::event::Scalar;
 use tessera_types::{
     DatasetName, Env, EventBatch, LogRow, PoolId, Seq, TenantId, Timestamp, Window,
@@ -572,4 +577,141 @@ async fn a_rule_behind_a_trimmed_log_rebuilds_from_the_files() {
     // window it could have touched, and the mark clears.
     let later = group.evaluate(&fx.engine, at(1_100)).await.unwrap();
     assert!(later.degraded.is_empty(), "{:?}", later.degraded);
+}
+
+/// A store that watches one writer's log: it remembers the entries
+/// fetched, and lets a held-back entry land the second time the log is
+/// listed, as a segment written while a rule group evaluates.
+#[derive(Debug)]
+struct WatchedLog {
+    inner: Arc<MemoryStore>,
+    log: Key,
+    listed: AtomicUsize,
+    landing: Mutex<Option<(Key, Bytes)>>,
+    fetched: Mutex<Vec<String>>,
+}
+
+impl WatchedLog {
+    fn of(fx: &Fixture, landing: Option<(Key, Bytes)>) -> Arc<Self> {
+        Arc::new(WatchedLog {
+            inner: fx.store.clone(),
+            log: layout::writer_log(fx.log.writer_id()),
+            listed: AtomicUsize::new(0),
+            landing: Mutex::new(landing),
+            fetched: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[async_trait]
+impl ObjectStore for WatchedLog {
+    async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
+        if key.is_under(&self.log) {
+            self.fetched.lock().unwrap().push(key.name().to_owned());
+        }
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
+        self.inner.head(key).await
+    }
+
+    async fn put(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+        self.inner.put(key, body).await
+    }
+
+    async fn put_if_absent(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+        self.inner.put_if_absent(key, body).await
+    }
+
+    fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+        if *prefix == self.log
+            && self.listed.fetch_add(1, Ordering::SeqCst) == 1
+            && let Some((key, body)) = self.landing.lock().unwrap().take()
+        {
+            // The memory store answers at once, so this never waits.
+            futures::executor::block_on(self.inner.put(&key, body)).unwrap();
+        }
+        self.inner.list(prefix)
+    }
+
+    async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
+        self.inner.delete(key).await
+    }
+}
+
+/// A group of two rules that each count the errors of a minute, over
+/// `store`.
+fn two_counts(fx: &Fixture, store: Arc<dyn ObjectStore>) -> RuleGroup {
+    let rules = ["first", "second"]
+        .into_iter()
+        .map(|name| {
+            let mut rule = AlertRule::new(
+                name,
+                Language::Sql,
+                "SELECT count(*) AS n FROM logs WHERE severity_text = 'ERROR' \
+                 GROUP BY tumble(timestamp, INTERVAL '1 minute') HAVING count(*) >= 1",
+            );
+            rule.dataset = "prod".into();
+            rule
+        })
+        .collect();
+    RuleGroup::open(store, TenantId::DEFAULT, "inc", rules, fx.env.clone())
+}
+
+/// The rows each rule has counted.
+async fn counted(fx: &Fixture) -> BTreeMap<String, u64> {
+    windows(fx)
+        .await
+        .values()
+        .map(|w| (w.rule.clone(), w.partials[0].count))
+        .collect()
+}
+
+/// CQ-5: the rules of a group share the positions in the writer logs,
+/// so they read the logs together: a segment that lands between one
+/// rule and the next is not behind the position for either.
+#[tokio::test]
+async fn a_segment_landing_while_a_group_evaluates_counts_for_every_rule() {
+    let mut fx = fixture().await;
+    fx.log
+        .append_segment(&[errors(at(1_000), 3, "checkout", 17)])
+        .await
+        .unwrap();
+    let second = fx
+        .log
+        .append_segment(&[errors(at(1_001), 2, "checkout", 17)])
+        .await
+        .unwrap();
+    let key = layout::writer_log_entry(fx.log.writer_id(), second);
+    let body = fx.store.get(&key).await.unwrap();
+    fx.store.delete(&key).await.unwrap();
+    let group = two_counts(&fx, WatchedLog::of(&fx, Some((key, body))));
+
+    group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    group.evaluate(&fx.engine, at(1_006)).await.unwrap();
+    let both = BTreeMap::from([("first".to_owned(), 5), ("second".to_owned(), 5)]);
+    assert_eq!(counted(&fx).await, both);
+}
+
+/// CQ-2: an entry is fetched once for all the rules of a group.
+#[tokio::test]
+async fn a_group_fetches_each_entry_once_for_all_its_rules() {
+    let mut fx = fixture().await;
+    let seq = fx
+        .log
+        .append_segment(&[errors(at(1_000), 3, "checkout", 17)])
+        .await
+        .unwrap();
+    let store = WatchedLog::of(&fx, None);
+    let group = two_counts(&fx, store.clone());
+
+    group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert_eq!(*store.fetched.lock().unwrap(), [seq.to_string()]);
+    let both = BTreeMap::from([("first".to_owned(), 3), ("second".to_owned(), 3)]);
+    assert_eq!(counted(&fx).await, both);
 }

@@ -276,7 +276,8 @@ impl RuleGroup {
 
     /// Evaluates every rule that is due at `now` and commits what
     /// changed. Rules in the incremental subset read their new segments
-    /// every time (CQ-1); the others run through the engine at their
+    /// every time (CQ-1), together, since they share the positions in
+    /// the logs (CQ-5); the others run through the engine at their
     /// interval (CQ-8). A rule that fails is logged, counted as
     /// evaluated so that its interval holds, and leaves its instances
     /// as they were.
@@ -288,18 +289,16 @@ impl RuleGroup {
         let Some(snapshot) = self.aligned().await? else {
             return Ok(Evaluated::default());
         };
-        // A recording rule runs through the engine at its interval.
-        let shapes: Vec<Option<incremental::Shape>> = self
+        let shapes = self.shapes();
+        let incremental: Vec<(&AlertRule, &incremental::Shape)> = self
             .rules
             .iter()
-            .map(|rule| match rule.record {
-                Some(_) => None,
-                None => incremental::shape_of(rule, &self.tenant).ok(),
-            })
+            .zip(&shapes)
+            .filter_map(|(rule, shape)| Some((rule, shape.as_ref()?)))
             .collect();
-        if self.parts > 1 {
-            self.run_sources(&shapes, snapshot.state()).await;
-        }
+        let (ingested, read) = self
+            .read_logs(engine, &incremental, snapshot.state(), now)
+            .await;
         let mut observed: Vec<Observed<'_>> = Vec::new();
         let mut recorded = Vec::new();
         for (rule, incremental) in self.rules.iter().zip(&shapes) {
@@ -312,9 +311,12 @@ impl RuleGroup {
                 continue;
             }
             let outcome = match incremental {
-                Some(shape) => self
-                    .observe_incrementally(engine, rule, shape, snapshot.state(), now)
-                    .await
+                Some(shape) => ingested
+                    .as_ref()
+                    .map_err(String::clone)
+                    .and_then(|ingested| {
+                        observe_windows(rule, shape, ingested, snapshot.state(), now)
+                    })
                     .map(|(observations, extra, degraded)| (observations, extra, degraded, None)),
                 None => observe(engine, &self.tenant, rule, now)
                     .await
@@ -344,7 +346,7 @@ impl RuleGroup {
                 rule,
                 observations,
                 extra,
-                positions_before: snapshot.state().positions.clone(),
+                from_logs: incremental.is_some(),
                 degraded,
                 run,
             });
@@ -359,7 +361,8 @@ impl RuleGroup {
         let transitions = Mutex::new(Vec::new());
         self.log
             .update(|state| {
-                let (actions, changed) = decide(state, &observed, now, &|fp| self.owns(fp));
+                let (actions, changed) =
+                    decide(state, &observed, read.as_ref(), now, &|fp| self.owns(fp));
                 *transitions.lock().unwrap_or_else(PoisonError::into_inner) = changed;
                 Ok::<_, ApplyError>(actions)
             })
@@ -384,20 +387,10 @@ impl RuleGroup {
     /// partition is the source of, the ones that hash to it: those of
     /// the writers registered for the datasets of the incremental
     /// rules, and those the state still holds a position of, whose
-    /// partials end or go with the log. A group without incremental
-    /// rules has nothing to leave. A log that cannot be read is logged
-    /// and tried again at the next evaluation; the partitions wait for
-    /// its partials meanwhile.
-    async fn run_sources(&self, shapes: &[Option<incremental::Shape>], state: &EvalState) {
-        let rules: Vec<(&AlertRule, incremental::Shape)> = self
-            .rules
-            .iter()
-            .zip(shapes)
-            .filter_map(|(rule, shape)| Some((rule, shape.clone()?)))
-            .collect();
-        if rules.is_empty() {
-            return;
-        }
+    /// partials end or go with the log. A log that cannot be read is
+    /// logged and tried again at the next evaluation; the partitions
+    /// wait for its partials meanwhile.
+    async fn run_sources(&self, rules: &[(&AlertRule, &incremental::Shape)], state: &EvalState) {
         let datasets: BTreeSet<&DatasetName> = rules.iter().map(|(_, s)| &s.dataset).collect();
         let mut writers: BTreeSet<String> = state.positions.keys().cloned().collect();
         for dataset in datasets {
@@ -416,7 +409,7 @@ impl RuleGroup {
             tenant: &self.tenant,
             group: &self.name,
             parts: self.parts,
-            rules: &rules,
+            rules,
         };
         let mine = |name: &&String| partition::partition_of(name, self.parts) == self.part;
         for name in writers.iter().filter(mine) {
@@ -468,20 +461,54 @@ impl RuleGroup {
         Ok(written)
     }
 
-    /// The incremental path (CQ-1): read the new segments into the
-    /// windows, then read the windows; the actions that record the
-    /// read come back with the observations.
-    /// The incremental path of one rule: its new segments folded into
-    /// its windows, what they say, the actions that record it, and
-    /// whether the rule is degraded after them (section 11.7).
-    async fn observe_incrementally(
+    /// The incremental shape of each rule, in the rules' order; none
+    /// for a rule that runs through the engine at its interval, as
+    /// every recording rule does.
+    fn shapes(&self) -> Vec<Option<incremental::Shape>> {
+        self.rules
+            .iter()
+            .map(|rule| match rule.record {
+                Some(_) => None,
+                None => incremental::shape_of(rule, &self.tenant).ok(),
+            })
+            .collect()
+    }
+
+    /// Reads the writer logs for the incremental `rules`, as their
+    /// source first when the group has several partitions (CQ-4):
+    /// what was read, and how to record where it left the logs.
+    /// Nothing is read for a group without incremental rules.
+    async fn read_logs(
         &self,
         engine: &Engine,
-        rule: &AlertRule,
-        shape: &incremental::Shape,
+        rules: &[(&AlertRule, &incremental::Shape)],
         state: &EvalState,
         now: Timestamp,
-    ) -> Result<(Vec<Observation>, Vec<Action>, bool), String> {
+    ) -> (Result<incremental::Ingested, String>, Option<LogRead>) {
+        if rules.is_empty() {
+            return (Ok(incremental::Ingested::default()), None);
+        }
+        if self.parts > 1 {
+            self.run_sources(rules, state).await;
+        }
+        let ingested = self.ingest(engine, rules, state, now).await;
+        let read = ingested.as_ref().ok().map(|ingested| LogRead {
+            positions_before: ingested.positions_before.clone(),
+            actions: incremental::position_actions(ingested, state),
+        });
+        (ingested, read)
+    }
+
+    /// The incremental path (CQ-1), first half: the new segments of
+    /// every writer folded once into the windows of all of `rules`,
+    /// of which this partition keeps those of its own instances.
+    async fn ingest(
+        &self,
+        engine: &Engine,
+        rules: &[(&AlertRule, &incremental::Shape)],
+        state: &EvalState,
+        now: Timestamp,
+    ) -> Result<incremental::Ingested, String> {
         let source = incremental::Source {
             store: &self.store,
             keys: &self.keys,
@@ -491,27 +518,19 @@ impl RuleGroup {
             part: self.part,
             parts: self.parts,
         };
-        let mut ingested = incremental::ingest(&source, rule, shape, state, now).await?;
-        // Another partition keeps the windows of the instances it owns.
+        let mut ingested = incremental::ingest(&source, rules, state, now).await?;
         ingested.windows.retain(|_, window| {
-            partition::window_partition(rule, &window.keys, self.parts) == self.part
+            rules
+                .iter()
+                .find(|(rule, _)| rule.name == window.rule)
+                .is_some_and(|(rule, _)| {
+                    partition::window_partition(rule, &window.keys, self.parts) == self.part
+                })
         });
         if ingested.late_rows > 0 {
-            tracing::info!(tenant = %self.tenant, rule = %rule.name, late_rows = ingested.late_rows, "late rows ignored");
+            tracing::info!(tenant = %self.tenant, group = %self.name, late_rows = ingested.late_rows, "late rows ignored");
         }
-        let writers: Vec<String> = ingested.watermarks.keys().cloned().collect();
-        let mut after = state.clone();
-        after.positions.clone_from(&ingested.positions);
-        after.watermarks.clone_from(&ingested.watermarks);
-        if ingested.rebuilt.is_some() {
-            after.windows.retain(|_, w| w.rule != rule.name);
-        }
-        after.windows.extend(ingested.windows.clone());
-        let horizon = incremental::watermark(&after, &writers, now);
-        let observations = incremental::observe(rule, shape, &after.windows, horizon)?;
-        let actions = incremental::actions(rule, shape, &ingested, state, horizon);
-        let degraded = incremental::degraded_mark(rule, shape, &ingested, state, horizon).is_some();
-        Ok((observations, actions, degraded))
+        Ok(ingested)
     }
 
     /// Delivers the outbox (CQ-15). Every pending transition is written
@@ -975,16 +994,54 @@ fn applies(state: &EvalState, action: &Action) -> bool {
 struct Observed<'a> {
     rule: &'a AlertRule,
     observations: Option<Vec<Observation>>,
-    /// Actions of the incremental path: positions, watermarks, windows.
+    /// Actions of the incremental path: the rule's windows.
     extra: Vec<Action>,
-    /// The writer positions the evaluation started from; a state that
-    /// moved past them belongs to another owner (AR-6) and the
-    /// evaluation is dropped rather than counted twice.
-    positions_before: BTreeMap<String, Seq>,
+    /// Whether the rule was observed from what the evaluation read of
+    /// the writer logs.
+    from_logs: bool,
     /// Whether the rule is degraded after this evaluation (section 11.7).
     degraded: bool,
     /// What the engine was asked, when the rule ran through it.
     run: Option<RuleRun>,
+}
+
+/// The incremental path, second half, for one rule: what its
+/// windows say after the read, the actions that record them, and
+/// whether the rule is degraded after them (section 11.7).
+fn observe_windows(
+    rule: &AlertRule,
+    shape: &incremental::Shape,
+    ingested: &incremental::Ingested,
+    state: &EvalState,
+    now: Timestamp,
+) -> Result<(Vec<Observation>, Vec<Action>, bool), String> {
+    if let Some(why) = ingested.failed.get(&rule.name) {
+        return Err(why.clone());
+    }
+    let writers: Vec<String> = ingested.watermarks.keys().cloned().collect();
+    let mut after = state.clone();
+    after.positions.clone_from(&ingested.positions);
+    after.watermarks.clone_from(&ingested.watermarks);
+    if ingested.rebuilt.is_some() {
+        after.windows.retain(|_, w| w.rule != rule.name);
+    }
+    after.windows.extend(ingested.windows.clone());
+    let horizon = incremental::watermark(&after, &writers, now);
+    let observations = incremental::observe(rule, shape, &after.windows, horizon)?;
+    let actions = incremental::window_actions(rule, shape, ingested, state, horizon);
+    let degraded = incremental::degraded_mark(rule, shape, ingested, state, horizon).is_some();
+    Ok((observations, actions, degraded))
+}
+
+/// What an evaluation read of the writer logs for its incremental
+/// rules.
+struct LogRead {
+    /// The writer positions the read started from; a state that moved
+    /// past them belongs to another owner (AR-6) and what was read is
+    /// dropped rather than counted twice.
+    positions_before: BTreeMap<String, Seq>,
+    /// The actions that record where the read left the logs.
+    actions: Vec<Action>,
 }
 
 /// The actions that bring `state` up to date with what was observed,
@@ -993,22 +1050,32 @@ struct Observed<'a> {
 fn decide(
     state: &EvalState,
     observed: &[Observed<'_>],
+    read: Option<&LogRead>,
     now: Timestamp,
     owns: &dyn Fn(&str) -> bool,
 ) -> (Vec<Action>, Vec<Transition>) {
     let mut actions = Vec::new();
     let mut transitions = Vec::new();
+    let moved = read.is_some_and(|read| state.positions != read.positions_before);
+    match read {
+        Some(_) if moved => {
+            tracing::warn!(
+                "another owner moved the positions; what was read of the logs is dropped"
+            );
+        }
+        Some(read) => actions.extend(read.actions.iter().cloned()),
+        None => {}
+    }
     for Observed {
         rule,
         observations,
         extra,
-        positions_before,
+        from_logs,
         degraded: _,
         run: _,
     } in observed
     {
-        if !extra.is_empty() && state.positions != *positions_before {
-            tracing::warn!(rule = %rule.name, "another owner moved the positions; evaluation dropped");
+        if *from_logs && moved {
             continue;
         }
         actions.push(EvalState::put_evaluated(&rule.name, now));

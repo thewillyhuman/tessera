@@ -281,8 +281,7 @@ one evaluation later, an entry leaves its objects even when it holds
 nothing for the group, a row is late by its window, once the
 watermark has closed it, and not on its own, and what a stale source
 leaves under a partition count the group no longer has stays until
-the next re-split; an entry, or its partials, is read once per
-incremental rule; the
+the next re-split; the
 incremental subset is SQL
 only, counting and summing rows with the weight `1 / sample_rate` as
 the batch aggregates do (QE-13); the alert latency of 17.1, from the
