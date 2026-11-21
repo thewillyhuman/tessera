@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tessera_commit::{
     Action, ApplyError, CommitError, CommitLog, DecodeError, RemoveReason, Snapshot, State,
@@ -534,6 +534,10 @@ impl std::fmt::Debug for Manifest {
     }
 }
 
+/// How many windows are asked about at once when a dataset's
+/// partitions are looked for.
+const LISTINGS_AT_ONCE: usize = 16;
+
 /// The partitions of one dataset and kind that exist (MF-3): those whose
 /// manifest log has at least one commit, in window order.
 ///
@@ -547,26 +551,24 @@ pub async fn list_partitions(
     kind: Kind,
 ) -> Result<Vec<PartitionId>, ManifestError> {
     let prefix = layout::partitions(tenant, dataset, kind);
-    let mut windows: Vec<Window> = Vec::new();
-    let mut listing = store.list(&prefix);
-    while let Some(meta) = listing.try_next().await? {
-        let rest = meta
-            .key
-            .as_str()
-            .strip_prefix(prefix.as_str())
-            .and_then(|r| r.strip_prefix('/'));
-        let Some((window, tail)) = rest.and_then(|r| r.split_once('/')) else {
-            continue;
-        };
-        if !tail.starts_with("_log/") {
-            continue;
-        }
-        if let Ok(window) = window.parse::<Window>()
-            && !windows.contains(&window)
-        {
-            windows.push(window);
+    // The names under the prefix are the windows that hold anything; a
+    // window has a manifest once `_log` is among the names under it.
+    // Neither walks the files, so the cost follows the windows.
+    let mut named: Vec<(Window, Key)> = Vec::new();
+    for name in store.list_names(&prefix).await? {
+        if let (Ok(window), Ok(under)) = (name.parse::<Window>(), prefix.join(&name)) {
+            named.push((window, under));
         }
     }
+    let committed = named.into_iter().map(|(window, under)| async move {
+        let below = store.list_names(&under).await?;
+        Ok::<_, ManifestError>(below.iter().any(|name| name == "_log").then_some(window))
+    });
+    let found: Vec<Option<Window>> = futures::stream::iter(committed)
+        .buffered(LISTINGS_AT_ONCE)
+        .try_collect()
+        .await?;
+    let mut windows: Vec<Window> = found.into_iter().flatten().collect();
     windows.sort_unstable();
     Ok(windows
         .into_iter()
@@ -761,6 +763,29 @@ mod tests {
         .await
         .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// A query finds its partitions on every run: what that costs must
+    /// follow the number of partitions, not of the files in them.
+    #[tokio::test]
+    async fn partitions_are_found_without_walking_their_objects() {
+        let store = MemoryStore::new();
+        let writer = WriterId::from_u128(1);
+        for start in [0, 100_000] {
+            let manifest = Manifest::open(Arc::new(store.clone()), partition(start), env(1));
+            let files = [file(1, &partition(start), writer, 1)];
+            manifest.adopt(writer, Seq::new(1), &files).await.unwrap();
+        }
+        // A file written for a window whose manifest has no commit yet.
+        let unadopted = layout::data_file(&partition(200_000), FileId::from_u128(9));
+        store.put(&unadopted, "rows".into()).await.unwrap();
+
+        let dataset = DatasetName::new("prod").unwrap();
+        let shallow = crate::shallow::Shallow(store);
+        let found = list_partitions(&shallow, &TenantId::DEFAULT, &dataset, Kind::Log)
+            .await
+            .unwrap();
+        assert_eq!(found, [partition(0), partition(100_000)]);
     }
 
     #[tokio::test]

@@ -92,8 +92,8 @@ pub async fn list(
 }
 
 /// The datasets of a tenant that have at least one registered writer, in
-/// name order. Found by listing the tenant's prefix, which is adequate
-/// while tenants are small; a dedicated index can replace it later.
+/// name order. Found from the names under the tenant's prefix and under
+/// each dataset's registry, never by walking the tenant's objects.
 ///
 /// # Errors
 ///
@@ -105,13 +105,14 @@ pub async fn datasets(
     let prefix = tessera_object::Key::new(tenant.as_str())
         .unwrap_or_else(|e| unreachable!("a tenant id is a valid key: {e}"));
     let mut datasets: Vec<DatasetName> = Vec::new();
-    let mut listing = store.list(&prefix);
-    while let Some(meta) = listing.try_next().await? {
-        let components: Vec<&str> = meta.key.as_str().split('/').collect();
-        if let [_, dataset, "_writers", _] = components.as_slice()
-            && let Ok(dataset) = DatasetName::new(*dataset)
-            && !datasets.contains(&dataset)
-        {
+    for name in store.list_names(&prefix).await? {
+        // What is not a dataset's name is the tenant's own: its control
+        // store, its rule state.
+        let Ok(dataset) = DatasetName::new(name) else {
+            continue;
+        };
+        let writers = layout::writer_registry(tenant, &dataset);
+        if !store.list_names(&writers).await?.is_empty() {
             datasets.push(dataset);
         }
     }
@@ -145,6 +146,28 @@ mod tests {
 
     fn dataset() -> DatasetName {
         DatasetName::new("prod").unwrap()
+    }
+
+    /// The background work asks for a tenant's datasets every round.
+    #[tokio::test]
+    async fn datasets_are_found_without_walking_the_tenant() {
+        let store = MemoryStore::new();
+        let env = Env::simulated(1, Timestamp::from_nanos(5));
+        let other = DatasetName::new("staging").unwrap();
+        for dataset in [dataset(), other.clone()] {
+            let writer = WriterId::from_u128(1);
+            register(&store, &env, &TenantId::DEFAULT, &dataset, writer)
+                .await
+                .unwrap();
+        }
+        // A dataset with a log of its own and no writer registered.
+        let unwritten = layout::dataset_log(&TenantId::DEFAULT, &DatasetName::new("idle").unwrap());
+        let commit = unwritten.join("_log").unwrap().join("1").unwrap();
+        store.put(&commit, Bytes::from_static(b"{}")).await.unwrap();
+
+        let shallow = crate::shallow::Shallow(store);
+        let found = datasets(&shallow, &TenantId::DEFAULT).await.unwrap();
+        assert_eq!(found, [dataset(), other]);
     }
 
     #[tokio::test]

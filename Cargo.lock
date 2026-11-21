@@ -3833,6 +3833,7 @@ name = "tessera-manifest"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "futures",
  "serde",
