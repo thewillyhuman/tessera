@@ -55,6 +55,12 @@ const RECLUSTER_BUDGET: u64 = 256 << 20;
 /// (section 13.1): the grain a storage bill is reconciled at.
 const HELD_EVERY: Duration = Duration::from_secs(3_600);
 
+/// How often the writers' logs are looked over for entries to collect
+/// (GC-2). An entry stays an hour after it is adopted, so a look every
+/// round finds what the one before found; a minute's delay on an hour
+/// is not felt.
+const COLLECT_EVERY: Duration = Duration::from_secs(60);
+
 /// How often the Iceberg metadata of the tables this node owns the
 /// export of is brought up to date (OP-9): a table whose files did not
 /// change costs its hint and metadata reads, nothing more.
@@ -126,6 +132,7 @@ pub async fn run(background: Background) {
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_held: Option<Timestamp> = None;
     let mut last_export: Option<Timestamp> = None;
+    let mut last_collection: Option<Timestamp> = None;
     let mut positions = Positions::new();
     loop {
         ticks.tick().await;
@@ -173,8 +180,12 @@ pub async fn run(background: Background) {
             background.meter.held(held);
             last_held = Some(now);
         }
-        if let Err(error) = collect_logs(&background).await {
-            tracing::warn!(error = %error, "segment collection failed");
+        if is_due(last_collection, now, COLLECT_EVERY) {
+            // A look that failed is taken again next round.
+            match collect_logs(&background).await {
+                Ok(()) => last_collection = Some(now),
+                Err(error) => tracing::warn!(error = %error, "segment collection failed"),
+            }
         }
         if let Some(exporter) = &background.export {
             let due = last_export.is_none_or(|at: Timestamp| {
@@ -189,6 +200,12 @@ pub async fn run(background: Background) {
             }
         }
     }
+}
+
+/// Whether what was last done at `last`, if ever, is to be done again
+/// at `now`: when it never was, or was `every` ago or longer.
+fn is_due(last: Option<Timestamp>, now: Timestamp, every: Duration) -> bool {
+    last.is_none_or(|at| now.duration_since(at).is_some_and(|since| since >= every))
 }
 
 /// Publishes the Iceberg metadata of every table this node owns the
@@ -630,4 +647,19 @@ async fn quiet_for(background: &Background, writer: WriterId) -> Result<Option<D
         now.duration_since(entry.header().written_at)
             .unwrap_or(Duration::ZERO),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_work_is_due_at_first_and_then_every_interval() {
+        let at = |seconds: i64| Timestamp::from_nanos(seconds * 1_000_000_000);
+        assert!(is_due(None, at(0), COLLECT_EVERY));
+        assert!(!is_due(Some(at(0)), at(59), COLLECT_EVERY));
+        assert!(is_due(Some(at(0)), at(60), COLLECT_EVERY));
+        // A clock set back does not bring the work forward.
+        assert!(!is_due(Some(at(60)), at(0), COLLECT_EVERY));
+    }
 }
