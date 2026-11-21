@@ -281,14 +281,19 @@ every route and over gRPC.
 
 ## Requests against the store
 
-A bucket bills per request. An idle node makes about fifteen a
-second, measured against MinIO on one node with every role and no
-cache: a third are listings by the background work, a third are reads
-of log heads that find nothing new, a fifth are reads of writer-log
-entries by the node's own health rules, which `--cache-dir` serves
-from disk, and the rest are heartbeats, leases and the node's own
-metrics. Budget for it per node, and prefer few larger nodes to many
-small ones where that matters.
+A bucket bills per request. A node left idle makes about twenty a
+second, measured against MinIO on one node with every role, a cache
+directory, five datasets and seven partitions: four in ten are
+listings and four in ten are reads of log heads that find nothing
+new, both mostly by the background work, which every five seconds
+goes over every dataset's writers and partitions again; the rest are
+heartbeats, leases and the node's own metrics. The number grows with
+what the cluster holds: about eighty requests a minute for each
+dataset and sixty for each partition, one a day by default, so a
+dataset kept thirty days costs about thirty requests a second while
+nothing is written or asked. Without `--cache-dir` the node's own
+health rules add the writer-log entries they read, a fifth more.
+Budget for it where requests are billed, and see the known limits.
 
 A query's requests grow with the partitions of its dataset, one a day
 by default, not with the files in them: it asks for the partitions'
@@ -306,4 +311,7 @@ operator meets first:
 - only the root pool is opened: further pools in the catalog are not
   used yet;
 - the cache keeps whole ranges as they were read, so it helps
-  repeated queries more than new ones.
+  repeated queries more than new ones;
+- the background work goes over every dataset and partition every
+  five seconds whether or not anything changed, so the requests of an
+  idle cluster grow with what it holds (see above).
