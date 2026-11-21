@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The push-based physical operator (section 18.2) and the operators of
 //! the engine core.

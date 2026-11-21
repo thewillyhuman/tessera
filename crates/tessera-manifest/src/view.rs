@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The consistent view (spec section 6.8): the rows of a dataset and kind
 //! at one moment, with no gaps and no duplicates (VW-1).

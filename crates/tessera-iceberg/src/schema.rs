@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The schema of an exported table (OP-9): every column of the kind's
 //! base schema and every dedicated column its files hold, as Iceberg

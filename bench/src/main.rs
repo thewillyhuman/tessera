@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `tessera-bench`: one node, in this process, measured against the
 //! performance targets of spec section 17.1 that a single machine can

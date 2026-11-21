@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The L1 flush: rows of a range of segments become Parquet files, one
 //! per partition (section 6.9). Ingest flushes its own buffers this way,

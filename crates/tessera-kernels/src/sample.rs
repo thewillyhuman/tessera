@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Row sampling (CO-6, CO-7): keeps a deterministic share of the rows
 //! and sets `sample_rate` on the survivors so weighted aggregates stay

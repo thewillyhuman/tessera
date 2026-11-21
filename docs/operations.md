@@ -296,5 +296,4 @@ operator meets first:
 - only the root pool is opened: further pools in the catalog are not
   used yet;
 - the cache keeps whole ranges as they were read, so it helps
-  repeated queries more than new ones;
-- the license of the project itself is not final.
+  repeated queries more than new ones.

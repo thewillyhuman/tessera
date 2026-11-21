@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! OTLP metrics (IN-1): decoding an export request and normalizing its
 //! data points (IN-5).

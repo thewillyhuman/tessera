@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The HTTP administration API (CT-2): tenants are created, altered,
 //! suspended, dropped and restored while the system runs.

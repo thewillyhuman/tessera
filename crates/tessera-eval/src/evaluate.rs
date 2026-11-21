@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Periodic evaluation (CQ-8): a rule is re-executed at its interval
 //! through the engine, in its own language, and each row or sample of

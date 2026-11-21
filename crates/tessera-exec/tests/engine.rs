@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The engine over real storage: files written by the write path, tail
 //! rows in segments, pruning at every stage, and the operators above.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The node registry (section 14.1): one object per node under
 //! `_cluster/nodes/` in the root pool, rewritten at every heartbeat and

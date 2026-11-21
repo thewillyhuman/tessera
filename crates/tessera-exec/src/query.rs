@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! One query, end to end: text in any language, through its front end,
 //! the optimizer and the engine. `EXPLAIN` shows the optimized plan and

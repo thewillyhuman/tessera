@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `Sort`: order every input row. Blocking; accounts its buffer and,
 //! when the grant runs out, spills what it holds as a sorted run to

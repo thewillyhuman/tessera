@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Differential testing of `LogQL` against Loki (QL-4, section 18.5): the
 //! same lines are pushed to a Loki instance and to an in-process Tessera

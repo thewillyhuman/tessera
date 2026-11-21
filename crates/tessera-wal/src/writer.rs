@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The writer side of a log: one ingester process appending entries at
 //! strictly increasing sequence numbers (ST-5).

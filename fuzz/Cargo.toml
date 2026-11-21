@@ -3,7 +3,7 @@ name = "tessera-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
-license = "LicenseRef-Tessera-Pending"
+license = "Apache-2.0"
 description = "cargo-fuzz targets for every decoder and parser (RS-5)"
 
 [package.metadata]

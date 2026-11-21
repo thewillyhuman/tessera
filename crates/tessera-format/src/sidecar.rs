@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The sidecar index file (ST-14): secondary indexes of one data file in
 //! a Tessera-specific format. A data file stays readable without it.

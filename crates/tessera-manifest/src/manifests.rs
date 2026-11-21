@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Open manifests kept in memory (section 10.8): a commit log remembers
 //! the last snapshot it built and reads only what was committed after

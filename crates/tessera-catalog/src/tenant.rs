@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tenants (spec section 12.2): the isolation, accounting and
 //! authorization boundary, managed while the system runs.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Reading a span's `links` column for `TraceQL`'s `link.` scope
 //! (QL-15, DM-9): the column is a JSON list of objects with the linked

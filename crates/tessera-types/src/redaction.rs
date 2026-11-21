@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Redaction rules (SE-4): what to do with an attribute before anything
 //! is written. A rule names an attribute path, or every path under a

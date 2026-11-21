@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! What nodes say to each other (sections 7.3 and 10.7), under
 //! `/internal/v1`: a leaf task to run (`POST /internal/v1/scan`, a JSON

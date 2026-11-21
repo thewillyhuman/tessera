@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Where alert events go (CQ-14): each transition is written as an
 //! `alert` event of the rule's dataset with a deterministic event id,

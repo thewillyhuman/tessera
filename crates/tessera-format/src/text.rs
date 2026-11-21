@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tokenization and trigrams, fixed per layout epoch (QL-18) so that an
 //! index and a query always agree.

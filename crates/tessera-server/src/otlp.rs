@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! OTLP over HTTP (IN-1): `POST /v1/logs`, `POST /v1/traces` and
 //! `POST /v1/metrics` with a protobuf or JSON body.

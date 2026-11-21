@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Stage outputs between workers (QE-14): a partial stage keeps its
 //! output on the node that ran it, split by a hash of the group keys

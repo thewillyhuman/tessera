@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! One Tessera node (AR-1): opens the root pool, the catalog, the ingest
 //! service, the query engine and the HTTP API, keeps the catalog fresh

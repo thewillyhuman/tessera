@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Partitions (spec section 6.6): one tenant, dataset, kind and event-time
 //! window. The unit of manifest, compaction and retention.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The table metadata file, `v{N}.metadata.json`, and the version hint
 //! a reader finds the current one by, as a Hadoop-style catalog lays

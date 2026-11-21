@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Trace groups over real storage: the candidate phase, the span phase
 //! restricted to the candidate traces (QL-13), files and the tail.

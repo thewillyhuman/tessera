@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Running a compaction job: read the inputs, merge, deduplicate,
 //! promote the attribute paths worth a column (section 8.2), write the

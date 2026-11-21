@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Authentication by client certificate (SE-1). The listener checks a
 //! certificate against the client CA the operator configured and hands

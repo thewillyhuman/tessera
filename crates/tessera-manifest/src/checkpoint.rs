@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! A manifest's checkpoint as a Parquet file (MF-5): one row per file,
 //! sorted by the files' first timestamps, in row groups whose

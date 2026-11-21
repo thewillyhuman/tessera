@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `GET /metrics`: the node's load signals (OP-5) in the Prometheus text
 //! exposition format, open like liveness so that an autoscaler or a

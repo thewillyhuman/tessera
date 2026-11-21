@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The dataset log (section 6.2, `{tenant}/{dataset}/_log/`): the
 //! dataset's physical design as the advisor sets it and the writers

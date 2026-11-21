@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Column promotion (section 8.2): when a file is written, an attribute
 //! path gets a dedicated column when it is well known, when at least a

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The search syntax (spec section 9.6): a small filter language for
 //! interactive use that applies to any kind.

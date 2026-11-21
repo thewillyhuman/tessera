@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! What people write into the control store (CS-3): alert rules
 //! (section 11.2), where their notifications go (11.9), and the

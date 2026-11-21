@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Rules and alerts as Prometheus and Loki clients expect them (CQ-3):
 //! `GET /api/v1/rules` and `GET /api/v1/alerts` in Prometheus' shape,

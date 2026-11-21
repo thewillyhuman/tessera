@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The rollups the planner may read (section 8.7, AD-13), as the engine
 //! asks for them: the enabled rollups of a tenant from its control

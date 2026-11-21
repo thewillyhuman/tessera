@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Load generation: representative application logs, gauge metrics and
 //! spans, built as OTLP protobuf and posted to the node's OTLP HTTP

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Queries over HTTP: `POST /api/v1/query` with a JSON body
 //! `{"query": "...", "language": "sql", "dataset": "prod"}`. The

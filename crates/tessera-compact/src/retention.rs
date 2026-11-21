@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Applying a retention policy at compaction (CO-9, CP-3): the rows a
 //! clause's condition matches are removed, sampled or downsampled on

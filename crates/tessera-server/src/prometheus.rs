@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The Prometheus HTTP API (section 16): remote write, instant and
 //! range queries, series, labels, label values, metadata, readiness

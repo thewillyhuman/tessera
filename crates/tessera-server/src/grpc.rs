@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! OTLP over gRPC (IN-1): the logs, traces and metrics export services
 //! on the same listener as everything else, as HTTP/2 routes the main

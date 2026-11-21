@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! A snapshot's manifest file, one entry per data file with its row
 //! count, size, value and null counts and bounds, and the manifest

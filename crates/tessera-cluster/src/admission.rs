@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Admission control (QE-18, IN-11): per-tenant limits on concurrent
 //! queries, on how long a query may wait for a turn, and on the bytes

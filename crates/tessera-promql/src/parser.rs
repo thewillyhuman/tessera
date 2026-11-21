@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! A recursive-descent parser for `PromQL` (section 9.3), with
 //! Prometheus' precedence: `^` binds tightest and to the right, then

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Runs every scenario over many seeds. `TESSERA_SIM_SEEDS` raises the
 //! count for a long run.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Line and label templates (`LogQL` `line_format`, `label_format`): the
 //! subset of Go templates dashboards use, `{{.label}}` and `{{__line__}}`.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `tessera-sim`: runs the simulation scenarios over a range of seeds and
 //! reports the first safety violation, with the seed that reproduces it.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Encryption in transit (SE-3): the HTTP API and the `PostgreSQL`
 //! protocol serve TLS from one certificate and key, and the peer client

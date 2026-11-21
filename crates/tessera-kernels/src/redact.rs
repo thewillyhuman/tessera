@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Applying redaction rules (SE-4) to a batch before it is written: the
 //! attributes in `_overflow` that a rule names are dropped, hashed or

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The advisor's loop (spec section 8): every interval, for each
 //! tenant, dataset and kind whose partition slot this node holds, the

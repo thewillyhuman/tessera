@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Apache Iceberg metadata over a dataset's adopted Parquet files
 //! (OP-9, G2), so that an external engine reads a Tessera table without

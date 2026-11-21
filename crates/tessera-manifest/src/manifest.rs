@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! One partition's manifest: a commit log of `AddFile`, `RemoveFile`,
 //! `AdvanceWriter` and `DropPartition` actions (MF-4).

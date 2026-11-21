@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-tenant encryption keys (SE-2, SE-3). A node is given a keyring
 //! of named 256-bit keys when it starts; a tenant's `encryption_key`

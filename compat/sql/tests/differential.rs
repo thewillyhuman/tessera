@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The SQL differential suite (QL-4 for SQL, section 18.5): every case is
 //! one question in Tessera's dialect and in `SQLite`'s. Rows are ordered by

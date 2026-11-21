@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Loki push over protobuf (section 16): decoding a snappy-compressed
 //! `logproto.PushRequest`, the form promtail and Alloy send by default,

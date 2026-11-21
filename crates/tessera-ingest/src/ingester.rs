@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The ingester: buffers batches, writes segments to its own writer log,
 //! acknowledges, keeps rows in a memtable until they are flushed to L1

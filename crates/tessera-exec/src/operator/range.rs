@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `RangeVector`: group rows by their full label set and evaluate a
 //! range function per series at every step. Blocking; memory is

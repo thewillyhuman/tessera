@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! What a manifest records about a data file (ST-12). Files describe
 //! themselves (P3): every layout decision is recorded per file, so files

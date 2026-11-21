@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The plan representation (spec section 10.2): one relational algebra
 //! with time-series extensions that every query language lowers into

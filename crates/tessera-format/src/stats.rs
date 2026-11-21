@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Per-column statistics for manifest entries (ST-12): min, max, null
 //! count and octiles of every column whose type has an order, and the

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `compact` role's background work: intake for every registered
 //! writer (section 6.7), recovery of writers that are dead (ST-9, ST-10),

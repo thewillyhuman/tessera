@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! A rule group: the rules one slot owner evaluates together, with one
 //! state log per state partition (section 11.3). A partition of

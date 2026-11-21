@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Which retention policy applies to a partition and what it does
 //! (section 13.3, CO-9): the first clause whose condition can match the

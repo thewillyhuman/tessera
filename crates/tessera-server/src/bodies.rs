@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Structured log bodies at ingest (DM-10), as the tenant's settings
 //! ask: JSON objects by default, logfmt lines on request.

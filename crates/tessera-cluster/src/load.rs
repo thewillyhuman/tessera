@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Load signals (OP-5): what an autoscaler needs from every node. The
 //! roles set the gauges as they work, writes and queries update them

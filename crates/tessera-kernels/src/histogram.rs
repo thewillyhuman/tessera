@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Histogram points: the JSON a metric row stores for a classic
 //! histogram (`bounds` and `counts`), an exponential one (`scale`,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Periodic evaluation end to end: rules in SQL and `PromQL` over rows
 //! in a writer log, the lifecycle through pending, firing and resolved,

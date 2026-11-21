@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Intake (spec section 6.7): moves L1 files from writer logs into
 //! partition manifests. Metadata work only.

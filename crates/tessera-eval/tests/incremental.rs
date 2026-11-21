@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The incremental subset over writer-log segments: a windowed count
 //! fires as soon as it holds, positions move so nothing is counted

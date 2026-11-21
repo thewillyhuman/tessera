@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `eval` role's loop: every interval, for every active tenant, the
 //! alert rules in the control store are grouped and each group this

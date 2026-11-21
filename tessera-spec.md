@@ -3,7 +3,7 @@
 **Status:** Draft 0.2 · 2026-10-10
 **Implementation language:** Rust
 **Distribution:** self-hosted software; no managed service is planned
-**License:** source-available, pending confirmation (section 20)
+**License:** Apache License 2.0 (section 20)
 
 The key words MUST, SHOULD and MAY are used as in RFC 2119. Requirements carry IDs (for example `ST-4`) so that code, tests and issues can refer to them. IDs were renumbered in this draft.
 
@@ -17,7 +17,7 @@ The key words MUST, SHOULD and MAY are used as in RFC 2119. Requirements carry I
 | Parquet confirmed | No longer an open question |
 | LogQL and TraceQL from the start | Five query languages (section 9); Loki and Tempo HTTP APIs (section 16); each signal ships with its native language in the same milestone (section 19) |
 | Single region | Unchanged (section 14.5) |
-| Name confirmed; license intent stated | Section 20 records the intent and the candidates; one decision remains |
+| Name confirmed; license decided | Section 20: open source under the Apache License 2.0 |
 
 ---
 
@@ -1095,44 +1095,44 @@ Each milestone ends with a usable system and has an exit criterion. Two rules sh
 
 ## 20. Licensing
 
-### 20.1 Intent
+### 20.1 Decision
 
-- **LI-1** Anyone may run, study, modify and redistribute Tessera free of charge, including companies running it for their own internal use.
-- **LI-2** No one may charge others for Tessera, or for a product or service whose value comes substantially from it. This includes selling it, bundling it into a paid product, and offering it as a paid hosted service.
-- **LI-3** In every other respect the terms should follow the Apache License 2.0: attribution, patent grant, no warranty.
+Tessera is open source under the Apache License 2.0.
 
-### 20.2 Why this is not simply "Apache 2.0"
+- **LI-1** Anyone may run, study, modify and redistribute Tessera free of charge and for any purpose, commercial ones included.
+- **LI-2** Withdrawn. Earlier drafts barred charging for Tessera or for a product or service built on it. No open source license allows that restriction, and it was dropped with the decision to be open source.
+- **LI-3** The terms are those of the Apache License 2.0: attribution, patent grant, no warranty.
 
-The Apache License 2.0 on its own grants everyone the right to sell the software and to offer it as a paid service, so it does not satisfy LI-2. Any license that does satisfy LI-2 falls outside the Open Source Definition, which forbids restricting commercial use. Tessera would therefore be **source-available**, and should describe itself that way and not as "open source".
+### 20.2 Why the Apache License 2.0
 
-### 20.3 Candidates
+- **It is the license of the ecosystem.** Prometheus, OpenTelemetry, Arrow, Parquet and Iceberg, whose protocols and formats Tessera speaks and whose libraries it builds on, are all under it. Code and people move between these projects without a license question.
+- **It carries a patent grant.** Every contributor licenses the patents their contribution needs, and loses the license by suing over it. MIT and BSD say nothing on patents.
+- **It asks little of an adopter.** Tessera is self-hosted software with no managed service planned (section 2.2), so what the project needs most is to be easy to adopt and to contribute to. A company can run, change and embed permissively licensed software without the review a copyleft or source-available license calls for.
+- **What it gives up.** Anyone may sell Tessera or host it for a fee and owes nothing back but attribution. A project with a hosted business to protect would weigh that differently; this one has none.
 
-| License | Company runs it internally for free | Others selling it or charging for a service built on it | Notes |
-|---------|-------------------------------------|----------------------------------------------------------|-------|
-| Apache 2.0 | Allowed | Allowed | Open source. Does not meet LI-2. |
-| AGPL 3.0 | Allowed | Allowed, but modified versions offered over a network must be published | Open source. Discourages closed forks; does not meet LI-2. |
-| Apache 2.0 with Commons Clause | Allowed | Not allowed. The clause removes the right to "Sell", defined to include hosting, consulting and support for a fee where the value derives entirely or substantially from the software | Closest to the stated intent and to "some Apache". "Substantially" is not defined, which leaves room for dispute. It also bars third parties from paid support and consulting. |
-| Elastic License 2.0 | Allowed | Offering it as a hosted or managed service is not allowed; other commercial use is | Short and widely used. Does not stop a company from selling it inside a product. |
-| Functional Source License 1.1 (Apache 2.0 future license) | Allowed | A competing commercial product or service is not allowed | Each release becomes plain Apache 2.0 two years after publication; from then on that version may be sold. |
-| PolyForm Noncommercial | Not allowed | Not allowed | Stricter than LI-1: a company could not run it for its business at all. |
+### 20.3 Alternatives considered
 
-### 20.4 Status and consequences
+| License | Why not |
+|---------|---------|
+| MIT, BSD | As permissive, but without the patent grant. |
+| MIT or Apache 2.0, at the user's choice | The convention for Rust libraries, so that they link into anything. Tessera is a server, not a library; one license is simpler. |
+| AGPL 3.0 | Open source, and it keeps network forks open. Many companies do not allow it at all, which costs the adoption the project is after. |
+| Apache 2.0 with Commons Clause, Elastic License 2.0, Functional Source License | Not open source: each restricts selling or hosting. They were the candidates while LI-2 stood. |
 
-- **LI-4** The license is not final. The text must be chosen and reviewed by a lawyer before the first public release; this document is not legal advice.
-- **LI-5** Dependencies MUST be under permissive licenses (Apache 2.0, MIT, BSD and similar). Copyleft dependencies are excluded so that the project's own license can be chosen freely (RS-6).
-- **LI-6** Contributions are accepted under a contributor agreement that lets the project owner set and later change the license.
-- **LI-7** Source files carry an SPDX identifier from the first commit, updated once the license is final.
+### 20.4 Consequences
 
-License texts: [Commons Clause](https://commonsclause.com/) · [Elastic License 2.0](https://spdx.org/licenses/Elastic-2.0.html) · [FSL-1.1-ALv2](https://spdx.org/licenses/FSL-1.1-ALv2.html)
+- **LI-4** The license text is the unmodified Apache License 2.0, in `LICENSE`; `NOTICE` carries the copyright line. This document is not legal advice.
+- **LI-5** Dependencies MUST be under permissive licenses (Apache 2.0, MIT, BSD and similar), so that the whole can be distributed under the project's own. Copyleft dependencies are excluded, save file-level copyleft in a dependency the project does not modify (RS-6).
+- **LI-6** Contributions are accepted under the project's license, as its section 5 provides, and each commit is signed off under the [Developer Certificate of Origin](https://developercertificate.org/). No contributor agreement is asked for; a later change of license would therefore need every contributor's consent.
+- **LI-7** Source files carry the SPDX identifier `Apache-2.0`.
 
 ## 21. Open questions and risks
 
 ### 21.1 Decisions needed
 
-1. **License text.** Which candidate in section 20.3, or another, with legal review. Two points to settle: whether third-party paid support and consulting should be barred as well, and whether a time-delayed conversion to Apache 2.0 is acceptable.
-2. **Name availability.** Other software projects already use the name "Tessera". A trademark search and a check of package names (crates.io, container registries, domain) should be done before the first public release.
-3. **Engine boundary.** QE-2 reuses the Arrow memory layout and the Parquet page codecs and builds everything above them. Confirm this boundary, or state that these should be written from scratch too.
-4. **Compatibility baseline.** Which Prometheus, Loki, Tempo and Grafana versions the first release pins (AP-2).
+1. **Name availability.** Other software projects already use the name "Tessera". A trademark search and a check of package names (crates.io, container registries, domain) should be done before the first public release.
+2. **Engine boundary.** QE-2 reuses the Arrow memory layout and the Parquet page codecs and builds everything above them. Confirm this boundary, or state that these should be written from scratch too.
+3. **Compatibility baseline.** Which Prometheus, Loki, Tempo and Grafana versions the first release pins (AP-2).
 
 ### 21.2 Technical risks
 

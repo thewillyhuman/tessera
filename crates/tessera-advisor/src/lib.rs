@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The advisor (spec section 8): from the workload log, weighted by age
 //! (AD-2), and the files as they are, it chooses for each tenant,

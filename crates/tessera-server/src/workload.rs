@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The workload log (AD-1): every query appends one event per scanned
 //! table to `_system.queries`, with the columns it referenced, the

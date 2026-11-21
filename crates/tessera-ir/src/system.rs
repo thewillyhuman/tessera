@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `system` schema (CS-3): the control tables and the view over the
 //! rule state logs (CQ-13) as the planner sees them. The typed tables

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Enforcing budgets (section 13.4) at the node's doors. A write is
 //! counted against the tenant's ingest budget and against the budget

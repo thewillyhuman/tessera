@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! A check, made of a store before it is trusted, that it has the one
 //! property everything rests on (ST-3, P2): an object cannot be

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Metering (section 13.1): what ingest received, compaction stored and
 //! queries cost, per tenant, dataset, kind, service and team, and for

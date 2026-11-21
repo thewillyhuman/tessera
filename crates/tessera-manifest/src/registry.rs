@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The writer registry of a dataset: the writers that may hold rows of
 //! the dataset not yet adopted by its partitions.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The Loki HTTP API (section 16): push, instant and range queries,
 //! labels, label values, series, index statistics and volume, detected

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Principals and what they may do (CT-5, SE-1): the API keys of a
 //! tenant, the roles that grant reading and writing its datasets and

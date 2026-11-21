@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 #![no_main]
 
 //! RS-5: the promql parser over arbitrary text.

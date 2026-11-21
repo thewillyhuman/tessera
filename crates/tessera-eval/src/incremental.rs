@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The incremental subset (CQ-7): an SQL rule that filters, groups by
 //! keys and a tumbling window, and aggregates with `count`, `sum`,

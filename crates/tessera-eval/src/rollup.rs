@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Rollups (section 8.7): a continuous query whose output is written to
 //! a derived dataset, so that queries with the same shape read a few

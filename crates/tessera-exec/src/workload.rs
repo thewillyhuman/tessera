@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! What a query asked of each table it scanned (AD-1): the columns it
 //! referenced, the predicates it applied with their observed

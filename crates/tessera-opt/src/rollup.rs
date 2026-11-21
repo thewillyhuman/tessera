@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Rollup substitution (AD-13, QE-6): an aggregation over a tumbling
 //! window whose source, filter, keys and aggregates match a rollup is

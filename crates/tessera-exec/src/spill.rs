@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Spilling to local disk (QE-11): a blocking operator whose memory
 //! grant is exhausted writes what it buffers as an Arrow IPC file under

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `PromQL` node over real storage: metric rows in the tail, read
 //! through projected scans, evaluated step by step.

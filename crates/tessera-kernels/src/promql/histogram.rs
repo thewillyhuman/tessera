@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Native histograms (QL-5): the sample type a stored histogram point
 //! takes in `PromQL`, with Prometheus' bucket layout and algorithms.

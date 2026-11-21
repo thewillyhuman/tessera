@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Where the engine learns what rollups exist (section 8.7, AD-13): a
 //! provider the node gives, answering per tenant with the rollups the

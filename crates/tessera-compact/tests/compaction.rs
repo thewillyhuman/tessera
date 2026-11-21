@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Compaction and collection over real storage: L1 files written by the
 //! write path become one indexed L2 file, duplicates disappear, the view

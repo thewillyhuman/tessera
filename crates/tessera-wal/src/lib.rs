@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Writer logs (spec section 6.3): the durability mechanism, the source of
 //! sub-second freshness and the stream that continuous queries consume.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Maintaining rollups (section 8.7): each round, the windows of a
 //! rollup that closed since its progress mark, allowing for late rows

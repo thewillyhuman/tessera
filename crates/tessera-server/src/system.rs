@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The rows of the `system` tables (CS-3): the control tables from the
 //! tenant's control store, and `alert_instances` as a view over the rule

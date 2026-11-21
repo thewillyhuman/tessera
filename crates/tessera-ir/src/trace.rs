@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Trace grouping (QL-13): the spanset algebra of `TraceQL` (QL-12) as
 //! the `TraceGroup` operator evaluates it on each trace.

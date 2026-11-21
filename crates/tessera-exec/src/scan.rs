@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The scan: one dataset and kind through every pruning stage of
 //! section 10.4, over files and the tail alike (QE-16).

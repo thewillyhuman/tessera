@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Reconciliation of `system.usage` with the object store (section
 //! 13.1; the exit criterion of M9): what the usage says each tenant

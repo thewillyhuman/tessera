@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Which evaluation mode a rule runs in (CQ-8): the incremental subset
 //! of CQ-7 over writer-log segments, or periodic re-execution through

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The membership view (section 14.1): the live nodes by role, refreshed
 //! from the registry and from what the peers gossip, and the rendezvous

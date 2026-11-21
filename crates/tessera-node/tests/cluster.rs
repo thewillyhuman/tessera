@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The cluster tests of M6 (G1): scale-up, scale-down and node loss with
 //! zero manual steps (OP-4), on three nodes in one process sharing a

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Ingest (spec section 7): decode, normalize, buffer, append to the
 //! writer log, acknowledge, and flush to L1 files.

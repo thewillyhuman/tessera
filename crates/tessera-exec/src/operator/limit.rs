@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `Limit`: skip `offset` rows, then pass at most `count` and stop the
 //! producer early.

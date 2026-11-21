@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Metering (section 13.1): ingest records the bytes and events it
 //! received per tenant, dataset, kind, service and team (CO-1),

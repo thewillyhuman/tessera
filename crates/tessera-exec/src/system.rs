@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The rows of the `system` tables (CS-3, CQ-13). The engine plans them
 //! from their static schemas and asks a provider for the rows at run

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Structured log bodies at ingest (DM-10): a body that is a JSON
 //! object or a logfmt line has its fields stored under `body.*` next

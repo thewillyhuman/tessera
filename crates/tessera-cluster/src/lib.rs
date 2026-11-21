@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The cluster (spec sections 5.2 and 14): the roles a node runs, the
 //! node registry in the root pool, the membership view built from it,

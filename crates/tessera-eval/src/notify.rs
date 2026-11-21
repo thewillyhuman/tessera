@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Notifications (section 11.9, CQ-15): a transition is committed first,
 //! then sent, then marked sent, so delivery is at least once and every

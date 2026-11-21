@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The audit dataset (SE-6): administrative actions and control
 //! statements are recorded as events of `_system.audit`, one per action

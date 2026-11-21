@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `HashJoin`: the pairs of rows of two inputs with equal keys (DM-2).
 //!

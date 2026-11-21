@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `ObjectStore` trait: the only way any crate touches durable storage
 //! (spec section 18.2).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The HTTP side of the benchmark: posting OTLP, running the queries
 //! the targets name, and a webhook that times an eager alert.

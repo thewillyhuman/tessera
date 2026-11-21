@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! An object store in an S3-compatible bucket, or under a prefix of
 //! one (ST-1, G2), through the `object_store` crate's client (spec

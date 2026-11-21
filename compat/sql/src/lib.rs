@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Differential testing of SQL against a reference engine (spec section
 //! 18.5): the same generated rows are loaded into Tessera and into

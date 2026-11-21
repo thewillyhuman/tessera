@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The catalog service: tenant lifecycle (CT-2, CT-4, CT-8), pool
 //! configuration (ST-2) and slot counts (AR-5), all through the commit log

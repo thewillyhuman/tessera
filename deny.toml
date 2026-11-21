@@ -1,13 +1,11 @@
-# RS-6 / LI-5: dependencies must be under permissive licenses so that the
-# project's own license can be chosen freely. Checked in CI with cargo-deny.
+# RS-6 / LI-5: dependencies must be under permissive licenses, so that
+# the whole can be distributed under the project's own, Apache 2.0.
+# Checked in CI with cargo-deny.
 
 [graph]
 all-features = true
 
 [licenses]
-# Workspace crates carry LicenseRef-Tessera-Pending until the license is
-# final (LI-4); they are not published and are not checked.
-private = { ignore = true }
 allow = [
     "0BSD",
     "Apache-2.0",

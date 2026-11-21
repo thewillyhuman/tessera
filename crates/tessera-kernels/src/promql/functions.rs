@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `PromQL` functions, with Prometheus' algorithms: the rate family
 //! with counter resets and extrapolation, the `_over_time` family,

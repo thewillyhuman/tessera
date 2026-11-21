@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The data file format (spec section 6.4). Data files are Apache Parquet
 //! (ST-11); everything else reaches them through the [`FileFormat`] trait

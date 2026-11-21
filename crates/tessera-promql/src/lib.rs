@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `PromQL` front end (spec section 9.3): a hand-written lexer and
 //! parser with positioned errors (QL-2) and lowering into the shared

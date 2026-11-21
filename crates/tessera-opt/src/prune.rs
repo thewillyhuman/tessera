@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Pruning from manifest data only (section 10.4, stages 1 to 4; QE-7).
 //!

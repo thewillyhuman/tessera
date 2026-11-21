@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Which node reads which file (QE-15): rendezvous hashing of the file
 //! id over the live `query` nodes, so that a file tends to be scanned by

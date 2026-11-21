@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Matching addresses against the patterns of `LogQL`'s `ip()` label
 //! filter (QL-7): one address, a CIDR block such as `10.0.0.0/8`, or

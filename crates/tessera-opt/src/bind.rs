@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Binding: giving every attribute path the type its context asks for,
 //! and checking that every expression types over its input.

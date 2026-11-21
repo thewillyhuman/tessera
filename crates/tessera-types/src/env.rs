@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The injected environment of a node: its identity, clock, random
 //! source (RS-2) and tenant keys (SE-2), bundled so that components take

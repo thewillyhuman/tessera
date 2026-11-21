@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Text with units, as `LogQL` reads it: durations as seconds, byte sizes
 //! as bytes, and lines without ANSI colour codes.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Names across languages (section 9.8): the Prometheus name of a
 //! metric, following the OpenTelemetry-to-Prometheus rules for

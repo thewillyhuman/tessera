@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Arbitrary events over HTTP as JSON lines (IN-4): `POST
 //! /api/v1/events` takes one JSON object per line, each with a

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The tenant control store (section 12.3): the small transactional
 //! corner, a per-tenant key-value store whose only durable form is the

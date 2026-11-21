@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Several state partitions per rule group (CQ-6): each partition keeps
 //! the instances whose fingerprint hashes to it, and a change of the

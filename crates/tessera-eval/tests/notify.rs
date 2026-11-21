@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Delivery to routes: firing and resolved transitions reach their
 //! routes once, silences and acknowledgments hold them back, a route

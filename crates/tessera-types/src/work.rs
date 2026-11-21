@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The kinds of single-owner work that are assigned through slots and
 //! leases (spec section 5.3).

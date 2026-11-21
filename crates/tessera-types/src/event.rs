@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The event model (spec section 4.2) as Arrow schemas, and batches of
 //! events in flight.

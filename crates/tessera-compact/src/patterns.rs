@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Log patterns (section 13.2): at compaction every log body is reduced
 //! to a template, `connection to <*> timed out after <*> ms`, and the

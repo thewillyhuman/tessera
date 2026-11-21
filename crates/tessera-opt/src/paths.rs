@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Attribute paths as scan columns (AD-4): every path an expression of
 //! the plan reads is asked of every scan, which outputs it as a column

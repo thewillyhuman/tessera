@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Sharing budget counts across the cluster (section 13.4): on every
 //! tick the node publishes what it counted today and absorbs what the

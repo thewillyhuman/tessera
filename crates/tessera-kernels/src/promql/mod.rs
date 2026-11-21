@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `PromQL` evaluation over series in memory (section 9.3, QL-5): the
 //! semantics of Prometheus 3, step by step.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! What the planner knows about a rollup (section 8.7, AD-13): the shape
 //! of its query, where its output is and the time it covers, so that an

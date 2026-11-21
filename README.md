@@ -966,5 +966,7 @@ with zero findings, `cargo test --workspace` and `cargo deny check`.
 
 ## License
 
-Source-available; text pending (see [`LICENSE`](LICENSE) and spec
-section 20).
+Open source under the [Apache License 2.0](LICENSE); spec section 20
+says why. Contributions come under the same license, each commit
+signed off under the Developer Certificate of Origin
+(`git commit -s`).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The Avro object container file the Iceberg manifests are written
 //! as, with the binary encoding of the values they hold [1].

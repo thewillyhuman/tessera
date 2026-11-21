@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The default alert rules for Tessera's own health (section 14.7),
 //! over the node metrics in `_system.metrics`: intake and compaction

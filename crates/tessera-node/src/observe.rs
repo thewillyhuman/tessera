@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Self-observability (section 14.7): a node writes its own logs and
 //! metrics to the `_system` tenant. The load signals (OP-5) go to

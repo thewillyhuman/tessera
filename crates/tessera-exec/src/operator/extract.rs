@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `Extract`: derive labels from a text column into `_extracted`, and
 //! `Format`: rewrite the line and the labels of each row.

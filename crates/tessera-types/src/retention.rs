@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Retention policies (section 13.3): what to do with data as it ages,
 //! by kind, severity, value or pattern. A policy is a row of

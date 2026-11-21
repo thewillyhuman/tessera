@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Leaf tasks on other nodes (section 10.7): a scan's files are assigned
 //! to the live `query` nodes by rendezvous hashing on file id (QE-15),

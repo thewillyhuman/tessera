@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `PromQL` evaluation (section 9.3): the expression a `PromQL` node
 //! evaluates over the samples of its inputs with Prometheus' semantics

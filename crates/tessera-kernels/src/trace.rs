@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The shape of a trace from its spans: the parent of each span among
 //! them, their nested-set numbers from a depth-first walk with children

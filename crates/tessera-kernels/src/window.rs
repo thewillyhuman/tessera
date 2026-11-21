@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Range-vector functions over one series (section 10.6, "series-at-a-
 //! time range vectors"): the samples of a series, sorted by time, are

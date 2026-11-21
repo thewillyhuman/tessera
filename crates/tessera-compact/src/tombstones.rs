@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Applying deletes by predicate at compaction (SE-5): the rows a
 //! tombstone's predicate matches, observed before the delete, are left

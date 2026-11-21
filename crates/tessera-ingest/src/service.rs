@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The ingest service: a task owns each [`Ingester`] and drives it from
 //! a timer; request handlers reach them through a cloneable

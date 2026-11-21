@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The Tempo HTTP API (section 16): trace by id, search with `TraceQL`,
 //! tag names and values, and `TraceQL` metrics, under `/api`. Grafana's

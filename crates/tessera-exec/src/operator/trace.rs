@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `TraceGroup`: group spans by trace and evaluate a spanset expression
 //! on each trace (QL-13). Blocking; the input is kept in trace order

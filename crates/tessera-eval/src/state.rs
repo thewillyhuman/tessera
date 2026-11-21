@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The state log of a rule group partition (CQ-12): a commit log at
 //! `{tenant}/_eval/{group}/{part}/_log/` whose one commit records the

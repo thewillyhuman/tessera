@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Takeover produces no duplicate transitions (M7): a new owner resumes
 //! from the state log, and two owners that evaluate from the same

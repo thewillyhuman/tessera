@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The node's presence in the cluster (section 14.1): on every heartbeat
 //! the node announces itself in the registry, re-reads the registry

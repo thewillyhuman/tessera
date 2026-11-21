@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Rollups end to end (section 8.7): closed windows of a rollup's query
 //! over rows in a writer log are evaluated and written as events of the

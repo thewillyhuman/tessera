@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Leaf tasks shared with peers: files assigned to another node are read
 //! there (QE-15), a peer that fails is read around (QE-17), and the rows

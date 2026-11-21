@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Redaction at ingest (SE-4): a tenant's rules are applied to every
 //! batch on the way in, before budgets, metering and the writer log, so

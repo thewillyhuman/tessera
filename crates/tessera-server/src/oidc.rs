@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Authentication by `OpenID` Connect (SE-1): a bearer token that is not
 //! an API key is a JWT, checked against the issuer's signing keys,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The contract every `ObjectStore` implementation must honour (ST-3),
 //! as executable checks. Each implementation's tests call [`run_all`].

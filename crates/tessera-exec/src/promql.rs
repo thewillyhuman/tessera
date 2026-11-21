@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `PromQL` node in the engine: the inputs' rows become series, the
 //! kernels evaluate the expression step by step, and the result rows

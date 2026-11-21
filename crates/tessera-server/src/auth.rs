@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Who a request is (CT-5, SE-1). A request presents an API key as
 //! `Authorization: Bearer tsk_<tenant>_<id>_<secret>`; the key's tenant

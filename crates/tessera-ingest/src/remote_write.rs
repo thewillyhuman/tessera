@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Prometheus remote write (IN-2): decoding a snappy-compressed
 //! `WriteRequest` and normalizing its samples into metric rows.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Deriving labels from text (`Extract`): JSON, logfmt, regular
 //! expressions with named groups, patterns with `<name>` captures, and

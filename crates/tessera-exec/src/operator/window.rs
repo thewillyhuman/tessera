@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `Window`: the input's rows with a column per window function
 //! (QE-20), each computed over the rows of equal partition values in

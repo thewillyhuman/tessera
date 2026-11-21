@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The error shape of every endpoint: `{"error": "..."}` with a status
 //! that says whether to retry. 503 means the object store or the ingest

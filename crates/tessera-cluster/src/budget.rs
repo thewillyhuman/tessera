@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Counting against budgets (section 13.4): a ledger of the bytes each
 //! tenant and team has ingested, and each tenant's queries have

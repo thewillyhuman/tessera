@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! A file of which only some byte ranges were fetched, for the Parquet
 //! page reader. Reads outside the fetched ranges are a bug in the range

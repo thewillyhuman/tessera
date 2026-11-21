@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `PostgreSQL` wire protocol (section 16): enough for `psql`, common
 //! drivers and Grafana's `PostgreSQL` data source to run SQL queries.

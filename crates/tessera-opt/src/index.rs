@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Pruning with sidecar indexes (section 10.4, stage 5; QL-16, QL-17).
 //!

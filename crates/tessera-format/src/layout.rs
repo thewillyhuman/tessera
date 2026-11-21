@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! How a file is laid out (spec section 8): its sort key, its row-group
 //! size and the indexes built into its sidecar. Every layout decision is

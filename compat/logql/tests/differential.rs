@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The `LogQL` differential suite: identical pushes, identical queries,
 //! normalized answers compared. Runs against Loki when

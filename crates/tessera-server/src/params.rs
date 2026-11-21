@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Request parameters the APIs share: who a request is, the tenant and
 //! dataset it addresses and what it needs of them, and times and

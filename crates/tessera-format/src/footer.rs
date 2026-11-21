@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! File footers kept in memory (section 10.8): a Parquet footer costs a
 //! range request and a decode per scan, and never changes, since a file

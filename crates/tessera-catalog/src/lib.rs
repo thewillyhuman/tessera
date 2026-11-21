@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The cluster catalog (spec section 12.1): the only cluster-wide mutable
 //! state. It holds tenants, storage pools, slot counts and cluster-wide

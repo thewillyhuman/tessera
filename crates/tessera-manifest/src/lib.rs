@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Partitions and their manifests (spec section 6.6), the writer registry,
 //! intake (section 6.7) and the consistent view (section 6.8).

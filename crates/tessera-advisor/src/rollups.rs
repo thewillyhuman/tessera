@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Rollup proposals (section 8.7): a windowed aggregation shape that the
 //! workload log shows repeated often enough, typically a dashboard

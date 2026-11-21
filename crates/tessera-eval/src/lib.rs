@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Continuous queries and alerting (spec section 11): alert rules kept
 //! in the tenant's control store, the alert lifecycle of section 11.8,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Trace completion at L3 (QL-14): once a span partition's window has
 //! ended a completion horizon ago, compaction rewrites the partition to

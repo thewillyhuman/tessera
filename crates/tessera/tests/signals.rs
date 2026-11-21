@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The binary as a supervisor runs it: started with its output on a
 //! pipe, then told to stop.

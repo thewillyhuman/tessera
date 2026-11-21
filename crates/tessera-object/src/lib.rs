@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The only way any Tessera crate touches durable storage (spec section
 //! 18.2): object keys, the `ObjectStore` trait, its implementations, storage

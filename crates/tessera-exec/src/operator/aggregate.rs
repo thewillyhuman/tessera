@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `HashAggregate`: group rows by key expressions and fold each group
 //! through its accumulators. Blocking; accounts its state, and when the

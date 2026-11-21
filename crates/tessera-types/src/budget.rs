@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Budgets (section 13.4): how many bytes a tenant, or one of its teams,
 //! may ingest or scan per UTC day, and what happens to what arrives

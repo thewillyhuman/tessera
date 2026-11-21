@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The recent ingest volume of each dataset (IN-9): a smoothed rate of
 //! bytes per second, from which the size of the dataset's preferred set

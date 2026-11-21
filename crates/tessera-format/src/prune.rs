@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Row-group pruning against Parquet column statistics (stage 6 of
 //! section 10.4).

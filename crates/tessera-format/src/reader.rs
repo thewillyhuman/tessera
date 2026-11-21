@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The Parquet [`FileReader`]: footer by range request, pruning, range
 //! planning with coalescing, and decoding over the fetched ranges.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Differential testing of `PromQL` and the Prometheus API against
 //! Prometheus (QL-4, section 18.5): the same samples are pushed to a

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Tessera's network front ends (spec section 16): the HTTP
 //! administration API, OTLP ingest over HTTP, SQL over HTTP and over

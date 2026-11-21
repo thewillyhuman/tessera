@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! `TopK`: the first `k` rows under an ordering, with memory proportional
 //! to `k` rather than to the input. Past the grant, when `k` is large,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! The optimizer (spec section 10.3) and manifest-level pruning (section
 //! 10.4, stages 1 to 4).

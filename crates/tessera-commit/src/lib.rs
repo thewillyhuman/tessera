@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LicenseRef-Tessera-Pending
+// SPDX-License-Identifier: Apache-2.0
 
 //! Commit logs (spec section 6.5): totally ordered, durable logs of
 //! commits backed by create-if-absent writes. The cluster catalog, tenant
