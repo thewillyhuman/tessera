@@ -43,7 +43,9 @@ use tessera_format::{FileFormat, ParquetFormat};
 use tessera_iceberg::Exporter;
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::DatasetLogs;
-use tessera_object::{CachedStore, LocalStore, ObjectStore, PoolState, Pools, RemoteStore, layout};
+use tessera_object::{
+    CachedStore, LocalStore, ObjectStore, PoolState, Pools, RemoteStore, SealedStore, layout,
+};
 use tessera_server::{
     AppState, Auth, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows,
 };
@@ -283,11 +285,7 @@ impl Node {
     /// If the data directory, the catalog or a listener cannot be opened.
     pub async fn start(config: Config, env: Env) -> Result<Node, RunError> {
         let (store, catalog, pool, cache) = open(&config, &env).await?;
-        if !config.keyring.is_empty() {
-            tracing::info!(keys = ?config.keyring.names().collect::<Vec<_>>(), "keyring loaded");
-        }
-        let policy: Arc<dyn KeyPolicy> = catalog.clone();
-        let env = env.with_keys(Keys::new(config.keyring.clone(), policy));
+        let (env, store) = keyed(&config, env, &catalog, store);
         let mut loops = vec![tokio::spawn(keep_fresh(Arc::clone(&catalog)))];
 
         let format: Arc<dyn FileFormat> = Arc::new(
@@ -531,6 +529,26 @@ pub async fn run(config: Config) -> Result<(), RunError> {
         return Err(RunError::Broken);
     }
     Ok(())
+}
+
+/// The environment with the node's tenant keys, named for each tenant
+/// by the catalog, and `store` sealing with them what the tenants'
+/// prefixes hold (SE-2). The sealing sits over the cache, which thus
+/// keeps what it holds as the store does. The catalog was opened
+/// under it: it is the cluster's and stays plain.
+fn keyed(
+    config: &Config,
+    env: Env,
+    catalog: &Arc<Catalog>,
+    store: Arc<dyn ObjectStore>,
+) -> (Env, Arc<dyn ObjectStore>) {
+    if !config.keyring.is_empty() {
+        tracing::info!(keys = ?config.keyring.names().collect::<Vec<_>>(), "keyring loaded");
+    }
+    let policy: Arc<dyn KeyPolicy> = catalog.clone();
+    let env = env.with_keys(Keys::new(config.keyring.clone(), policy));
+    let store = Arc::new(SealedStore::new(store, Arc::clone(&env.keys)));
+    (env, store)
 }
 
 /// The root pool's store with the node's cache in front of it, when

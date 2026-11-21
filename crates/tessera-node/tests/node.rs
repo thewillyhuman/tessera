@@ -360,15 +360,19 @@ async fn client_certificates_authenticate_over_mutual_tls() {
 
 /// SE-2: with a keyring, a tenant whose setting names a key has its
 /// writer-log blocks sealed and its files encrypted at rest, any index
-/// sealed, and reads back as before.
+/// sealed and every other object under its prefix sealed whole, and
+/// reads back as before, by a node that starts over them too.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keyed_tenants_data_is_sealed_at_rest() {
     use tessera_types::{Keyring, TenantKey};
 
     let dir = tempfile::tempdir().unwrap();
-    let mut config = config(dir.path());
-    config.keyring = Keyring::default().with("k2025", TenantKey::from_bytes([5; 32]));
-    let node = Node::start(config, Env::system()).await.unwrap();
+    let keyed = || {
+        let mut config = config(dir.path());
+        config.keyring = Keyring::default().with("k2025", TenantKey::from_bytes([5; 32]));
+        config
+    };
+    let node = Node::start(keyed(), Env::system()).await.unwrap();
     let base = format!("http://{}", node.http_address());
     let (status, text) = common::post(
         format!("{base}/api/v1/tenants"),
@@ -425,9 +429,33 @@ async fn a_keyed_tenants_data_is_sealed_at_rest() {
         "read from encrypted files: {answer}"
     );
 
+    assert_sealed_at_rest(dir.path(), &id);
+    node.stop().await;
+
+    let node = Node::start(keyed(), Env::system()).await.unwrap();
+    let (status, text) = common::post(
+        format!("http://{}/api/v1/query", node.http_address()),
+        as_acme,
+        serde_json::json!({ "dataset": "prod", "query": "SELECT count(*) FROM logs" }),
+    )
+    .await;
+    assert_eq!(status, 200, "{text}");
+    let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        answer["rows"][0][0], 20.0,
+        "read over sealed logs: {answer}"
+    );
+    node.stop().await;
+}
+
+/// Checks what the tenant `id` left under `root`: sealed blocks in the
+/// writer logs, encrypted files, sealed indexes, and everything else
+/// under its prefix sealed whole.
+fn assert_sealed_at_rest(root: &std::path::Path, id: &str) {
     let mut sealed_entries = 0;
     let mut encrypted_files = 0;
-    for path in walkdir(dir.path()) {
+    let mut sealed_whole = 0;
+    for path in walkdir(root) {
         let text = path.to_string_lossy().into_owned();
         // The node keeps running: an object may be gone, or half written,
         // between the listing and the read.
@@ -450,17 +478,26 @@ async fn a_keyed_tenants_data_is_sealed_at_rest() {
             );
             sealed_entries += 1;
         }
-        if text.contains(&id) && extension == Some("parquet") {
+        if text.contains(id) && extension == Some("parquet") {
             assert!(bytes.ends_with(b"PARE"), "{text}: an encrypted footer");
             encrypted_files += 1;
         }
-        if text.contains(&id) && extension == Some("idx") {
+        if text.contains(id) && extension == Some("idx") {
             assert!(bytes.starts_with(b"TSX1"), "{text}: a sealed sidecar");
+        }
+        // The dataset's log, its partitions' manifests, its writers:
+        // whatever else the tenant's prefix holds.
+        let hidden = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+        if text.contains(&format!("/{id}/")) && !hidden && extension.is_none() {
+            assert!(bytes.starts_with(b"\0TSSEAL1"), "{text}: sealed whole");
+            sealed_whole += 1;
         }
     }
     assert!(sealed_entries > 0, "acme's segments were found");
     assert!(encrypted_files > 0, "acme's files were found");
-    node.stop().await;
+    assert!(sealed_whole > 0, "acme's logs were found");
 }
 
 /// Every file under `root`, recursively.
