@@ -448,6 +448,64 @@ async fn a_keyed_tenants_data_is_sealed_at_rest() {
     node.stop().await;
 }
 
+/// A dataset whose round fails is one dataset: on a cluster, a layout
+/// no file could be sorted by failed one dataset's compaction every
+/// round, and intake and compaction stopped for every dataset of the
+/// tenant that came after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dataset_that_fails_leaves_the_others_their_round() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.background = Duration::from_millis(100);
+    let node = Node::start(config, Env::system()).await.unwrap();
+
+    // A dataset that comes first in the tenant, with a writer registered
+    // and a log that cannot be read.
+    let broken = dir.path().join("default").join("aaa");
+    std::fs::create_dir_all(broken.join("_writers")).unwrap();
+    std::fs::create_dir_all(broken.join("_log")).unwrap();
+    let writer = "0".repeat(31) + "7";
+    let other_node = "0".repeat(31) + "9";
+    std::fs::write(
+        broken.join("_writers").join(&writer),
+        format!(r#"{{"writer":"{writer}","node":"{other_node}","registered_at":0}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        broken.join("_log").join(format!("{:020}", 1)),
+        "not a commit",
+    )
+    .unwrap();
+
+    let now = node.env().clock.now().as_nanos();
+    let body = serde_json::json!({
+        "streams": [{ "stream": { "app": "web" }, "values": [[now.to_string(), "a line"]] }]
+    });
+    let headers = vec![("x-tessera-dataset".to_owned(), "prod".to_owned())];
+    let base = format!("http://{}", node.http_address());
+    let (status, text) = common::post(format!("{base}/loki/api/v1/push"), headers, body).await;
+    assert_eq!(status, 204, "{text}");
+
+    let partitions = dir
+        .path()
+        .join("default")
+        .join("prod")
+        .join("p")
+        .join("log");
+    common::eventually(
+        "the flush of the dataset after the broken one is adopted",
+        Duration::from_secs(10),
+        || {
+            partitions.exists()
+                && walkdir(&partitions)
+                    .iter()
+                    .any(|path| path.components().any(|part| part.as_os_str() == "_log"))
+        },
+    )
+    .await;
+    node.stop().await;
+}
+
 /// Checks what the tenant `id` left under `root`: sealed blocks in the
 /// writer logs, encrypted files, sealed indexes, and everything else
 /// under its prefix sealed whole.

@@ -154,6 +154,7 @@ pub async fn run(background: Background) {
             let mut cursors = Cursors {
                 positions: &mut positions,
                 met: BTreeSet::new(),
+                whole: true,
             };
             match round(&background, &compactor, tenant, &mut held, &mut cursors).await {
                 Ok(left) => {
@@ -161,9 +162,11 @@ pub async fn run(background: Background) {
                     backlog.recoveries += left.recoveries;
                     // A writer a whole round did not meet has left its
                     // registry or this node's care: its position goes
-                    // with it. A round that failed met only some.
-                    let met = cursors.met;
-                    positions.retain(|at, _| at.0 != *tenant || met.contains(at));
+                    // with it. A round that failed in part met only some.
+                    let Cursors { met, whole, .. } = cursors;
+                    if whole {
+                        positions.retain(|at, _| at.0 != *tenant || met.contains(at));
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(tenant = %tenant, error = %error, "background round failed");
@@ -255,6 +258,9 @@ struct Cursors<'a> {
     positions: &'a mut Positions,
     /// The logs the round ran intake for.
     met: BTreeSet<(TenantId, DatasetName, WriterId)>,
+    /// Whether every part of the round went through: one that failed
+    /// may have met only some of its logs.
+    whole: bool,
 }
 
 async fn round(
@@ -266,71 +272,106 @@ async fn round(
 ) -> Result<Backlog, Failure> {
     let mut backlog = Backlog::default();
     for dataset in registry::datasets(&*background.store, tenant).await? {
-        for registration in registry::list(&*background.store, tenant, &dataset).await? {
-            let writer = registration.writer;
-            let key = writer.to_string();
-            let mut ended = false;
-            if background.owned.owns(WorkKind::Intake, key.as_bytes()) {
-                let at = (tenant.clone(), dataset.clone(), writer);
-                let after = cursors.positions.get(&at).copied().unwrap_or(Seq::ZERO);
-                cursors.met.insert(at.clone());
-                // A run that fails leaves the position where it was, to
-                // be repeated from there.
-                let outcome = intake::run_after(
-                    Arc::clone(&background.store),
-                    &background.env,
-                    tenant,
-                    &dataset,
-                    writer,
-                    after,
-                )
-                .await?;
-                cursors.positions.insert(at, outcome.through);
-                if outcome.adoptions > 0 || outcome.removed {
-                    tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
-                }
-                ended = outcome.ended;
+        // A dataset's failure is its own: the tenant's other datasets
+        // still get their round, and this one its next.
+        match dataset_round(background, compactor, tenant, &dataset, held, cursors).await {
+            Ok(left) => {
+                backlog.deferred += left.deferred;
+                backlog.recoveries += left.recoveries;
             }
-            if !ended
-                && background.owned.owns(WorkKind::Recovery, key.as_bytes())
-                && is_dead(background, &registration).await?
-            {
-                let target = FlushTarget {
-                    store: Arc::clone(&background.store),
-                    pool: background.pool.clone(),
-                    format: Arc::clone(&background.format),
-                };
-                let windows = windows_of(background, std::slice::from_ref(tenant)).await?;
-                let recovered = recover(&target, &background.env, writer, windows).await?;
-                backlog.recoveries += 1;
-                tracing::info!(%tenant, %dataset, %writer, ?recovered, "recovery");
+            Err(error) => {
+                cursors.whole = false;
+                tracing::warn!(%tenant, %dataset, error = %error, "background round failed");
             }
         }
-        let mut budget = RECLUSTER_BUDGET;
-        let policies = policies_of(background, tenant).await;
-        // Read once for the five kinds: each asks for its layout, its
-        // tombstones and its value score.
-        let settings = background.datasets.open(tenant, &dataset).state().await?;
-        let held_kinds = list_kinds(&*background.store, tenant, &dataset).await?;
-        for kind in Kind::ALL {
-            // A kind the dataset holds nothing of has no partition to
-            // look for; only its tombstones, if it has any, still have
-            // to be seen through.
-            if !held_kinds.contains(&kind) && settings.tombstones(kind)?.is_empty() {
-                continue;
-            }
-            backlog.deferred += compact_and_collect(
-                background,
-                compactor,
+    }
+    Ok(backlog)
+}
+
+/// One dataset's part of a tenant's round: intake and recovery for its
+/// writers, then compaction and collection of its partitions, kind by
+/// kind. A kind that fails is logged and left for the next round; the
+/// kinds after it are still gone through.
+async fn dataset_round(
+    background: &Background,
+    compactor: &Compactor,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    held: &mut Vec<Held>,
+    cursors: &mut Cursors<'_>,
+) -> Result<Backlog, Failure> {
+    let mut backlog = Backlog::default();
+    for registration in registry::list(&*background.store, tenant, dataset).await? {
+        let writer = registration.writer;
+        let key = writer.to_string();
+        let mut ended = false;
+        if background.owned.owns(WorkKind::Intake, key.as_bytes()) {
+            let at = (tenant.clone(), dataset.clone(), writer);
+            let after = cursors.positions.get(&at).copied().unwrap_or(Seq::ZERO);
+            cursors.met.insert(at.clone());
+            // A run that fails leaves the position where it was, to
+            // be repeated from there.
+            let outcome = intake::run_after(
+                Arc::clone(&background.store),
+                &background.env,
                 tenant,
-                &dataset,
-                &settings,
-                kind,
-                &mut budget,
-                &policies,
-                held,
+                dataset,
+                writer,
+                after,
             )
             .await?;
+            cursors.positions.insert(at, outcome.through);
+            if outcome.adoptions > 0 || outcome.removed {
+                tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
+            }
+            ended = outcome.ended;
+        }
+        if !ended
+            && background.owned.owns(WorkKind::Recovery, key.as_bytes())
+            && is_dead(background, &registration).await?
+        {
+            let target = FlushTarget {
+                store: Arc::clone(&background.store),
+                pool: background.pool.clone(),
+                format: Arc::clone(&background.format),
+            };
+            let windows = windows_of(background, std::slice::from_ref(tenant)).await?;
+            let recovered = recover(&target, &background.env, writer, windows).await?;
+            backlog.recoveries += 1;
+            tracing::info!(%tenant, %dataset, %writer, ?recovered, "recovery");
+        }
+    }
+    let mut budget = RECLUSTER_BUDGET;
+    let policies = policies_of(background, tenant).await;
+    // Read once for the five kinds: each asks for its layout, its
+    // tombstones and its value score.
+    let settings = background.datasets.open(tenant, dataset).state().await?;
+    let held_kinds = list_kinds(&*background.store, tenant, dataset).await?;
+    for kind in Kind::ALL {
+        // A kind the dataset holds nothing of has no partition to
+        // look for; only its tombstones, if it has any, still have
+        // to be seen through.
+        if !held_kinds.contains(&kind) && settings.tombstones(kind)?.is_empty() {
+            continue;
+        }
+        let compacted = compact_and_collect(
+            background,
+            compactor,
+            tenant,
+            dataset,
+            &settings,
+            kind,
+            &mut budget,
+            &policies,
+            held,
+        )
+        .await;
+        match compacted {
+            Ok(deferred) => backlog.deferred += deferred,
+            Err(error) => {
+                cursors.whole = false;
+                tracing::warn!(%tenant, %dataset, %kind, error = %error, "background round failed");
+            }
         }
     }
     Ok(backlog)
