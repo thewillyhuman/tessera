@@ -176,10 +176,11 @@ impl<S: State> CommitLog<S> {
         let key = self.commit_key(version);
         match self.store.put_if_absent(&key, commit.encode()).await {
             Ok(()) => {}
-            Err(ObjectError::AlreadyExists { .. }) => {
-                return Err(CommitError::Conflict { version });
-            }
-            Err(error) if error.is_retryable() => {
+            // The version is taken, by another committer or by this
+            // very write: a store's client that sends a write again
+            // after a lost answer reports the refusal of the second.
+            // The commit's id says which.
+            Err(error) if error.is_retryable() || is_taken(&error) => {
                 self.verify_landed(&key, commit.id, error).await?;
             }
             Err(error) => return Err(CommitError::Store(error)),
@@ -389,8 +390,8 @@ impl<S: State> CommitLog<S> {
             .expect("log key components are valid")
     }
 
-    /// Reads back a version whose write got a lost response and decides
-    /// whether our commit is the one that exists.
+    /// Reads back a version whose write failed or was refused and
+    /// decides whether our commit is the one that exists.
     async fn verify_landed(
         &self,
         key: &Key,
@@ -455,6 +456,11 @@ fn corrupt(key: &Key, source: impl std::error::Error + Send + Sync + 'static) ->
         key: key.clone(),
         source: Box::new(source),
     }
+}
+
+/// Whether a conditional write was refused because the key exists.
+fn is_taken(error: &ObjectError) -> bool {
+    matches!(error, ObjectError::AlreadyExists { .. })
 }
 
 #[cfg(test)]
@@ -676,6 +682,47 @@ mod tests {
             .unwrap();
         let error = log.commit(&base, vec![put("a", "1")]).await.unwrap_err();
         assert!(matches!(error, CommitError::Conflict { .. }), "{error}");
+    }
+
+    /// A store whose client sends a conditional write again when the
+    /// first answer is lost: the write lands, and what comes back is
+    /// the refusal of the second.
+    #[derive(Debug)]
+    struct Resent(MemoryStore);
+
+    #[async_trait]
+    impl ObjectStore for Resent {
+        async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
+            self.0.get(key).await
+        }
+        async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
+            self.0.get_range(key, range).await
+        }
+        async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
+            self.0.head(key).await
+        }
+        async fn put(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+            self.0.put(key, body).await
+        }
+        async fn put_if_absent(&self, key: &Key, body: Bytes) -> Result<(), ObjectError> {
+            self.0.put_if_absent(key, body.clone()).await?;
+            self.0.put_if_absent(key, body).await
+        }
+        fn list(&self, prefix: &Key) -> BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+            self.0.list(prefix)
+        }
+        async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
+            self.0.delete(key).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_found_present_on_a_resent_write_is_ours() {
+        let log = log(Arc::new(Resent(MemoryStore::new())), 1);
+        let base = log.snapshot().await.unwrap();
+        let next = log.commit(&base, vec![put("a", "1")]).await.unwrap();
+        assert_eq!(next.version(), Version::new(1));
+        assert_eq!(next.state().get("a"), Some("1"));
     }
 
     #[tokio::test(start_paused = true)]
