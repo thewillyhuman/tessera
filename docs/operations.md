@@ -246,6 +246,11 @@ every route and over gRPC.
   rows. Upgrade between adjacent versions only. A node refuses to
   start beside a live one that cannot read the data format it
   writes; upgrade that one first.
+- **Releases.** A tag `v<version>` on the repository publishes the
+  image `ghcr.io/thewillyhuman/tessera:<version>`, which the chart
+  uses by default, and the chart itself to
+  `oci://ghcr.io/thewillyhuman/charts`, after the smoke test has
+  passed on that image.
 - **Rolling back** to the previous version is safe while no node of
   the new version has written a newer format; the refusal above is
   what tells.

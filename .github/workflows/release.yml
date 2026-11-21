@@ -1,0 +1,57 @@
+name: release
+
+# A tag `v<version>` publishes that version: the container image and
+# the Helm chart, both to the repository's registry, so that the
+# chart's default image is one that exists. The tag must name the
+# version the workspace and the chart carry, and the image is proved
+# on a kind cluster before anything is pushed.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  publish:
+    name: image and chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check the tag against the versions in the tree
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          workspace=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          chart=$(sed -n 's/^version: //p' deploy/helm/tessera/Chart.yaml)
+          app=$(sed -n 's/^appVersion: "\(.*\)"/\1/p' deploy/helm/tessera/Chart.yaml)
+          for found in "$workspace" "$chart" "$app"; do
+            if [ "$found" != "$version" ]; then
+              echo "the tag says $version; the tree says $workspace (workspace), $chart (chart), $app (chart appVersion)" >&2
+              exit 1
+            fi
+          done
+          {
+            echo "VERSION=$version"
+            echo "IMAGE=$REGISTRY/${GITHUB_REPOSITORY,,}"
+            echo "CHARTS=oci://$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/charts"
+          } >> "$GITHUB_ENV"
+      - name: build the image and prove it on a cluster
+        run: IMAGE="$IMAGE:$VERSION" deploy/kind/smoke.sh
+      - name: push the image
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$VERSION"
+      - name: push the chart
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          helm package deploy/helm/tessera --destination "$RUNNER_TEMP"
+          echo "$TOKEN" | helm registry login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin
+          helm push "$RUNNER_TEMP/tessera-$VERSION.tgz" "$CHARTS"
