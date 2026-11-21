@@ -74,12 +74,33 @@ pub async fn read(store: &dyn ObjectStore, writer: WriterId, seq: Seq) -> Result
     })
 }
 
+/// The first position after `from` that the log still has. Asked of
+/// the store as what lies past `from`'s key, which costs the same
+/// however many entries the log keeps before it.
+async fn first_after(
+    store: &dyn ObjectStore,
+    writer: WriterId,
+    from: Seq,
+) -> Result<Option<Seq>, WalError> {
+    let log = layout::writer_log(writer);
+    let mut later = store.list_after(&log, &layout::writer_log_entry(writer, from));
+    // In key order, which is the order of the positions: the first
+    // entry met is the one, and the rest is not asked for.
+    while let Some(meta) = later.try_next().await? {
+        if let Ok(seq) = meta.key.name().parse::<Seq>() {
+            return Ok(Some(seq));
+        }
+    }
+    Ok(None)
+}
+
 /// The entries after `from`, in order, until the first missing position,
 /// their sealed blocks unlocked with `keys` (SE-2).
 ///
 /// Garbage collection deletes a log's oldest entries (GC-2), so reading
 /// starts at the first entry that still exists after `from`, found by
-/// listing the log once; from there every position must be present.
+/// asking the store once what lies past it; from there every position
+/// must be present.
 pub fn entries(
     store: Arc<dyn ObjectStore>,
     writer: WriterId,
@@ -93,7 +114,7 @@ pub fn entries(
             let next = if started {
                 seq.next()
             } else {
-                match list(&*store, writer).await?.into_iter().find(|s| *s > seq) {
+                match first_after(&*store, writer, seq).await? {
                     Some(first) => first,
                     None => return Ok(None),
                 }
@@ -144,6 +165,46 @@ mod tests {
             last(&store, log.writer_id()).await.unwrap(),
             Some(Seq::new(3))
         );
+    }
+
+    /// A reader that resumes asks what came after its position, not
+    /// for the whole log: a log keeps an hour of entries, and walking
+    /// them all to find nothing new is what every poll used to cost.
+    /// The entries a collection removed from the front are skipped the
+    /// same way.
+    #[tokio::test]
+    async fn entries_after_a_position_are_found_without_walking_the_log() {
+        let store = MemoryStore::new();
+        let mut log = WriterLog::start(
+            Arc::new(store.clone()),
+            Env::simulated(1, Timestamp::UNIX_EPOCH),
+        );
+        for _ in 0..4 {
+            log.append(EntryBody::End).await.unwrap();
+        }
+        let writer = log.writer_id();
+        for collected in [1, 2] {
+            store
+                .delete(&layout::writer_log_entry(writer, Seq::new(collected)))
+                .await
+                .unwrap();
+        }
+        let shallow: Arc<dyn ObjectStore> = Arc::new(tessera_object::ShallowStore(store));
+        let after = async |from: u64| {
+            entries(
+                Arc::clone(&shallow),
+                writer,
+                Seq::new(from),
+                Arc::new(Keys::none()),
+            )
+            .map_ok(|e| e.seq())
+            .try_collect::<Vec<Seq>>()
+            .await
+            .unwrap()
+        };
+        assert_eq!(after(0).await, [Seq::new(3), Seq::new(4)]);
+        assert_eq!(after(3).await, [Seq::new(4)]);
+        assert!(after(4).await.is_empty());
     }
 
     #[tokio::test]
