@@ -166,8 +166,12 @@ closed by another node's recovery.
   tenant whose `encryption_key` setting names one has everything
   under its prefix sealed under it: data files, indexes, manifests,
   the dataset and control logs, the state of its rules, and its
-  blocks and flush records in the writer logs. What was written
-  before the setting stays as it was until compaction rewrites it.
+  blocks and flush records in the writer logs. A tenant created with
+  a key is sealed from its first row: a node that has not heard of
+  the tenant yet refuses its rows, and the node that knows it writes
+  them. A key set on a tenant that already exists reaches each node
+  within a second, and what was written before stays as it was until
+  compaction rewrites it.
   With the chart, `keyringSecret` names the secret whose entry
   `keyring` is that file, mounted read-only into every node.
   Not sealed, since they place the data and do not hold it: object

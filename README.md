@@ -473,7 +473,9 @@ which carry the bounds of every column, the dataset log, the control
 store, the state of the rules. Each names its key, so a tenant moved
 to a new key keeps reading what the old one sealed while that key
 stays in the keyring, and a tenant naming a key the node lacks is
-refused rather than stored plain (SE-2, SE-3). Key material never
+refused rather than stored plain, as are the rows of a tenant a
+node has not heard of yet, which the node that has writes itself
+(SE-2, SE-3). Key material never
 enters the object store; the catalog holds names only. A flush
 record in a writer's log, which names files with the bounds of their
 columns, has those sealed in the entry. What stays readable is what
