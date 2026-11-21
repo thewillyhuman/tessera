@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::array::{BooleanArray, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::filter_record_batch;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tessera_format::FileFormat;
 use tessera_object::{Pools, layout};
 use tessera_types::event::TIMESTAMP;
@@ -29,7 +29,10 @@ use tessera_types::{
 };
 use tessera_wal::{EntryBody, reader};
 
-use crate::{ManifestError, Manifests, list_partitions, registry};
+use crate::{ManifestError, Manifests, Partial, list_partitions, registry};
+
+/// How many of a dataset's manifests a query reads at once.
+const MANIFESTS_AT_ONCE: usize = 16;
 
 /// What a view read, for `EXPLAIN` and for tests.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -110,6 +113,10 @@ pub async fn sources(
     let partitions = list_partitions(&**root, tenant, dataset, kind).await?;
     let mut files = Vec::new();
     let mut positions: BTreeMap<Window, BTreeMap<WriterId, Seq>> = BTreeMap::new();
+    // Every partition's manifest is needed, for its positions if not
+    // for its files, and each read is a request or a few to the store:
+    // they are made together, not one after another.
+    let mut wanted = Vec::with_capacity(partitions.len());
     for partition in &partitions {
         let w = partition.window;
         let in_range = time_range.overlaps_closed(
@@ -119,18 +126,29 @@ pub async fn sources(
         // A partition outside the range contributes its positions only:
         // an empty range reads the checkpoint's header rows and no file
         // row group (MF-5).
-        let wanted = if in_range {
+        let range = if in_range {
             time_range
         } else {
             TimeRange::new(Timestamp::MAX, Timestamp::MAX)
         };
-        let partial = manifests.open(partition).read_in(wanted).await?;
+        wanted.push((in_range, range, manifests.open(partition)));
+    }
+    let reads = wanted
+        .into_iter()
+        .map(|(in_range, range, manifest)| async move {
+            Ok::<_, ManifestError>((in_range, manifest.read_in(range).await?))
+        });
+    let read: Vec<(bool, Partial)> = futures::stream::iter(reads)
+        .buffered(MANIFESTS_AT_ONCE)
+        .try_collect()
+        .await?;
+    for (partition, (in_range, partial)) in partitions.iter().zip(read) {
         sources.manifests.insert(partition.clone(), partial.version);
         if let Some(read) = partial.read {
             sources.manifest_row_groups += read.row_groups;
             sources.manifest_row_groups_read += read.row_groups_read;
         }
-        positions.insert(w, partial.positions);
+        positions.insert(partition.window, partial.positions);
         if in_range {
             files.extend(partial.files.into_values());
         }
@@ -286,7 +304,7 @@ mod tests {
     use arrow::array::{Array, FixedSizeBinaryArray};
     use std::time::Duration;
     use tessera_format::ParquetFormat;
-    use tessera_object::MemoryStore;
+    use tessera_object::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
     use tessera_types::event::EVENT_ID;
     use tessera_types::{EventBatch, LogRow, PoolId};
     use tessera_wal::{FlushTarget, WriterLog, write_l1_files};
@@ -563,6 +581,104 @@ mod tests {
         let mut log = WriterLog::start(Arc::new(store.clone()), env());
         log.append_segment(&[batch(0, 1, 1)]).await.unwrap();
         assert!(read_view(&store).await.is_empty());
+    }
+
+    /// A store that says how many reads were in flight at once.
+    #[derive(Debug, Default)]
+    struct Busy {
+        inner: MemoryStore,
+        reading: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Busy {
+        /// Counts a read as in flight while the caller's turn passes
+        /// to whatever else is ready to read.
+        async fn read(&self) {
+            use std::sync::atomic::Ordering;
+
+            let now = self.reading.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            self.reading.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Busy {
+        async fn get(&self, key: &Key) -> Result<bytes::Bytes, ObjectError> {
+            self.read().await;
+            self.inner.get(key).await
+        }
+        async fn get_range(
+            &self,
+            key: &Key,
+            range: std::ops::Range<u64>,
+        ) -> Result<bytes::Bytes, ObjectError> {
+            self.read().await;
+            self.inner.get_range(key, range).await
+        }
+        async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
+            self.inner.head(key).await
+        }
+        async fn put(&self, key: &Key, body: bytes::Bytes) -> Result<(), ObjectError> {
+            self.inner.put(key, body).await
+        }
+        async fn put_if_absent(&self, key: &Key, body: bytes::Bytes) -> Result<(), ObjectError> {
+            self.inner.put_if_absent(key, body).await
+        }
+        fn list(
+            &self,
+            prefix: &Key,
+        ) -> futures::stream::BoxStream<'_, Result<ObjectMeta, ObjectError>> {
+            self.inner.list(prefix)
+        }
+        async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
+            self.inner.delete(key).await
+        }
+    }
+
+    /// A query needs the manifest of every partition of its dataset,
+    /// for the positions if not for the files. Over a bucket each is a
+    /// request or a few: one after another they are the query's
+    /// latency.
+    #[tokio::test]
+    async fn the_manifests_of_a_dataset_are_read_at_once() {
+        let store = MemoryStore::new();
+        let env = env();
+        let mut log = WriterLog::start(Arc::new(store.clone()), env.clone());
+        let writer = log.writer_id();
+        registry::register(&store, &env, &TenantId::DEFAULT, &dataset(), writer)
+            .await
+            .unwrap();
+        let days = vec![
+            batch(0, 0, 1),
+            batch(1, 10, 1),
+            batch(2, 20, 1),
+            batch(3, 30, 1),
+        ];
+        log.append_segment(&days).await.unwrap();
+        flush(&store, &env, &mut log, 0, 1, days).await;
+        adopt(&store, &log).await;
+
+        let busy = Arc::new(Busy {
+            inner: store,
+            ..Busy::default()
+        });
+        let manifests = Manifests::new(busy.clone(), env, 8);
+        let found = sources(
+            &manifests,
+            &TenantId::DEFAULT,
+            &dataset(),
+            Kind::Log,
+            WINDOW,
+            TimeRange::ALL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.partitions.len(), 4);
+        let most = busy.most.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(most > 1, "at most {most} read at a time");
     }
 
     #[tokio::test]
