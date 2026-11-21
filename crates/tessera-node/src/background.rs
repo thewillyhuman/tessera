@@ -9,9 +9,9 @@
 //! their logs under the intake and recovery kinds, partitions under the
 //! partition kind. A writer is dead when the node that registered it is
 //! no longer live in the membership view and its log has been quiet for
-//! a few heartbeats, or, whatever the view says, when the log has been
-//! quiet for a long time. Writers of this process are never recovered;
-//! the ingester ends or rotates its own logs.
+//! a few heartbeats, or, whatever the view says, when rows have waited
+//! in its log for a long time without a flush. Writers of this process
+//! are never recovered; the ingester ends or rotates its own logs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -47,7 +47,9 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// quiet before it is recovered: enough for a registration to reach the
 /// view before its node does.
 const DEAD_QUIET: Duration = Duration::from_secs(15);
-/// How long any foreign writer may be quiet before it is recovered.
+/// How long rows may wait in a quiet log of a node that is in the view
+/// before its writer is recovered: more than twice what a live
+/// ingester lets them wait for a flush.
 const RECOVER_AFTER: Duration = Duration::from_secs(300);
 /// Bytes of files of an older layout epoch rewritten per round (AD-10).
 const RECLUSTER_BUDGET: u64 = 256 << 20;
@@ -782,41 +784,96 @@ async fn collect_logs(background: &Background) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Whether a foreign writer counts as dead: its node is gone from the
-/// view and its log quiet for a few heartbeats, or the log quiet for a
-/// long time whatever the view says. A writer of this node or one whose
-/// log has ended is never dead.
+/// Whether a foreign writer counts as dead ([`dead`]). A writer of
+/// this node or one whose log has ended is never dead.
 async fn is_dead(background: &Background, registration: &Registration) -> Result<bool, Failure> {
     if registration.node == background.env.node {
         return Ok(false);
     }
-    let Some(quiet) = quiet_for(background, registration.writer).await? else {
+    let Some(log) = quiet_for(background, registration.writer).await? else {
         return Ok(false);
     };
     let gone = !background.membership.is_live(registration.node);
-    Ok(quiet >= RECOVER_AFTER || (gone && quiet >= DEAD_QUIET))
+    Ok(dead(log, gone))
 }
 
-/// How long a writer's log has been quiet; `None` once it has ended. A
-/// log without entries has been quiet forever.
-async fn quiet_for(background: &Background, writer: WriterId) -> Result<Option<Duration>, Failure> {
+/// A writer's log that has not ended, as recovery judges it.
+#[derive(Clone, Copy, Debug)]
+struct Quiet {
+    /// How long since its last entry; forever for a log without one.
+    since: Duration,
+    /// Whether its last entry is a segment: rows no flush has taken.
+    holds_rows: bool,
+}
+
+/// Whether the writer of a log is to be recovered. One whose node is
+/// gone from the view is, once its log has been quiet for a few
+/// heartbeats. One whose node is in the view is only when rows have
+/// been waiting in its log for longer than a live ingester leaves them
+/// unflushed: a log that is quiet because nothing is written to it,
+/// its last entry a flush, has nothing to recover, and recovering it
+/// fenced a writer that was merely idle, every five minutes.
+fn dead(log: Quiet, gone: bool) -> bool {
+    if gone {
+        log.since >= DEAD_QUIET
+    } else {
+        log.holds_rows && log.since >= RECOVER_AFTER
+    }
+}
+
+/// How long a writer's log has been quiet and whether rows wait in it;
+/// `None` once it has ended. A log without entries has been quiet
+/// forever.
+async fn quiet_for(background: &Background, writer: WriterId) -> Result<Option<Quiet>, Failure> {
     let Some(last) = reader::last(&*background.store, writer).await? else {
-        return Ok(Some(Duration::MAX));
+        return Ok(Some(Quiet {
+            since: Duration::MAX,
+            holds_rows: false,
+        }));
     };
     let entry = reader::read(&*background.store, writer, last).await?;
     if matches!(entry.body(), EntryBody::End) {
         return Ok(None);
     }
     let now = background.env.clock.now();
-    Ok(Some(
-        now.duration_since(entry.header().written_at)
+    Ok(Some(Quiet {
+        since: now
+            .duration_since(entry.header().written_at)
             .unwrap_or(Duration::ZERO),
-    ))
+        holds_rows: matches!(entry.body(), EntryBody::Segment { .. }),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ST-9, ST-10: a writer is recovered when its node is gone, or
+    /// when rows wait in its log that a live ingester would have
+    /// flushed long ago. On a cluster, every idle writer was fenced
+    /// five minutes after its last write, its node alive and its log
+    /// flushed, and started a new log on the next.
+    #[test]
+    fn a_live_nodes_idle_writer_is_not_recovered() {
+        let log = |seconds: u64, holds_rows: bool| Quiet {
+            since: Duration::from_secs(seconds),
+            holds_rows,
+        };
+        assert!(!dead(log(3_600, false), false), "idle, flushed, alive");
+        assert!(dead(log(300, true), false), "rows left waiting");
+        assert!(!dead(log(299, true), false), "not for long enough");
+        assert!(dead(log(15, false), true), "its node is gone");
+        assert!(
+            !dead(log(14, false), true),
+            "a registration ahead of the view"
+        );
+        let never_written = Quiet {
+            since: Duration::MAX,
+            holds_rows: false,
+        };
+        assert!(!dead(never_written, false));
+        assert!(dead(never_written, true));
+    }
 
     #[test]
     fn periodic_work_is_due_at_first_and_then_every_interval() {
