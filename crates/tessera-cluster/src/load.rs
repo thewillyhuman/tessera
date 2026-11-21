@@ -13,6 +13,11 @@
 //! | `tessera_intake_backlog` | Writers whose logs the last round had to recover |
 //! | `tessera_evaluator_lag_seconds` | How far the slowest owned rule group is behind |
 //! | `tessera_slots_owned{kind}` | Slots this node holds, per kind of work |
+//!
+//! and, for a node that keeps object reads on local disk (section
+//! 10.8), the counters `tessera_object_cache_hits_total` and
+//! `tessera_object_cache_misses_total` with the gauge
+//! `tessera_object_cache_bytes`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -33,7 +38,20 @@ pub struct Load {
     evaluator_lag_nanos: AtomicU64,
     degraded_rules: AtomicU64,
     alert_latency_nanos: AtomicU64,
+    object_cache: Mutex<ObjectCache>,
     slots: Mutex<BTreeMap<WorkKind, u64>>,
+}
+
+/// How much a node's cache of object reads on local disk was used
+/// (section 10.8); all zero on a node without one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectCache {
+    /// Reads served from the disk since the node started.
+    pub hits: u64,
+    /// Reads that went to the store since the node started.
+    pub misses: u64,
+    /// The bytes the cache holds.
+    pub bytes: u64,
 }
 
 /// A write in flight; dropping it counts the write as done.
@@ -67,6 +85,8 @@ pub struct Snapshot {
     /// Smoothed time from the last row an alert's rule received to the
     /// notification sent (section 17.1).
     pub alert_latency: Duration,
+    /// The use of the cache of object reads on local disk.
+    pub object_cache: ObjectCache,
     /// Slots held per kind of work.
     pub slots: BTreeMap<WorkKind, u64>,
 }
@@ -142,6 +162,14 @@ impl Load {
         self.degraded_rules.store(rules, Ordering::Relaxed);
     }
 
+    /// Sets the use of the cache of object reads on local disk.
+    pub fn set_object_cache(&self, used: ObjectCache) {
+        *self
+            .object_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = used;
+    }
+
     /// Sets the slots held of `kind`.
     pub fn set_slots(&self, kind: WorkKind, held: u64) {
         self.slots
@@ -162,6 +190,10 @@ impl Load {
             evaluator_lag: Duration::from_nanos(self.evaluator_lag_nanos.load(Ordering::Relaxed)),
             degraded_rules: self.degraded_rules.load(Ordering::Relaxed),
             alert_latency: Duration::from_nanos(self.alert_latency_nanos.load(Ordering::Relaxed)),
+            object_cache: *self
+                .object_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
             slots: self
                 .slots
                 .lock()
@@ -220,6 +252,31 @@ impl Snapshot {
             "tessera_alert_latency_seconds",
             "Time from the last row an alert's rule received to the notification sent, smoothed.",
             format!("{:.3}", self.alert_latency.as_secs_f64()),
+        );
+        let mut counter = |name: &str, help: &str, value: u64| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} counter");
+            let _ = writeln!(out, "{name} {value}");
+        };
+        counter(
+            "tessera_object_cache_hits_total",
+            "Object reads served from the cache on local disk.",
+            self.object_cache.hits,
+        );
+        counter(
+            "tessera_object_cache_misses_total",
+            "Reads of cacheable objects that went to the store.",
+            self.object_cache.misses,
+        );
+        let _ = writeln!(
+            out,
+            "# HELP tessera_object_cache_bytes Bytes the cache of object reads holds."
+        );
+        let _ = writeln!(out, "# TYPE tessera_object_cache_bytes gauge");
+        let _ = writeln!(
+            out,
+            "tessera_object_cache_bytes {}",
+            self.object_cache.bytes
         );
         let _ = writeln!(
             out,
@@ -287,7 +344,21 @@ mod tests {
         load.set_evaluator_lag(Duration::from_millis(1_500));
         load.set_degraded_rules(1);
         load.alert_sent(Duration::from_millis(2_500));
+        load.set_object_cache(ObjectCache {
+            hits: 7,
+            misses: 2,
+            bytes: 4096,
+        });
         let text = load.snapshot().prometheus_text();
+        assert!(
+            text.contains("tessera_object_cache_hits_total 7\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tessera_object_cache_misses_total 2\n"),
+            "{text}"
+        );
+        assert!(text.contains("tessera_object_cache_bytes 4096\n"), "{text}");
         assert!(text.contains("tessera_rules_degraded 1\n"), "{text}");
         assert!(
             text.contains("tessera_alert_latency_seconds 0.500\n"),

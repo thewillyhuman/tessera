@@ -51,6 +51,16 @@ struct RunArgs {
     /// temporary directory by default.
     #[arg(long, default_value_os_t = std::env::temp_dir().join("tessera-spill"))]
     spill_dir: PathBuf,
+    /// A directory to keep on local disk what was read of the objects
+    /// that never change: data files, their indexes and writer-log
+    /// entries. With a bucket as the root pool, each is then asked of
+    /// it once. The directory is the cache's alone and is emptied at
+    /// every start.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+    /// The most bytes the cache keeps; eight gibibytes by default.
+    #[arg(long, default_value_t = 8 << 30, requires = "cache_dir")]
+    cache_bytes: u64,
     /// Where the HTTP API listens. Loopback by default, since requests
     /// without an API key are served unless --no-anonymous is given.
     #[arg(long, default_value = "127.0.0.1:8080")]
@@ -208,6 +218,10 @@ async fn main() -> ExitCode {
                 keyring,
                 spill_dir: args.spill_dir,
                 root_pool: args.root_pool,
+                cache: args.cache_dir.map(|dir| tessera_node::DiskCache {
+                    dir,
+                    bytes: args.cache_bytes,
+                }),
                 ..tessera_node::Config::single_node(args.data_dir)
             })
             .await
@@ -302,6 +316,25 @@ mod tests {
             "/tmp/x",
         ];
         assert!(Cli::try_parse_from(both).is_err());
+    }
+
+    #[test]
+    fn the_cache_is_a_directory_and_a_size() {
+        let Command::Run(none) = Cli::try_parse_from(["tessera", "run"]).unwrap().command;
+        assert_eq!(none.cache_dir, None);
+        let sized = [
+            "tessera",
+            "run",
+            "--cache-dir",
+            "/var/cache/tessera",
+            "--cache-bytes",
+            "1024",
+        ];
+        let Command::Run(args) = Cli::try_parse_from(sized).unwrap().command;
+        assert_eq!(args.cache_dir, Some(PathBuf::from("/var/cache/tessera")));
+        assert_eq!(args.cache_bytes, 1024);
+        let no_directory = ["tessera", "run", "--cache-bytes", "1024"];
+        assert!(Cli::try_parse_from(no_directory).is_err());
     }
 
     #[test]

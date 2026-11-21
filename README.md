@@ -233,9 +233,9 @@ each worker groups the traces of its partition.
 Gaps left in M6: PromQL evaluation and joins over other inputs
 still run on the coordinator over the rows the leaf tasks return,
 and the outputs of sort, top-k, limit and keyless aggregate stages
-go through the coordinator; there is no object byte
-range cache on local disk, so every read of a bucket is a request;
-the scale envelope of section 17.2 has not been
+go through the coordinator; the cache of object reads
+on local disk keeps whole ranges as they were asked, so two reads
+that overlap share nothing; the scale envelope of section 17.2 has not been
 run.
 
 **M7, control store, continuous queries and alerting: done, with
@@ -563,6 +563,13 @@ AWS_REGION=eu-west-1 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 AWS_ENDPOINT_URL=http://minio:9000 AWS_ALLOW_HTTP=true AWS_REGION=us-east-1 ... \
     cargo run -p tessera -- run --root-pool s3://my-bucket
 ```
+
+With `--cache-dir`, a node keeps on local disk what it read of the
+objects that never change, data files, their indexes and writer-log
+entries, up to `--cache-bytes` (eight gibibytes by default), and asks
+the bucket for each range once (section 10.8); `GET /metrics` counts
+the reads the cache served and those it did not. The directory is the
+cache's alone and is emptied at every start.
 
 A cluster is several nodes on one root pool: the same bucket, or a
 shared directory. Each node announces itself in the pool's registry and finds the

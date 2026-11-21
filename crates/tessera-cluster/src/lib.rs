@@ -19,7 +19,7 @@ pub mod role;
 
 pub use admission::{Admission, IngestPermit, Limits, QueryPermit, Rejected};
 pub use budget::{Account, Charge, Counts, Ledger, Phase};
-pub use load::{Inflight, Load};
+pub use load::{Inflight, Load, ObjectCache};
 pub use membership::Membership;
 pub use registry::{NodeRecord, Registry, RegistryError, oldest_reader};
 pub use role::{Role, UnknownRole};

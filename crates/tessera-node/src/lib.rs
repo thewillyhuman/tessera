@@ -42,7 +42,7 @@ use tessera_format::{FileFormat, ParquetFormat};
 use tessera_iceberg::Exporter;
 use tessera_ingest::{IngestConfig, IngestHandle, Ingester};
 use tessera_manifest::DatasetLogs;
-use tessera_object::{LocalStore, ObjectStore, PoolState, Pools, RemoteStore, layout};
+use tessera_object::{CachedStore, LocalStore, ObjectStore, PoolState, Pools, RemoteStore, layout};
 use tessera_server::{
     AppState, Auth, Cluster, HttpRemote, IngestMeter, RollupEntries, SystemTableRows,
 };
@@ -83,6 +83,10 @@ pub struct Config {
     pub root_pool: Option<String>,
     /// Where queries spill when a memory grant runs out (QE-11).
     pub spill_dir: PathBuf,
+    /// The cache of object reads on local disk (section 10.8); none
+    /// reads everything from the root pool, which is right when that
+    /// is a local directory.
+    pub cache: Option<DiskCache>,
     /// Where the HTTP API listens; port zero picks a free one.
     pub listen: SocketAddr,
     /// Where the `PostgreSQL` wire protocol listens; port zero picks a
@@ -144,6 +148,17 @@ pub struct Config {
     pub export_interval: Duration,
 }
 
+/// Where a node keeps what it read of the objects that never change,
+/// and how much of it (section 10.8). The directory is the cache's
+/// alone: it is emptied at every start.
+#[derive(Clone, Debug)]
+pub struct DiskCache {
+    /// The directory.
+    pub dir: PathBuf,
+    /// The most bytes kept.
+    pub bytes: u64,
+}
+
 impl Config {
     /// Every role, loopback listeners, the default tunables, against
     /// `data_dir`.
@@ -154,6 +169,7 @@ impl Config {
             data_dir,
             root_pool: None,
             spill_dir: std::env::temp_dir().join("tessera-spill"),
+            cache: None,
             listen: loopback(8080),
             pg_listen: loopback(5432),
             roles: Role::ALL.into_iter().collect(),
@@ -185,6 +201,15 @@ pub enum RunError {
     /// The data directory cannot be used.
     #[error("cannot open data directory {path}: {source}")]
     DataDir {
+        /// The directory.
+        path: PathBuf,
+        /// The failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The cache directory cannot be used.
+    #[error("cannot open the cache directory {path}: {source}")]
+    Cache {
         /// The directory.
         path: PathBuf,
         /// The failure.
@@ -250,7 +275,7 @@ impl Node {
     ///
     /// If the data directory, the catalog or a listener cannot be opened.
     pub async fn start(config: Config, env: Env) -> Result<Node, RunError> {
-        let (store, catalog, pool) = open(&config, &env).await?;
+        let (store, catalog, pool, cache) = open(&config, &env).await?;
         if !config.keyring.is_empty() {
             tracing::info!(keys = ?config.keyring.names().collect::<Vec<_>>(), "keyring loaded");
         }
@@ -305,6 +330,8 @@ impl Node {
             membership,
             load: Load::new(),
         };
+        loops
+            .extend(cache.map(|cache| tokio::spawn(report_cache(cache, Arc::clone(&shared.load)))));
         let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
         let (state, engine, controls) =
@@ -476,12 +503,57 @@ pub async fn run(config: Config) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Opens the root pool and the catalog in it.
-async fn open(
+/// The root pool's store with the node's cache in front of it, when
+/// it has one, and the cache to report the use of.
+async fn cached(
     config: &Config,
-    env: &Env,
-) -> Result<(Arc<dyn ObjectStore>, Arc<Catalog>, PoolId), RunError> {
-    let (store, url) = root_store(config).await?;
+    (store, url): (Arc<dyn ObjectStore>, String),
+) -> Result<(RootStore, Option<Arc<CachedStore>>), RunError> {
+    let Some(DiskCache { dir, bytes }) = &config.cache else {
+        return Ok(((store, url), None));
+    };
+    let cache = CachedStore::open(store, dir, *bytes)
+        .await
+        .map_err(|source| RunError::Cache {
+            path: dir.clone(),
+            source,
+        })?;
+    let cache = Arc::new(cache);
+    tracing::info!(dir = %dir.display(), bytes, "object cache open");
+    let store: Arc<dyn ObjectStore> = cache.clone();
+    Ok(((store, url), Some(cache)))
+}
+
+/// Copies the cache's use into the node's load signals every second.
+async fn report_cache(cache: Arc<CachedStore>, load: Arc<Load>) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        ticks.tick().await;
+        let used = cache.stats();
+        load.set_object_cache(tessera_cluster::ObjectCache {
+            hits: used.hits,
+            misses: used.misses,
+            bytes: used.bytes,
+        });
+    }
+}
+
+/// A root pool's store and the URL the catalog records it under.
+type RootStore = (Arc<dyn ObjectStore>, String);
+
+/// What a node opens first: the root pool's store, the catalog in
+/// it, the pool's id and the cache in front of the store, if any.
+type Opened = (
+    Arc<dyn ObjectStore>,
+    Arc<Catalog>,
+    PoolId,
+    Option<Arc<CachedStore>>,
+);
+
+/// Opens the root pool, behind the node's cache when it has one, and
+/// the catalog in it.
+async fn open(config: &Config, env: &Env) -> Result<Opened, RunError> {
+    let ((store, url), cache) = cached(config, root_store(config).await?).await?;
     let pool = PoolId::new("root").unwrap_or_else(|_| unreachable!("a literal valid pool id"));
     let root_pool = PoolConfig {
         id: pool.clone(),
@@ -496,12 +568,12 @@ async fn open(
         version = %catalog.cached().version(),
         "catalog open"
     );
-    Ok((store, catalog, pool))
+    Ok((store, catalog, pool, cache))
 }
 
 /// The store of the root pool and the URL the catalog records it
 /// under: the bucket `root_pool` names, or the data directory.
-async fn root_store(config: &Config) -> Result<(Arc<dyn ObjectStore>, String), RunError> {
+async fn root_store(config: &Config) -> Result<RootStore, RunError> {
     if let Some(url) = &config.root_pool {
         return Ok((Arc::new(RemoteStore::s3(url)?), url.clone()));
     }

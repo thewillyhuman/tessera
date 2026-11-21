@@ -115,6 +115,56 @@ async fn a_node_on_a_bucket_keeps_nothing_durable_to_itself() {
     second.stop().await;
 }
 
+/// Section 10.8: with a cache directory, what a query read of the
+/// objects that never change is on local disk for the next one, and
+/// the node says how much the cache serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_with_a_cache_serves_repeated_reads_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let mut config = config(&dir.path().join("data"));
+    config.cache = Some(tessera_node::DiskCache {
+        dir: cache.clone(),
+        bytes: 1 << 30,
+    });
+    let node = Node::start(config, Env::system()).await.unwrap();
+    let base = format!("http://{}", node.http_address());
+    let now = node.env().clock.now().as_nanos();
+    let values: Vec<serde_json::Value> = (0..20)
+        .map(|i| serde_json::json!([(now + i).to_string(), format!("line {i}")]))
+        .collect();
+    let push = serde_json::json!({ "streams": [{ "stream": { "app": "web" }, "values": values }] });
+    let headers = vec![("x-tessera-dataset".to_owned(), "prod".to_owned())];
+    let (status, text) = common::post(format!("{base}/loki/api/v1/push"), headers, push).await;
+    assert_eq!(status, 204, "{text}");
+    for _ in 0..3 {
+        let body = serde_json::json!({ "dataset": "prod", "query": "SELECT count(*) FROM logs" });
+        let (status, text) = common::post(format!("{base}/api/v1/query"), vec![], body).await;
+        assert_eq!(status, 200, "{text}");
+    }
+
+    let hits = || {
+        let text = ureq::get(&format!("{base}/metrics"))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_to_string()
+            .unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix("tessera_object_cache_hits_total "))
+            .map(|hits| hits.parse::<u64>().unwrap())
+    };
+    eventually("the cache serves a read", || {
+        tokio::task::block_in_place(|| hits().is_some_and(|hits| hits > 0))
+    })
+    .await;
+    assert!(
+        std::fs::read_dir(&cache).unwrap().next().is_some(),
+        "the reads are kept in the cache directory"
+    );
+    node.stop().await;
+}
+
 /// IN-1: a collector's gRPC exporter reaches the logs service on the
 /// node's one port, and the rows come back over HTTP.
 #[tokio::test(flavor = "multi_thread")]
