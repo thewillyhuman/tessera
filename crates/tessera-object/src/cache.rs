@@ -5,7 +5,8 @@
 //! [`CachedStore`] stands in front of a store whose every read is a
 //! request to somewhere else, a bucket, and keeps on local disk what
 //! was read of the objects that never change once written: data
-//! files, their sidecar indexes and writer-log entries
+//! files, their sidecar indexes, writer-log entries and the
+//! checkpoints of commit logs
 //! ([`layout::is_immutable`]). A read asked again, the same object
 //! and the same range, is served from the disk; anything else goes to
 //! the store. Reads that differ in their range share nothing, which

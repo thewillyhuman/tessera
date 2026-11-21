@@ -94,13 +94,18 @@ pub fn writer_log_entry(writer: WriterId, seq: Seq) -> Key {
 }
 
 /// Whether the object at `key` never changes once it is written: a
-/// data file, a sidecar index or a writer-log entry. What was read of
-/// such an object stays true for as long as the object exists, which
-/// is what lets a node keep it on local disk (section 10.8).
+/// data file, a sidecar index, a writer-log entry or a checkpoint of
+/// a commit log, which is the log's state at a version and the same
+/// whoever writes it. What was read of such an object stays true for
+/// as long as the object exists, which is what lets a node keep it
+/// on local disk (section 10.8).
 #[must_use]
 pub fn is_immutable(key: &Key) -> bool {
     let extension = key.name().rsplit_once('.').map(|(_, extension)| extension);
-    matches!(extension, Some("parquet" | "idx")) || key.as_str().starts_with("_wal/")
+    let directory = key.as_str().rsplit('/').nth(1);
+    matches!(extension, Some("parquet" | "idx"))
+        || key.as_str().starts_with("_wal/")
+        || directory == Some("_checkpoint")
 }
 
 /// The tenant whose key seals the object at `key` whole, when the
@@ -295,17 +300,25 @@ mod tests {
     }
 
     #[test]
-    fn files_indexes_and_log_entries_never_change() {
+    fn files_indexes_log_entries_and_checkpoints_never_change() {
         let file = FileId::from_u128(7);
         let writer = WriterId::from_u128(9);
         assert!(is_immutable(&data_file(&partition_id(), file)));
         assert!(is_immutable(&sidecar(&partition_id(), file)));
         assert!(is_immutable(&writer_log_entry(writer, Seq::new(3))));
+        let checkpoint = partition(&partition_id())
+            .join("_checkpoint")
+            .and_then(|key| key.join("00000000000000000007"))
+            .unwrap();
+        assert!(is_immutable(&checkpoint), "{checkpoint}");
         for key in [catalog(), leases(), node(NodeId::from_u128(1))] {
             assert!(!is_immutable(&key), "{key}");
         }
+        // What names the newest checkpoint is replaced with each one.
         let hint = catalog().join("_hint").unwrap();
         assert!(!is_immutable(&hint));
+        let commit = catalog().join("_log").unwrap();
+        assert!(!is_immutable(&commit));
     }
 
     #[test]

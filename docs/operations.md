@@ -133,8 +133,8 @@ closed by another node's recovery.
   when nodes come and go.
 - Give query nodes a `--cache-dir` on fast local disk
   (`--cache-bytes`, 8 GiB by default). It holds what was read of data
-  files, their indexes and writer-log entries, and is emptied at
-  every start.
+  files, their indexes, writer-log entries and manifest checkpoints,
+  and is emptied at every start.
 - Queries spill to `--spill-dir` (the system's temporary directory by
   default) when they outgrow their memory grant.
 
@@ -291,8 +291,8 @@ A query's requests grow with the partitions of its dataset, one a day
 by default, not with the files in them: it asks for the partitions'
 names, reads the head of each one's manifest, sixteen at a time, and
 then only the files and ranges its time range and filters leave.
-What it read of files, indexes and writer-log entries the cache
-keeps.
+What it read of files, indexes, writer-log entries and manifest
+checkpoints the cache keeps.
 
 ## Known limits
 

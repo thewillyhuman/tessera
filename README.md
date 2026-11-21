@@ -584,8 +584,9 @@ AWS_ENDPOINT_URL=http://minio:9000 AWS_ALLOW_HTTP=true AWS_REGION=us-east-1 ... 
 ```
 
 With `--cache-dir`, a node keeps on local disk what it read of the
-objects that never change, data files, their indexes and writer-log
-entries, up to `--cache-bytes` (eight gibibytes by default), and asks
+objects that never change, data files, their indexes, writer-log
+entries and manifest checkpoints, up to `--cache-bytes` (eight
+gibibytes by default), and asks
 the bucket for each range once (section 10.8); `GET /metrics` counts
 the reads the cache served and those it did not. The directory is the
 cache's alone and is emptied at every start.
