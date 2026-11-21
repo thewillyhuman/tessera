@@ -280,6 +280,13 @@ from disk, and the rest are heartbeats, leases and the node's own
 metrics. Budget for it per node, and prefer few larger nodes to many
 small ones where that matters.
 
+A query's requests grow with the partitions of its dataset, one a day
+by default, not with the files in them: it asks for the partitions'
+names, reads the head of each one's manifest, sixteen at a time, and
+then only the files and ranges its time range and filters leave.
+What it read of files, indexes and writer-log entries the cache
+keeps.
+
 ## Known limits
 
 Listed with their context in the README's status section. The ones an
