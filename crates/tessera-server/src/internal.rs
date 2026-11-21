@@ -303,7 +303,15 @@ async fn ingest(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// The client of the internal routes, over HTTP with a bounded timeout.
+/// How long a request to a peer may take in all.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a peer has to accept the connection. A node of the same
+/// cluster answers in milliseconds; one that takes seconds is gone,
+/// its address answering nothing, and the caller's fallback (QE-17)
+/// must not wait a whole request's time for it.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The client of the internal routes, over HTTP with bounded timeouts.
 #[derive(Clone, Debug)]
 pub struct HttpRemote {
     agent: ureq::Agent,
@@ -318,17 +326,22 @@ impl Default for HttpRemote {
 }
 
 impl HttpRemote {
-    /// A client whose requests time out after a minute.
+    /// A client whose requests time out after a minute, or after two
+    /// seconds without a connection.
     #[must_use]
     pub fn new() -> Self {
         HttpRemote {
-            agent: ureq::Agent::config_builder()
-                .http_status_as_error(false)
-                .timeout_global(Some(std::time::Duration::from_secs(60)))
-                .build()
-                .into(),
+            agent: Self::config().build().into(),
             secret: None,
         }
+    }
+
+    /// What every agent of the client is configured with.
+    fn config() -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(REQUEST_TIMEOUT))
+            .timeout_connect(Some(CONNECT_TIMEOUT))
     }
 
     /// This client presenting `secret` to its peers.
@@ -353,12 +366,7 @@ impl HttpRemote {
         let tls = ureq::tls::TlsConfig::builder()
             .root_certs(ureq::tls::RootCerts::new_with_certs(&[ca]))
             .build();
-        self.agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(std::time::Duration::from_secs(60)))
-            .tls_config(tls)
-            .build()
-            .into();
+        self.agent = Self::config().tls_config(tls).build().into();
         Ok(self)
     }
 
@@ -607,6 +615,23 @@ mod tests {
 
     /// SE-3: with a cluster secret configured, the internal routes take
     /// it as a bearer token and refuse requests without it.
+    /// QE-17: a peer whose machine is gone answers nothing, not even
+    /// a refusal, and the node that asked must fall back while its own
+    /// caller still waits. The address is one that is routed nowhere
+    /// (RFC 5737).
+    #[test]
+    fn a_peer_that_never_answers_is_given_up_on_within_seconds() {
+        let started = std::time::Instant::now();
+        let error = HttpRemote::new()
+            .get("http://192.0.2.1:8080/internal/v1/gossip")
+            .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "gave up after {:?}: {error}",
+            started.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn internal_routes_need_the_cluster_secret_once_one_is_set() {
         let mut state = crate::testing::state().await;
