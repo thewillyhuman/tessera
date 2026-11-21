@@ -57,12 +57,23 @@ spec:
             httpGet:
               path: /healthz
               port: http
+          # Nothing is written outside the volumes: queries spill
+          # under /tmp, and what is durable goes to the root pool.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
           volumeMounts:
+            - name: scratch
+              mountPath: /tmp
             - name: root-pool
               mountPath: /var/lib/tessera
           resources:
             {{- toYaml $root.Values.resources | nindent 12 }}
       volumes:
+        - name: scratch
+          emptyDir: {}
         - name: root-pool
           persistentVolumeClaim:
             claimName: {{ include "tessera.fullname" $root }}-root-pool
