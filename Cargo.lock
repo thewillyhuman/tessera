@@ -3902,6 +3902,7 @@ dependencies = [
  "tessera-types",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

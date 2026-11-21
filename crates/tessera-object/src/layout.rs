@@ -85,6 +85,16 @@ pub fn writer_log_entry(writer: WriterId, seq: Seq) -> Key {
     key(&["_wal", &writer.to_string(), &seq.to_string()])
 }
 
+/// Whether the object at `key` never changes once it is written: a
+/// data file, a sidecar index or a writer-log entry. What was read of
+/// such an object stays true for as long as the object exists, which
+/// is what lets a node keep it on local disk (section 10.8).
+#[must_use]
+pub fn is_immutable(key: &Key) -> bool {
+    let extension = key.name().rsplit_once('.').map(|(_, extension)| extension);
+    matches!(extension, Some("parquet" | "idx")) || key.as_str().starts_with("_wal/")
+}
+
 /// Prefix of a tenant's control store log.
 #[must_use]
 pub fn control_log(tenant: &TenantId) -> Key {
@@ -247,6 +257,20 @@ mod tests {
             kind: Kind::Log,
             window: Window::containing(Timestamp::UNIX_EPOCH, Window::DEFAULT_LENGTH).unwrap(),
         }
+    }
+
+    #[test]
+    fn files_indexes_and_log_entries_never_change() {
+        let file = FileId::from_u128(7);
+        let writer = WriterId::from_u128(9);
+        assert!(is_immutable(&data_file(&partition_id(), file)));
+        assert!(is_immutable(&sidecar(&partition_id(), file)));
+        assert!(is_immutable(&writer_log_entry(writer, Seq::new(3))));
+        for key in [catalog(), leases(), node(NodeId::from_u128(1))] {
+            assert!(!is_immutable(&key), "{key}");
+        }
+        let hint = catalog().join("_hint").unwrap();
+        assert!(!is_immutable(&hint));
     }
 
     #[test]
