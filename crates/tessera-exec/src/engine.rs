@@ -640,14 +640,27 @@ impl Engine {
         let mut analysis = Analysis::default();
         let execution = self.execute(plan, &grant, &mut analysis);
         let batches = match limits.wall_time {
-            Some(allowed) => tokio::time::timeout(allowed, execution)
-                .await
-                .map_err(|_| {
+            Some(allowed) => {
+                let too_long = || {
                     EngineError::Limit(format!(
                         "ran longer than the {} s a query may take",
                         allowed.as_secs_f64()
                     ))
-                })??,
+                };
+                let started = tokio::time::Instant::now();
+                let batches = tokio::time::timeout(allowed, execution)
+                    .await
+                    .map_err(|_| too_long())??;
+                // A timeout stops a query where it waits. One that did
+                // not wait once the time was up ends on its own, and is
+                // held to the limit all the same: whether a query past
+                // its time is refused must not depend on where it
+                // happened to pause.
+                if started.elapsed() > allowed {
+                    return Err(too_long());
+                }
+                batches
+            }
             None => execution.await?,
         };
         analysis.spilled_bytes = grant.memory.spilled_bytes();
