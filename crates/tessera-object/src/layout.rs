@@ -103,6 +103,33 @@ pub fn is_immutable(key: &Key) -> bool {
     matches!(extension, Some("parquet" | "idx")) || key.as_str().starts_with("_wal/")
 }
 
+/// The tenant whose key seals the object at `key` whole, when the
+/// tenant has one (SE-2): every object under a tenant's prefix but
+/// those that are sealed by what writes them and read by range, the
+/// data files and the sidecar indexes, and a dataset's Iceberg
+/// export, which is written for other engines to read. What is under
+/// no tenant's prefix, the cluster's objects and the writer logs, is
+/// sealed for no one.
+#[must_use]
+pub fn sealed_for(key: &Key) -> Option<TenantId> {
+    let mut parts = key.as_str().split('/');
+    let tenant = parts
+        .next()
+        .filter(|first| !matches!(*first, "_cluster" | "_wal"))?;
+    let of_a_dataset = parts.next().is_some_and(|name| !name.starts_with('_'));
+    let left_alone = of_a_dataset
+        && match parts.next() {
+            Some("iceberg") => true,
+            // {kind}/{window}/d or i: a data file or a sidecar index.
+            Some("p") => matches!(parts.nth(2), Some("d" | "i")),
+            _ => false,
+        };
+    if left_alone {
+        return None;
+    }
+    TenantId::new(tenant).ok()
+}
+
 /// Prefix of a tenant's control store log.
 #[must_use]
 pub fn control_log(tenant: &TenantId) -> Key {
@@ -279,6 +306,60 @@ mod tests {
         }
         let hint = catalog().join("_hint").unwrap();
         assert!(!is_immutable(&hint));
+    }
+
+    #[test]
+    fn what_tells_of_a_tenant_is_sealed_for_it() {
+        let acme = TenantId::new("acme").unwrap();
+        let prod = DatasetName::new("prod").unwrap();
+        let writer = WriterId::from_u128(9);
+        let partition = partition_id();
+        for prefix in [
+            control_log(&acme),
+            eval_log(&acme, "slo", 0),
+            // A group may be named as the export's directory is.
+            eval_log(&acme, "iceberg", 0),
+            dataset_log(&acme, &prod),
+            super::partition(&partition),
+        ] {
+            for object in [
+                "_log/00000000000000000001",
+                "_checkpoint/00000000000000000001",
+                "_hint",
+            ] {
+                let key = Key::new(format!("{prefix}/{object}")).unwrap();
+                assert_eq!(sealed_for(&key), Some(acme.clone()), "{key}");
+            }
+        }
+        for key in [
+            eval_split(&acme, "slo", "2-1-5"),
+            eval_partial(&acme, "slo", 2, 1, writer, Seq::new(3)),
+            writer_registration(&acme, &prod, writer),
+        ] {
+            assert_eq!(sealed_for(&key), Some(acme.clone()), "{key}");
+        }
+        let system = dataset_log(&TenantId::SYSTEM, &prod);
+        assert_eq!(sealed_for(&system), Some(TenantId::SYSTEM), "{system}");
+    }
+
+    #[test]
+    fn what_seals_itself_or_is_no_tenants_is_sealed_for_no_one() {
+        let acme = TenantId::new("acme").unwrap();
+        let prod = DatasetName::new("prod").unwrap();
+        let file = FileId::from_u128(7);
+        let exported = iceberg_table(&acme, &prod, Kind::Log)
+            .join("metadata")
+            .unwrap();
+        for key in [
+            data_file(&partition_id(), file),
+            sidecar(&partition_id(), file),
+            exported,
+            writer_log_entry(WriterId::from_u128(9), Seq::new(3)),
+            catalog(),
+            node(NodeId::from_u128(1)),
+        ] {
+            assert_eq!(sealed_for(&key), None, "{key}");
+        }
     }
 
     #[test]

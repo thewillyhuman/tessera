@@ -15,6 +15,7 @@ pub mod memory;
 pub mod pool;
 pub mod probe;
 pub mod remote;
+pub mod sealed;
 pub mod shallow;
 pub mod store;
 
@@ -26,5 +27,6 @@ pub use memory::MemoryStore;
 pub use pool::{ObjectRef, Pool, PoolError, PoolState, Pools};
 pub use probe::ProbeError;
 pub use remote::{OpenError, RemoteStore};
+pub use sealed::SealedStore;
 pub use shallow::ShallowStore;
 pub use store::{BoxError, ObjectError, ObjectMeta, ObjectStore};
