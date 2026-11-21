@@ -15,9 +15,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::TryStreamExt;
+use futures::stream::BoxStream;
 use tessera_object::ObjectStore;
 use tessera_types::{DatasetName, Env, FileMeta, PartitionId, Seq, TenantId, WriterId};
-use tessera_wal::{EntryBody, reader};
+use tessera_wal::{Entry, EntryBody, WalError, reader};
 
 use crate::{Manifest, ManifestError, registry};
 
@@ -75,12 +76,50 @@ pub async fn run_after(
     writer: WriterId,
     after: Seq,
 ) -> Result<IntakeOutcome, ManifestError> {
+    let entries = reader::entries(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
+    over(store, env, tenant, dataset, writer, after, entries).await
+}
+
+/// Runs intake for `writer` and one dataset over the entries that
+/// follow `after` directly, without listing the log: one read that
+/// finds nothing when the writer appended nothing, which is what most
+/// looks at a log find. Where the entries after `after` were
+/// collected it finds nothing though the log goes on; [`run_after`]
+/// finds where, and is to be run from time to time by whoever follows
+/// a log this way.
+///
+/// # Errors
+///
+/// If the log cannot be read or a manifest cannot be committed; the
+/// run can then be repeated from the same position.
+pub async fn run_following(
+    store: Arc<dyn ObjectStore>,
+    env: &Env,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    writer: WriterId,
+    after: Seq,
+) -> Result<IntakeOutcome, ManifestError> {
+    let entries =
+        reader::entries_following(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
+    over(store, env, tenant, dataset, writer, after, entries).await
+}
+
+/// Intake over `entries`, those of `writer`'s log after `after`.
+async fn over(
+    store: Arc<dyn ObjectStore>,
+    env: &Env,
+    tenant: &TenantId,
+    dataset: &DatasetName,
+    writer: WriterId,
+    after: Seq,
+    mut entries: BoxStream<'static, Result<Entry, WalError>>,
+) -> Result<IntakeOutcome, ManifestError> {
     let mut outcome = IntakeOutcome {
         through: after,
         ..IntakeOutcome::default()
     };
     let mut adopted = None;
-    let mut entries = reader::entries(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
     while let Some(entry) = entries.try_next().await? {
         outcome.through = entry.seq();
         match entry.body() {
@@ -350,10 +389,26 @@ mod tests {
         })
         .await
         .unwrap();
+        let followed = run_following(
+            Arc::new(store.clone()),
+            &env(),
+            &TenantId::DEFAULT,
+            &dataset(),
+            writer,
+            first.through,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (followed.flushes, followed.adoptions, followed.through),
+            (1, 1, Seq::new(6)),
+            "following the log finds what a listing finds"
+        );
         let later = resume(first.through).await;
         assert_eq!(
             (later.flushes, later.adoptions, later.through),
-            (1, 1, Seq::new(6))
+            (1, 0, Seq::new(6)),
+            "adopted already"
         );
         let partitions = list_partitions(&store, &TenantId::DEFAULT, &dataset(), Kind::Log)
             .await
