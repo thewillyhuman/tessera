@@ -813,8 +813,8 @@ Logging is controlled by `TESSERA_LOG` (for example `TESSERA_LOG=debug`).
 
 ## Benchmark
 
-`tessera-bench` runs one node in its own process over a local root
-pool and measures it against the targets of spec section 17.1 that one
+`tessera-bench` runs one node in its own process, over a local root
+pool unless given a bucket, and measures it against the targets of spec section 17.1 that one
 machine can speak to:
 
 ```
@@ -860,7 +860,8 @@ What the numbers say:
 
 - The query, freshness, alert, metric storage and start-up targets
   hold at this size on local disk. They remain to be measured at the
-  sizes the targets name and against an object store.
+  sizes the targets name; the table further down has them over a
+  bucket.
 - Acknowledgment latency is the ingester's linger plus queueing. At the
   default 50 ms linger it meets the target until the ingest task
   saturates; `--linger-ms` trades it for larger segments.
@@ -881,6 +882,32 @@ What the numbers say:
   construction, are 15; the body is 9 and the delta-encoded time 4.
   The data's own entropy is most of what is left; dropping the stored
   event id after deduplication would be the next step.
+
+With `--root-pool s3://<bucket>` the same run goes over a bucket, and
+`--cache-dir` gives the node its cache of object reads. Against MinIO
+on the same machine, 2026-11-21, where a request costs about a
+millisecond and none of the latency of a bucket in a region:
+
+| Area | Local directory | Bucket | Bucket with the cache |
+|------|-----------------|--------|-----------------------|
+| Write acknowledgment | p50 99 ms, p99 106 ms | p50 127 ms, p99 206 ms | p50 124 ms, p99 170 ms |
+| Ingest throughput | 30.9 MB/s | 21.6 MB/s | 24.5 MB/s |
+| Freshness | p50 168 ms | p50 470 ms | p50 204 ms |
+| Dashboard panel, SQL, warm p95 | 121 ms | 646 ms | 128 ms |
+| Error count, SQL, warm p95 | 104 ms | 749 ms | 112 ms |
+| Line-filter search, LogQL, warm p95 | 134 ms | 620 ms | 146 ms |
+| Dashboard panel, PromQL, warm p95 | 190 ms | 647 ms | 191 ms |
+| Trace by id, warm p95 | 66 ms | 1096 ms | 54 ms |
+| Attribute search, TraceQL, warm p95 | 61 ms | 1414 ms | 62 ms |
+| Alert, eager rule, p99 | 300 ms | 1047 ms | 447 ms |
+
+Without the cache every read of a file, an index or a log entry is a
+request, and a query makes hundreds of them: the query targets do
+not hold. With it a query asked again costs what it does on local
+disk, so a node on a bucket should run with `--cache-dir`. The first
+read of each range still pays the store's latency, tens of
+milliseconds on a bucket in a region rather than one, and the cold
+numbers above do not show it: they remain to be taken against one.
 
 ## Testing
 

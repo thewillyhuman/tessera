@@ -7,12 +7,15 @@
 //! bytes go, runs the panel, search and trace queries warm and cold,
 //! measures an eager alert from write to webhook, and prints a table of
 //! targets and measurements. Nothing it prints is a claim about cloud
-//! hardware or same-region object storage: the root pool is a local
-//! directory, so the object-store latencies the targets assume are
-//! absent and the numbers bound what the code paths themselves cost.
+//! hardware or same-region object storage: by default the root pool is
+//! a local directory, so the object-store latencies the targets assume
+//! are absent and the numbers bound what the code paths themselves
+//! cost. With `--root-pool` it is a bucket, reached as the `AWS_*`
+//! variables say, and every read and write is a request to it.
 //!
 //! ```text
 //! cargo run --release -p tessera-bench -- --rows 300000
+//! cargo run --release -p tessera-bench -- --root-pool s3://bucket/bench --cache-dir /tmp/bench-cache
 //! ```
 
 // Measurements are ratios of counts far below 2^53; the precision the
@@ -20,7 +23,7 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -74,6 +77,15 @@ struct Args {
     /// The root pool; a temporary directory by default.
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// A bucket, or a prefix in one, as the root pool in place of a
+    /// directory: `s3://<bucket>[/<prefix>]`. The run's objects go
+    /// under a prefix of its own below it and are left there.
+    #[arg(long, conflicts_with = "data_dir")]
+    root_pool: Option<String>,
+    /// A directory for the node's cache of object reads; none by
+    /// default, so that every read reaches the root pool.
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
     /// How long to wait for compaction to settle, in seconds.
     #[arg(long, default_value_t = 120)]
     settle_secs: u64,
@@ -122,11 +134,33 @@ struct Tuning {
     writers: Option<usize>,
 }
 
-fn config(dir: &Path, tuning: Tuning) -> Config {
+/// Where the node keeps its data: the directory, or the bucket in its
+/// place, and the cache in front of either.
+struct Root {
+    dir: PathBuf,
+    bucket: Option<String>,
+    cache: Option<PathBuf>,
+}
+
+impl std::fmt::Display for Root {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.bucket {
+            Some(url) => f.write_str(url),
+            None => write!(f, "{}", self.dir.display()),
+        }
+    }
+}
+
+fn config(root: &Root, tuning: Tuning) -> Config {
     let free: SocketAddr = "127.0.0.1:0"
         .parse()
         .unwrap_or_else(|_| unreachable!("a literal"));
-    let mut config = Config::single_node(dir.to_path_buf());
+    let mut config = Config::single_node(root.dir.clone());
+    config.root_pool.clone_from(&root.bucket);
+    config.cache = root.cache.clone().map(|dir| tessera_node::DiskCache {
+        dir,
+        bytes: 8 << 30,
+    });
     config.listen = free;
     config.pg_listen = free;
     config.background = Duration::from_secs(1);
@@ -143,11 +177,11 @@ fn config(dir: &Path, tuning: Tuning) -> Config {
     config
 }
 
-/// Starts a node over `dir` and waits until it serves; the node and
+/// Starts a node over `root` and waits until it serves; the node and
 /// its base URL and how long that took.
-async fn start(dir: &Path, tuning: Tuning) -> (Node, String, Duration) {
+async fn start(root: &Root, tuning: Tuning) -> (Node, String, Duration) {
     let started = Instant::now();
-    let node = Node::start(config(dir, tuning), Env::system())
+    let node = Node::start(config(root, tuning), Env::system())
         .await
         .expect("the node starts");
     let base = format!("http://{}", node.http_address());
@@ -159,10 +193,20 @@ async fn start(dir: &Path, tuning: Tuning) -> (Node, String, Duration) {
 async fn main() {
     let args = Args::parse();
     let temp = tempfile::tempdir().expect("a temporary directory");
-    let dir = args
-        .data_dir
-        .clone()
-        .unwrap_or_else(|| temp.path().to_path_buf());
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let root = Root {
+        dir: args
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| temp.path().to_path_buf()),
+        bucket: args
+            .root_pool
+            .as_ref()
+            .map(|url| format!("{}/run-{run}", url.trim_end_matches('/'))),
+        cache: args.cache_dir.clone(),
+    };
     let linger = args.linger_ms.map(Duration::from_millis);
     let tuning = Tuning {
         linger,
@@ -171,18 +215,11 @@ async fn main() {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     println!(
         "tessera-bench: {} log rows in batches of {} from {} clients, {} series x {} samples, {} traces; {} cores; root pool {}",
-        args.rows,
-        args.batch,
-        args.clients,
-        args.series,
-        args.samples,
-        args.traces,
-        cores,
-        dir.display()
+        args.rows, args.batch, args.clients, args.series, args.samples, args.traces, cores, root
     );
     let mut report = Report::default();
 
-    let (node, base, startup) = start(&dir, tuning).await;
+    let (node, base, startup) = start(&root, tuning).await;
     report.add(
         "New node serving",
         "<= 30 s from process start",
@@ -212,7 +249,7 @@ async fn main() {
 
     // Cold: the same node restarted over the same root pool, each query once.
     node.stop().await;
-    let (node, base, restart) = start(&dir, tuning).await;
+    let (node, base, restart) = start(&root, tuning).await;
     let queries = web::queries(&base, &traces.ids);
     let cold_runs: Vec<Duration> = queries
         .iter()
