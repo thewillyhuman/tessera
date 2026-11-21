@@ -462,14 +462,16 @@ fn ingesters(
     ingesters
 }
 
-/// Runs a node until Ctrl-C.
+/// Runs a node until the process is interrupted or terminated, then
+/// stops it as [`Node::stop`] does.
 ///
 /// # Errors
 ///
 /// If the data directory, the catalog or a listener cannot be opened.
 pub async fn run(config: Config) -> Result<(), RunError> {
+    let shutdown = shutdown_signal();
     let node = Node::start(config, Env::system()).await?;
-    shutdown_signal().await;
+    shutdown.await;
     node.stop().await;
     Ok(())
 }
@@ -880,10 +882,41 @@ async fn keep_fresh(catalog: Arc<Catalog>) {
     }
 }
 
-async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::warn!(error = %error, "cannot listen for ctrl-c; running until killed");
-        std::future::pending::<()>().await;
+/// Starts listening for the signals that ask the process to stop, an
+/// interrupt from a terminal and the termination a supervisor such as
+/// Kubernetes sends before it kills, and returns what completes at the
+/// first of them. The listening starts with the call, not with the
+/// wait, so that a signal arriving while the node starts is kept.
+#[cfg(unix)]
+fn shutdown_signal() -> impl Future<Output = ()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let signals = signal(SignalKind::interrupt())
+        .and_then(|interrupt| Ok((interrupt, signal(SignalKind::terminate())?)));
+    async move {
+        match signals {
+            Ok((mut interrupt, mut terminate)) => {
+                let interrupted = Box::pin(interrupt.recv());
+                let terminated = Box::pin(terminate.recv());
+                futures::future::select(interrupted, terminated).await;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot listen for signals; running until killed");
+                std::future::pending::<()>().await;
+            }
+        }
+        tracing::info!("shutdown requested");
     }
-    tracing::info!("shutdown requested");
+}
+
+/// Completes at Ctrl-C, the one request to stop there is off Unix.
+#[cfg(not(unix))]
+fn shutdown_signal() -> impl Future<Output = ()> {
+    async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %error, "cannot listen for ctrl-c; running until killed");
+            std::future::pending::<()>().await;
+        }
+        tracing::info!("shutdown requested");
+    }
 }

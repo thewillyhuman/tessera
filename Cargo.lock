@@ -3504,6 +3504,7 @@ name = "tessera"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "tempfile",
  "tessera-cluster",
  "tessera-ingest",
  "tessera-node",
