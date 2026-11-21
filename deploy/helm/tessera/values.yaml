@@ -21,6 +21,14 @@ groups:
 # bootstrap the first one with anonymous access on, then turn it off.
 allowAnonymous: false
 
+# A secret whose entry `secret` the nodes present to each other on
+# the routes between them (SE-3), so that nothing else can use those
+# routes. Empty, they are open to whatever reaches a pod's port:
+# name one wherever the pods' network is shared.
+#   kubectl create secret generic tessera-cluster \
+#       --from-literal=secret="$(openssl rand -hex 32)"
+clusterSecret: ""
+
 rootPool:
   # The root pool as a bucket, or a prefix in one: s3://<bucket> or
   # s3://<bucket>/<prefix>, in a store that refuses a PUT with

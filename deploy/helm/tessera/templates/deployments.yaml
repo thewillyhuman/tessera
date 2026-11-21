@@ -55,6 +55,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            {{- with $root.Values.clusterSecret }}
+            - name: TESSERA_CLUSTER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: secret
+            {{- end }}
             {{- range $key, $value := $root.Values.rootPool.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}

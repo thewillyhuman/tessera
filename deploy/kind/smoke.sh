@@ -9,7 +9,8 @@
 #      at a time, while writes keep arriving (OP-4, section 14.6), and
 #   4. the rows are still there once every pod is a new one, since
 #      nothing durable lives on a node (G2).
-
+#
+# The nodes present a cluster secret to each other (SE-3).
 #
 # Needs docker, kind, kubectl and helm. The cluster gets a kubeconfig
 # of its own, so the caller's is never touched, and is deleted at the
@@ -70,10 +71,13 @@ kind load docker-image --name "$CLUSTER" "$IMAGE"
 
 say "installing MinIO and the chart"
 kubectl apply -f deploy/kind/minio.yaml
+kubectl get secret tessera-cluster >/dev/null 2>&1 ||
+    kubectl create secret generic tessera-cluster --from-literal=secret="smoke-$RANDOM$RANDOM"
 kubectl rollout status deployment/minio --timeout=180s
 helm upgrade --install tessera deploy/helm/tessera --wait --timeout 180s \
     --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" \
     --set allowAnonymous=true \
+    --set clusterSecret=tessera-cluster \
     --set rootPool.url=s3://tessera/smoke \
     --set rootPool.credentialsSecret=tessera-bucket \
     --set rootPool.env.AWS_REGION=us-east-1 \
