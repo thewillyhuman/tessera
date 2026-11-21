@@ -5,21 +5,25 @@
 //!
 //! A group with one partition reads the writer logs itself. With more,
 //! each writer's log is read once for the whole group: the partition
-//! the writer hashes to is the log's source. It reads every new entry,
-//! applies each incremental rule's filter and partial aggregation, and
-//! leaves the windows each state partition keeps as one object per
-//! entry and partition, at
+//! the writer hashes to is the log's source. At each evaluation it
+//! reads the new entries, applies each incremental rule's filter and
+//! partial aggregation, and leaves the windows each state partition
+//! keeps, entry by entry, as one object per partition, named by the
+//! last entry it covers:
 //! `{tenant}/_eval/{group}/_partials/{parts}/{part}/{writer}/{seq}`.
 //! Every partition, the source's own included, then folds the partials
-//! left for it instead of the segments (CQ-5).
+//! left for it instead of the segments (CQ-5). The objects written
+//! thus follow the evaluations, not the segments.
 //!
-//! The task holds no state. An entry's objects are written in
-//! partition order, so the last partition's object marks a complete
-//! set and the newest of them is where the task resumes; writing a set
-//! again is harmless, since it follows from the entry and the rules
-//! alone. An entry that holds nothing for the group still leaves its
-//! objects, empty: a partition tells a trimmed log from a quiet one by
-//! the positions being contiguous, as it does on the log itself.
+//! The task holds no state. A run's objects are written in partition
+//! order, so the last partition's object marks a complete set and the
+//! newest of them is where the task resumes. A run cut short is done
+//! again, perhaps over more entries: a partition that read an object
+//! of the first attempt takes from the second the entries after it,
+//! since the partials are kept per entry. An entry that holds nothing
+//! for the group is still listed, empty: a partition tells a trimmed
+//! log from a quiet one by the entries being contiguous, as it does on
+//! the log itself.
 
 use std::sync::Arc;
 
@@ -34,9 +38,17 @@ use crate::partition::window_partition;
 use crate::rule::AlertRule;
 use crate::state::EvalState;
 
-/// What one entry of a writer's log holds for one state partition.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// How many entries one object of partials covers at most, so that a
+/// source far behind catches up an object at a time.
+const ENTRIES_PER_OBJECT: usize = 256;
+
+/// What one entry of a writer's log holds for one state partition. An
+/// object of partials is the list of them for the entries of one run,
+/// in order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Partials {
+    /// The entry.
+    pub seq: Seq,
     /// The newest observed time of the entry's segment, for the
     /// writer's watermark; none when the entry is not a segment.
     pub max_observed: Option<Timestamp>,
@@ -47,7 +59,8 @@ pub struct Partials {
     pub windows: Vec<WindowState>,
 }
 
-/// The positions of the partials under `prefix`, ascending.
+/// The objects of partials under `prefix`, each by the last entry it
+/// covers, ascending.
 pub(crate) async fn list(store: &dyn ObjectStore, prefix: &Key) -> Result<Vec<Seq>, String> {
     let mut positions = Vec::new();
     let mut listing = store.list(prefix);
@@ -60,9 +73,12 @@ pub(crate) async fn list(store: &dyn ObjectStore, prefix: &Key) -> Result<Vec<Se
     Ok(positions)
 }
 
-/// The partials at `key`; none when they are gone, trimmed with their
-/// entry.
-pub(crate) async fn read(store: &dyn ObjectStore, key: &Key) -> Result<Option<Partials>, String> {
+/// The partials of the object at `key`, in entry order; none when it
+/// is gone, trimmed with its entries.
+pub(crate) async fn read(
+    store: &dyn ObjectStore,
+    key: &Key,
+) -> Result<Option<Vec<Partials>>, String> {
     match store.get(key).await {
         Ok(body) => serde_json::from_slice(&body)
             .map(Some)
@@ -104,8 +120,8 @@ pub struct SourceTask<'a> {
 pub struct Emitted {
     /// The entries whose partials were written.
     pub entries: usize,
-    /// The entries whose partials were removed, garbage collection
-    /// having removed the entries (GC-2).
+    /// The objects of partials removed, garbage collection having
+    /// removed every entry they covered (GC-2).
     pub trimmed: usize,
 }
 
@@ -124,43 +140,66 @@ impl SourceTask<'_> {
         let log = reader::list(store, writer)
             .await
             .map_err(|e| e.to_string())?;
+        let first = log.first().copied();
         let complete = list(store, &self.prefix(self.parts.saturating_sub(1), writer)).await?;
         let mut emitted = Emitted::default();
-        let mut resume = held;
-        for seq in complete {
-            if log.first().is_some_and(|first| seq >= *first) {
-                resume = seq;
-            } else {
-                self.remove(writer, seq).await?;
-                emitted.trimmed += 1;
-            }
+        if complete
+            .first()
+            .is_some_and(|oldest| first.is_none_or(|first| *oldest < first))
+        {
+            emitted.trimmed = self.trim(writer, first).await?;
         }
-        for seq in log.into_iter().filter(|seq| *seq > resume) {
-            // An entry collected between the listing and the read ends
-            // the run; the next one finds the log trimmed.
-            let mut entry = match reader::read(store, writer, seq).await {
-                Ok(entry) => entry,
-                Err(WalError::Store(ObjectError::NotFound { .. })) => break,
-                Err(error) => return Err(error.to_string()),
+        let resume = complete
+            .last()
+            .copied()
+            .filter(|newest| first.is_some_and(|first| *newest >= first))
+            .unwrap_or(held);
+        let new: Vec<Seq> = log.into_iter().filter(|seq| *seq > resume).collect();
+        for chunk in new.chunks(ENTRIES_PER_OBJECT) {
+            let mut each: Vec<Vec<Partials>> = vec![Vec::new(); self.parts as usize];
+            for seq in chunk {
+                // An entry collected between the listing and the read
+                // ends the run; the next one finds the log trimmed.
+                let mut entry = match reader::read(store, writer, *seq).await {
+                    Ok(entry) => entry,
+                    Err(WalError::Store(ObjectError::NotFound { .. })) => break,
+                    Err(error) => return Err(error.to_string()),
+                };
+                entry.unlock(self.keys).map_err(|e| e.to_string())?;
+                for (entries, partials) in each.iter_mut().zip(self.fold(&entry)?) {
+                    entries.push(partials);
+                }
+            }
+            let read = each.first().map_or(0, Vec::len);
+            let Some(through) = read.checked_sub(1).map(|last| chunk[last]) else {
+                break;
             };
-            entry.unlock(self.keys).map_err(|e| e.to_string())?;
-            for (part, partials) in (0..self.parts).zip(self.fold(&entry)?) {
-                let body = serde_json::to_vec(&partials).map_err(|e| e.to_string())?;
-                let key =
-                    layout::eval_partial(self.tenant, self.group, self.parts, part, writer, seq);
+            for (part, entries) in (0..self.parts).zip(&each) {
+                let body = serde_json::to_vec(entries).map_err(|e| e.to_string())?;
+                let key = self.key(part, writer, through);
                 match store.put_if_absent(&key, body.into()).await {
                     Ok(()) | Err(ObjectError::AlreadyExists { .. }) => {}
                     Err(error) => return Err(error.to_string()),
                 }
             }
-            emitted.entries += 1;
+            emitted.entries += read;
+            if read < chunk.len() {
+                break;
+            }
         }
         Ok(emitted)
     }
 
     /// What `entry` holds for each partition, in partition order.
     fn fold(&self, entry: &Entry) -> Result<Vec<Partials>, String> {
-        let mut each = vec![Partials::default(); self.parts as usize];
+        let mut each: Vec<Partials> = (0..self.parts)
+            .map(|_| Partials {
+                seq: entry.seq(),
+                max_observed: None,
+                ended: false,
+                windows: Vec::new(),
+            })
+            .collect();
         match entry.body() {
             EntryBody::Segment { blocks } => {
                 let newest = blocks.iter().map(|b| b.max_observed).max();
@@ -209,14 +248,28 @@ impl SourceTask<'_> {
         Ok(each)
     }
 
-    /// Removes the partials of entry `seq`, the last partition's last
-    /// so that a removal cut short is found again.
-    async fn remove(&self, writer: WriterId, seq: Seq) -> Result<(), String> {
+    /// Removes the objects of `writer` whose entries are all before
+    /// `first`, the oldest the log still holds, or every one when the
+    /// log is gone; under every partition, since a run cut short may
+    /// have left an object under some only, and the last partition's
+    /// last, so that a removal cut short is found again. Returns how
+    /// many went.
+    async fn trim(&self, writer: WriterId, first: Option<Seq>) -> Result<usize, String> {
+        let mut removed = 0;
         for part in 0..self.parts {
-            let key = layout::eval_partial(self.tenant, self.group, self.parts, part, writer, seq);
-            self.store.delete(&key).await.map_err(|e| e.to_string())?;
+            for through in list(&**self.store, &self.prefix(part, writer)).await? {
+                if first.is_none_or(|first| through < first) {
+                    let key = self.key(part, writer, through);
+                    self.store.delete(&key).await.map_err(|e| e.to_string())?;
+                    removed += 1;
+                }
+            }
         }
-        Ok(())
+        Ok(removed)
+    }
+
+    fn key(&self, part: u32, writer: WriterId, through: Seq) -> Key {
+        layout::eval_partial(self.tenant, self.group, self.parts, part, writer, through)
     }
 
     fn prefix(&self, part: u32, writer: WriterId) -> Key {

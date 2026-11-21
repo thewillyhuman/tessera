@@ -664,9 +664,10 @@ async fn read_logs(
 }
 
 /// The positions `writer` can be read at: the entries of its log, or
-/// in a group with several partitions the entries whose partials are
-/// left for this one. The source task removes a log's partials with
-/// its entries, so either listing is trimmed and gone as the log is.
+/// in a group with several partitions the objects of partials left
+/// for this one, each by the last entry it covers. The source task
+/// removes a log's partials with its entries, so either listing is
+/// trimmed and gone as the log is.
 async fn available(source: &Source<'_>, writer: WriterId) -> Result<Vec<Seq>, String> {
     if source.parts > 1 {
         let prefix = layout::eval_partials(
@@ -703,9 +704,24 @@ enum Read {
     Gap,
 }
 
-/// Reads the `entries` of `writer` past the position held, folding
-/// them into the windows and remembering the log's end.
+/// Reads what is new of `writer` out of `available`: the entries of
+/// its log, or the objects of partials its source left.
 async fn read_new(
+    reading: &Reading<'_>,
+    ingested: &mut Ingested,
+    writer: WriterId,
+    available: Vec<Seq>,
+) -> Result<Read, String> {
+    if reading.source.parts > 1 {
+        read_partials(reading, ingested, writer, available).await
+    } else {
+        read_entries(reading, ingested, writer, available).await
+    }
+}
+
+/// Reads the `entries` of `writer`'s log past the position held,
+/// folding them into the windows and remembering the log's end.
+async fn read_entries(
     reading: &Reading<'_>,
     ingested: &mut Ingested,
     writer: WriterId,
@@ -725,12 +741,7 @@ async fn read_new(
     for seq in new {
         // An entry collected between the listing and the read is
         // found missing next time, as a gap.
-        let found = if source.parts > 1 {
-            read_partials(reading, ingested, writer, seq).await?
-        } else {
-            read_entry(reading, ingested, writer, seq).await?
-        };
-        if !found {
+        if !read_entry(reading, ingested, writer, seq).await? {
             break;
         }
     }
@@ -831,41 +842,76 @@ fn fold_rule<'r>(
     }
 }
 
-/// Folds the partials the source task left for this partition of
-/// entry `seq` of `writer`'s log into the windows. False when they are
-/// gone. The source keeps every row, so lateness is judged here and by
-/// the window: one the horizon has closed is late whole (CQ-11), and
-/// one still open keeps the rows a single partition would have found
-/// late one by one.
+/// Reads the partials the source task left for this partition of
+/// `writer`'s log past the position held, out of `objects`, each named
+/// by the last entry it covers and listing its entries in order. An
+/// object that starts after the next entry expected means partials
+/// went with their entries, trimmed past the position held: a gap.
 async fn read_partials(
     reading: &Reading<'_>,
     ingested: &mut Ingested,
     writer: WriterId,
-    seq: Seq,
-) -> Result<bool, String> {
-    let Reading {
-        source,
-        rules,
-        state,
-    } = *reading;
-    let key = layout::eval_partial(
-        source.tenant,
-        source.group,
-        source.parts,
-        source.part,
-        writer,
-        seq,
-    );
-    let Some(partials) = source::read(&**source.store, &key).await? else {
-        return Ok(false);
-    };
+    objects: Vec<Seq>,
+) -> Result<Read, String> {
+    let Reading { source, state, .. } = *reading;
     let name = writer.to_string();
-    ingested.positions.insert(name.clone(), seq);
+    let mut held = state.positions.get(&name).copied().unwrap_or(Seq::ZERO);
+    for through in objects {
+        if through <= held {
+            continue;
+        }
+        let key = layout::eval_partial(
+            source.tenant,
+            source.group,
+            source.parts,
+            source.part,
+            writer,
+            through,
+        );
+        // An object trimmed between the listing and the read is found
+        // missing next time, as a gap.
+        let Some(entries) = source::read(&**source.store, &key).await? else {
+            break;
+        };
+        for partials in &entries {
+            if partials.seq <= held {
+                continue;
+            }
+            if held != Seq::ZERO && partials.seq != held.next() {
+                tracing::warn!(
+                    tenant = %source.tenant, group = %source.group, %writer, %held, first = %partials.seq,
+                    "partials trimmed past the position held; rebuilding the windows from the files"
+                );
+                return Ok(Read::Gap);
+            }
+            fold_partials(reading, ingested, &name, partials);
+            held = partials.seq;
+        }
+    }
+    Ok(Read::Caught)
+}
+
+/// Folds what one entry holds for this partition into the windows.
+/// The source keeps every row, so lateness is judged here and by the
+/// window: one the horizon has closed is late whole (CQ-11), and one
+/// still open keeps the rows a single partition would have found late
+/// one by one.
+fn fold_partials(
+    reading: &Reading<'_>,
+    ingested: &mut Ingested,
+    writer: &str,
+    partials: &source::Partials,
+) {
+    let Reading { rules, state, .. } = *reading;
+    ingested.positions.insert(writer.to_owned(), partials.seq);
     if partials.ended {
-        ingested.ended.insert(name.clone());
+        ingested.ended.insert(writer.to_owned());
     }
     if let Some(newest) = partials.max_observed {
-        let seen = ingested.watermarks.entry(name).or_insert(newest);
+        let seen = ingested
+            .watermarks
+            .entry(writer.to_owned())
+            .or_insert(newest);
         *seen = (*seen).max(newest);
     }
     for window in &partials.windows {
@@ -897,7 +943,6 @@ async fn read_partials(
             })
             .merge(window);
     }
-    Ok(true)
 }
 
 /// Rebuilds the windows of every rule from the consistent view

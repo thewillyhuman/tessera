@@ -491,6 +491,34 @@ async fn partitions_read_each_log_once_between_them() {
     assert_eq!(services.len(), SERVICES.len(), "{services:?}");
 }
 
+/// CQ-4: a source leaves the entries it reads in one run as one object
+/// per partition, so that the objects written follow the evaluations
+/// and not the segments.
+#[tokio::test]
+async fn a_source_leaves_the_entries_of_a_run_as_one_object() {
+    let mut divided = Divided::start().await;
+    for seconds in 1_001..1_004 {
+        divided.write(at(seconds)).await;
+    }
+    divided.evaluate(0, 1_008).await;
+    divided.evaluate(1, 1_008).await;
+    divided.evaluate(0, 1_009).await;
+
+    let (first, last) = (Seq::new(1).to_string(), Seq::new(4).to_string());
+    for part in 0..2 {
+        for writer in 0..2 {
+            assert_eq!(
+                divided.partials(part, writer).await,
+                [first.as_str(), last.as_str()],
+                "the entry of the first run, then the three of the second"
+            );
+        }
+        for window in divided.windows(part).await {
+            assert_eq!(window.partials[0].count, 20, "five errors, four times");
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_source_trims_the_partials_of_collected_entries() {
     let mut divided = Divided::start().await;
@@ -512,6 +540,33 @@ async fn a_source_trims_the_partials_of_collected_entries() {
     for part in 0..2 {
         assert_eq!(divided.partials(part, 0).await, [second.as_str()]);
     }
+}
+
+/// Section 11.7: a partition whose position the partials were trimmed
+/// past, with the entries they covered, rebuilds its windows from the
+/// files and says so.
+#[tokio::test]
+async fn a_partition_behind_the_trimmed_partials_rebuilds() {
+    let mut divided = Divided::start().await;
+    divided.write(at(1_001)).await;
+    divided.evaluate(0, 1_006).await;
+    divided.write(at(1_002)).await;
+    for seq in [1, 2] {
+        let collected = layout::writer_log_entry(divided.logs[0].writer_id(), Seq::new(seq));
+        divided.fx.store.delete(&collected).await.unwrap();
+    }
+    divided.evaluate(0, 1_007).await;
+    assert_eq!(divided.partials(1, 0).await, [Seq::new(3).to_string()]);
+
+    let behind = divided.parts[1]
+        .evaluate(&divided.fx.engine, at(1_008))
+        .await
+        .unwrap();
+    assert_eq!(
+        behind.degraded,
+        ["errors"],
+        "it had read the first entry only"
+    );
 }
 
 #[tokio::test]

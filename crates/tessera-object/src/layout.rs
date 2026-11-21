@@ -15,7 +15,7 @@
 //!   {tenant}/_eval/{group}/{part}/_log/{version:020}    rule state log
 //!   {tenant}/_eval/{group}/_split/{name}                re-split checkpoint
 //!   {tenant}/_eval/{group}/_partials/{parts}/{part}/{writer_id}/{seq:012}
-//!                                                partial windows of a log entry
+//!                                                partial windows of log entries up to seq
 //!   {tenant}/{dataset}/_log/{version:020}        dataset log
 //!   {tenant}/{dataset}/_writers/{writer_id}      writer registry
 //!   {tenant}/{dataset}/p/{kind}/{window}/_log/{version:020}       partition manifest log
@@ -141,8 +141,9 @@ pub fn eval_partials(
     ])
 }
 
-/// The partial windows of entry `seq` of `writer`'s log for state
-/// partition `part` of the `parts` of a rule group (CQ-4).
+/// The partial windows of a run of entries of `writer`'s log, the
+/// last of them `seq`, for state partition `part` of the `parts` of a
+/// rule group (CQ-4).
 #[must_use]
 pub fn eval_partial(
     tenant: &TenantId,

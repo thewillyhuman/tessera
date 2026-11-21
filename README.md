@@ -272,16 +272,16 @@ re-splits the state through a checkpoint partition 0 writes. The
 partitions divide the reading of the writer logs too (CQ-4): the
 partition a writer hashes to is the source of its log, reads each
 entry once, folds it for every incremental rule and leaves the
-partial windows each partition keeps as one object per entry and
-partition under `_eval/{group}/_partials/`, which the partitions fold
-in place of the segments; the partials go with the entries garbage
+partial windows each partition keeps, entry by entry, as one object
+per evaluation and partition under `_eval/{group}/_partials/`, which
+the partitions fold in place of the segments; the partials go with the entries garbage
 collection removes, and a re-split clears them.
 
 Gaps left in M7: a rule that runs through the engine runs in every
 partition, each keeping its own instances; with several partitions,
 the rows of a log another partition is the source of reach a window
-one evaluation later, an entry leaves its objects even when it holds
-nothing for the group, a row is late by its window, once the
+one evaluation later, a source leaves its objects even when the
+entries it read hold nothing for the group, a row is late by its window, once the
 watermark has closed it, and not on its own, and what a stale source
 leaves under a partition count the group no longer has stays until
 the next re-split; the
