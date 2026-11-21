@@ -18,7 +18,7 @@
 //! `attr.code#str` (DM-5), is read back by [`merge_columns`] under the
 //! same rules.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -260,29 +260,44 @@ pub fn label(
         })
         .find(|columns| !columns.is_empty())
         .unwrap_or_default();
+    // The rows of a stream carry the same text in these columns, and a
+    // dataset of logs has few streams for its rows: what a text gives
+    // for the label is worked out once for each text, not parsed again
+    // on every row.
+    let mut of_extracted: HashMap<&str, Option<Value>> = HashMap::new();
+    let mut of_attributes: HashMap<&str, Option<Value>> = HashMap::new();
     let values = (0..rows.num_rows()).map(|i| {
-        let from_extracted = extracted
-            .filter(|e| !e.is_null(i))
-            .and_then(|e| serde_json::from_str::<Value>(e.value(i)).ok())
-            .and_then(|object| object.get(name).cloned());
+        let from_extracted = extracted.filter(|e| !e.is_null(i)).and_then(|e| {
+            of_extracted
+                .entry(e.value(i))
+                .or_insert_with_key(|text| {
+                    serde_json::from_str::<Value>(text)
+                        .ok()
+                        .and_then(|object| object.get(name).cloned())
+                })
+                .clone()
+        });
         if from_extracted.is_some() {
             return from_extracted;
         }
         if let Some(value) = dedicated.iter().find_map(|column| cell_json(column, i)) {
             return Some(value);
         }
-        let from_attributes = overflow
-            .filter(|o| !o.is_null(i))
-            .and_then(|o| serde_json::from_str::<Value>(o.value(i)).ok())
-            .and_then(|object| {
-                let object = object.as_object()?;
-                LABEL_SCOPES.iter().find_map(|scope| {
-                    object
-                        .iter()
-                        .find(|(path, _)| path.starts_with(scope) && label_name(path) == name)
-                        .map(|(_, v)| v.clone())
+        let from_attributes = overflow.filter(|o| !o.is_null(i)).and_then(|o| {
+            of_attributes
+                .entry(o.value(i))
+                .or_insert_with_key(|text| {
+                    let object = serde_json::from_str::<Value>(text).ok()?;
+                    let object = object.as_object()?;
+                    LABEL_SCOPES.iter().find_map(|scope| {
+                        object
+                            .iter()
+                            .find(|(path, _)| path.starts_with(scope) && label_name(path) == name)
+                            .map(|(_, v)| v.clone())
+                    })
                 })
-            });
+                .clone()
+        });
         from_attributes.or_else(|| match name {
             "level" => severity_text
                 .filter(|s| !s.is_null(i))
