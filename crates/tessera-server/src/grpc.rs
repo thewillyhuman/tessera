@@ -28,18 +28,31 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 use tessera_ingest::otlp;
+use tonic::codec::CompressionEncoding;
 use tonic::{Code, Request, Response, Status};
 
 use crate::mtls::ClientCertificate;
 use crate::params::{Need, Scope, scope};
 use crate::{ApiError, AppState};
 
-/// The three export services as routes of the main router.
+/// The three export services as routes of the main router. Each takes
+/// messages compressed with gzip, as a collector sends them unless
+/// told otherwise, of up to [`crate::MAX_REQUEST_BYTES`] once
+/// decompressed, the limit of a request over HTTP.
 pub fn router(state: AppState) -> Router {
     let exporter = Exporter { state };
-    tonic::service::Routes::new(LogsServiceServer::new(exporter.clone()))
-        .add_service(TraceServiceServer::new(exporter.clone()))
-        .add_service(MetricsServiceServer::new(exporter))
+    let logs = LogsServiceServer::new(exporter.clone())
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(crate::MAX_REQUEST_BYTES);
+    let traces = TraceServiceServer::new(exporter.clone())
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(crate::MAX_REQUEST_BYTES);
+    let metrics = MetricsServiceServer::new(exporter)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .max_decoding_message_size(crate::MAX_REQUEST_BYTES);
+    tonic::service::Routes::new(logs)
+        .add_service(traces)
+        .add_service(metrics)
         .into_axum_router()
 }
 

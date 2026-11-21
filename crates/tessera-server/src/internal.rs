@@ -27,7 +27,7 @@ use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
 use arrow_ipc::writer::StreamWriter;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -62,6 +62,10 @@ pub fn router(state: AppState) -> Router {
         .route("/internal/v1/final", post(finalize))
         .route("/internal/v1/ingest", post(ingest))
         .route("/internal/v1/gossip", post(gossip))
+        // A peer hands over rows the cluster already admitted, in an
+        // encoding wider than the one they came in: no limit of a
+        // client's request applies to them.
+        .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
 

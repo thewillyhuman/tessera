@@ -149,13 +149,25 @@ async fn otlp_grpc_exports_on_the_same_port() {
     request
         .metadata_mut()
         .insert("x-tessera-dataset", "prod".parse().unwrap());
+    let export = request.get_ref().clone();
     client.export(request).await.unwrap();
+    // A collector compresses with gzip unless told otherwise.
+    let mut compressed = tonic::Request::new(export);
+    compressed
+        .metadata_mut()
+        .insert("x-tessera-dataset", "prod".parse().unwrap());
+    client
+        .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .export(compressed)
+        .await
+        .unwrap();
     let url = format!("http://{}/api/v1/query", node.http_address());
     let body = serde_json::json!({ "dataset": "prod", "query": "SELECT body FROM logs" });
     let (status, text) = common::post(url, vec![], body).await;
     assert_eq!(status, 200, "{text}");
     let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(answer["rows"][0][0], "over grpc", "{answer}");
+    assert_eq!(answer["rows"].as_array().map(Vec::len), Some(2), "{answer}");
     node.stop().await;
 }
 

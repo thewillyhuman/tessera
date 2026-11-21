@@ -41,13 +41,15 @@ serde_urlencoded = "0.7"
 serde_yaml_ng = "0.10"
 tessera-opt.workspace = true
 tokio = { version = "1", features = ["net", "rt", "macros"] }
-tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip", "router", "server"] }
+tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip"] }
 tracing = "0.1"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 x509-certificate = "0.25"
 
 [dev-dependencies]
 base64 = "0.22"
+flate2 = "1"
 http-body-util = "0.1"
 rand = "0.8"
 rcgen = "0.13"

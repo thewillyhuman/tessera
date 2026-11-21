@@ -623,7 +623,10 @@ write at `/api/v1/write`. An OpenTelemetry Collector's `otlphttp`
 exporter pointed at `http://localhost:8080` works as is for logs,
 traces and metrics, and so does its `otlp` (gRPC) exporter with
 `tls: {insecure: true}` on a node without TLS: the three export
-services answer on the same port over HTTP/2 (IN-1). Arbitrary events
+services answer on the same port over HTTP/2 (IN-1). Both compress
+with gzip unless told otherwise, and a node takes that on every
+route; a request holds at most 32 MiB once decompressed, and a larger
+one is refused with 413. Arbitrary events
 go to `/api/v1/events` as JSON
 lines, one object per line with a `timestamp` (RFC 3339 or
 nanoseconds), an optional `name`, `trace_id` and `span_id`, and any

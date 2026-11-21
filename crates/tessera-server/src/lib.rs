@@ -45,6 +45,7 @@ pub mod workload;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use tessera_catalog::{Catalog, ControlStores};
 use tessera_cluster::{Admission, Ledger, Load, Membership, QueryPermit, Role};
 use tessera_exec::Engine;
@@ -52,6 +53,7 @@ use tessera_format::FileFormat;
 use tessera_ingest::IngestHandle;
 use tessera_object::Pools;
 use tessera_types::{Env, EventBatch, TenantId};
+use tower_http::decompression::RequestDecompressionLayer;
 
 pub use auth::Auth;
 pub use error::ApiError;
@@ -208,6 +210,11 @@ impl AppState {
     }
 }
 
+/// The most bytes a request body may hold, once decompressed: room
+/// for the batches collectors send, which run to megabytes, and a
+/// bound on what one request can make a node buffer.
+pub const MAX_REQUEST_BYTES: usize = 32 << 20;
+
 /// Every HTTP route of a node.
 pub fn router(state: AppState) -> Router {
     admin::router(state.clone())
@@ -221,6 +228,11 @@ pub fn router(state: AppState) -> Router {
         .merge(rules::router(state.clone()))
         .merge(metrics::router(state.clone()))
         .merge(query::router(state))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        // A gzip body is undone here, before the limit counts it and
+        // before any handler reads it; an encoding a handler decodes
+        // itself, as remote write's snappy, goes through as it came.
+        .layer(RequestDecompressionLayer::new().pass_through_unaccepted(true))
 }
 
 impl AppState {
@@ -368,6 +380,94 @@ mod tests {
             volumes: volume::Volumes::default(),
         }));
         state
+    }
+
+    /// Sends `body` to `/api/v1/events` of a whole node's router, as
+    /// `encoding` when one is named.
+    async fn send_events(encoding: Option<&str>, body: Vec<u8>) -> (StatusCode, String) {
+        let app = router(testing::state().await);
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/events")
+            .header("x-tessera-dataset", "prod");
+        if let Some(encoding) = encoding {
+            request = request.header(header::CONTENT_ENCODING, encoding);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `count` events as JSON lines, each padded to about `width` bytes.
+    fn event_lines(count: usize, width: usize) -> Vec<u8> {
+        use std::fmt::Write;
+
+        let padding = "x".repeat(width);
+        let mut lines = String::new();
+        for i in 0..count {
+            let timestamp = 1_700_000_000_000_000_000 + i64::try_from(i).unwrap();
+            let _ = writeln!(
+                lines,
+                "{{\"timestamp\":{timestamp},\"name\":\"e\",\"pad\":\"{padding}\"}}"
+            );
+        }
+        lines.into_bytes()
+    }
+
+    fn gzip(body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// IN-1: an OpenTelemetry Collector compresses what it exports
+    /// with gzip unless told otherwise.
+    #[tokio::test]
+    async fn a_gzip_body_is_read_as_what_it_holds() {
+        let (status, text) = send_events(Some("gzip"), gzip(&event_lines(3, 10))).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+    }
+
+    /// Remote write names snappy as its encoding and its handler
+    /// decodes it: an encoding the router does not undo is the
+    /// handler's business, not a refusal.
+    #[tokio::test]
+    async fn an_encoding_left_to_the_handler_reaches_it() {
+        let app = router(testing::state().await);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/write")
+            .header(header::CONTENT_ENCODING, "snappy")
+            .body(Body::from(
+                snap::raw::Encoder::new().compress_vec(b"").unwrap(),
+            ))
+            .unwrap();
+        let status = app.oneshot(request).await.unwrap().status();
+        assert_ne!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// A collector's batch runs to megabytes; the limit is on what a
+    /// body holds once decompressed, so a small body cannot stand for
+    /// a huge one.
+    #[tokio::test]
+    async fn a_body_is_bounded_by_what_it_holds() {
+        let megabyte = 1 << 20;
+        let (status, text) = send_events(None, event_lines(4, megabyte)).await;
+        assert_eq!(status, StatusCode::OK, "four megabytes: {text}");
+
+        let past = event_lines(MAX_REQUEST_BYTES / megabyte + 1, megabyte);
+        let (status, _) = send_events(None, past.clone()).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let small = gzip(&past);
+        assert!(small.len() < megabyte, "the padding compresses away");
+        let (status, _) = send_events(Some("gzip"), small).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     fn logs() -> EventBatch {
