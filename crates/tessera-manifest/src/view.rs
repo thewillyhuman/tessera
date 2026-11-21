@@ -158,10 +158,15 @@ pub async fn sources(
     let mut tail = Vec::new();
     for registration in writers {
         let writer = registration.writer;
+        // What the writer flushed through this position is in the
+        // manifests just read, whichever partitions it went to: the
+        // tail starts after it, not at the log's first entry, which is
+        // an hour of segments back (GC-2). The registration was read
+        // before the manifests, so they hold at least what it says.
         let mut entries = reader::entries(
             Arc::clone(root),
             writer,
-            Seq::ZERO,
+            registration.adopted,
             Arc::clone(&manifests.env().keys),
         );
         while let Some(entry) = entries.try_next().await? {
@@ -471,6 +476,10 @@ mod tests {
             "files plus the unadopted segment, no duplicates"
         );
         assert_eq!((mixed.sources.files, mixed.sources.manifests.len()), (2, 2));
+        assert_eq!(
+            mixed.sources.segments, 1,
+            "the segment that was adopted is not read again"
+        );
 
         flush(&store, &env, &mut log, 1, 2, vec![batch(0, 20, 2)]).await;
         log.end().await.unwrap();

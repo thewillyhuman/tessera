@@ -185,7 +185,8 @@ async fn a_full_scan_reads_files_and_the_tail() {
     assert_eq!(scanned.files_read, 3);
     assert_eq!(scanned.rows_from_files, 18);
     assert_eq!(scanned.rows_from_tail, 3);
-    assert_eq!(scanned.segments, 3);
+    // The two segments that were flushed and adopted are not read again.
+    assert_eq!(scanned.segments, 1);
     assert!(scanned.bytes_read > 0);
 }
 
