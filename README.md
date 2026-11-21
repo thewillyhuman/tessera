@@ -480,6 +480,13 @@ image and the chart run on a kind cluster against MinIO, where
 losing an acknowledged one, but not yet on a provider's cluster and
 bucket, nor across two releases of the format.
 
+## Operating
+
+[`docs/operations.md`](docs/operations.md) is the guide for whoever
+runs a deployment: what the object store must provide, installing on
+Kubernetes or as a process, securing, tenants and settings, what to
+watch, scaling and upgrading, and what each failure looks like.
+
 ## Layout
 
 ```
@@ -512,6 +519,7 @@ crates/
 sim/                deterministic simulation harness (library, tests and the tessera-sim binary)
 deploy/helm/tessera/ Helm chart: node groups by role over one shared root pool
 deploy/kind/        the chart's smoke test on a kind cluster against MinIO
+docs/               the operations guide
 Dockerfile          the container image
 compat/sql/         SQL differential tests against SQLite
 compat/logql/       LogQL differential tests against a Loki instance
