@@ -11,3 +11,16 @@ allowAnonymous=true, issue one with
   curl -X POST http://.../api/v1/tenants/_system/keys -d '{"name":"ops","roles":["admin"]}'
 and upgrade with allowAnonymous=false.
 {{- end }}
+{{- if .Values.grafana.enabled }}
+
+A Grafana with the cluster's dashboards is on the service
+{{ include "tessera.fullname" . }}-grafana (port {{ .Values.grafana.service.port }}):
+  kubectl port-forward service/{{ include "tessera.fullname" . }}-grafana 3000:{{ .Values.grafana.service.port }}
+and open http://localhost:3000. The dashboards are in the folder
+Tessera: Overview, Tenants and Costs.
+{{- if not .Values.grafana.adminPasswordSecret }}
+Nobody can sign in to it: whoever reaches the service sees the
+dashboards read-only. Name a secret in grafana.adminPasswordSecret to
+sign in as admin instead.
+{{- end }}
+{{- end }}

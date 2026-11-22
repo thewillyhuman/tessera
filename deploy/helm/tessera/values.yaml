@@ -77,6 +77,33 @@ service:
   httpPort: 8080
   pgPort: 5432
 
+# A Grafana that shows the cluster itself. Its data sources read the
+# _system tenant through this release's service: the nodes' metrics
+# over the Prometheus API, their logs over the Loki API and the usage
+# they record over the PostgreSQL protocol. Its dashboards, which
+# cannot be edited in place, show the state of the nodes, what each
+# tenant sends, stores and reads, and what that costs at the cluster's
+# prices (the settings price.*; a cost is zero until they are set).
+grafana:
+  enabled: false
+  image:
+    repository: grafana/grafana
+    tag: "13.2.0"
+    pullPolicy: IfNotPresent
+  # A secret whose entry `api-key` is an API key of the _system tenant
+  # with the reader role, which the data sources present. Required
+  # unless allowAnonymous is true.
+  #   kubectl create secret generic tessera-grafana --from-literal=api-key=tsk_...
+  apiKeySecret: ""
+  # A secret whose entry `admin-password` is the password of Grafana's
+  # user `admin`. Empty, nobody can sign in, and whoever reaches the
+  # service sees the dashboards read-only.
+  adminPasswordSecret: ""
+  service:
+    type: ClusterIP
+    port: 3000
+  resources: {}
+
 resources: {}
 nodeSelector: {}
 tolerations: []

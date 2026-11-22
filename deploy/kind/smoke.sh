@@ -6,9 +6,11 @@
 #   1. rows pushed through the service are read back through it,
 #   2. the nodes read the bucket through their cache (section 10.8),
 #   3. no acknowledged write is lost when every node is replaced, one
-#      at a time, while writes keep arriving (OP-4, section 14.6), and
+#      at a time, while writes keep arriving (OP-4, section 14.6),
 #   4. the rows are still there once every pod is a new one, since
-#      nothing durable lives on a node (G2).
+#      nothing durable lives on a node (G2), and
+#   5. the chart's Grafana has its dashboards and its three data
+#      sources answer: the nodes' metrics, their logs and the usage.
 #
 # The nodes present a cluster secret to each other (SE-3).
 #
@@ -25,6 +27,7 @@ CLUSTER=${CLUSTER:-tessera-smoke}
 IMAGE=${IMAGE:-tessera:smoke}
 CLIENT_IMAGE=curlimages/curl:8.11.1
 API=http://tessera-tessera:8080
+GRAFANA=http://tessera-tessera-grafana:3000
 export KUBECONFIG=${SMOKE_KUBECONFIG:-$(mktemp)}
 
 say() { printf '\n== %s\n' "$*"; }
@@ -44,6 +47,16 @@ count() {
     client "curl -sf -m 30 -X POST $API/api/v1/query -H 'content-type: application/json' \
         -d '{\"dataset\":\"prod\",\"query\":\"SELECT count(*) FROM logs\"}'" |
         sed -E 's/.*"rows":\[\[([0-9]+)(\.0)?\]\].*/\1/'
+}
+
+# Has Grafana run one query, the JSON fields in $3, against its data
+# source of type $1 and uid $2, and prints what it answers.
+grafana_query() {
+    kubectl exec -i client -- curl -s -m 30 -X POST "$GRAFANA/api/ds/query" \
+        -H 'content-type: application/json' -d @- <<JSON
+{"from": "now-15m", "to": "now", "queries": [{"refId": "A", "intervalMs": 60000, "maxDataPoints": 100,
+  "datasource": {"type": "$1", "uid": "$2"}, $3}]}
+JSON
 }
 
 # Pushes log lines numbered $1 to $2 in one request.
@@ -74,9 +87,10 @@ kubectl apply -f deploy/kind/minio.yaml
 kubectl get secret tessera-cluster >/dev/null 2>&1 ||
     kubectl create secret generic tessera-cluster --from-literal=secret="smoke-$RANDOM$RANDOM"
 kubectl rollout status deployment/minio --timeout=180s
-helm upgrade --install tessera deploy/helm/tessera --wait --timeout 180s \
+helm upgrade --install tessera deploy/helm/tessera --wait --timeout 420s \
     --set image.repository="${IMAGE%:*}" --set image.tag="${IMAGE##*:}" \
     --set allowAnonymous=true \
+    --set grafana.enabled=true \
     --set clusterSecret=tessera-cluster \
     --set rootPool.url=s3://tessera/smoke \
     --set rootPool.credentialsSecret=tessera-bucket \
@@ -145,5 +159,38 @@ kubectl rollout status deployment/tessera-tessera-back --timeout=300s
 again=$(count)
 [ "$again" = "$after" ] || fail "$after rows before the pods were deleted, $again after"
 echo "ok: $again rows"
+
+say "the chart's Grafana shows the cluster"
+kubectl rollout status deployment/tessera-tessera-grafana --timeout=300s
+boards=$(client "curl -sf -m 30 '$GRAFANA/api/search?tag=tessera'")
+for uid in tessera-overview tessera-tenants tessera-costs; do
+    case "$boards" in *"\"uid\":\"$uid\""*) ;; *) fail "the dashboard $uid is not provisioned: $boards" ;; esac
+done
+# Each data source answers with a value: the nodes' metrics, their
+# logs and the usage they record. Grafana's plugins take a moment to
+# start, so each is asked again for a while.
+answers() {
+    local answer=""
+    for _ in $(seq 1 30); do
+        answer=$(grafana_query "$@")
+        case "$answer" in
+            *'"error"'*) ;;
+            *'"values":[['[0-9\"]*) return 0 ;;
+        esac
+        sleep 3
+    done
+    printf '%s\n' "$answer" >&2
+    return 1
+}
+answers prometheus tessera-metrics \
+    '"expr": "count(count by (node) (tessera_ingest_queue_depth))", "instant": true, "range": false' ||
+    fail "the metrics data source does not answer"
+answers loki tessera-logs \
+    '"expr": "sum(count_over_time({level=~\".+\"}[15m]))", "queryType": "instant"' ||
+    fail "the logs data source does not answer"
+answers grafana-postgresql-datasource tessera-usage \
+    '"rawSql": "SELECT count(*) AS value FROM system.usage WHERE phase = '"'"'ingest'"'"'", "format": "table", "rawQuery": true' ||
+    fail "the usage data source does not answer"
+echo "ok: three dashboards, three data sources"
 
 say "passed"

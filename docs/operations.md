@@ -242,6 +242,33 @@ every route and over gRPC.
        -H 'x-tessera-dataset: metrics' --data-urlencode 'query=tessera_write_ack_seconds'
   ```
 
+- The chart can run a Grafana that shows all of it
+  (`grafana.enabled=true`). Its three data sources read the `_system`
+  tenant through the release's own service: the metrics over the
+  Prometheus API, the logs over the Loki API and the usage over the
+  PostgreSQL protocol; with anonymous access off they present the
+  API key in the secret `grafana.apiKeySecret` names, a `_system`
+  key with the `reader` role. Its dashboards are provisioned from the
+  chart and cannot be edited in place:
+
+  | Dashboard | Shows |
+  |-----------|-------|
+  | Tessera / Overview | The signals above per node, the calls to the object store by operation, the cache, the slots each node holds and the nodes' warnings and errors |
+  | Tessera / Tenants | What each tenant sends, by dataset, kind and service, what its queries scan and take, what compaction stored for it and what its partitions hold |
+  | Tessera / Costs | The same usage at the cluster's prices, by tenant, phase, dataset, team and query |
+
+  The costs are zero until the prices are set (`price.ingest_byte`,
+  `price.stored_byte`, `price.scanned_byte`, `price.cpu_ms`,
+  `price.request`, over `PUT /api/v1/settings/{name}`), and a
+  tenant's rows written before 0.1.5 carry no name and are left out
+  of the last two. Without `grafana.adminPasswordSecret` nobody can
+  sign in and the dashboards are shown read-only to whoever reaches
+  the service, which is a `ClusterIP`:
+
+  ```
+  kubectl port-forward service/tessera-tessera-grafana 3000:3000
+  ```
+
 - The `_system` tenant ships with alert rules on those metrics:
   write acknowledgement above 5 s, commit conflicts growing, intake
   or compaction backlog, evaluator lag above 60 s, degraded rules,

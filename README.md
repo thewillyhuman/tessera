@@ -650,7 +650,12 @@ stop, so a rolling upgrade refuses no request. `deploy/kind/smoke.sh`
 builds the image, installs MinIO and the chart on a kind cluster and
 checks that rows pushed through the service are read back, that no
 acknowledged write is lost while every node is replaced under writes,
-and that the rows outlive the pods; the CI runs it.
+that the rows outlive the pods, and that the chart's Grafana has
+its dashboards and data sources; the CI runs it. With
+`grafana.enabled=true` the chart runs a Grafana whose dashboards
+show the nodes' own signals, what each tenant sends, stores and
+reads, and what that costs, all read from the cluster itself (see
+the operations guide).
 
 ```
 curl -X POST localhost:8080/api/v1/tenants \

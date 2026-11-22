@@ -1,0 +1,229 @@
+{{- if .Values.grafana.enabled }}
+{{- if and (not .Values.allowAnonymous) (not .Values.grafana.apiKeySecret) }}
+{{- fail "grafana.apiKeySecret is required when allowAnonymous is false: Grafana's data sources need an API key of the _system tenant" }}
+{{- end }}
+{{- $name := printf "%s-grafana" (include "tessera.fullname" .) -}}
+{{- $http := printf "http://%s:%v" (include "tessera.fullname" .) .Values.service.httpPort -}}
+{{- $keyed := .Values.grafana.apiKeySecret -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-provisioning
+  labels:
+    {{- include "tessera.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+data:
+  # The nodes' own signals are in the _system tenant: its metrics
+  # dataset over the Prometheus API, its logs dataset over the Loki
+  # API, and the usage of every tenant as system.usage over the
+  # PostgreSQL protocol, where the password is the API key.
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Tessera metrics
+        uid: tessera-metrics
+        type: prometheus
+        access: proxy
+        url: {{ $http }}
+        isDefault: true
+        editable: false
+        jsonData:
+          httpMethod: POST
+          timeInterval: 15s
+          httpHeaderName1: X-Scope-OrgID
+          httpHeaderName2: x-tessera-dataset
+          {{- if $keyed }}
+          httpHeaderName3: Authorization
+          {{- end }}
+        secureJsonData:
+          httpHeaderValue1: _system
+          httpHeaderValue2: metrics
+          {{- if $keyed }}
+          httpHeaderValue3: Bearer $TESSERA_API_KEY
+          {{- end }}
+      - name: Tessera logs
+        uid: tessera-logs
+        type: loki
+        access: proxy
+        url: {{ $http }}
+        editable: false
+        jsonData:
+          httpHeaderName1: X-Scope-OrgID
+          httpHeaderName2: x-tessera-dataset
+          {{- if $keyed }}
+          httpHeaderName3: Authorization
+          {{- end }}
+        secureJsonData:
+          httpHeaderValue1: _system
+          httpHeaderValue2: logs
+          {{- if $keyed }}
+          httpHeaderValue3: Bearer $TESSERA_API_KEY
+          {{- end }}
+      - name: Tessera usage
+        uid: tessera-usage
+        type: grafana-postgresql-datasource
+        access: proxy
+        url: {{ include "tessera.fullname" . }}:{{ .Values.service.pgPort }}
+        user: grafana
+        editable: false
+        jsonData:
+          database: usage
+          sslmode: disable
+          postgresVersion: 1600
+          timescaledb: false
+          maxOpenConns: 4
+        secureJsonData:
+          password: {{ if $keyed }}$TESSERA_API_KEY{{ else }}anonymous{{ end }}
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: tessera
+        folder: Tessera
+        type: file
+        disableDeletion: true
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-dashboards
+  labels:
+    {{- include "tessera.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+data:
+{{ (.Files.Glob "dashboards/*.json").AsConfig | indent 2 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tessera.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "tessera.name" . }}-grafana
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        # Not the name of the nodes' pods: nothing that selects them
+        # is to find this one.
+        app.kubernetes.io/name: {{ include "tessera.name" . }}-grafana
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        # A change to what is provisioned restarts the pod, which reads
+        # the data sources once, at its start.
+        checksum/provisioning: {{ printf "%s%s" (toJson .Values.grafana) ((.Files.Glob "dashboards/*.json").AsConfig) | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: {{ printf "%s:%s" .Values.grafana.image.repository .Values.grafana.image.tag }}
+          imagePullPolicy: {{ .Values.grafana.image.pullPolicy }}
+          env:
+            {{- if .Values.grafana.adminPasswordSecret }}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.grafana.adminPasswordSecret }}
+                  key: admin-password
+            {{- else }}
+            # Nobody signs in: the dashboards are shown read-only.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Viewer
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+            {{- end }}
+            {{- if $keyed }}
+            - name: TESSERA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.grafana.apiKeySecret }}
+                  key: api-key
+            {{- end }}
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+            - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
+              value: /var/lib/grafana/dashboards/overview.json
+            # Nothing is asked of, or reported to, anything outside
+            # the cluster.
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+            - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+              value: "false"
+            - name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES
+              value: "false"
+            - name: GF_NEWS_NEWS_FEED_ENABLED
+              value: "false"
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+          volumeMounts:
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning/datasources/tessera.yaml
+              subPath: datasources.yaml
+            - name: provisioning
+              mountPath: /etc/grafana/provisioning/dashboards/tessera.yaml
+              subPath: dashboards.yaml
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+            - name: data
+              mountPath: /var/lib/grafana
+          {{- with .Values.grafana.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: provisioning
+          configMap:
+            name: {{ $name }}-provisioning
+        - name: dashboards
+          configMap:
+            name: {{ $name }}-dashboards
+        # What Grafana keeps of its own is its users' preferences: it
+        # goes with the pod. The dashboards and data sources are the
+        # chart's.
+        - name: data
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "tessera.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  type: {{ .Values.grafana.service.type }}
+  selector:
+    app.kubernetes.io/name: {{ include "tessera.name" . }}-grafana
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.grafana.service.port }}
+      targetPort: http
+{{- end }}
