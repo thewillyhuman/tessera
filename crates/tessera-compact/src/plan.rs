@@ -144,8 +144,12 @@ fn retire(
     if state.files().all(|f| f.level == Level::L3) {
         return None;
     }
+    // The files still to be rewritten come first, the ones already at
+    // L3 after them: a job takes the inputs that fit, and one that
+    // began with what an earlier job wrote would rewrite it again and
+    // again without reaching the rest.
     let mut inputs: Vec<FileMeta> = state.files().cloned().collect();
-    inputs.sort_by_key(|f| f.max_timestamp);
+    inputs.sort_by_key(|f| (f.level == Level::L3, f.max_timestamp));
     Some(Job {
         partition: partition.clone(),
         inputs: take_within(inputs, policy.max_input_bytes),
@@ -314,6 +318,26 @@ mod tests {
         let job = plan(&partition(), &state(&files), old, &policy).unwrap();
         assert_eq!(job.level, Level::L3);
         assert_eq!(job.inputs.len(), 3, "the L3 file joins the rewrite");
+        // A partition larger than a job takes is rewritten a part at a
+        // time, and each part is of files not yet rewritten: the file
+        // an earlier job wrote holds the oldest rows and would
+        // otherwise be taken first, alone, every time.
+        let written = FileMeta {
+            max_timestamp: Timestamp::from_nanos(5),
+            ..files[2].clone()
+        };
+        let partial = [written, files[0].clone(), files[1].clone()];
+        let small = Policy {
+            max_input_bytes: files[0].size_bytes,
+            ..policy
+        };
+        let job = plan(&partition(), &state(&partial), old, &small).unwrap();
+        assert_eq!(
+            job.inputs.iter().map(|f| f.level).collect::<Vec<_>>(),
+            [Level::L2],
+            "the oldest of the files below L3"
+        );
+        assert_eq!(job.inputs[0].file_id, files[0].file_id);
         let only_l3 = [file(&mut random, Level::L3, 1, 30)];
         assert!(plan(&partition(), &state(&only_l3), old, &policy).is_none());
     }
