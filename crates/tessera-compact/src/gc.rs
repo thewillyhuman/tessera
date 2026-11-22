@@ -149,13 +149,15 @@ pub async fn collect_log(
     let mut deletable: Vec<Seq> = Vec::new();
     let mut ended = false;
     for seq in &seqs {
-        let entry = reader::read(&**store, writer, *seq).await?;
-        let age = now.duration_since(entry.header().written_at);
+        // What an entry is and when it was written is in its header:
+        // the rows of a segment are deleted without being read.
+        let entry = reader::header(&**store, writer, *seq, &env.keys).await?;
+        let age = now.duration_since(entry.written_at);
         let aged = age.is_some_and(|age| age >= grace);
         if !aged || checkpoints.keeps(writer, *seq, age.unwrap_or(Duration::ZERO)) {
             break;
         }
-        match entry.body() {
+        match &entry.body {
             EntryBody::Segment { blocks } => {
                 if !positions.adopted(blocks, writer, *seq).await? {
                     break;

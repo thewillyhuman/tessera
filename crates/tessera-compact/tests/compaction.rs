@@ -824,6 +824,37 @@ async fn adopted_segments_are_collected_after_the_grace_period() {
     assert_eq!(collect(&node, soon).await.deleted, 0);
 }
 
+/// Collection asks what each entry is and when it was written, which
+/// its header says: the rows of the segments it deletes stay unread.
+#[tokio::test]
+async fn collection_reads_the_headers_of_a_log_and_not_its_rows() {
+    let mut node = node(&[&[1, 2], &[3]], Timestamp::UNIX_EPOCH).await;
+    node.log.append_segment(&[batch(&[9])]).await.unwrap();
+    let later = node.env.clock.now().checked_add(2 * GRACE).unwrap();
+    let metered = Arc::new(tessera_object::MeteredStore::new(node.store.clone()));
+    let store: Arc<dyn ObjectStore> = metered.clone();
+    let datasets = DatasetLogs::new(Arc::clone(&store), node.env.clone());
+    let collected = collect_log(
+        &store,
+        &node.env,
+        node.log.writer_id(),
+        later,
+        GRACE,
+        &datasets,
+        &Checkpoints::none(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(collected.deleted, 4);
+    let tails = metered
+        .requests()
+        .by_operation()
+        .into_iter()
+        .find(|(operation, _)| *operation == "get_tail")
+        .map(|(_, made)| made);
+    assert_eq!(tails, Some(5), "the four entries deleted and the one kept");
+}
+
 /// GC-2 (c): an adopted entry a rule group has not read stays until the
 /// group reads past it, or until the hard cap, after which the group
 /// rebuilds its windows from the files instead (section 11.7).
