@@ -3919,6 +3919,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tessera-pgcatalog"
+version = "0.1.4"
+dependencies = [
+ "regex",
+ "rusqlite",
+ "thiserror",
+]
+
+[[package]]
 name = "tessera-promql"
 version = "0.1.4"
 dependencies = [

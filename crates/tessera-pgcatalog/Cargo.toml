@@ -1,0 +1,17 @@
+[package]
+name = "tessera-pgcatalog"
+description = "Tessera's PostgreSQL system catalogs: what SQL clients ask of pg_catalog and information_schema to connect and browse, answered from a description of the tables"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+regex = "1"
+rusqlite = { version = "0.40", features = ["bundled", "column_decltype", "functions"] }
+thiserror = "2"
+
+[lints]
+workspace = true
