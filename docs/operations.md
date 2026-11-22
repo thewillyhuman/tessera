@@ -153,7 +153,9 @@ closed by another node's recovery.
 
 What one cluster took, as a point to size from. Six machines of 4
 CPUs and 7 GiB ran four `ingest,query` nodes and two `compact,eval`
-nodes of version 0.1.6, each asking for 2 CPUs and limited to 5 GiB,
+nodes, each asking for 2 CPUs and limited to 5 GiB, of the commits
+that became version 0.1.6 (the last of the four-tenant runs and the
+compaction rate are of 0.1.6 itself),
 with one writer, against a Ceph object store. Log lines of 130 bytes
 were pushed 2,000 at a time over the Loki API, 32 pushes at once per
 tenant, each tenant to one dataset, with queries over the last
@@ -167,7 +169,7 @@ minutes of the same data every 20 seconds:
 | 4 | 235,000 to 242,000 (32 MB/s) | 0.5 to 0.9 s, 3 to 6 s | Three minutes; ingest nodes at 3 cores; in one of two runs two of them ran out of memory under the queries and restarted |
 
 Every run counted its lines afterwards, and none that was
-acknowledged was missing, 250 million in all. Compaction ran at
+acknowledged was missing, 275 million over nine runs. Compaction ran at
 29,000 rows a second on the node that held the datasets' partitions,
 so at these rates the files of each flush wait their turn, readable
 all the while; the queries alongside took 5 to 20 seconds.
