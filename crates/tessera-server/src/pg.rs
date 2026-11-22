@@ -1,18 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `PostgreSQL` wire protocol (section 16): enough for `psql`, common
-//! drivers and Grafana's `PostgreSQL` data source to run SQL queries.
+//! drivers and the tools built on them (Grafana's `PostgreSQL` data
+//! source, `DBeaver`, `SQLAlchemy`) to connect, to browse what there is
+//! and to run SQL queries.
 //!
 //! The database a client connects to is the dataset its unqualified
 //! table names read. Both the simple and the extended query protocol
 //! are served; a prepared statement is described by planning it without
-//! running it. Parameters (`$1`) are not supported yet. Session
-//! statements drivers send on connect (`SET`, `BEGIN`, `COMMIT`, ...)
-//! are acknowledged and ignored. Timestamps travel with `PostgreSQL`'s
-//! microsecond precision.
+//! running it, and its `$n` parameters bind with the types the
+//! statement implies. Session statements drivers send on connect
+//! (`SET`, `BEGIN`, `COMMIT`, ...) are acknowledged and ignored.
+//! Timestamps travel with `PostgreSQL`'s microsecond precision.
 //!
-//! Authentication (SE-1) is not implemented; `tessera run` binds the
-//! listener to the loopback interface.
+//! What a client asks of the system catalogs, `pg_catalog` and
+//! `information_schema`, and of the session (`SHOW`, `version()`,
+//! `current_schema()`) is not Tessera's SQL and is answered by
+//! [`tessera_pgcatalog`], from what the connection can see: the
+//! datasets its key may read as databases, the views over a dataset's
+//! events in the schema `public` and the tenant's control tables in
+//! `system`.
+//!
+//! Where anonymous access is off, the password is an API key (SE-1)
+//! and the user name is not looked at.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -127,6 +137,17 @@ impl PgServer {
         if session_statement(&prepared.text).is_some() {
             return Ok((Vec::new(), None));
         }
+        if tessera_pgcatalog::concerns(&prepared.text) {
+            // The catalogs take any value: each parameter is what the
+            // client declared, else text.
+            let types = (0..tessera_pgcatalog::rewrite::parameters(&prepared.text))
+                .map(|i| match prepared.declared.get(i) {
+                    Some(Some(declared)) if *declared != Type::UNKNOWN => declared.clone(),
+                    _ => Type::TEXT,
+                })
+                .collect();
+            return Ok((types, None));
+        }
         let (ctx, _) = self.context(client).await?;
         let described = tessera_sql::describe(&prepared.text, &ctx)
             .map_err(|e| query_error(&QueryError::Syntax(e), &prepared.text))?;
@@ -171,6 +192,35 @@ impl PgServer {
         Ok((ctx, principal))
     }
 
+    /// What the system catalogs answer to `text` for this connection
+    /// (see [`tessera_pgcatalog`]), its parameters bound to
+    /// `parameters`: nulls where a client only asks what the statement
+    /// returns.
+    async fn catalog<C: ClientInfo>(
+        &self,
+        client: &C,
+        text: &str,
+        parameters: &[Parameter],
+    ) -> PgWireResult<tessera_pgcatalog::Answer> {
+        let (ctx, principal) = self.context(client).await?;
+        let user = LoginInfo::from_client_info(client)
+            .user()
+            .map_or_else(|| principal.name.clone(), str::to_owned);
+        tracing::debug!(statement = %text, "catalog statement");
+        let shape = crate::pgcatalog::shape(&self.state, &principal, &ctx, &user).await;
+        let values: Vec<_> = parameters.iter().map(crate::pgcatalog::value).collect();
+        let statement = text.to_owned();
+        // The catalogs are built and asked on a thread of their own:
+        // neither waits for anything, both take a moment.
+        tokio::task::spawn_blocking(move || tessera_pgcatalog::answer(&shape, &statement, &values))
+            .await
+            .map_err(|e| user_error("XX000", e.to_string()))?
+            .map_err(|e| {
+                tracing::debug!(error = %e, statement = %text, "catalog statement not answered");
+                user_error("42601", e.to_string())
+            })
+    }
+
     /// Runs `text` with its `$n` parameters bound to `parameters` and
     /// encodes the result in `format`.
     async fn execute<C: ClientInfo>(
@@ -182,6 +232,10 @@ impl PgServer {
     ) -> PgWireResult<Response> {
         if let Some(tag) = session_statement(text) {
             return Ok(Response::Execution(Tag::new(tag)));
+        }
+        if tessera_pgcatalog::concerns(text) {
+            let answer = self.catalog(client, text, &parameters).await?;
+            return crate::pgcatalog::response(&answer, format);
         }
         let (ctx, principal) = self.context(client).await?;
         let started = std::time::Instant::now();
@@ -484,7 +538,12 @@ impl ExtendedQueryHandler for PgServer {
     {
         let prepared = &statement.statement;
         let (types, lowered) = self.lower_unbound(client, prepared).await?;
-        let fields = self.fields_of(lowered, &prepared.text, &Format::UnifiedBinary)?;
+        let fields = if tessera_pgcatalog::concerns(&prepared.text) {
+            let answer = self.catalog(client, &prepared.text, &[]).await?;
+            crate::pgcatalog::fields(&answer, &Format::UnifiedBinary)
+        } else {
+            self.fields_of(lowered, &prepared.text, &Format::UnifiedBinary)?
+        };
         Ok(DescribeStatementResponse::new(types, fields))
     }
 
@@ -497,8 +556,15 @@ impl ExtendedQueryHandler for PgServer {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let prepared = &portal.statement.statement;
-        let (_, lowered) = self.lower_unbound(client, prepared).await?;
-        let fields = self.fields_of(lowered, &prepared.text, &portal.result_column_format)?;
+        let (types, lowered) = self.lower_unbound(client, prepared).await?;
+        let format = &portal.result_column_format;
+        let fields = if tessera_pgcatalog::concerns(&prepared.text) {
+            let parameters = bind(portal, &types)?;
+            let answer = self.catalog(client, &prepared.text, &parameters).await?;
+            crate::pgcatalog::fields(&answer, format)
+        } else {
+            self.fields_of(lowered, &prepared.text, format)?
+        };
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -624,7 +690,11 @@ impl PgServer {
     {
         let (pid, secret_key) = RandomPidSecretKeyGenerator::default().generate(client);
         client.set_pid_and_secret_key(pid, secret_key);
-        auth::finish_authentication(client, &DefaultServerParameterProvider::default()).await
+        // The version the catalogs answer with: drivers choose what
+        // they ask by it.
+        let mut parameters = DefaultServerParameterProvider::default();
+        tessera_pgcatalog::SERVER_VERSION.clone_into(&mut parameters.server_version);
+        auth::finish_authentication(client, &parameters).await
     }
 }
 
@@ -824,6 +894,82 @@ mod tests {
             .unwrap();
         let first_line: String = rows[0].get(0);
         assert_eq!(first_line, "Scan: prod/log [all time) default");
+        server.abort();
+    }
+
+    /// Section 16: a client that browses asks the catalogs, with
+    /// `PostgreSQL`'s own SQL, what databases, tables and columns
+    /// there are, and reads the answers by their types.
+    #[tokio::test]
+    async fn clients_browse_the_catalogs() {
+        let (address, server) = node().await;
+        let client = connect(address, "prod").await;
+
+        let shown = client.simple_query("SHOW server_version").await.unwrap();
+        let version = shown.iter().find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        });
+        assert_eq!(version.as_deref(), Some("16.0"));
+
+        // Extended protocol, a parameter, and fields of the catalogs'
+        // own types: an oid, a name, a boolean.
+        let tables = client
+            .query(
+                "SELECT c.oid, c.relname, c.relhasindex \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relkind = 'r' ORDER BY c.relname",
+                &[&"public"],
+            )
+            .await
+            .unwrap();
+        let names: Vec<String> = tables.iter().map(|row| row.get(1)).collect();
+        assert_eq!(names, ["alerts", "logs", "metrics", "spans"]);
+        let oid: u32 = tables[1].get(0);
+        let indexed: bool = tables[1].get(2);
+        assert!(oid > 0 && !indexed);
+
+        // The connection's dataset is its database; the columns are
+        // the ones a query on the table returns.
+        let database: String = client
+            .query_one("SELECT current_database()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(database, "prod");
+        let column = client
+            .query_one(
+                "SELECT data_type, is_nullable FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = 'logs' AND column_name = 'body'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let (data_type, nullable): (String, String) = (column.get(0), column.get(1));
+        assert_eq!((data_type.as_str(), nullable.as_str()), ("text", "YES"));
+        let system = client
+            .query(
+                "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'system' \
+                 AND tablename IN ('usage', 'alert_rules')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(system.len(), 2);
+
+        // A query on a table is the engine's, whatever its strings say.
+        let rows = client
+            .query("SELECT body FROM logs WHERE body LIKE 'pg_%'", &[])
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        // What the catalogs cannot answer is a syntax error to the client.
+        let error = client
+            .query("SELECT nope FROM pg_catalog.pg_class", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.as_db_error().unwrap().code().code(), "42601");
         server.abort();
     }
 

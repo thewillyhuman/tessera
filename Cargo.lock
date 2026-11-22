@@ -3984,6 +3984,7 @@ dependencies = [
  "tessera-manifest",
  "tessera-object",
  "tessera-opt",
+ "tessera-pgcatalog",
  "tessera-promql",
  "tessera-sql",
  "tessera-traceql",

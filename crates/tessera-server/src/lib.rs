@@ -31,6 +31,7 @@ pub mod oidc;
 pub mod otlp;
 mod params;
 pub mod pg;
+mod pgcatalog;
 pub mod prometheus;
 pub mod query;
 pub mod reconcile;

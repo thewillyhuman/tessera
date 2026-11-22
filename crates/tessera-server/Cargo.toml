@@ -20,6 +20,8 @@ tessera-ir.workspace = true
 tessera-kernels.workspace = true
 tessera-logql.workspace = true
 tessera-object.workspace = true
+tessera-opt.workspace = true
+tessera-pgcatalog.workspace = true
 tessera-promql.workspace = true
 tessera-sql.workspace = true
 tessera-traceql.workspace = true
@@ -40,7 +42,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 serde_yaml_ng = "0.10"
-tessera-opt.workspace = true
 tokio = { version = "1", features = ["net", "rt", "macros"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "gzip", "router", "server"] }
 tower-http = { version = "0.6", default-features = false, features = ["decompression-gzip"] }

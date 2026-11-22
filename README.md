@@ -551,6 +551,7 @@ crates/
   tessera-promql    PromQL lexer, parser and lowering
   tessera-eval      continuous queries and alerting: rules, lifecycle, state logs, incremental and periodic evaluation, notifications
   tessera-advisor   adaptive physical design: the cost model that turns the workload log into sort keys, indexes, dedicated columns and windows
+  tessera-pgcatalog PostgreSQL's system catalogs, as SQL clients ask of them to connect and browse
   tessera-server    HTTP administration, OTLP ingest, remote write, SQL over HTTP, PostgreSQL wire protocol, Loki, Tempo, Prometheus and ruler APIs
   tessera-node      one node: wires the roles, the background work and the APIs of a process
   tessera           the binary: the command line over tessera-node
@@ -731,6 +732,20 @@ end)` return the rows their own APIs would (QL-3).
 
 The database a PostgreSQL client connects to is the dataset. `EXPLAIN`
 shows the plan and `EXPLAIN ANALYZE` what each scan read and pruned.
+
+A client that browses finds the tenant's datasets as databases, the
+views of a dataset in the schema `public` and the tenant's control
+tables in `system`: what it asks of `pg_catalog` and
+`information_schema` to list them (`\l`, `\dt` and `\d logs` in
+psql, a JDBC driver's metadata, SQLAlchemy's reflection) is answered
+as PostgreSQL 16 would, without keys, indexes or functions to show.
+The user is any name and the password an API key, or anything where
+anonymous access is on. The answers were checked against psql 17,
+the PostgreSQL JDBC driver 42.7, SQLAlchemy 2 with psycopg2,
+psycopg 3 and asyncpg; the statements DBeaver and Grafana's
+PostgreSQL data source are known to send are answered too, but
+neither tool was run against a node. A statement that joins a
+catalog with a table's rows is not supported.
 
 The Loki API lives under `/loki/api/v1`: push streams as JSON or as
 the snappy-compressed protobuf promtail and Alloy send, query with
