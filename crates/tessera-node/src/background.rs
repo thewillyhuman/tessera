@@ -14,11 +14,12 @@
 //! are never recovered; the ingester ends or rotates its own logs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tessera_catalog::{Catalog, ControlStores, Table, TenantSettingsSource};
-use tessera_cluster::{Load, Membership};
+use tessera_cluster::{Load, Membership, Work};
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{
     Checkpoints, Compactor, Outcome, Policy, Retain, Spared, collect_files, collect_log,
@@ -34,8 +35,8 @@ use tessera_manifest::{
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
-    DatasetName, Env, FileMeta, Held, Kind, Level, Meter, PartitionId, PoolId, RetentionPolicy,
-    Seq, TenantId, Timestamp, Window, Windows, WorkKind, WriterId,
+    Clock, DatasetName, Env, FileMeta, Held, Kind, Level, Meter, PartitionId, PoolId,
+    RetentionPolicy, Seq, TenantId, Timestamp, Window, Windows, WorkKind, WriterId,
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
@@ -213,6 +214,42 @@ pub struct Background {
     pub export_interval: Duration,
 }
 
+impl Background {
+    /// Does `work` and counts the time it took as `kind`'s.
+    async fn timed<T>(&self, kind: Work, work: impl Future<Output = T>) -> T {
+        timed(&*self.env.clock, &self.load, kind, work).await
+    }
+}
+
+/// Does `work` and adds the time it took by `clock` to what `load`
+/// reports of `kind` (`tessera_background_seconds_total`).
+async fn timed<T>(clock: &dyn Clock, load: &Load, kind: Work, work: impl Future<Output = T>) -> T {
+    let started = clock.now();
+    let done = work.await;
+    load.worked(kind, since(clock, started));
+    done
+}
+
+/// How long ago `started` was by `clock`; nothing if the clock went
+/// back.
+fn since(clock: &dyn Clock, started: Timestamp) -> Duration {
+    clock
+        .now()
+        .duration_since(started)
+        .unwrap_or(Duration::ZERO)
+}
+
+/// The time `load` counted so far for the kinds of work that are
+/// timed one by one, which is every kind but the rest of a round.
+fn timed_so_far(load: &Load) -> Duration {
+    load.snapshot()
+        .background
+        .iter()
+        .filter(|(kind, _)| *kind != Work::Other.name())
+        .map(|(_, took)| *took)
+        .sum()
+}
+
 /// Where intake stopped in each writer's log, per dataset: a round
 /// reads on from there (IT-2 lets one start over, so nothing is lost
 /// with this memory but the reading it saves).
@@ -271,6 +308,7 @@ pub async fn run(background: Background) {
     loop {
         ticks.tick().await;
         let now = background.env.clock.now();
+        let timed_before = timed_so_far(&background.load);
         // Every tenant is gone over when what the partitions hold is
         // to be recorded, and when the slots this node owns changed
         // since it last went over them all: a tenant at rest may have
@@ -327,7 +365,10 @@ pub async fn run(background: Background) {
         }
         if is_due(last_collection, now, COLLECT_EVERY) {
             // A look that failed is taken again next round.
-            match collect_logs(&background, &mut ruleless).await {
+            let collected = background
+                .timed(Work::Collection, collect_logs(&background, &mut ruleless))
+                .await;
+            match collected {
                 Ok(()) => last_collection = Some(now),
                 Err(error) => tracing::warn!(error = %error, "segment collection failed"),
             }
@@ -344,6 +385,13 @@ pub async fn run(background: Background) {
                 last_export = Some(now);
             }
         }
+        // What the round took besides the work timed within it: the
+        // looking for what there is to do.
+        let timed_in_round = timed_so_far(&background.load).saturating_sub(timed_before);
+        let round = since(&*background.env.clock, now);
+        background
+            .load
+            .worked(Work::Other, round.saturating_sub(timed_in_round));
     }
 }
 
@@ -519,15 +567,15 @@ async fn follow(
             if cursors.quiet.contains(&(writer, after)) {
                 continue;
             }
-            let followed = intake::run_following(
+            let following = intake::run_following(
                 Arc::clone(&background.store),
                 &background.env,
                 tenant,
                 dataset,
                 writer,
                 after,
-            )
-            .await;
+            );
+            let followed = background.timed(Work::Intake, following).await;
             match followed {
                 Ok(outcome) => {
                     if outcome.through == after {
@@ -585,15 +633,15 @@ async fn dataset_round(
             cursors.met.insert(at.clone());
             // A run that fails leaves the position where it was, to
             // be repeated from there.
-            let outcome = intake::run_after(
+            let run = intake::run_after(
                 Arc::clone(&background.store),
                 &background.env,
                 tenant,
                 dataset,
                 writer,
                 after,
-            )
-            .await?;
+            );
+            let outcome = background.timed(Work::Intake, run).await?;
             cursors.positions.insert(at, outcome.through);
             if outcome.adoptions > 0 || outcome.removed {
                 tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
@@ -701,7 +749,9 @@ async fn compact_and_collect(
                     tracing::info!(%tenant, %dataset, %kind, window = %partition.window, "partition dropped by retention");
                     changes += 1;
                 }
-                collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION).await?;
+                let dropped =
+                    collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION);
+                background.timed(Work::Collection, dropped).await?;
                 continue;
             }
             retention::Decision::Retire { retain: r, after } => {
@@ -732,13 +782,12 @@ async fn compact_and_collect(
             if let Some(retain) = retain.as_mut().filter(|r| spares(r, kind, job.level)) {
                 retain.spared = Arc::new(spared_beside(background, &partition, &every).await?);
             }
-            let outcome = compactor
-                .run(&manifest, &job, &record, retain.as_ref(), &tombstones)
-                .await?;
+            let run = compactor.run(&manifest, &job, &record, retain.as_ref(), &tombstones);
+            let outcome = background.timed(Work::Compaction, run).await?;
             compacted(&manifest, &partition, outcome).await;
         }
-        let collected =
-            collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION).await?;
+        let replaced = collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION);
+        let collected = background.timed(Work::Collection, replaced).await?;
         if collected > 0 {
             tracing::info!(%tenant, %dataset, %kind, window = %partition.window, collected, "files collected");
             changes += 1;
@@ -1078,6 +1127,8 @@ async fn quiet_for(background: &Background, writer: WriterId) -> Result<Option<Q
 
 #[cfg(test)]
 mod tests {
+    use tessera_types::ManualClock;
+
     use super::*;
 
     /// ST-9, ST-10: a writer is recovered when its node is gone, or
@@ -1239,6 +1290,32 @@ mod tests {
             ..sampling
         };
         assert!(!spares(&dropping, Kind::Span, Level::L3));
+    }
+
+    #[tokio::test]
+    async fn the_time_a_piece_of_work_takes_is_counted_as_its_kind() {
+        let clock = ManualClock::new(Timestamp::from_nanos(0));
+        let load = Load::new();
+        let intake = async {
+            clock.advance(Duration::from_secs(3));
+            7
+        };
+        assert_eq!(timed(&clock, &load, Work::Intake, intake).await, 7);
+        timed(&clock, &load, Work::Compaction, async {
+            clock.advance(Duration::from_secs(20));
+        })
+        .await;
+        assert_eq!(
+            load.snapshot().background[..2],
+            [
+                ("intake", Duration::from_secs(3)),
+                ("compaction", Duration::from_secs(20)),
+            ]
+        );
+        // The rest of a round is what it took besides these.
+        assert_eq!(timed_so_far(&load), Duration::from_secs(23));
+        load.worked(Work::Other, Duration::from_secs(2));
+        assert_eq!(timed_so_far(&load), Duration::from_secs(23));
     }
 
     #[test]

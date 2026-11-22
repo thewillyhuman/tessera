@@ -43,6 +43,36 @@ const LOG_LINGER: Duration = Duration::from_secs(1);
 /// label's value.
 type Point = (String, f64, Option<(&'static str, String)>);
 
+/// The points of the signals that have a series per label value: the
+/// time the background loop took by kind of work, the slots by kind
+/// and the calls to the store by operation.
+#[allow(clippy::cast_precision_loss)]
+fn labelled(snapshot: &Snapshot) -> Vec<Point> {
+    let mut points: Vec<Point> = Vec::new();
+    for (work, took) in &snapshot.background {
+        points.push((
+            "tessera_background_seconds_total".into(),
+            took.as_secs_f64(),
+            Some(("work", (*work).to_owned())),
+        ));
+    }
+    for (kind, held) in &snapshot.slots {
+        points.push((
+            "tessera_slots_owned".into(),
+            *held as f64,
+            Some(("kind", kind.to_string())),
+        ));
+    }
+    for (operation, calls) in &snapshot.store_requests {
+        points.push((
+            "tessera_object_store_requests_total".into(),
+            *calls as f64,
+            Some(("operation", (*operation).to_owned())),
+        ));
+    }
+    points
+}
+
 /// The load signals as metric points, one gauge per signal, one per
 /// kind of work for the slots and one per operation for the calls to
 /// the store, all labelled with the node. The counts are far below
@@ -110,20 +140,7 @@ pub fn metric_rows(
     ] {
         points.push((name.into(), value as f64, None));
     }
-    for (kind, held) in &snapshot.slots {
-        points.push((
-            "tessera_slots_owned".into(),
-            *held as f64,
-            Some(("kind", kind.to_string())),
-        ));
-    }
-    for (operation, calls) in &snapshot.store_requests {
-        points.push((
-            "tessera_object_store_requests_total".into(),
-            *calls as f64,
-            Some(("operation", (*operation).to_owned())),
-        ));
-    }
+    points.extend(labelled(snapshot));
     points
         .into_iter()
         .map(|(name, value, label)| {
@@ -345,12 +362,16 @@ mod tests {
                 misses: 10,
                 bytes: 4_096,
             },
+            background: vec![
+                ("intake", Duration::from_millis(500)),
+                ("compaction", Duration::from_secs(9)),
+            ],
             store_requests: vec![("get", 12), ("list", 5)],
             slots: BTreeMap::from([(WorkKind::Partition, 4), (WorkKind::Intake, 1)]),
             alert_latency: Duration::from_millis(1_200),
         };
         let rows = metric_rows(&snapshot, 3, NodeId::from_u128(7), Timestamp::from_nanos(1));
-        assert_eq!(rows.len(), 16);
+        assert_eq!(rows.len(), 18);
         // What the node asks of its store and what its cache saves it
         // are what an idle cluster costs: they are recorded too.
         let of =
@@ -364,6 +385,13 @@ mod tests {
             == Scalar::Text("get".into())
             && r.value == Some(12.0)));
         assert_ne!(requests[0].series_id, requests[1].series_id);
+        // What the background loop spends its time on says whether
+        // compaction keeps up, and with what.
+        let background = of("tessera_background_seconds_total");
+        assert_eq!(background.len(), 2);
+        assert!(background.iter().any(|r| r.attributes["attr.work"]
+            == Scalar::Text("compaction".into())
+            && r.value == Some(9.0)));
         let latency = rows
             .iter()
             .find(|r| r.name == "tessera_alert_latency_seconds")

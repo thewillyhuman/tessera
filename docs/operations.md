@@ -268,6 +268,7 @@ every route and over gRPC.
   | `tessera_slots_owned{kind}` | Slots this node holds |
   | `tessera_object_cache_hits_total`, `_misses_total`, `_bytes` | The use of `--cache-dir` |
   | `tessera_object_store_requests_total{operation}` | What the node asks of its store, by operation; its rate while idle is what the store bills for nothing |
+  | `tessera_background_seconds_total{work}` | What a `compact` node's loop spends its time on: `intake`, `compaction`, `collection` or `other`. Their rates add up to the share of time the loop is busy; near one, the node has more to do than it does, and the largest says what with |
 
 - Every node writes the same signals to the `_system` tenant's
   `metrics` dataset and its own log events to `logs`, so they can be

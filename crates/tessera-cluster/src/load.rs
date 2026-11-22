@@ -18,7 +18,11 @@
 //! 10.8), the counters `tessera_object_cache_hits_total` and
 //! `tessera_object_cache_misses_total` with the gauge
 //! `tessera_object_cache_bytes`. What the node asks of its root pool's
-//! store is the counter `tessera_object_store_requests_total{operation}`.
+//! store is the counter `tessera_object_store_requests_total{operation}`,
+//! and the time its background loop took, by what it was doing, is the
+//! counter `tessera_background_seconds_total{work}`: the kinds of work
+//! add up to the time the loop was busy, so their rates add up to one
+//! on a node whose loop never waits for its next round.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -27,6 +31,40 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tessera_types::WorkKind;
+
+/// What a node's background loop spends its time on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Work {
+    /// Reading writer logs and adopting what they flushed.
+    Intake,
+    /// Running compaction jobs.
+    Compaction,
+    /// Deleting replaced files and adopted segments.
+    Collection,
+    /// The rest of a round: finding what there is to do.
+    Other,
+}
+
+impl Work {
+    /// Every kind, in the order they are reported.
+    pub const ALL: [Work; 4] = [
+        Work::Intake,
+        Work::Compaction,
+        Work::Collection,
+        Work::Other,
+    ];
+
+    /// The kind as the `work` label names it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Work::Intake => "intake",
+            Work::Compaction => "compaction",
+            Work::Collection => "collection",
+            Work::Other => "other",
+        }
+    }
+}
 
 /// The gauges of one node.
 #[derive(Default)]
@@ -39,6 +77,7 @@ pub struct Load {
     evaluator_lag_nanos: AtomicU64,
     degraded_rules: AtomicU64,
     alert_latency_nanos: AtomicU64,
+    background_nanos: [AtomicU64; Work::ALL.len()],
     object_cache: Mutex<ObjectCache>,
     store_requests: Mutex<Vec<(&'static str, u64)>>,
     slots: Mutex<BTreeMap<WorkKind, u64>>,
@@ -87,6 +126,9 @@ pub struct Snapshot {
     /// Smoothed time from the last row an alert's rule received to the
     /// notification sent (section 17.1).
     pub alert_latency: Duration,
+    /// The time the background loop took since the node started, by
+    /// kind of work, always every kind in the same order.
+    pub background: Vec<(&'static str, Duration)>,
     /// The use of the cache of object reads on local disk.
     pub object_cache: ObjectCache,
     /// Calls to the root pool's store since the node started, by
@@ -142,6 +184,12 @@ impl Load {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 Some(old / 5 * 4 + wait / 5)
             });
+    }
+
+    /// Adds `took` to the time the background loop spent on `work`.
+    pub fn worked(&self, work: Work, took: Duration) {
+        let took = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        self.background_nanos[work as usize].fetch_add(took, Ordering::Relaxed);
     }
 
     /// Sets the compaction jobs deferred in the last round.
@@ -204,6 +252,13 @@ impl Load {
             evaluator_lag: Duration::from_nanos(self.evaluator_lag_nanos.load(Ordering::Relaxed)),
             degraded_rules: self.degraded_rules.load(Ordering::Relaxed),
             alert_latency: Duration::from_nanos(self.alert_latency_nanos.load(Ordering::Relaxed)),
+            background: Work::ALL
+                .iter()
+                .map(|work| {
+                    let nanos = self.background_nanos[*work as usize].load(Ordering::Relaxed);
+                    (work.name(), Duration::from_nanos(nanos))
+                })
+                .collect(),
             object_cache: *self
                 .object_cache
                 .lock()
@@ -297,26 +352,50 @@ impl Snapshot {
             "tessera_object_cache_bytes {}",
             self.object_cache.bytes
         );
-        let _ = writeln!(
-            out,
-            "# HELP tessera_object_store_requests_total Calls to the root pool's store, by operation; a listing counts once however many pages it takes."
+        labelled(
+            &mut out,
+            ("tessera_object_store_requests_total", "counter"),
+            "Calls to the root pool's store, by operation; a listing counts once however many pages it takes.",
+            "operation",
+            self.store_requests
+                .iter()
+                .map(|(o, calls)| (*o, calls.to_string())),
         );
-        let _ = writeln!(out, "# TYPE tessera_object_store_requests_total counter");
-        for (operation, calls) in &self.store_requests {
-            let _ = writeln!(
-                out,
-                "tessera_object_store_requests_total{{operation=\"{operation}\"}} {calls}"
-            );
-        }
-        let _ = writeln!(
-            out,
-            "# HELP tessera_slots_owned Slots this node holds, per kind of work."
+        labelled(
+            &mut out,
+            ("tessera_background_seconds_total", "counter"),
+            "Time the background loop took, by what it was doing.",
+            "work",
+            self.background
+                .iter()
+                .map(|(work, took)| (*work, format!("{:.3}", took.as_secs_f64()))),
         );
-        let _ = writeln!(out, "# TYPE tessera_slots_owned gauge");
-        for (kind, held) in &self.slots {
-            let _ = writeln!(out, "tessera_slots_owned{{kind=\"{kind}\"}} {held}");
-        }
+        labelled(
+            &mut out,
+            ("tessera_slots_owned", "gauge"),
+            "Slots this node holds, per kind of work.",
+            "kind",
+            self.slots
+                .iter()
+                .map(|(kind, held)| (kind.to_string(), held.to_string())),
+        );
         out
+    }
+}
+
+/// Writes a metric of the given name and type that has one series per
+/// value of `label`, in the Prometheus text exposition format.
+fn labelled<L: std::fmt::Display>(
+    out: &mut String,
+    (name, metric_type): (&str, &str),
+    help: &str,
+    label: &str,
+    series: impl Iterator<Item = (L, String)>,
+) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {metric_type}");
+    for (of, value) in series {
+        let _ = writeln!(out, "{name}{{{label}=\"{of}\"}} {value}");
     }
 }
 
@@ -349,6 +428,37 @@ mod tests {
             load.snapshot()
                 .prometheus_text()
                 .contains("tessera_write_ack_seconds 0.99")
+        );
+    }
+
+    #[test]
+    fn the_time_background_work_takes_adds_up_by_kind() {
+        let load = Load::new();
+        load.worked(Work::Compaction, Duration::from_millis(1_500));
+        load.worked(Work::Compaction, Duration::from_millis(500));
+        load.worked(Work::Intake, Duration::from_millis(250));
+        let snapshot = load.snapshot();
+        assert_eq!(
+            snapshot.background,
+            vec![
+                ("intake", Duration::from_millis(250)),
+                ("compaction", Duration::from_secs(2)),
+                ("collection", Duration::ZERO),
+                ("other", Duration::ZERO),
+            ]
+        );
+        let text = snapshot.prometheus_text();
+        assert!(
+            text.contains("# TYPE tessera_background_seconds_total counter\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tessera_background_seconds_total{work=\"compaction\"} 2.000\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("tessera_background_seconds_total{work=\"collection\"} 0.000\n"),
+            "a kind that took nothing is reported too: {text}"
         );
     }
 
