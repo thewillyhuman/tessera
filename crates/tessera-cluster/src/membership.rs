@@ -15,7 +15,7 @@
 use std::collections::BTreeSet;
 use std::sync::RwLock;
 
-use tessera_types::{Env, NodeId, stable_hash};
+use tessera_types::{Env, NodeId, TenantId, stable_hash};
 
 use crate::registry::NodeRecord;
 use crate::role::Role;
@@ -122,6 +122,18 @@ impl Membership {
         self.live(role).into_iter().map(|r| r.node).collect()
     }
 
+    /// The tenants the live nodes say they began to write to
+    /// ([`crate::Woken`]).
+    #[must_use]
+    pub fn woken(&self) -> BTreeSet<TenantId> {
+        let now = self.env.clock.now();
+        self.records()
+            .into_iter()
+            .filter(|r| r.node == self.env.node || r.is_live_at(now))
+            .flat_map(|r| r.woken)
+            .collect()
+    }
+
     /// Whether `node` is live in any role.
     #[must_use]
     pub fn is_live(&self, node: NodeId) -> bool {
@@ -186,6 +198,7 @@ mod tests {
             http: format!("http://n{seed}"),
             started_at: Timestamp::from_nanos(0),
             heartbeat_at: Timestamp::from_nanos(heartbeat),
+            woken: Vec::new(),
         }
     }
 
@@ -221,6 +234,29 @@ mod tests {
             view.live(Role::Query).len(),
             1,
             "node 2 aged out; oneself stays"
+        );
+    }
+
+    #[test]
+    fn the_tenants_live_nodes_began_to_write_to_are_known() {
+        let clock = Arc::new(ManualClock::new(Timestamp::from_nanos(20_000_000_000)));
+        let tenant = |name: &str| TenantId::new(name).unwrap();
+        let naming = |seed: u64, heartbeat: i64, names: &[&str]| NodeRecord {
+            woken: names.iter().map(|name| tenant(name)).collect(),
+            ..record(seed, &[Role::Ingest], heartbeat)
+        };
+        let own = naming(1, 0, &["own"]);
+        let view = membership(own.clone(), Arc::clone(&clock));
+        view.replace(vec![
+            own,
+            naming(2, 19_000_000_000, &["acme", "globex"]),
+            naming(3, 1_000_000_000, &["stale"]),
+            naming(4, 20_000_000_000, &["acme"]),
+        ]);
+        assert_eq!(
+            view.woken(),
+            BTreeSet::from([tenant("acme"), tenant("globex"), tenant("own")]),
+            "what a node that is gone said is not heard"
         );
     }
 
@@ -281,6 +317,7 @@ mod tests {
             http: format!("http://node-{node}"),
             started_at: Timestamp::from_nanos(0),
             heartbeat_at: Timestamp::from_nanos(seconds * 1_000_000_000),
+            woken: Vec::new(),
         };
         let view = Membership::new(env, at(1, 1_000));
         view.merge(vec![at(2, 999), at(1, 0)]);

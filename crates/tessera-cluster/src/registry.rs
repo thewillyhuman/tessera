@@ -13,9 +13,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tessera_object::{Key, ObjectError, ObjectStore, layout};
-use tessera_types::{Env, NodeId, Timestamp};
+use tessera_types::{Env, NodeId, TenantId, Timestamp};
 
 use crate::role::Role;
+use crate::woken::Woken;
 
 /// The format of registry entries (OP-7).
 pub const FORMAT: u32 = 1;
@@ -54,6 +55,10 @@ pub struct NodeRecord {
     /// the field read the first.
     #[serde(default = "reads_through_before_the_field")]
     pub reads_through: u32,
+    /// The tenants the node began to write to within the last minute
+    /// ([`Woken`]): the nodes that compact go over them at once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub woken: Vec<TenantId>,
 }
 
 /// The live record with the oldest reader (OP-7): a node must not write
@@ -106,6 +111,7 @@ pub struct Registry {
     roles: BTreeSet<Role>,
     http: String,
     started_at: Timestamp,
+    woken: Arc<Woken>,
 }
 
 impl Registry {
@@ -119,7 +125,16 @@ impl Registry {
             roles,
             http,
             started_at,
+            woken: Arc::default(),
         }
+    }
+
+    /// This registry naming in the node's record the tenants `woken`
+    /// holds: those the node's writers began to write to.
+    #[must_use]
+    pub fn telling(mut self, woken: Arc<Woken>) -> Self {
+        self.woken = woken;
+        self
     }
 
     /// This node's record at `now`.
@@ -133,6 +148,7 @@ impl Registry {
             started_at: self.started_at,
             heartbeat_at: now,
             reads_through: READS_THROUGH,
+            woken: self.woken.lately(now),
         }
     }
 
@@ -215,6 +231,7 @@ mod tests {
             started_at: Timestamp::from_nanos(0),
             heartbeat_at: Timestamp::from_nanos(heartbeat),
             reads_through,
+            woken: Vec::new(),
         };
         let now = Timestamp::from_nanos(100_000_000_000);
         let records = [
@@ -233,6 +250,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.reads_through, 1, "a record from before the field");
+        assert!(old.woken.is_empty(), "nor does it name a tenant");
     }
 
     use tessera_object::MemoryStore;
@@ -277,6 +295,27 @@ mod tests {
             Timestamp::from_nanos(1_000_000_000)
         );
         assert_eq!(records[1].format, FORMAT);
+
+        // A node names the tenants it began to write to, for a while.
+        let woken = Arc::new(Woken::default());
+        let acme = TenantId::new("acme").unwrap();
+        let c = Registry::new(
+            Arc::clone(&store),
+            env(3, Arc::clone(&clock)),
+            BTreeSet::from([Role::Ingest]),
+            "http://c".into(),
+        )
+        .telling(Arc::clone(&woken));
+        assert!(c.announce().await.unwrap().woken.is_empty());
+        woken.note(&acme, clock.now());
+        assert_eq!(
+            c.announce().await.unwrap().woken,
+            std::slice::from_ref(&acme)
+        );
+        let listed = c.list().await.unwrap();
+        let named: Vec<&TenantId> = listed.iter().flat_map(|r| &r.woken).collect();
+        assert_eq!(named, [&acme]);
+        c.withdraw().await.unwrap();
 
         clock.advance(TIMEOUT);
         let now = clock.now();

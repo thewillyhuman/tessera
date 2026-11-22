@@ -154,7 +154,13 @@ pub struct Ingester {
     log_started: Timestamp,
     in_doubt: Option<Doubt>,
     stopped: bool,
+    told: Option<OnRegister>,
 }
+
+/// What an ingester calls with the tenant of each dataset it registers
+/// its writer with, once the registration is stored: the first time
+/// its log is to hold rows of the dataset.
+pub type OnRegister = Arc<dyn Fn(&TenantId) + Send + Sync>;
 
 impl Ingester {
     /// Starts an ingester with a fresh writer log, storing files in `pool`.
@@ -189,7 +195,17 @@ impl Ingester {
             log_started,
             in_doubt: None,
             stopped: false,
+            told: None,
         }
+    }
+
+    /// This ingester calling `told` for each dataset it registers its
+    /// writer with: whoever leaves an idle tenant alone hears that it
+    /// is written to again.
+    #[must_use]
+    pub fn on_register(mut self, told: OnRegister) -> Self {
+        self.told = Some(told);
+        self
     }
 
     /// This ingester's writer id.
@@ -443,6 +459,9 @@ impl Ingester {
                 self.log.writer_id(),
             )
             .await?;
+            if let Some(told) = &self.told {
+                told(&key.0);
+            }
             self.registered.insert(key);
         }
         Ok(())
@@ -673,6 +692,31 @@ mod tests {
             "registered before the first acknowledgement"
         );
         assert_eq!(h.view_ids("prod").await, [0, 1]);
+    }
+
+    /// CT-6: whoever leaves an idle tenant alone is told when a writer
+    /// registers with one of its datasets, once per dataset and log.
+    #[tokio::test]
+    async fn the_tenant_of_a_dataset_the_writer_registers_with_is_told() {
+        let h = Harness::new();
+        let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = Arc::clone(&told);
+        let mut ingester = h
+            .ingester(config())
+            .on_register(Arc::new(move |tenant: &TenantId| {
+                heard.lock().unwrap().push(tenant.clone());
+            }));
+        for dataset in ["prod", "prod", "test"] {
+            let ack = ingester.write(batch(dataset, 0..1)).await;
+            h.clock.advance(Duration::from_millis(250));
+            ingester.tick().await;
+            ack.wait().await.unwrap();
+        }
+        assert_eq!(
+            *told.lock().unwrap(),
+            [TenantId::DEFAULT, TenantId::DEFAULT],
+            "once for each of the two datasets"
+        );
     }
 
     /// SE-2: on a cluster, a tenant created with a key had its first

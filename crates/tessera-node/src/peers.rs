@@ -52,6 +52,7 @@ mod tests {
         NodeRecord {
             format: registry::FORMAT,
             reads_through: registry::READS_THROUGH,
+            woken: Vec::new(),
             node,
             roles: BTreeSet::from([role]),
             http: format!("http://{node}"),

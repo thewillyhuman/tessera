@@ -606,6 +606,7 @@ async fn a_node_refuses_to_start_beside_one_that_cannot_read_its_format() {
         started_at: Timestamp::from_system_time(std::time::SystemTime::now()),
         heartbeat_at: Timestamp::from_system_time(std::time::SystemTime::now()),
         reads_through: 0,
+        woken: Vec::new(),
     };
     store
         .put(

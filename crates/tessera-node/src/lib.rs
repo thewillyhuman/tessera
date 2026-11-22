@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use tessera_catalog::{Catalog, ControlStores, PoolConfig};
 use tessera_cluster::{
-    Admission, Ledger, Limits, Load, Membership, NodeRecord, Registry, Role, registry,
+    Admission, Ledger, Limits, Load, Membership, NodeRecord, Registry, Role, Woken, registry,
 };
 use tessera_commit::LeaseManager;
 use tessera_eval::HttpNotifier;
@@ -294,7 +294,8 @@ impl Node {
                 .with_keys(Arc::clone(&env.keys)),
         );
         let pools = Arc::new(Pools::new(pool.clone(), Arc::clone(&store)));
-        let ingesters = ingesters(&store, &env, config.ingest, &pool, &format);
+        let woken = Arc::new(Woken::default());
+        let ingesters = ingesters(&store, &env, config.ingest, &pool, &format, &woken);
         let (ingest, ingest_tasks) = tessera_ingest::spawn_all(ingesters, INGEST_TICK);
 
         let listener = bind(config.listen).await?;
@@ -316,16 +317,15 @@ impl Node {
             dns: config.seed_dns.clone(),
             scheme,
         };
-        let (registry, membership) = join(
-            &store,
-            &env,
+        let registry = Registry::new(
+            Arc::clone(&store),
+            env.clone(),
             config.roles.clone(),
             advertise,
-            &mut loops,
-            config.heartbeat,
-            gossip,
         )
-        .await?;
+        .telling(woken);
+        let (registry, membership) =
+            join(registry, &env, &mut loops, config.heartbeat, gossip).await?;
         let shared = Shared {
             store,
             env,
@@ -496,9 +496,13 @@ fn ingesters(
     config: IngestConfig,
     pool: &PoolId,
     format: &Arc<dyn FileFormat>,
+    woken: &Arc<Woken>,
 ) -> Vec<Ingester> {
     let ingesters: Vec<Ingester> = (0..config.writers.max(1))
         .map(|_| {
+            // The tenant of a dataset a writer registers with is one
+            // the node begins to write to: its heartbeats say so.
+            let (woken, clock) = (Arc::clone(woken), Arc::clone(&env.clock));
             Ingester::start(
                 Arc::clone(store),
                 env.clone(),
@@ -506,6 +510,7 @@ fn ingesters(
                 pool.clone(),
                 Arc::clone(format),
             )
+            .on_register(Arc::new(move |tenant| woken.note(tenant, clock.now())))
         })
         .collect();
     for ingester in &ingesters {
@@ -879,23 +884,16 @@ fn engine(
     )
 }
 
-/// Announces the node under `roles` and `advertise`, and keeps the
+/// Announces the node as `registry` describes it, and keeps the
 /// registry and the membership view fresh from a heartbeat loop.
 async fn join(
-    store: &Arc<dyn ObjectStore>,
+    registry: Registry,
     env: &Env,
-    roles: BTreeSet<Role>,
-    advertise: String,
     loops: &mut Vec<JoinHandle<()>>,
     heartbeat: Duration,
     gossip: heartbeat::Gossip,
 ) -> Result<(Arc<Registry>, Arc<Membership>), RunError> {
-    let registry = Arc::new(Registry::new(
-        Arc::clone(store),
-        env.clone(),
-        roles.clone(),
-        advertise.clone(),
-    ));
+    let registry = Arc::new(registry);
     let own = registry.announce().await?;
     let now = env.clock.now();
     let others: Vec<NodeRecord> = registry
@@ -914,7 +912,7 @@ async fn join(
             reads_through: reader.reads_through,
         });
     }
-    tracing::info!(?roles, %advertise, "joined the cluster");
+    tracing::info!(roles = ?own.roles, advertise = %own.http, "joined the cluster");
     let membership = Arc::new(Membership::new(env.clone(), own));
     loops.push(tokio::spawn(heartbeat::run(
         Arc::clone(&registry),

@@ -352,6 +352,7 @@ mod tests {
         NodeRecord {
             format: registry::FORMAT,
             reads_through: registry::READS_THROUGH,
+            woken: Vec::new(),
             node: state.env.node,
             roles: roles.iter().copied().collect::<BTreeSet<_>>(),
             http: http.to_owned(),
