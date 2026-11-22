@@ -665,6 +665,33 @@ impl std::fmt::Debug for Manifest {
 /// partitions are looked for.
 const LISTINGS_AT_ONCE: usize = 16;
 
+/// The datasets of a tenant, in name order: every one it has anything
+/// of, whether a writer is registered with it or not. What a dataset
+/// holds is compacted, retired and collected long after its last
+/// writer ended, and every writer ends when its node is replaced.
+/// Found from the names under the tenant's prefix, in one listing;
+/// what is not a dataset's name there is the tenant's own, its control
+/// store and its rule state.
+///
+/// # Errors
+///
+/// If the store cannot be listed.
+pub async fn list_datasets(
+    store: &dyn ObjectStore,
+    tenant: &TenantId,
+) -> Result<Vec<DatasetName>, ManifestError> {
+    let prefix = tessera_object::Key::new(tenant.as_str())
+        .unwrap_or_else(|e| unreachable!("a tenant id is a valid key: {e}"));
+    let mut datasets: Vec<DatasetName> = store
+        .list_names(&prefix)
+        .await?
+        .into_iter()
+        .filter_map(|name| DatasetName::new(name).ok())
+        .collect();
+    datasets.sort();
+    Ok(datasets)
+}
+
 /// The kinds a dataset has anything stored of, in the order of
 /// [`Kind::ALL`]: one listing, so that a caller going through the kinds
 /// asks about the partitions of those only.
@@ -953,6 +980,36 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// A dataset's files outlive its writers: the datasets of a tenant
+    /// are those it has anything of, found in one listing, and not
+    /// only those being written to.
+    #[tokio::test]
+    async fn the_datasets_of_a_tenant_are_listed_with_or_without_writers() {
+        let store = MemoryStore::new();
+        let writer = WriterId::from_u128(1);
+        // Files adopted in `prod`, whose writer has since left, and a
+        // writer registered with `staging`, which holds nothing yet.
+        let manifest = Manifest::open(Arc::new(store.clone()), partition(0), env(1));
+        let files = [file(1, &partition(0), writer, 1)];
+        manifest.adopt(writer, Seq::new(1), &files).await.unwrap();
+        let staging = DatasetName::new("staging").unwrap();
+        crate::registry::register(&store, &env(1), &TenantId::DEFAULT, &staging, writer)
+            .await
+            .unwrap();
+        // The tenant's own objects are not datasets.
+        let own = tessera_object::Key::new("default/_control/_log/1").unwrap();
+        store
+            .put(&own, bytes::Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+
+        let shallow = tessera_object::ShallowStore(store);
+        let found = list_datasets(&shallow, &TenantId::DEFAULT).await.unwrap();
+        assert_eq!(found, [DatasetName::new("prod").unwrap(), staging]);
+        let nobody = TenantId::new("nobody").unwrap();
+        assert!(list_datasets(&shallow, &nobody).await.unwrap().is_empty());
     }
 
     /// A query finds its partitions on every run: what that costs must

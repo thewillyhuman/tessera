@@ -23,7 +23,8 @@ pub use dataset::{
     Tombstone,
 };
 pub use manifest::{
-    Manifest, ManifestError, ManifestState, Partial, list_kinds, list_partitions, list_windows,
+    Manifest, ManifestError, ManifestState, Partial, list_datasets, list_kinds, list_partitions,
+    list_windows,
 };
 pub use manifests::Manifests;
 pub use registry::Registration;

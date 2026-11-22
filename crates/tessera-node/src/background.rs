@@ -31,7 +31,7 @@ use tessera_format::FileFormat;
 use tessera_iceberg::{Exporter, Outcome as Export};
 use tessera_manifest::{
     DatasetLog, DatasetLogs, DatasetState, Manifest, ManifestState, Manifests, Registration,
-    intake, list_kinds, list_partitions, registry,
+    intake, list_datasets, list_kinds, list_partitions, registry,
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
@@ -463,7 +463,7 @@ fn is_due(last: Option<Timestamp>, now: Timestamp, every: Duration) -> bool {
 async fn export_round(background: &Background, exporter: &Exporter, tenants: &[TenantId]) -> usize {
     let mut tables = 0;
     for tenant in tenants {
-        let datasets = match registry::datasets(&*background.store, tenant).await {
+        let datasets = match list_datasets(&*background.store, tenant).await {
             Ok(datasets) => datasets,
             Err(error) => {
                 tracing::warn!(%tenant, error = %error, "listing datasets for export failed");
@@ -521,7 +521,10 @@ async fn round(
 ) -> Result<Backlog, Failure> {
     let mut backlog = Backlog::default();
     found.clear();
-    for dataset in registry::datasets(&*background.store, tenant).await? {
+    // Every dataset the tenant has anything of, with a writer or not:
+    // what a dataset holds is compacted, retired and collected after
+    // its writers ended, as all do when their nodes are replaced.
+    for dataset in list_datasets(&*background.store, tenant).await? {
         // A dataset's failure is its own: the tenant's other datasets
         // still get their round, and this one its next.
         match dataset_round(background, compactor, tenant, &dataset, held, cursors).await {

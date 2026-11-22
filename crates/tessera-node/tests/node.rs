@@ -555,6 +555,104 @@ async fn a_tenant_at_rest_is_gone_over_once_it_is_written_to() {
     node.stop().await;
 }
 
+/// What a dataset holds is compacted whether or not anyone writes to
+/// it. Every writer ends when its node is replaced, and what the
+/// nodes of a cluster had flushed and not yet merged when they were
+/// upgraded stayed as it was, unindexed, until someone wrote to the
+/// dataset again: the rounds went over the datasets with a writer
+/// registered and no others.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_dataset_holds_is_compacted_after_its_writers_ended() {
+    use std::sync::Arc;
+
+    use tessera_manifest::{Manifest, intake, list_partitions, registry};
+    use tessera_types::{EventBatch, Level, LogRow, PoolId, Seq, Window};
+    use tessera_wal::{EntryBody, FlushTarget, WriterLog, write_l1_files};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn tessera_object::ObjectStore> =
+        Arc::new(LocalStore::open(dir.path()).await.unwrap());
+    let env = Env::system();
+    let dataset = DatasetName::new("left").unwrap();
+    // A writer that flushed four files, which were adopted, and ended:
+    // nothing is registered with the dataset any more.
+    let mut log = WriterLog::start(Arc::clone(&store), env.clone());
+    let writer = log.writer_id();
+    registry::register(&*store, &env, &TenantId::DEFAULT, &dataset, writer)
+        .await
+        .unwrap();
+    let target = FlushTarget {
+        store: Arc::clone(&store),
+        pool: PoolId::new("root").unwrap(),
+        format: Arc::new(tessera_format::ParquetFormat::default()),
+    };
+    let mut after = Seq::ZERO;
+    for line in 0..4u8 {
+        let row = LogRow {
+            timestamp: env.clock.now(),
+            event_id: [line; 16],
+            body: Some(format!("line {line}")),
+            ..LogRow::default()
+        };
+        let rows = EventBatch::from_logs(TenantId::DEFAULT, dataset.clone(), &[row]).unwrap();
+        let through = log
+            .append_segment(std::slice::from_ref(&rows))
+            .await
+            .unwrap();
+        let windows = Window::DEFAULT_LENGTH;
+        let files = write_l1_files(&target, &env, writer, after, through, windows, vec![rows])
+            .await
+            .unwrap();
+        let flush = EntryBody::Flush {
+            tenant: TenantId::DEFAULT,
+            dataset: dataset.clone(),
+            after,
+            through,
+            files,
+        };
+        log.append(flush).await.unwrap();
+        after = through;
+    }
+    log.end().await.unwrap();
+    let adopted = intake::run(
+        Arc::clone(&store),
+        &env,
+        &TenantId::DEFAULT,
+        &dataset,
+        writer,
+    )
+    .await
+    .unwrap();
+    assert!(adopted.removed, "the writer left the registry: {adopted:?}");
+
+    let mut config = config(dir.path());
+    config.background = Duration::from_millis(100);
+    let node = Node::start(config, Env::system()).await.unwrap();
+    let levels = async || {
+        let partitions = list_partitions(&*store, &TenantId::DEFAULT, &dataset, Kind::Log)
+            .await
+            .unwrap();
+        let mut levels = Vec::new();
+        for partition in partitions {
+            let manifest = Manifest::open(Arc::clone(&store), partition, env.clone());
+            let snapshot = manifest.snapshot().await.unwrap();
+            levels.extend(snapshot.state().files().map(|file| file.level));
+        }
+        levels
+    };
+    assert_eq!(levels().await, [Level::L1; 4]);
+    let mut merged = false;
+    for _ in 0..300 {
+        merged = levels().await == [Level::L2];
+        if merged {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(merged, "the four files became one: {:?}", levels().await);
+    node.stop().await;
+}
+
 /// Checks what the tenant `id` left under `root`: sealed blocks in the
 /// writer logs, encrypted files, sealed indexes, and everything else
 /// under its prefix sealed whole.

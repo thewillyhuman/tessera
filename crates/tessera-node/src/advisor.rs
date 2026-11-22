@@ -23,7 +23,7 @@ use tessera_eval::rule::decode_rows;
 use tessera_eval::{Origin, Rollup};
 use tessera_exec::{Engine, Response, query};
 use tessera_ir::{BindContext, RollupDefinition};
-use tessera_manifest::{DatasetLogs, Manifests, list_partitions, registry};
+use tessera_manifest::{DatasetLogs, Manifests, list_datasets, list_partitions};
 use tessera_object::ObjectStore;
 use tessera_sql::SqlFrontend;
 use tessera_types::event::Scalar;
@@ -94,7 +94,7 @@ async fn round(advisor: &Advisor, manifests: &Manifests, tenant: &TenantId) -> R
     {
         propose_rollups(advisor, tenant).await?;
     }
-    for dataset in registry::datasets(&*advisor.store, tenant).await? {
+    for dataset in list_datasets(&*advisor.store, tenant).await? {
         for kind in Kind::ALL {
             let key = format!("{tenant}/{dataset}/{kind}");
             if !advisor.owned.owns(WorkKind::Partition, key.as_bytes()) {
