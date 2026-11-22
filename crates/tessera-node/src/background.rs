@@ -781,10 +781,11 @@ fn is_beside(window: Window, other: Window) -> bool {
 }
 
 /// The traces a policy that spares errors is to keep whole in the span
-/// partition `partition` though its own rows do not say so (CO-7):
-/// those with an error span in the partitions beside it, of `spans`,
-/// and those an alert event beside it names. A trace longer than a
-/// window that fails further away is not found.
+/// partition `partition` though the rows being sampled may not say so
+/// (CO-7): those with an error span in the partition, which a job
+/// may sample a part of at a time, or in the partitions beside it, of
+/// `spans`, and those an alert event there names. A trace longer than
+/// a window that fails further away is not found.
 async fn spared_beside(
     background: &Background,
     partition: &PartitionId,
@@ -796,7 +797,7 @@ async fn spared_beside(
     let beside = |others: &[PartitionId]| -> Vec<PartitionId> {
         others
             .iter()
-            .filter(|other| *other != partition && is_beside(partition.window, other.window))
+            .filter(|other| is_beside(partition.window, other.window))
             .cloned()
             .collect()
     };
