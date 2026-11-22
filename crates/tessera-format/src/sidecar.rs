@@ -21,14 +21,14 @@
 //! columns followed by `(u16 length, name, u8 hashes, u32 words, u64
 //! words...)` entries.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, StringArray};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tessera_types::{Keys, NamedKey, stable_hash};
 
 use crate::FormatError;
-use crate::text::{tokenize, trigrams};
+use crate::text::{tokenize, tokens_into, trigrams, trigrams_into};
 
 const MAGIC: &[u8; 4] = b"TSC1";
 /// The magic of a sidecar sealed under a tenant key (SE-2): the key's
@@ -189,13 +189,17 @@ impl Sidecar {
         for name in &spec.term {
             let mut postings: BTreeMap<String, RowGroups> = BTreeMap::new();
             for rg in 0..row_groups {
+                // The row group's tokens once, whatever the rows that
+                // repeat them.
+                let mut tokens = HashSet::new();
                 for text in strings(column(name, rg).as_ref(), name)? {
-                    for token in tokenize(text) {
-                        postings
-                            .entry(token)
-                            .or_insert_with(|| RowGroups::with_capacity(row_groups))
-                            .set(rg);
-                    }
+                    tokens_into(text, &mut tokens);
+                }
+                for token in tokens {
+                    postings
+                        .entry(token)
+                        .or_insert_with(|| RowGroups::with_capacity(row_groups))
+                        .set(rg);
                 }
             }
             sidecar.terms.insert(name.clone(), postings);
@@ -203,13 +207,15 @@ impl Sidecar {
         for name in &spec.trigram {
             let mut postings: BTreeMap<String, RowGroups> = BTreeMap::new();
             for rg in 0..row_groups {
+                let mut found = HashSet::new();
                 for text in strings(column(name, rg).as_ref(), name)? {
-                    for trigram in trigrams(text) {
-                        postings
-                            .entry(trigram)
-                            .or_insert_with(|| RowGroups::with_capacity(row_groups))
-                            .set(rg);
-                    }
+                    trigrams_into(text, &mut found);
+                }
+                for trigram in found {
+                    postings
+                        .entry(trigram)
+                        .or_insert_with(|| RowGroups::with_capacity(row_groups))
+                        .set(rg);
                 }
             }
             sidecar.trigrams.insert(name.clone(), postings);
