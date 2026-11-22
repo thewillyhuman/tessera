@@ -38,7 +38,7 @@ use tessera_types::event::{OBSERVED_TIMESTAMP, SAMPLE_RATE, TIMESTAMP};
 use tessera_types::{
     DatasetName, EventBatch, Keys, Kind, Seq, TenantId, TimeRange, Timestamp, WriterId,
 };
-use tessera_wal::{Entry, EntryBody, WalError, reader};
+use tessera_wal::{BlockMeta, EntryBody, WalError, reader};
 
 use crate::lifecycle::{Observation, fingerprint};
 use crate::rule::{AlertRule, Language};
@@ -761,15 +761,24 @@ async fn read_entry(
         rules,
         state,
     } = *reading;
-    let mut entry = match reader::read(&**source.store, writer, seq).await {
+    // Of a segment, the blocks the rules read: a log holds the rows
+    // of every dataset its writer took, and the others stay in the
+    // store.
+    let read_by_a_rule = |block: &BlockMeta| {
+        block.tenant == *source.tenant
+            && rules
+                .iter()
+                .any(|f| f.shape.dataset == block.dataset && f.shape.kind == block.kind)
+    };
+    let store = &**source.store;
+    let entry = match reader::blocks(store, writer, seq, source.keys, &read_by_a_rule).await {
         Ok(entry) => entry,
         Err(WalError::Store(ObjectError::NotFound { .. })) => return Ok(false),
         Err(error) => return Err(error.to_string()),
     };
-    entry.unlock(source.keys).map_err(|e| e.to_string())?;
     let name = writer.to_string();
     ingested.positions.insert(name.clone(), seq);
-    let blocks = match entry.body() {
+    let blocks = match &entry.header.body {
         EntryBody::Segment { blocks } => blocks,
         EntryBody::End => {
             ingested.ended.insert(name);
@@ -783,43 +792,27 @@ async fn read_entry(
         let seen = ingested.watermarks.entry(name).or_insert(newest);
         *seen = (*seen).max(newest);
     }
-    fold_entry(&entry, source.tenant, rules, state, ingested)?;
+    fold_entry(&entry.rows, rules, state, ingested);
     Ok(true)
 }
 
-/// Folds the blocks `entry` holds for each of `rules` into the
-/// windows, the blocks of a dataset and kind decoded once for the
-/// rules that read them (CQ-2).
-///
-/// # Errors
-///
-/// If a block is corrupt.
+/// Folds `rows`, the blocks an entry holds of the tenant, into the
+/// windows of each of `rules`: a block is read once for the rules of
+/// its dataset and kind (CQ-2).
 pub(crate) fn fold_entry(
-    entry: &Entry,
-    tenant: &TenantId,
+    rows: &[EventBatch],
     rules: &[Folding<'_>],
     state: &EvalState,
     ingested: &mut Ingested,
-) -> Result<(), String> {
-    let mut decoded: Vec<(&DatasetName, Kind, Vec<EventBatch>)> = Vec::new();
+) {
     for folding in rules {
-        let (dataset, kind) = (&folding.shape.dataset, folding.shape.kind);
-        let found = decoded
+        let shape = folding.shape;
+        let read = rows
             .iter()
-            .position(|(d, k, _)| *d == dataset && *k == kind);
-        let at = if let Some(at) = found {
-            at
-        } else {
-            let blocks = entry
-                .blocks_for(tenant, dataset, kind)
-                .map_err(|e| e.to_string())?;
-            decoded.push((dataset, kind, blocks));
-            decoded.len() - 1
-        };
-        let rows = decoded[at].2.iter().map(EventBatch::rows);
-        fold_rule(folding, folding.horizon, state, ingested, rows);
+            .filter(|block| *block.dataset() == shape.dataset && block.kind() == shape.kind)
+            .map(EventBatch::rows);
+        fold_rule(folding, folding.horizon, state, ingested, read);
     }
-    Ok(())
 }
 
 /// Folds `rows` into the windows of one rule, rows before `horizon`

@@ -31,7 +31,8 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use tessera_object::{Key, ObjectError, ObjectStore, layout};
 use tessera_types::{Keys, Seq, TenantId, Timestamp, WriterId};
-use tessera_wal::{Entry, EntryBody, WalError, reader};
+use tessera_wal::reader::Blocks;
+use tessera_wal::{BlockMeta, EntryBody, WalError, reader};
 
 use crate::incremental::{self, Folding, Ingested, Shape, WindowState};
 use crate::partition::window_partition;
@@ -155,18 +156,27 @@ impl SourceTask<'_> {
             .filter(|newest| first.is_some_and(|first| *newest >= first))
             .unwrap_or(held);
         let new: Vec<Seq> = log.into_iter().filter(|seq| *seq > resume).collect();
+        // Of a segment, the blocks the rules read: the rows of the
+        // other datasets its writer took stay in the store.
+        let read_by_a_rule = |block: &BlockMeta| {
+            block.tenant == *self.tenant
+                && self
+                    .rules
+                    .iter()
+                    .any(|(_, shape)| shape.dataset == block.dataset && shape.kind == block.kind)
+        };
         for chunk in new.chunks(ENTRIES_PER_OBJECT) {
             let mut each: Vec<Vec<Partials>> = vec![Vec::new(); self.parts as usize];
             for seq in chunk {
                 // An entry collected between the listing and the read
                 // ends the run; the next one finds the log trimmed.
-                let mut entry = match reader::read(store, writer, *seq).await {
+                let read = reader::blocks(store, writer, *seq, self.keys, &read_by_a_rule);
+                let entry = match read.await {
                     Ok(entry) => entry,
                     Err(WalError::Store(ObjectError::NotFound { .. })) => break,
                     Err(error) => return Err(error.to_string()),
                 };
-                entry.unlock(self.keys).map_err(|e| e.to_string())?;
-                for (entries, partials) in each.iter_mut().zip(self.fold(&entry)?) {
+                for (entries, partials) in each.iter_mut().zip(self.fold(&entry)) {
                     entries.push(partials);
                 }
             }
@@ -191,16 +201,16 @@ impl SourceTask<'_> {
     }
 
     /// What `entry` holds for each partition, in partition order.
-    fn fold(&self, entry: &Entry) -> Result<Vec<Partials>, String> {
+    fn fold(&self, entry: &Blocks) -> Vec<Partials> {
         let mut each: Vec<Partials> = (0..self.parts)
             .map(|_| Partials {
-                seq: entry.seq(),
+                seq: entry.header.seq,
                 max_observed: None,
                 ended: false,
                 windows: Vec::new(),
             })
             .collect();
-        match entry.body() {
+        match &entry.header.body {
             EntryBody::Segment { blocks } => {
                 let newest = blocks.iter().map(|b| b.max_observed).max();
                 for partials in &mut each {
@@ -218,15 +228,9 @@ impl SourceTask<'_> {
                     })
                     .collect();
                 let mut folded = Ingested::default();
-                incremental::fold_entry(
-                    entry,
-                    self.tenant,
-                    &rules,
-                    &EvalState::default(),
-                    &mut folded,
-                )?;
+                incremental::fold_entry(&entry.rows, &rules, &EvalState::default(), &mut folded);
                 for (rule, error) in &folded.failed {
-                    tracing::warn!(tenant = %self.tenant, group = %self.group, %rule, seq = %entry.seq(), error = %error, "rule not folded over a log entry; its partials leave the entry out");
+                    tracing::warn!(tenant = %self.tenant, group = %self.group, %rule, seq = %entry.header.seq, error = %error, "rule not folded over a log entry; its partials leave the entry out");
                 }
                 for window in folded.windows.into_values() {
                     let rule = self.rules.iter().find(|(rule, _)| rule.name == window.rule);
@@ -245,7 +249,7 @@ impl SourceTask<'_> {
             }
             EntryBody::Flush { .. } | EntryBody::SealedFlush { .. } | EntryBody::Seal { .. } => {}
         }
-        Ok(each)
+        each
     }
 
     /// Removes the objects of `writer` whose entries are all before

@@ -589,6 +589,8 @@ struct WatchedLog {
     listed: AtomicUsize,
     landing: Mutex<Option<(Key, Bytes)>>,
     fetched: Mutex<Vec<String>>,
+    /// The entries that were read whole, among those fetched.
+    whole: Mutex<Vec<String>>,
 }
 
 impl WatchedLog {
@@ -599,6 +601,7 @@ impl WatchedLog {
             listed: AtomicUsize::new(0),
             landing: Mutex::new(landing),
             fetched: Mutex::new(Vec::new()),
+            whole: Mutex::new(Vec::new()),
         })
     }
 }
@@ -608,12 +611,20 @@ impl ObjectStore for WatchedLog {
     async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
         if key.is_under(&self.log) {
             self.fetched.lock().unwrap().push(key.name().to_owned());
+            self.whole.lock().unwrap().push(key.name().to_owned());
         }
         self.inner.get(key).await
     }
 
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
         self.inner.get_range(key, range).await
+    }
+
+    async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+        if key.is_under(&self.log) {
+            self.fetched.lock().unwrap().push(key.name().to_owned());
+        }
+        self.inner.get_tail(key, length).await
     }
 
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
@@ -712,6 +723,50 @@ async fn a_group_fetches_each_entry_once_for_all_its_rules() {
 
     group.evaluate(&fx.engine, at(1_005)).await.unwrap();
     assert_eq!(*store.fetched.lock().unwrap(), [seq.to_string()]);
+    let both = BTreeMap::from([("first".to_owned(), 3), ("second".to_owned(), 3)]);
+    assert_eq!(counted(&fx).await, both);
+}
+
+/// A writer's log holds the rows of every dataset it took. A group
+/// reads, of each segment, the blocks of the datasets its rules read:
+/// the rest of the segment stays in the store, however much it is.
+#[tokio::test]
+async fn a_group_reads_the_blocks_of_its_rules_and_not_the_segment() {
+    let mut fx = fixture().await;
+    // Lines of another dataset that no compression makes short, so
+    // that the segment is much longer than its header.
+    let mut random = tessera_types::SeededRandom::new(3);
+    let others: Vec<LogRow> = (0..4_000)
+        .map(|_| LogRow {
+            timestamp: at(1_000),
+            body: Some(format!(
+                "{:032x}{:032x}",
+                tessera_types::Random::next_u128(&mut random),
+                tessera_types::Random::next_u128(&mut random)
+            )),
+            ..LogRow::default()
+        })
+        .collect();
+    let other = EventBatch::from_logs(
+        TenantId::DEFAULT,
+        DatasetName::new("other").unwrap(),
+        &others,
+    )
+    .unwrap();
+    let seq = fx
+        .log
+        .append_segment(&[errors(at(1_000), 3, "checkout", 17), other])
+        .await
+        .unwrap();
+    let store = WatchedLog::of(&fx, None);
+    let group = two_counts(&fx, store.clone());
+
+    group.evaluate(&fx.engine, at(1_005)).await.unwrap();
+    assert_eq!(*store.fetched.lock().unwrap(), [seq.to_string()]);
+    assert!(
+        store.whole.lock().unwrap().is_empty(),
+        "the segment was not read whole"
+    );
     let both = BTreeMap::from([("first".to_owned(), 3), ("second".to_owned(), 3)]);
     assert_eq!(counted(&fx).await, both);
 }
