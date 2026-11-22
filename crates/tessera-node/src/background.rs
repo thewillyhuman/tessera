@@ -21,7 +21,8 @@ use tessera_catalog::{Catalog, ControlStores, Table, TenantSettingsSource};
 use tessera_cluster::{Load, Membership};
 use tessera_compact::gc::{DEFAULT_FILE_RETENTION, DEFAULT_SEGMENT_GRACE};
 use tessera_compact::{
-    Checkpoints, Compactor, Outcome, Policy, collect_files, collect_log, input_bytes, plan,
+    Checkpoints, Compactor, Outcome, Policy, Retain, Spared, collect_files, collect_log,
+    input_bytes, plan,
 };
 use tessera_eval::AlertRule;
 use tessera_eval::rule::decode_rows;
@@ -33,8 +34,8 @@ use tessera_manifest::{
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
-    DatasetName, Env, Held, Kind, Level, Meter, PartitionId, PoolId, RetentionPolicy, Seq,
-    TenantId, Timestamp, Windows, WorkKind, WriterId,
+    DatasetName, Env, FileMeta, Held, Kind, Level, Meter, PartitionId, PoolId, RetentionPolicy,
+    Seq, TenantId, Timestamp, Window, Windows, WorkKind, WriterId,
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
@@ -661,6 +662,7 @@ async fn compact_and_collect(
     let tombstones = settings.tombstones(kind)?;
     let mut partitions = list_partitions(&*background.store, tenant, dataset, kind).await?;
     partitions.sort_by_key(|p| std::cmp::Reverse(p.window.start()));
+    let every = partitions.clone();
     for partition in partitions {
         if !background
             .owned
@@ -713,6 +715,9 @@ async fn compact_and_collect(
         });
         if let Some(job) = job {
             changes += 1;
+            if let Some(retain) = retain.as_mut().filter(|r| spares(r, kind, job.level)) {
+                retain.spared = Arc::new(spared_beside(background, &partition, &every).await?);
+            }
             let outcome = compactor
                 .run(&manifest, &job, &record, retain.as_ref(), &tombstones)
                 .await?;
@@ -741,6 +746,63 @@ async fn compact_and_collect(
         changes,
         ..Backlog::default()
     })
+}
+
+/// Whether a job that writes at `level` samples the spans of a
+/// partition of `kind` sparing the traces with errors: the job for
+/// which the traces to spare are worth finding.
+fn spares(retain: &Retain, kind: Kind, level: Level) -> bool {
+    retain.except_errors && retain.sample.is_some() && kind == Kind::Span && level == Level::L3
+}
+
+/// Whether what is in `other` can belong with what is in `window`:
+/// the two overlap or lie within a window's length of each other. A
+/// trace that crosses the boundary of `window` has its other spans
+/// there, and so has an alert about it.
+fn is_beside(window: Window, other: Window) -> bool {
+    let reach = i64::try_from(window.length().as_nanos()).unwrap_or(i64::MAX);
+    let (start, end) = (window.start().as_nanos(), window.end().as_nanos());
+    other.start().as_nanos() < end.saturating_add(reach)
+        && other.end().as_nanos() > start.saturating_sub(reach)
+}
+
+/// The traces a policy that spares errors is to keep whole in the span
+/// partition `partition` though its own rows do not say so (CO-7):
+/// those with an error span in the partitions beside it, of `spans`,
+/// and those an alert event beside it names. A trace longer than a
+/// window that fails further away is not found.
+async fn spared_beside(
+    background: &Background,
+    partition: &PartitionId,
+    spans: &[PartitionId],
+) -> Result<Spared, Failure> {
+    let (tenant, dataset) = (&partition.tenant, &partition.dataset);
+    let alerts = list_partitions(&*background.store, tenant, dataset, Kind::Alert).await?;
+    let mut files: [Vec<FileMeta>; 2] = Default::default();
+    let beside = |others: &[PartitionId]| -> Vec<PartitionId> {
+        others
+            .iter()
+            .filter(|other| *other != partition && is_beside(partition.window, other.window))
+            .cloned()
+            .collect()
+    };
+    for (kind, others) in [beside(spans), beside(&alerts)].into_iter().enumerate() {
+        for other in others {
+            let snapshot = background.manifests.open(&other).snapshot().await?;
+            files[kind].extend(snapshot.state().files().cloned());
+        }
+    }
+    let spared = tessera_compact::spared::traces(
+        &background.pools,
+        &background.format,
+        &files[0],
+        &files[1],
+    )
+    .await?;
+    if !spared.is_empty() {
+        tracing::info!(%tenant, %dataset, window = %partition.window, traces = spared.len(), "traces spared from sampling");
+    }
+    Ok(spared)
 }
 
 /// What follows a compaction of `partition`: it is logged, and a
@@ -1105,6 +1167,46 @@ mod tests {
         // One that has rules, or was never read, is read every look.
         ruleless.looks = 7;
         assert!(!ruleless.skips(&globex));
+    }
+
+    /// CO-7: the traces to spare are looked for in the windows a trace
+    /// of this one can reach into, and for a job that samples spans
+    /// sparing errors only.
+    #[test]
+    fn traces_to_spare_are_looked_for_in_the_windows_beside() {
+        let hour = |n: i64| {
+            Window::containing(
+                Timestamp::from_nanos(n * 3_600_000_000_000),
+                Duration::from_secs(3_600),
+            )
+            .unwrap()
+        };
+        let noon = hour(12);
+        assert!(is_beside(noon, hour(11)) && is_beside(noon, hour(13)));
+        assert!(is_beside(noon, noon), "an alert of the same hour");
+        assert!(!is_beside(noon, hour(10)) && !is_beside(noon, hour(14)));
+        // A day of alerts holds the hour.
+        let day = Window::containing(noon.start(), Duration::from_secs(86_400)).unwrap();
+        assert!(is_beside(noon, day));
+
+        let sampling = Retain {
+            sample: Some(0.1),
+            except_errors: true,
+            ..Retain::default()
+        };
+        assert!(spares(&sampling, Kind::Span, Level::L3));
+        assert!(!spares(&sampling, Kind::Log, Level::L3));
+        assert!(!spares(&sampling, Kind::Span, Level::L2), "not sampled yet");
+        let all = Retain {
+            except_errors: false,
+            ..sampling.clone()
+        };
+        assert!(!spares(&all, Kind::Span, Level::L3));
+        let dropping = Retain {
+            sample: None,
+            ..sampling
+        };
+        assert!(!spares(&dropping, Kind::Span, Level::L3));
     }
 
     #[test]

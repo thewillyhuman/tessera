@@ -378,7 +378,9 @@ AFTER d ... ELSE
 ...` over `kind`, severity, `value_score` and row columns;
 `EXPLAIN RETENTION` estimates what a policy removes and saves (CO-9);
 policies are applied at compaction, sampling by event or by trace
-with `sample_rate` scaled on the survivors (CO-6, CO-7), downsampling
+with `sample_rate` scaled on the survivors (CO-6, CO-7), where
+`EXCEPT ERRORS` keeps whole a trace with an error span in the
+partition or in the windows beside it, downsampling
 metrics to count, sum, min, max and last per series and interval
 (CO-8), and dropping by age alone removes whole partitions; nothing
 is reduced by value without an enabled policy (CO-10). Budgets per
@@ -410,10 +412,13 @@ outputs awaiting adoption, replaced files awaiting collection and the
 hour between two records.
 
 Gaps left in M9: the reconciliation has been run against the local
-store only, not against a provider's bill; `EXCEPT ERRORS` sees the
-error spans of the files
-being compacted only, and traces referenced by alert events are not
-exempt; sketches are not merged when downsampling (CO-8);
+store only, not against a provider's bill; `EXCEPT ERRORS` looks
+for a trace's error a window's length either side of the partition
+being sampled, so a trace longer than a window that fails further
+away is sampled, and so is one whose error arrives after its
+partition was sampled; a trace an alert event names would be spared
+too, but the events the rules write name none yet; sketches are not
+merged when downsampling (CO-8);
 Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a
