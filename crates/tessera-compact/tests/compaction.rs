@@ -522,6 +522,91 @@ async fn removed_files_are_deleted_after_the_retention_window() {
     assert_eq!(event_ids(&node).await, vec![1, 2, 3, 4]);
 }
 
+/// CO-7: a trace does not stop at a partition's window, and an alert
+/// that names one is in no span. The traces a sampling is to spare
+/// are read from the error spans of other span files and from the
+/// alert events: the ids, of the rows that qualify, and nothing else.
+#[tokio::test]
+async fn the_traces_to_spare_are_read_from_error_spans_and_alerts() {
+    use tessera_types::event::EventRow;
+    use tessera_types::{SpanRow, StatusCode};
+
+    let store = Arc::new(MemoryStore::new());
+    let env = Env::simulated(1, Timestamp::UNIX_EPOCH);
+    let log = WriterLog::start(store.clone(), env.clone());
+    let format: Arc<dyn tessera_format::FileFormat> = Arc::new(ParquetFormat::default());
+    let target = FlushTarget {
+        store: store.clone(),
+        pool: PoolId::new("root").unwrap(),
+        format: Arc::clone(&format),
+    };
+    // Four traces of three spans; one span of trace 2 fails.
+    let spans: Vec<SpanRow> = (0..12u8)
+        .map(|i| SpanRow {
+            timestamp: Timestamp::from_nanos(i64::from(i)),
+            event_id: [i; 16],
+            trace_id: [i / 3; 16],
+            span_id: [i; 8],
+            name: "op".into(),
+            status_code: if i == 7 {
+                StatusCode::Error
+            } else {
+                StatusCode::Ok
+            },
+            ..SpanRow::default()
+        })
+        .collect();
+    // Two alerts, one of which names a trace.
+    let alerts: Vec<EventRow> = [Some([9u8; 16]), None]
+        .into_iter()
+        .zip(0u8..)
+        .map(|(trace_id, i)| EventRow {
+            timestamp: Timestamp::from_nanos(i64::from(i)),
+            observed_timestamp: Timestamp::from_nanos(i64::from(i)),
+            event_id: [100 + i; 16],
+            trace_id,
+            span_id: None,
+            name: "HighErrorRate".into(),
+            attributes: BTreeMap::new(),
+        })
+        .collect();
+    let written = |batch: EventBatch| {
+        let (target, env, writer) = (&target, &env, log.writer_id());
+        async move {
+            write_l1_files(
+                target,
+                env,
+                writer,
+                Seq::ZERO,
+                Seq::new(1),
+                Window::DEFAULT_LENGTH,
+                vec![batch],
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let span_files =
+        written(EventBatch::from_spans(TenantId::DEFAULT, dataset(), &spans).unwrap()).await;
+    let alert_files =
+        written(EventBatch::from_alerts(TenantId::DEFAULT, dataset(), &alerts).unwrap()).await;
+    assert_eq!((span_files.len(), alert_files.len()), (1, 1));
+
+    let pools = Pools::new(PoolId::new("root").unwrap(), store.clone());
+    let spared = tessera_compact::spared::traces(&pools, &format, &span_files, &alert_files)
+        .await
+        .unwrap();
+    assert_eq!(
+        spared,
+        tessera_compact::Spared::from([[2; 16], [9; 16]]),
+        "the trace with an error span and the one an alert names"
+    );
+    let none = tessera_compact::spared::traces(&pools, &format, &[], &[])
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
+
 const GRACE: Duration = Duration::from_secs(3_600);
 
 /// A collection pass over the node's writer log at `now`, with no rule

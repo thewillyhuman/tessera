@@ -20,6 +20,7 @@ pub mod plan;
 pub mod promote;
 pub mod retention;
 pub mod run;
+pub mod spared;
 pub mod tombstones;
 
 use tessera_format::FormatError;
@@ -32,6 +33,7 @@ pub use plan::{Job, Policy, TRACE_COMPLETION_HORIZON, input_bytes, plan};
 pub use promote::promote;
 pub use retention::{Applied, Retain};
 pub use run::{Compactor, Outcome, stored_usage};
+pub use spared::Spared;
 pub use tombstones::remove_deleted;
 
 /// Why compaction or collection failed.

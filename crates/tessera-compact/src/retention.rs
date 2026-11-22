@@ -28,6 +28,7 @@ use tessera_types::event::{
 };
 
 use crate::CompactError;
+use crate::spared::Spared;
 
 /// The downsample columns of an L3 metric file: the rows of the
 /// interval behind each kept row.
@@ -49,6 +50,10 @@ pub struct Retain {
     /// Whether spans of a trace with an error span are kept whole
     /// rather than sampled (CO-7).
     pub except_errors: bool,
+    /// The traces kept whole besides, when errors are spared: those
+    /// whoever applies the policy found an error of, or an alert
+    /// naming, outside the rows being sampled ([`crate::spared`]).
+    pub spared: Arc<Spared>,
     /// The interval kept per series, when downsampling is due.
     pub downsample: Option<Duration>,
     /// Whether matching rows are removed, when a drop is due.
@@ -90,7 +95,7 @@ pub fn apply(
     }
     if let Some(rate) = retain.sample.filter(|r| *r < 1.0) {
         let matches = if retain.except_errors && kind == Kind::Span {
-            without_errored_traces(&rows, &matches)
+            without_errored_traces(&rows, &matches, &retain.spared)
         } else {
             matches.clone()
         };
@@ -111,9 +116,15 @@ pub fn apply(
 }
 
 /// `matches` with the spans of every trace that has an error span
-/// among `rows` taken out (CO-7), so that sampling leaves those traces
-/// whole. A trace whose error span sits in another file is not seen.
-fn without_errored_traces(rows: &RecordBatch, matches: &BooleanArray) -> BooleanArray {
+/// among `rows`, or is one of `spared`, taken out (CO-7), so that
+/// sampling leaves those traces whole. A trace whose error span sits
+/// in another partition is not seen among the rows: it is spared when
+/// it is among `spared`.
+fn without_errored_traces(
+    rows: &RecordBatch,
+    matches: &BooleanArray,
+    spared: &Spared,
+) -> BooleanArray {
     let traces = rows
         .column_by_name(TRACE_ID)
         .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
@@ -127,13 +138,14 @@ fn without_errored_traces(rows: &RecordBatch, matches: &BooleanArray) -> Boolean
         .filter(|&i| !statuses.is_null(i) && statuses.value(i) == "error" && !traces.is_null(i))
         .map(|i| traces.value(i))
         .collect();
-    if errored.is_empty() {
+    if errored.is_empty() && spared.is_empty() {
         return matches.clone();
     }
+    let is_kept_whole = |trace: &[u8]| {
+        errored.contains(trace) || <[u8; 16]>::try_from(trace).is_ok_and(|id| spared.contains(&id))
+    };
     (0..rows.num_rows())
-        .map(|i| {
-            Some(matches.value(i) && (traces.is_null(i) || !errored.contains(traces.value(i))))
-        })
+        .map(|i| Some(matches.value(i) && (traces.is_null(i) || !is_kept_whole(traces.value(i)))))
         .collect()
 }
 
@@ -524,6 +536,23 @@ mod tests {
         let (kept, applied) = apply(&rows, Kind::Span, &exempt).unwrap();
         assert_eq!(count_of(&kept, 3), 5, "the errored trace stays whole");
         assert_eq!(applied.sampled_out, 95);
+        // A trace whose error is in another partition, or that an
+        // alert names, has no error among these rows: it stays whole
+        // when the policy is told to spare it.
+        let told = Retain {
+            spared: Arc::new(Spared::from([[7; 16]])),
+            ..exempt.clone()
+        };
+        let (kept, applied) = apply(&rows, Kind::Span, &told).unwrap();
+        assert_eq!((count_of(&kept, 3), count_of(&kept, 7)), (5, 5));
+        assert_eq!(applied.sampled_out, 90);
+        // Sparing is for a policy that spares errors.
+        let not_asked = Retain {
+            spared: Arc::new(Spared::from([[7; 16]])),
+            ..sampled
+        };
+        let (kept, _) = apply(&rows, Kind::Span, &not_asked).unwrap();
+        assert_eq!(count_of(&kept, 7), 0);
     }
 
     #[test]
