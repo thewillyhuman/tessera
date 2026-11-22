@@ -235,11 +235,13 @@ async fn tenants_round(
     held: &mut Vec<Held>,
 ) -> Backlog {
     let mut backlog = Backlog::default();
+    let mut quiet = BTreeSet::new();
     for tenant in tenants {
         let mut cursors = Cursors {
             positions: &mut *positions,
             met: BTreeSet::new(),
             whole: whole_round,
+            quiet: &mut quiet,
         };
         let found = known.entry(tenant.clone()).or_default();
         let done = if whole_round {
@@ -319,6 +321,11 @@ struct Cursors<'a> {
     /// Whether every part of the round went through: one that failed
     /// may have met only some of its logs.
     whole: bool,
+    /// The logs a round that follows found nothing new in, by writer
+    /// and position. A writer is registered in every dataset it wrote
+    /// to, and its log is one: asked once whether it goes on, the
+    /// answer holds for all of them.
+    quiet: &'a mut BTreeSet<(WriterId, Seq)>,
 }
 
 /// A whole round of a tenant: every dataset it has, gone over; what
@@ -377,6 +384,9 @@ async fn follow(
             }
             let at = (tenant.clone(), dataset.clone(), writer);
             let after = cursors.positions.get(&at).copied().unwrap_or(Seq::ZERO);
+            if cursors.quiet.contains(&(writer, after)) {
+                continue;
+            }
             let followed = intake::run_following(
                 Arc::clone(&background.store),
                 &background.env,
@@ -388,6 +398,9 @@ async fn follow(
             .await;
             match followed {
                 Ok(outcome) => {
+                    if outcome.through == after {
+                        cursors.quiet.insert((writer, after));
+                    }
                     cursors.positions.insert(at, outcome.through);
                     if outcome.adoptions > 0 || outcome.removed {
                         tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
