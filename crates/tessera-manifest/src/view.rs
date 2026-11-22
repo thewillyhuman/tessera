@@ -27,9 +27,9 @@ use tessera_types::{
     DatasetName, Env, FileMeta, Kind, PartitionId, Seq, TenantId, TimeRange, Timestamp, Version,
     Window, WindowSchedule, WriterId,
 };
-use tessera_wal::{EntryBody, reader};
+use tessera_wal::{BlockMeta, EntryBody, reader};
 
-use crate::{ManifestError, Manifests, Partial, list_windows, registry};
+use crate::{ManifestError, Manifests, Partial, Registration, list_windows, registry};
 
 /// How many of a dataset's manifests a query reads at once.
 const MANIFESTS_AT_ONCE: usize = 16;
@@ -102,6 +102,59 @@ struct Tail {
     segments: usize,
     /// The rows beyond the partitions' positions.
     rows: Vec<RecordBatch>,
+}
+
+/// What the tails of a dataset's writers are read with.
+struct Reading<'a> {
+    manifests: &'a Manifests,
+    /// Which blocks of a segment are the dataset's. A segment holds
+    /// the rows of every dataset its writer took: these are read, and
+    /// the rest left in the store.
+    of_the_dataset: Arc<dyn Fn(&BlockMeta) -> bool + Send + Sync>,
+    /// Where each writer is adopted to in each partition.
+    positions: &'a BTreeMap<Window, BTreeMap<WriterId, Seq>>,
+    window: &'a WindowSchedule,
+}
+
+impl Reading<'_> {
+    /// The rows of the dataset in the log of the writer of
+    /// `registration` after what it says is adopted, those beyond the
+    /// positions of their partitions.
+    async fn tail_of(
+        &self,
+        registration: &Registration,
+    ) -> Result<(WriterId, Tail), ManifestError> {
+        let writer = registration.writer;
+        let mut read = Tail::default();
+        let mut entries = reader::blocks_after(
+            Arc::clone(self.manifests.store()),
+            writer,
+            registration.adopted,
+            Arc::clone(&self.manifests.env().keys),
+            Arc::clone(&self.of_the_dataset),
+        );
+        while let Some(entry) = entries.try_next().await? {
+            let seq = entry.header.seq;
+            read.last = Some(seq);
+            if !matches!(entry.header.body, EntryBody::Segment { .. }) {
+                continue;
+            }
+            read.segments += 1;
+            for batch in entry.rows {
+                let position = |w: Window| {
+                    self.positions
+                        .get(&w)
+                        .and_then(|p| p.get(&writer))
+                        .copied()
+                        .unwrap_or(Seq::ZERO)
+                };
+                if let Some(rows) = beyond_position(batch.rows(), seq, self.window, position)? {
+                    read.rows.push(rows);
+                }
+            }
+        }
+        Ok((writer, read))
+    }
 }
 
 /// Lists the files and reads the tail rows of one dataset and kind for
@@ -184,38 +237,21 @@ pub async fn sources(
     // is an hour of segments back (GC-2). The registration was read
     // before the manifests, so they hold at least what it says. The
     // logs do not depend on each other and are read together.
-    let positions = &positions;
-    let window = &window;
-    let tails = writers.into_iter().map(|registration| async move {
-        let writer = registration.writer;
-        let mut read = Tail::default();
-        let mut entries = reader::entries(
-            Arc::clone(root),
-            writer,
-            registration.adopted,
-            Arc::clone(&manifests.env().keys),
-        );
-        while let Some(entry) = entries.try_next().await? {
-            read.last = Some(entry.seq());
-            if !matches!(entry.body(), EntryBody::Segment { .. }) {
-                continue;
-            }
-            read.segments += 1;
-            for batch in entry.blocks_for(tenant, dataset, kind)? {
-                let position = |w: Window| {
-                    positions
-                        .get(&w)
-                        .and_then(|p| p.get(&writer))
-                        .copied()
-                        .unwrap_or(Seq::ZERO)
-                };
-                if let Some(rows) = beyond_position(batch.rows(), entry.seq(), window, position)? {
-                    read.rows.push(rows);
-                }
-            }
-        }
-        Ok::<_, ManifestError>((writer, read))
-    });
+    let reading = Reading {
+        manifests,
+        of_the_dataset: {
+            let (tenant, dataset) = (tenant.clone(), dataset.clone());
+            Arc::new(move |block: &BlockMeta| {
+                block.tenant == tenant && block.dataset == dataset && block.kind == kind
+            })
+        },
+        positions: &positions,
+        window: &window,
+    };
+    let reading = &reading;
+    let tails = writers
+        .into_iter()
+        .map(|registration| async move { reading.tail_of(&registration).await });
     let read: Vec<(WriterId, Tail)> = futures::stream::iter(tails)
         .buffered(TAILS_AT_ONCE)
         .try_collect()
@@ -622,6 +658,64 @@ mod tests {
             other.sources.segments, 0,
             "no writer is registered for that dataset"
         );
+    }
+
+    /// A writer's segment holds the rows of every dataset it took. A
+    /// read of one dataset asks for the segment's header and for the
+    /// block of that dataset, not for the segment.
+    #[tokio::test]
+    async fn the_tail_is_read_for_the_blocks_of_its_dataset() {
+        let inner = MemoryStore::new();
+        let mut log = WriterLog::start(Arc::new(inner.clone()), env());
+        registry::register(
+            &inner,
+            &env(),
+            &TenantId::DEFAULT,
+            &dataset(),
+            log.writer_id(),
+        )
+        .await
+        .unwrap();
+        // Lines of another dataset that no compression makes short.
+        let mut random = tessera_types::SeededRandom::new(3);
+        let others: Vec<LogRow> = (0..4_000)
+            .map(|_| LogRow {
+                body: Some(format!(
+                    "{:032x}{:032x}",
+                    tessera_types::Random::next_u128(&mut random),
+                    tessera_types::Random::next_u128(&mut random)
+                )),
+                ..LogRow::default()
+            })
+            .collect();
+        let staging = DatasetName::new("staging").unwrap();
+        let other = EventBatch::from_logs(TenantId::DEFAULT, staging, &others).unwrap();
+        log.append_segment(&[batch(0, 1, 2), other]).await.unwrap();
+
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(inner)));
+        let manifests = Manifests::new(metered.clone(), env(), 8);
+        let found = sources(
+            &manifests,
+            &TenantId::DEFAULT,
+            &dataset(),
+            Kind::Log,
+            WINDOW,
+            TimeRange::ALL,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            found.tail.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            2
+        );
+        let made = metered.requests().by_operation();
+        let of = |operation: &str| {
+            made.iter()
+                .find(|(name, _)| *name == operation)
+                .map(|(_, made)| *made)
+        };
+        assert_eq!(of("get_tail"), Some(2), "the header, and the log's end");
+        assert_eq!(of("get_range"), Some(1), "the dataset's block");
     }
 
     #[tokio::test]
