@@ -294,10 +294,13 @@ every route and over gRPC.
 
 A bucket bills per request, and `tessera_object_store_requests_total`
 counts what each node asks, by operation. A node left idle makes
-about nine a second, measured against MinIO on one node with every
-role, a cache directory, five datasets and seven partitions: half
-are reads of log heads that find nothing new, a quarter listings,
-and the rest heartbeats, leases and the node's own metrics.
+about eight a second, measured against MinIO on one node with every
+role, a cache directory, five datasets and seven partitions: nearly
+half are reads of log heads that find nothing new (the catalog's
+once a second, the state of the node's own health rules, the
+writers' logs), a third listings, and the rest heartbeats, leases
+and the node's own metrics. That is what a node costs for being
+there, whatever it holds.
 
 The background work asks nothing for a tenant at rest: one with no
 writer registered in any of its datasets and nothing left to compact
@@ -319,7 +322,13 @@ within half a minute, not within five seconds; rows are readable all
 the while. An `eval` node reads the rules of a tenant
 that has any every round, and looks one round in six whether a
 tenant that had none has one now: a tenant's first rule or rollup
-starts within half a minute, a change to its rules within a round. Without `--cache-dir` the node's own health
+starts within half a minute, a change to its rules within a round.
+
+What still grows with the tenants a cluster holds, written to or
+not: the two reads a minute of an `eval` node that looks for a
+tenant's first rule, a read every half hour by the collection of
+the writers' logs, which keeps what a rule group has still to read,
+and the hourly round over every tenant. Without `--cache-dir` the node's own health
 rules add the writer-log entries they read. Budget for it where
 requests are billed.
 
