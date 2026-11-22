@@ -735,7 +735,7 @@ async fn compact_and_collect(
             let outcome = compactor
                 .run(&manifest, &job, &record, retain.as_ref(), &tombstones)
                 .await?;
-            compacted(&manifest, &partition, job.inputs.len(), outcome).await;
+            compacted(&manifest, &partition, outcome).await;
         }
         let collected =
             collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION).await?;
@@ -823,7 +823,7 @@ async fn spared_beside(
 /// rewrite is followed by a checkpoint of the manifest (CL-3, MF-5),
 /// so that a cold reader folds the few commits since it and a range
 /// read fetches only the row groups it needs.
-async fn compacted(manifest: &Manifest, partition: &PartitionId, inputs: usize, outcome: Outcome) {
+async fn compacted(manifest: &Manifest, partition: &PartitionId, outcome: Outcome) {
     let PartitionId {
         tenant,
         dataset,
@@ -832,6 +832,7 @@ async fn compacted(manifest: &Manifest, partition: &PartitionId, inputs: usize, 
     } = partition;
     match outcome {
         Outcome::Replaced {
+            inputs,
             output,
             rows,
             duplicates,

@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, FixedSizeBinaryArray};
-use tessera_compact::{Checkpoints, Compactor, Outcome, Policy, collect_files, collect_log, plan};
+use tessera_compact::{
+    Checkpoints, Compactor, Job, Outcome, Policy, collect_files, collect_log, plan,
+};
 use tessera_format::{ParquetFormat, Sidecar};
 use tessera_manifest::{
     DatasetLogs, LayoutRecord, Manifest, intake, list_partitions, registry, view,
@@ -288,6 +290,7 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
         .await
         .unwrap();
     let Outcome::Replaced {
+        inputs,
         output,
         rows,
         duplicates,
@@ -295,7 +298,7 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
     else {
         panic!("expected a replacement, got {outcome:?}");
     };
-    assert_eq!((rows, duplicates), (7, 2));
+    assert_eq!((inputs, rows, duplicates), (4, 7, 2));
 
     let after = manifest.snapshot().await.unwrap();
     let files: Vec<_> = after.state().files().collect();
@@ -353,6 +356,106 @@ async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
 /// refused, it stopped the partition's compaction for good, and the
 /// tenant's round with it. A path no row carries is a column all the
 /// same, promoted empty, and stays in the key.
+/// CP-1: a job merges what fits in memory. Rows that compress well
+/// take many times in memory what their files take in the store, by
+/// which a job is planned: on a cluster, a job of half a gibibyte of
+/// stored log lines killed its node every time it was tried. The
+/// inputs that do not fit are left for the next job, and no row is
+/// lost between the two.
+#[tokio::test]
+async fn a_job_merges_the_inputs_that_fit_in_memory() {
+    let node = node(&[&[1, 2], &[3, 4], &[5, 6], &[7, 8]], Timestamp::UNIX_EPOCH).await;
+    let manifest = manifest(&node).await;
+    let before = manifest.snapshot().await.unwrap();
+    let job = plan(
+        manifest.id(),
+        before.state(),
+        node.env.clock.now(),
+        &Policy::default(),
+    )
+    .unwrap();
+    assert_eq!(job.inputs.len(), 4);
+    // What one file's rows take in memory, and room for two such files.
+    let store = node.pools.root().store().clone();
+    let bytes = store
+        .get(&layout::data_file(&job.partition, job.inputs[0].file_id))
+        .await
+        .unwrap();
+    let one: usize = tessera_format::FileFormat::read(&ParquetFormat::default(), bytes)
+        .unwrap()
+        .iter()
+        .map(arrow::array::RecordBatch::get_array_memory_size)
+        .sum();
+    let compactor = Compactor::new(
+        node.pools.clone(),
+        Arc::new(ParquetFormat::default()),
+        node.env.clone(),
+    )
+    .with_job_memory(2 * one + one / 2);
+    let record = LayoutRecord::default_for(job.partition.kind);
+    let outcome = compactor
+        .run(&manifest, &job, &record, None, &[])
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Replaced {
+                inputs: 2,
+                rows: 4,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let after = manifest.snapshot().await.unwrap();
+    let levels: Vec<Level> = after.state().files().map(|f| f.level).collect();
+    assert_eq!(
+        levels.iter().filter(|l| **l == Level::L1).count(),
+        2,
+        "{levels:?}"
+    );
+    assert_eq!(
+        levels.iter().filter(|l| **l == Level::L2).count(),
+        1,
+        "{levels:?}"
+    );
+    assert_eq!(event_ids(&node).await, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // A job always merges its first input, however little it may hold.
+    let without_room = Compactor::new(
+        node.pools.clone(),
+        Arc::new(ParquetFormat::default()),
+        node.env.clone(),
+    )
+    .with_job_memory(0);
+    let rest = Job {
+        inputs: after
+            .state()
+            .files()
+            .filter(|f| f.level == Level::L1)
+            .cloned()
+            .collect(),
+        ..job
+    };
+    let outcome = without_room
+        .run(&manifest, &rest, &record, None, &[])
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Outcome::Replaced {
+                inputs: 1,
+                rows: 2,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(event_ids(&node).await, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
 #[tokio::test]
 async fn a_sort_key_the_rows_have_no_column_for_is_left_out() {
     let node = node(&[&[1, 2], &[3], &[4], &[5]], Timestamp::UNIX_EPOCH).await;

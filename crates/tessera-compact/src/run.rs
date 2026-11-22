@@ -34,13 +34,28 @@ pub struct Compactor {
     /// Where the tenants' pool and switches come from (CT-7); the
     /// defaults without one.
     tenants: Option<Arc<dyn TenantSettingsSource>>,
+    /// The most bytes of rows one job merges ([`DEFAULT_JOB_MEMORY`]).
+    memory: usize,
 }
+
+/// The most bytes of rows, as they are in memory, that one job merges
+/// by default. A job is planned by what its inputs take in the store,
+/// and rows that compress well take many times that once read: half a
+/// gibibyte of stored log lines was more than six in memory, and a
+/// node given less was killed by every attempt at the job, which it
+/// then began again. A job holds its rows a few times over while it
+/// drops duplicates, sorts and encodes them, so a node needs several
+/// times this for its compaction.
+pub const DEFAULT_JOB_MEMORY: usize = 256 << 20;
 
 /// What a job did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// The inputs were replaced by the output.
     Replaced {
+        /// How many of the job's inputs were merged: all of them, or
+        /// the first ones when all would not fit in memory.
+        inputs: usize,
         /// The output file.
         output: FileId,
         /// Rows in the output.
@@ -195,6 +210,7 @@ impl Compactor {
             env,
             meter: None,
             tenants: None,
+            memory: DEFAULT_JOB_MEMORY,
         }
     }
 
@@ -230,6 +246,46 @@ impl Compactor {
         self
     }
 
+    /// The compactor merging at most `bytes` of rows, as they are in
+    /// memory, in one job.
+    #[must_use]
+    pub fn with_job_memory(mut self, bytes: usize) -> Self {
+        self.memory = bytes;
+        self
+    }
+
+    /// The first inputs of `job` whose rows fit the memory a job may
+    /// take, read, with their rows: at least one, and every one when
+    /// they fit. The inputs left out stay in the manifest for a later
+    /// job. Whether the next input fits is judged from what the rows
+    /// read so far take each, so that it is not read to find out.
+    async fn read_within(
+        &self,
+        job: &Job,
+    ) -> Result<(Vec<FileMeta>, Vec<RecordBatch>), CompactError> {
+        let mut taken: Vec<FileMeta> = Vec::new();
+        let mut batches = Vec::new();
+        let (mut held, mut rows) = (0u64, 0u64);
+        for input in &job.inputs {
+            let expected = held
+                .checked_div(rows)
+                .map_or(0, |per_row| per_row.saturating_mul(input.row_count));
+            if !taken.is_empty() && held.saturating_add(expected) > self.memory as u64 {
+                break;
+            }
+            for batch in self.read(input).await? {
+                held += batch.get_array_memory_size() as u64;
+                // Inputs of different epochs carry different dedicated
+                // columns; the kind's own are the common ground, and
+                // `_overflow` still holds every attribute.
+                batches.push(kind_columns(&batch, job.partition.kind)?);
+            }
+            rows += input.row_count;
+            taken.push(input.clone());
+        }
+        Ok((taken, batches))
+    }
+
     /// The compactor reporting what it stores to `meter` (CO-2).
     #[must_use]
     pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
@@ -239,7 +295,9 @@ impl Compactor {
 
     /// Runs `job` against `manifest`, which must be the manifest of the
     /// job's partition, writing the output in `record`, the dataset's
-    /// current layout (AD-9).
+    /// current layout (AD-9). Where the job's inputs hold more rows
+    /// than a job may take in memory, the first of them are merged and
+    /// the rest left for the next job.
     ///
     /// # Errors
     ///
@@ -253,15 +311,7 @@ impl Compactor {
         retain: Option<&Retain>,
         tombstones: &[Tombstone],
     ) -> Result<Outcome, CompactError> {
-        let mut batches = Vec::new();
-        for input in &job.inputs {
-            for batch in self.read(input).await? {
-                // Inputs of different epochs carry different dedicated
-                // columns; the kind's own are the common ground, and
-                // `_overflow` still holds every attribute.
-                batches.push(kind_columns(&batch, job.partition.kind)?);
-            }
-        }
+        let (merged, batches) = self.read_within(job).await?;
         let layout = record.to_layout();
         let (settings, wanted, patterns) = self.tenant_choices(job, record);
         let format = Arc::clone(&self.format);
@@ -313,7 +363,7 @@ impl Compactor {
             pool: pool.id().clone(),
             level: job.level,
             source: FileSource::Compaction {
-                inputs: job.inputs.iter().map(|f| f.file_id).collect(),
+                inputs: merged.iter().map(|f| f.file_id).collect(),
             },
             min_timestamp: written.min_timestamp,
             max_timestamp: written.max_timestamp,
@@ -323,9 +373,9 @@ impl Compactor {
             sort_key: written.sort_key,
             columns: written.columns,
             indexes: written.indexes,
-            ingested_at: job.inputs.iter().filter_map(|f| f.ingested_at).max(),
+            ingested_at: merged.iter().filter_map(|f| f.ingested_at).max(),
         };
-        let inputs: Vec<FileId> = job.inputs.iter().map(|f| f.file_id).collect();
+        let inputs: Vec<FileId> = merged.iter().map(|f| f.file_id).collect();
         if manifest
             .replace(&inputs, std::slice::from_ref(&output))
             .await?
@@ -334,6 +384,7 @@ impl Compactor {
                 meter.stored(stored);
             }
             Ok(Outcome::Replaced {
+                inputs: inputs.len(),
                 output: file_id,
                 rows: written.row_count,
                 duplicates,

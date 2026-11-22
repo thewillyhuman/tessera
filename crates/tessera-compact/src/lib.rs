@@ -32,7 +32,7 @@ pub use gc::{Checkpoints, LogCollection, collect_files, collect_log};
 pub use plan::{Job, Policy, TRACE_COMPLETION_HORIZON, input_bytes, plan};
 pub use promote::promote;
 pub use retention::{Applied, Retain};
-pub use run::{Compactor, Outcome, stored_usage};
+pub use run::{Compactor, DEFAULT_JOB_MEMORY, Outcome, stored_usage};
 pub use spared::Spared;
 pub use tombstones::remove_deleted;
 
