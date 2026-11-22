@@ -8,9 +8,10 @@
 //! held back by its silences and acknowledgments. The rollups this node
 //! owns are maintained the same way (section 8.7), their output written
 //! through the same path. What a rule run through the engine asked of
-//! its scans goes to the workload log like any query's (AD-1).
+//! its scans goes to the workload log like any query's (AD-1). A tenant
+//! that has neither a rule nor a rollup is looked at one round in six.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -66,6 +67,25 @@ pub struct Evaluator {
 #[derive(Default)]
 struct Groups {
     open: HashMap<(TenantId, String, u32), Arc<RuleGroup>>,
+    /// The tenants that had neither a rule nor a rollup when their
+    /// control store was last read.
+    without_rules: BTreeSet<TenantId>,
+    /// How many rounds have run.
+    rounds: u64,
+}
+
+/// How many rounds pass between two looks at the control store of a
+/// tenant that had neither a rule nor a rollup: most tenants have
+/// none, and reading every one's store every round is a request per
+/// tenant per round for nothing. A tenant's first rule is therefore
+/// seen within half a minute at the default interval; once it has one,
+/// its store is read every round, and a change of its rules, silences
+/// or routes is acted on within one.
+const LOOK_AGAIN_EVERY: u64 = 6;
+
+/// Whether a tenant's control store is read in round number `round`.
+fn looks(without_rules: bool, round: u64) -> bool {
+    !without_rules || round.is_multiple_of(LOOK_AGAIN_EVERY)
 }
 
 /// Runs rounds forever. Failures are logged and retried next round.
@@ -91,11 +111,22 @@ async fn round(evaluator: &Evaluator, groups: &mut Groups) {
         .collect();
     let mut lag = Duration::ZERO;
     let mut degraded = 0;
+    let number = groups.rounds;
+    groups.rounds += 1;
+    groups.without_rules.retain(|t| tenants.contains(t));
     for tenant in tenants {
+        if !looks(groups.without_rules.contains(&tenant), number) {
+            continue;
+        }
         match tenant_round(evaluator, groups, &tenant).await {
             Ok(round) => {
                 lag = lag.max(round.lag);
                 degraded += round.degraded;
+                if round.without_rules {
+                    groups.without_rules.insert(tenant);
+                } else {
+                    groups.without_rules.remove(&tenant);
+                }
             }
             Err(error) => {
                 tracing::warn!(%tenant, error = %error, "rule evaluation round failed");
@@ -147,6 +178,8 @@ struct Round {
     lag: Duration,
     /// Owned rules degraded after the round (section 11.7).
     degraded: u64,
+    /// Whether the tenant has neither a rule nor a rollup.
+    without_rules: bool,
 }
 
 /// The labels of every alert firing in `tenant` across `groups`, from
@@ -200,6 +233,15 @@ fn delivery_inputs(control: &ControlState) -> Result<DeliveryInputs, String> {
     Ok((routes, silences, acknowledgments, inhibitions))
 }
 
+/// `rules` by the group each is in.
+fn by_group(rules: Vec<AlertRule>) -> BTreeMap<String, Vec<AlertRule>> {
+    let mut groups: BTreeMap<String, Vec<AlertRule>> = BTreeMap::new();
+    for rule in rules {
+        groups.entry(rule.group.clone()).or_default().push(rule);
+    }
+    groups
+}
+
 /// One round for `tenant`.
 async fn tenant_round(
     evaluator: &Evaluator,
@@ -219,10 +261,7 @@ async fn tenant_round(
     for problem in bad {
         tracing::warn!(%tenant, problem, "alert rule does not decode");
     }
-    let mut by_group: BTreeMap<String, Vec<AlertRule>> = BTreeMap::new();
-    for rule in rules {
-        by_group.entry(rule.group.clone()).or_default().push(rule);
-    }
+    let by_group = by_group(rules);
     let all_groups: Vec<String> = by_group.keys().cloned().collect();
     let settings = evaluator.catalog.settings_of(tenant);
     let owned = owned_partitions(evaluator, tenant, by_group, &settings);
@@ -231,7 +270,11 @@ async fn tenant_round(
     });
     rollups_round(evaluator, tenant, &control).await?;
     if owned.is_empty() {
-        return Ok(Round::default());
+        let rollups = control.rows(Table::Rollups).map_err(|e| e.to_string())?;
+        return Ok(Round {
+            without_rules: all_groups.is_empty() && rollups.is_empty(),
+            ..Round::default()
+        });
     }
     let (routes, silences, acknowledgments, inhibitions) = delivery_inputs(&control)?;
     let firing = if inhibitions.is_empty() {
@@ -414,5 +457,19 @@ impl AlertSink for StateSink {
             *self.seen.lock().unwrap_or_else(PoisonError::into_inner) += 1;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tenant with a rule or a rollup has its control store read
+    /// every round; one with neither, one round in six.
+    #[test]
+    fn a_tenant_without_rules_is_looked_at_one_round_in_six() {
+        assert!((0..12).all(|round| looks(false, round)));
+        let looked: Vec<u64> = (0..13).filter(|round| looks(true, *round)).collect();
+        assert_eq!(looked, [0, 6, 12]);
     }
 }

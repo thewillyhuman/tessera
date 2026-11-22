@@ -305,7 +305,10 @@ follow the logs of the writers it found, a read each, and go over a
 dataset only when a flush reached it. A new dataset, a writer that
 has just registered and a layout the advisor adopted are therefore
 acted on within half a minute, not within five seconds; rows are
-readable all the while. Without `--cache-dir` the node's own health
+readable all the while. An `eval` node reads the rules of a tenant
+that has any every round, and looks one round in six whether a
+tenant that had none has one now: a tenant's first rule or rollup
+starts within half a minute, a change to its rules within a round. Without `--cache-dir` the node's own health
 rules add the writer-log entries they read. Budget for it where
 requests are billed.
 
