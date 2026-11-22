@@ -65,6 +65,33 @@ const HELD_EVERY: Duration = Duration::from_secs(3_600);
 /// is not felt.
 const COLLECT_EVERY: Duration = Duration::from_secs(60);
 
+/// How many looks at the logs pass between two reads of the rules of
+/// a tenant that had none. A rule group holds the entries it has not
+/// read (GC-2), so each look reads where every group is, and a tenant
+/// without rules has no group: reading its control store to find that
+/// out again is a request per tenant and look. An entry is kept an
+/// hour whoever holds it, so a tenant's first group is known here
+/// well before an entry written after it began can go; one it had
+/// still to read of those written before is gone as it would be past
+/// the cap, and the group rebuilds its windows from the files
+/// (section 11.7).
+const RULES_EVERY: u64 = 30;
+
+/// The tenants the last read of their rules found none for, and how
+/// many looks at the logs were made.
+#[derive(Debug, Default)]
+struct Ruleless {
+    tenants: BTreeSet<TenantId>,
+    looks: u64,
+}
+
+impl Ruleless {
+    /// Whether this look leaves `tenant`'s rules unread.
+    fn skips(&self, tenant: &TenantId) -> bool {
+        self.tenants.contains(tenant) && !self.looks.is_multiple_of(RULES_EVERY)
+    }
+}
+
 /// How many rounds pass from one that goes over the whole of every
 /// tenant that is not at rest to the next. Such a round asks the
 /// store for every dataset of the tenant, their writers, their kinds
@@ -224,6 +251,7 @@ pub async fn run(background: Background) {
     let mut last_held: Option<Timestamp> = None;
     let mut last_export: Option<Timestamp> = None;
     let mut last_collection: Option<Timestamp> = None;
+    let mut ruleless = Ruleless::default();
     let mut positions = Positions::new();
     let mut known = Known::new();
     let mut slots = None;
@@ -284,7 +312,7 @@ pub async fn run(background: Background) {
         }
         if is_due(last_collection, now, COLLECT_EVERY) {
             // A look that failed is taken again next round.
-            match collect_logs(&background).await {
+            match collect_logs(&background, &mut ruleless).await {
                 Ok(()) => last_collection = Some(now),
                 Err(error) => tracing::warn!(error = %error, "segment collection failed"),
             }
@@ -800,7 +828,10 @@ async fn policies_of(background: &Background, tenant: &TenantId) -> Vec<Retentio
 
 /// Where every tenant's rule groups are in the writer logs (GC-2 c),
 /// from their state logs.
-async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
+async fn checkpoints(
+    background: &Background,
+    ruleless: &mut Ruleless,
+) -> Result<Checkpoints, Failure> {
     let mut checkpoints = Checkpoints::none();
     let tenants: Vec<TenantId> = background
         .catalog
@@ -809,7 +840,11 @@ async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
         .tenants()
         .map(|t| t.id.clone())
         .collect();
+    ruleless.tenants.retain(|tenant| tenants.contains(tenant));
     for tenant in tenants {
+        if ruleless.skips(&tenant) {
+            continue;
+        }
         let rows = background
             .controls
             .open(&tenant)
@@ -817,6 +852,11 @@ async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
             .await?;
         let (rules, _) = decode_rows::<AlertRule>(&rows);
         let groups: BTreeSet<String> = rules.into_iter().map(|r| r.group).collect();
+        if groups.is_empty() {
+            ruleless.tenants.insert(tenant);
+            continue;
+        }
+        ruleless.tenants.remove(&tenant);
         let settings = background.catalog.settings_of(&tenant);
         for group in groups {
             // Every partition of the group follows the logs (CQ-6),
@@ -840,6 +880,7 @@ async fn checkpoints(background: &Background) -> Result<Checkpoints, Failure> {
             }
         }
     }
+    ruleless.looks += 1;
     Ok(checkpoints)
 }
 
@@ -870,9 +911,9 @@ async fn windows_of(background: &Background, tenants: &[TenantId]) -> Result<Win
 
 /// Collects adopted segments of every writer log in the store that
 /// every rule group has read past (GC-2).
-async fn collect_logs(background: &Background) -> Result<(), Failure> {
+async fn collect_logs(background: &Background, ruleless: &mut Ruleless) -> Result<(), Failure> {
     let now = background.env.clock.now();
-    let checkpoints = checkpoints(background).await?;
+    let checkpoints = checkpoints(background, ruleless).await?;
     for writer in reader::writers(&*background.store).await? {
         if !background
             .owned
@@ -1044,6 +1085,26 @@ mod tests {
         }
         let all = one.into_iter().fold(Backlog::default(), Backlog::and);
         assert_eq!((all.deferred, all.recoveries, all.changes), (1, 1, 1));
+    }
+
+    #[test]
+    fn the_rules_of_a_tenant_that_had_none_are_read_one_look_in_thirty() {
+        let (acme, globex) = (
+            TenantId::new("acme").unwrap(),
+            TenantId::new("globex").unwrap(),
+        );
+        let mut ruleless = Ruleless::default();
+        ruleless.tenants.insert(acme.clone());
+        let read: Vec<u64> = (0..61)
+            .filter(|look| {
+                ruleless.looks = *look;
+                !ruleless.skips(&acme)
+            })
+            .collect();
+        assert_eq!(read, [0, 30, 60]);
+        // One that has rules, or was never read, is read every look.
+        ruleless.looks = 7;
+        assert!(!ruleless.skips(&globex));
     }
 
     #[test]
