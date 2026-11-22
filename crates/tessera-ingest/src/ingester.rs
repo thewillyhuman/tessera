@@ -238,7 +238,7 @@ impl Ingester {
             let _ = sender.send(Err(IngestError::NotStored(error.to_string())));
             return Ack(receiver);
         }
-        self.pending_bytes += batch.rows().get_array_memory_size();
+        self.pending_bytes += batch.memory_size();
         self.pending_since
             .get_or_insert_with(|| self.env.clock.now());
         self.pending.push((batch, sender));
@@ -417,11 +417,7 @@ impl Ingester {
             return;
         };
         memtable.rows.retain(|(seq, _)| *seq > through);
-        memtable.bytes = memtable
-            .rows
-            .iter()
-            .map(|(_, b)| b.rows().get_array_memory_size())
-            .sum();
+        memtable.bytes = memtable.rows.iter().map(|(_, b)| b.memory_size()).sum();
         if memtable.rows.is_empty() {
             memtable.oldest = None;
         }
@@ -473,7 +469,7 @@ impl Ingester {
             .memtables
             .entry((batch.tenant().clone(), batch.dataset().clone()))
             .or_default();
-        memtable.bytes += batch.rows().get_array_memory_size();
+        memtable.bytes += batch.memory_size();
         memtable.oldest.get_or_insert(now);
         memtable.rows.push((seq, batch));
     }
@@ -692,6 +688,60 @@ mod tests {
             "registered before the first acknowledgement"
         );
         assert_eq!(h.view_ids("prod").await, [0, 1]);
+    }
+
+    /// ST-6: writes that wait for the same segment are stored in one,
+    /// however their rows came. A batch another node forwarded is read
+    /// from one message, and each of its columns lies in the message's
+    /// allocation: counted whole for every column, a few hundred
+    /// kilobytes of rows passed for a full segment, so each such batch
+    /// was stored in a segment of its own, one write to the store
+    /// after the other, and flushed in L1 files of a few batches.
+    #[tokio::test]
+    async fn rows_that_share_an_allocation_wait_for_one_segment() {
+        let h = Harness::new();
+        // Five batches of ten rows, each a slice of one large batch:
+        // every one of them holds the large batch's buffers. Two
+        // batches as large as the whole fill a segment, three a
+        // memtable; the five parts together are a fifth of one.
+        let large = batch("prod", 0..250);
+        let whole = large.rows().get_array_memory_size();
+        let mut ingester = h.ingester(IngestConfig {
+            segment_bytes: 2 * whole,
+            flush_bytes: 3 * whole,
+            ..config()
+        });
+        let mut acks = Vec::new();
+        for i in 0..5 {
+            let rows = large.rows().slice(i * 10, 10);
+            let part = EventBatch::new(
+                large.tenant().clone(),
+                large.dataset().clone(),
+                large.kind(),
+                rows,
+            )
+            .unwrap();
+            assert!(part.memory_size() * 5 < whole, "a part counts its own rows");
+            acks.push(ingester.write(part).await);
+        }
+        assert!(
+            acks.iter_mut().all(|ack| ack.try_now().is_none()),
+            "none of them fills a segment"
+        );
+        h.clock.advance(Duration::from_millis(250));
+        ingester.tick().await;
+        for ack in acks {
+            assert_eq!(
+                ack.wait().await.unwrap(),
+                Seq::new(1),
+                "one segment for the five"
+            );
+        }
+        assert_eq!(
+            h.entry_kinds(&ingester).await,
+            ["segment"],
+            "and no flush: fifty rows are far from what fills a memtable"
+        );
     }
 
     /// CT-6: whoever leaves an idle tenant alone is told when a writer

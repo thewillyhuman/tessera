@@ -621,6 +621,26 @@ impl EventBatch {
         &self.rows
     }
 
+    /// The bytes the rows take in memory: of each buffer, the part the
+    /// rows use. Rows that share an allocation with other data count
+    /// their own part of it: a slice of a larger batch, or a batch read
+    /// from a message whose columns lie in one allocation, where
+    /// [`RecordBatch::get_array_memory_size`] counts the whole
+    /// allocation once for every column that lies in it.
+    #[must_use]
+    pub fn memory_size(&self) -> usize {
+        self.rows
+            .columns()
+            .iter()
+            .map(|column| {
+                column
+                    .to_data()
+                    .get_slice_memory_size()
+                    .unwrap_or_else(|_| column.get_array_memory_size())
+            })
+            .sum()
+    }
+
     /// The number of events.
     #[must_use]
     pub fn len(&self) -> usize {
