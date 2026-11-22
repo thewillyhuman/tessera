@@ -380,7 +380,9 @@ AFTER d ... ELSE
 policies are applied at compaction, sampling by event or by trace
 with `sample_rate` scaled on the survivors (CO-6, CO-7), where
 `EXCEPT ERRORS` keeps whole a trace with an error span in the
-partition or in the windows beside it, downsampling
+partition or in the windows beside it, and one an alert there is
+about (a rule that selects `trace_id` gives its alerts the trace),
+downsampling
 metrics to count, sum, min, max and last per series and interval
 (CO-8), and dropping by age alone removes whole partitions; nothing
 is reduced by value without an enabled policy (CO-10). Budgets per
@@ -416,9 +418,8 @@ store only, not against a provider's bill; `EXCEPT ERRORS` looks
 for a trace's error a window's length either side of the partition
 being sampled, so a trace longer than a window that fails further
 away is sampled, and so is one whose error arrives after its
-partition was sampled; a trace an alert event names would be spared
-too, but the events the rules write name none yet; sketches are not
-merged when downsampling (CO-8);
+partition was sampled; sketches are not merged when downsampling
+(CO-8);
 Prometheus recording rules
 are evaluated at their interval and written as gauges of the recorded
 name to the rule's dataset rather than turned into rollups, so a

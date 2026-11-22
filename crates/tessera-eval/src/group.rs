@@ -1202,6 +1202,28 @@ fn metric_rows(metric: &str, samples: &[Observation], now: Timestamp) -> Vec<Met
         .collect()
 }
 
+/// The label that names the trace an alert is about: a rule that
+/// groups by `trace_id` gives each of its instances one.
+const TRACE_LABEL: &str = "trace_id";
+
+/// The trace `labels` name, when they name one: thirty-two
+/// hexadecimal digits under [`TRACE_LABEL`].
+fn trace_of(labels: &BTreeMap<String, String>) -> Option<[u8; 16]> {
+    let text = labels.get(TRACE_LABEL)?;
+    if text.len() != 32 || !text.is_ascii() {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    for (byte, pair) in id.iter_mut().zip(text.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(id)
+}
+
+/// The event an alert's change of status is stored as. It names the
+/// trace the alert is about, when its labels do: a policy that
+/// samples spans can then spare the trace (CO-7), and a reader go
+/// from the alert to it.
 fn alert_event(tenant: &TenantId, transition: &Transition, now: Timestamp) -> EventRow {
     let mut attributes: Attributes = transition
         .labels
@@ -1229,9 +1251,64 @@ fn alert_event(tenant: &TenantId, transition: &Transition, now: Timestamp) -> Ev
         timestamp: transition.at,
         observed_timestamp: now,
         event_id: transition.event_id(tenant.as_str()),
-        trace_id: None,
+        trace_id: trace_of(&transition.labels),
         span_id: None,
         name: transition.rule.clone(),
         attributes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CO-7: an alert about a trace names it, so that the trace can
+    /// be spared from sampling.
+    #[test]
+    fn an_alert_event_names_the_trace_its_labels_name() {
+        let transition = |labels: &[(&str, &str)]| Transition {
+            rule: "SlowCheckout".into(),
+            fingerprint: "f".into(),
+            number: 1,
+            from: Status::Pending,
+            to: Status::Firing,
+            at: Timestamp::from_nanos(1),
+            labels: labels
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            value: 1.0,
+            received: None,
+        };
+        let event = |labels: &[(&str, &str)]| {
+            alert_event(
+                &TenantId::DEFAULT,
+                &transition(labels),
+                Timestamp::from_nanos(2),
+            )
+        };
+        let mut id = [0u8; 16];
+        id[14] = 0x27;
+        id[15] = 0x0f;
+        let about = event(&[
+            ("service", "checkout"),
+            ("trace_id", "0000000000000000000000000000270f"),
+        ]);
+        assert_eq!(about.trace_id, Some(id));
+        assert_eq!(
+            about.attributes.get("attr.trace_id"),
+            Some(&Scalar::Text("0000000000000000000000000000270f".into())),
+            "the label stays a label"
+        );
+        // Most alerts are about no trace, and a label that is not an
+        // id names none.
+        assert_eq!(event(&[("service", "checkout")]).trace_id, None);
+        for not_an_id in ["270f", "zz000000000000000000000000000000", ""] {
+            assert_eq!(
+                event(&[("trace_id", not_an_id)]).trace_id,
+                None,
+                "{not_an_id}"
+            );
+        }
     }
 }

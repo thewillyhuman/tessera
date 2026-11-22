@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    Array, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    UInt64Array,
 };
 use arrow::datatypes::DataType;
 use tessera_exec::{Engine, EngineError, QueryOutput, ScanUse};
@@ -18,7 +19,7 @@ use tessera_logql::LogqlFrontend;
 use tessera_opt::{OptError, optimize};
 use tessera_promql::PromqlFrontend;
 use tessera_sql::SqlFrontend;
-use tessera_types::event::{EXTRACTED, VALUE};
+use tessera_types::event::{EXTRACTED, TRACE_ID, VALUE};
 use tessera_types::{DatasetName, InvalidId, TenantId, Timestamp};
 
 use crate::lifecycle::Observation;
@@ -212,9 +213,21 @@ pub fn instance_labels(
     labels
 }
 
-/// SQL rows: every text column is a label, the last numeric column the
-/// value, one when there is none. Counts and sums far below 2^53 lose
-/// nothing in the conversion.
+/// The label an identifier gives: its bytes in hexadecimal, as trace
+/// and span ids are written.
+fn hexadecimal(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
+}
+
+/// SQL rows: every text column is a label, and so is `trace_id`, in
+/// hexadecimal, which makes an alert of a rule that groups by trace
+/// one about that trace; the last numeric column is the value, one
+/// when there is none. Counts and sums far below 2^53 lose nothing in
+/// the conversion.
 #[allow(clippy::cast_precision_loss)]
 fn observe_rows(output: &QueryOutput) -> Vec<Observation> {
     let mut observations = Vec::new();
@@ -231,6 +244,11 @@ fn observe_rows(output: &QueryOutput) -> Vec<Observation> {
                     DataType::Utf8 => {
                         if let Some(text) = column.as_any().downcast_ref::<StringArray>() {
                             labels.insert(field.name().clone(), text.value(row).to_owned());
+                        }
+                    }
+                    DataType::FixedSizeBinary(_) if field.name() == TRACE_ID => {
+                        if let Some(id) = column.as_any().downcast_ref::<FixedSizeBinaryArray>() {
+                            labels.insert(field.name().clone(), hexadecimal(id.value(row)));
                         }
                     }
                     DataType::Float64 => {
@@ -296,4 +314,18 @@ fn observe_samples(batches: &[RecordBatch]) -> Vec<Observation> {
         }
     }
     observations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_identifier_is_a_label_in_hexadecimal() {
+        let mut id = [0u8; 16];
+        id[0] = 0xab;
+        id[15] = 0x0f;
+        assert_eq!(hexadecimal(&id), "ab00000000000000000000000000000f");
+        assert_eq!(hexadecimal(&[]), "");
+    }
 }
