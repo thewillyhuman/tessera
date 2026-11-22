@@ -177,7 +177,7 @@ mod tests {
         use tessera_types::{Seq, WriterId};
 
         use crate::Manifest;
-        use crate::busy::Busy;
+        use tessera_object::BusyStore;
 
         let env = Env::simulated(1, Timestamp::from_nanos(0));
         let store = MemoryStore::new();
@@ -186,7 +186,7 @@ mod tests {
             let adopted = manifest.adopt(WriterId::from_u128(1), Seq::new(1), &[]);
             adopted.await.unwrap();
         }
-        let busy = Arc::new(Busy::over(store));
+        let busy = Arc::new(BusyStore::over(store));
         let manifests = Manifests::new(busy.clone(), env, 8);
         let dataset = DatasetName::new("prod").unwrap();
         let versions = manifests

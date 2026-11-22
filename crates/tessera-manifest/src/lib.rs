@@ -8,8 +8,6 @@
 //! the position up to which the writer's segments are represented by
 //! those files.
 
-#[cfg(test)]
-mod busy;
 pub mod checkpoint;
 pub mod dataset;
 pub mod intake;

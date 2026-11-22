@@ -4,6 +4,7 @@
 //! 18.2): object keys, the `ObjectStore` trait, its implementations, storage
 //! pools and fault injection for simulation.
 
+pub mod busy;
 pub mod cache;
 #[cfg(test)]
 pub mod conformance;
@@ -20,6 +21,7 @@ pub mod sealed;
 pub mod shallow;
 pub mod store;
 
+pub use busy::BusyStore;
 pub use cache::{CacheStats, CachedStore};
 pub use fault::{FaultPolicy, FaultyStore, LostResponseStore};
 pub use key::{InvalidKey, Key};

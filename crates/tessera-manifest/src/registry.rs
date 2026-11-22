@@ -325,7 +325,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let busy = crate::busy::Busy::over(store);
+        let busy = tessera_object::BusyStore::over(store);
         let listed = list(&busy, &TenantId::DEFAULT, &dataset()).await.unwrap();
         assert_eq!(
             listed.iter().map(|r| r.writer).collect::<Vec<_>>(),

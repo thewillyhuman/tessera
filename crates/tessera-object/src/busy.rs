@@ -2,18 +2,21 @@
 
 //! A store for tests of what must be read together.
 
+use std::future::poll_fn;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use tessera_object::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
+
+use crate::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
 
 /// A store that says how many reads were in flight at once. Over a
 /// bucket, reads made one after another are a round trip each.
 #[derive(Debug, Default)]
-pub struct Busy {
+pub struct BusyStore {
     inner: MemoryStore,
     /// The reads counted: those of keys that start with this.
     under: String,
@@ -21,26 +24,29 @@ pub struct Busy {
     most: AtomicUsize,
 }
 
-impl Busy {
+impl BusyStore {
     /// A store over `inner` that has seen no read yet.
+    #[must_use]
     pub fn over(inner: MemoryStore) -> Self {
-        Busy {
+        BusyStore {
             inner,
-            ..Busy::default()
+            ..BusyStore::default()
         }
     }
 
     /// A store over `inner` that counts only the reads of keys that
     /// start with `under`.
+    #[must_use]
     pub fn watching(inner: MemoryStore, under: &str) -> Self {
-        Busy {
+        BusyStore {
             inner,
             under: under.to_owned(),
-            ..Busy::default()
+            ..BusyStore::default()
         }
     }
 
     /// The most reads that were in flight at once.
+    #[must_use]
     pub fn most(&self) -> usize {
         self.most.load(Ordering::SeqCst)
     }
@@ -53,13 +59,22 @@ impl Busy {
         }
         let now = self.reading.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(now, Ordering::SeqCst);
-        tokio::task::yield_now().await;
+        let mut yielded = false;
+        poll_fn(|context| {
+            if yielded {
+                return Poll::Ready(());
+            }
+            yielded = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await;
         self.reading.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 #[async_trait]
-impl ObjectStore for Busy {
+impl ObjectStore for BusyStore {
     async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
         self.read(key).await;
         self.inner.get(key).await

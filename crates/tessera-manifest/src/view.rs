@@ -390,7 +390,6 @@ mod tests {
     use tessera_wal::{FlushTarget, WriterLog, write_l1_files};
 
     use super::*;
-    use crate::busy::Busy;
     use crate::intake;
 
     const WINDOW: Duration = Duration::from_secs(86_400);
@@ -749,7 +748,7 @@ mod tests {
         flush(&store, &env, &mut log, 0, 1, days).await;
         adopt(&store, &log).await;
 
-        let busy = Arc::new(Busy::over(store));
+        let busy = Arc::new(tessera_object::BusyStore::over(store));
         let manifests = Manifests::new(busy.clone(), env, 8);
         let found = sources(
             &manifests,
@@ -853,7 +852,7 @@ mod tests {
             .unwrap();
             log.append_segment(&[batch(0, node * 10, 2)]).await.unwrap();
         }
-        let busy = Arc::new(Busy::watching(store, "_wal/"));
+        let busy = Arc::new(tessera_object::BusyStore::watching(store, "_wal/"));
         let manifests = Manifests::new(busy.clone(), env, 8);
         let found = sources(
             &manifests,
