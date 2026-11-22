@@ -57,6 +57,15 @@ rootPool:
   storageClassName: ""      # must support ReadWriteMany
   size: 100Gi
 
+# How a node with the ingest role writes. Each writer is a log of its
+# own, appended to by one task: a node stores one segment at a time
+# per writer, so its writers are how many of its cores ingest uses and
+# how many writes to the store it has in flight. One suits a node of a
+# core or two; give a larger node as many as the cores it may spend on
+# ingest.
+ingest:
+  writers: 1
+
 # The cache of object reads on each pod's local disk, used when the
 # root pool is a bucket: the most bytes it keeps of data files, their
 # indexes and writer-log entries. Zero turns it off.

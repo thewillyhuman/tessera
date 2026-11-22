@@ -47,6 +47,9 @@ spec:
             - --pg-listen=0.0.0.0:5432
             - --roles={{ join "," $group.roles }}
             - --advertise=http://$(POD_IP):8080
+            {{- if and (has "ingest" $group.roles) (gt (int $root.Values.ingest.writers) 1) }}
+            - --ingest-writers={{ int $root.Values.ingest.writers }}
+            {{- end }}
             {{- if not $root.Values.allowAnonymous }}
             - --no-anonymous
             {{- end }}
