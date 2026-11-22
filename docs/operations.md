@@ -130,7 +130,12 @@ closed by another node's recovery.
   default) plus one `PUT`.
 - `compact` nodes own intake, compaction and garbage collection by
   slot; `eval` nodes own rule groups by slot. Slots move by lease
-  when nodes come and go.
+  when nodes come and go. A node compacts one partition at a time,
+  on one core, so compaction is scaled by adding `compact` nodes:
+  from the second one on, the partitions are spread over four slots
+  per node, each a lease renewed every few seconds, and the count
+  is not lowered when nodes leave. Writers and rule groups have one
+  slot each kind, held by one node.
 - Give query nodes a `--cache-dir` on fast local disk
   (`--cache-bytes`, 8 GiB by default). It holds what was read of data
   files, their indexes, writer-log entries and manifest checkpoints,

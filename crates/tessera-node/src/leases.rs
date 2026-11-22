@@ -116,6 +116,26 @@ impl Owned {
     }
 }
 
+/// How many slots of partitions a cluster has for each node that
+/// compacts, once it has more than one: enough for the slots to fall
+/// on every node, by the hash that places them, in all but a few
+/// clusters in a hundred. Each slot is a lease its owner renews, which
+/// is three requests to the store every renewal.
+const PARTITION_SLOTS_A_NODE: usize = 4;
+
+/// The slots of partitions for a cluster of `nodes` nodes that
+/// compact: one for a single node, which owns everything anyway.
+fn partition_slots(nodes: usize) -> u32 {
+    if nodes <= 1 {
+        return 1;
+    }
+    nodes
+        .saturating_mul(PARTITION_SLOTS_A_NODE)
+        .checked_next_power_of_two()
+        .and_then(|slots| u32::try_from(slots).ok())
+        .map_or(1 << 31, |slots| slots.min(1 << 31))
+}
+
 /// The lease loop's dependencies.
 pub struct Leases {
     /// The lease objects in the root pool.
@@ -139,6 +159,9 @@ impl Leases {
     /// sees a slot missing while its renewal is in flight.
     pub async fn tick(&self) {
         for kind in self.kinds.iter().copied() {
+            if kind == WorkKind::Partition {
+                self.share_partitions().await;
+            }
             let count = self.catalog.cached().state().slot_count(kind);
             let mut held = self.owned.leases(kind);
             let mut next = BTreeMap::new();
@@ -176,6 +199,35 @@ impl Leases {
             self.load
                 .set_slots(kind, u64::try_from(next.len()).unwrap_or(u64::MAX));
             self.owned.replace(kind, count, next);
+        }
+    }
+
+    /// Raises the slots of partitions to what the live nodes that
+    /// compact are to share (AR-5): with the one slot a cluster begins
+    /// with, one node compacts every partition and the others none,
+    /// however many are added. A failure is logged and tried again at
+    /// the next pass; the count is never lowered.
+    async fn share_partitions(&self) {
+        let nodes = self.membership.live(role_of(WorkKind::Partition)).len();
+        let wanted = partition_slots(nodes);
+        let count = self
+            .catalog
+            .cached()
+            .state()
+            .slot_count(WorkKind::Partition);
+        if count.get() >= wanted {
+            return;
+        }
+        match self.catalog.raise_slots(WorkKind::Partition, wanted).await {
+            Ok(raised) => {
+                tracing::info!(
+                    nodes,
+                    from = count.get(),
+                    to = raised.get(),
+                    "partition slots raised"
+                );
+            }
+            Err(error) => tracing::warn!(error = %error, "partition slots not raised"),
         }
     }
 
@@ -296,6 +348,56 @@ mod tests {
             kinds: COMPACT_KINDS.to_vec(),
             load: Load::new(),
         }
+    }
+
+    /// AR-5: a cluster begins with one slot of partitions, which one
+    /// node holds: on a cluster under load, the second node that
+    /// compacts did nothing while the first could not keep up. The
+    /// nodes that compact raise the count to what they are to share.
+    #[tokio::test]
+    async fn the_nodes_that_compact_share_the_partitions() {
+        assert_eq!(partition_slots(0), 1);
+        assert_eq!(partition_slots(1), 1, "one node owns everything anyway");
+        assert_eq!(partition_slots(2), 8);
+        assert_eq!(partition_slots(3), 16, "a power of two");
+        assert_eq!(partition_slots(usize::MAX), 1 << 31);
+
+        let fixture = fixture().await;
+        let (a, b) = (
+            fixture.env.node,
+            Env::simulated(4, Timestamp::from_nanos(0)).node,
+        );
+        let slots = || {
+            fixture
+                .catalog
+                .cached()
+                .state()
+                .slot_count(WorkKind::Partition)
+                .get()
+        };
+        // Alone, a node leaves the one slot there is.
+        let alone = node(&fixture, a, &[a]);
+        alone.tick().await;
+        assert_eq!(slots(), 1);
+        assert_eq!(alone.owned.slots(WorkKind::Partition).len(), 1);
+        alone.release_all().await;
+        // Two of them have eight to share, raised once.
+        let node_a = node(&fixture, a, &[a, b]);
+        let node_b = node(&fixture, b, &[a, b]);
+        node_a.tick().await;
+        node_b.tick().await;
+        assert_eq!(slots(), 8);
+        let (slots_a, slots_b) = (
+            node_a.owned.slots(WorkKind::Partition),
+            node_b.owned.slots(WorkKind::Partition),
+        );
+        assert_eq!(slots_a.len() + slots_b.len(), 8, "{slots_a:?} {slots_b:?}");
+        assert!(slots_a.is_disjoint(&slots_b));
+        assert!(!slots_a.is_empty() && !slots_b.is_empty());
+        // One of them leaving does not lower the count.
+        let left = node(&fixture, a, &[a]);
+        left.tick().await;
+        assert_eq!(slots(), 8);
     }
 
     #[tokio::test]

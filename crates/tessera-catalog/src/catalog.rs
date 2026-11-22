@@ -452,6 +452,35 @@ impl Catalog {
         Ok(snapshot.state().slot_count(kind))
     }
 
+    /// Raises the slot count of a kind of work to the least power of
+    /// two that is at least `at_least`, doubling it as often as that
+    /// takes (AR-5). A count already that large is left as it is, so
+    /// nodes that ask for the same at once change it once.
+    ///
+    /// # Errors
+    ///
+    /// `SlotsAtMaximum` or a log failure.
+    pub async fn raise_slots(
+        &self,
+        kind: WorkKind,
+        at_least: u32,
+    ) -> Result<SlotCount, CatalogError> {
+        let snapshot = self
+            .log
+            .update(|state| {
+                let mut count = state.slot_count(kind);
+                if count.get() >= at_least {
+                    return Ok(Vec::new());
+                }
+                while count.get() < at_least {
+                    count = count.doubled().ok_or(CatalogError::SlotsAtMaximum(kind))?;
+                }
+                Ok(vec![put_record(slots_key(kind), &count)])
+            })
+            .await?;
+        Ok(snapshot.state().slot_count(kind))
+    }
+
     /// Creates the built-in tenants and the root pool's record if the log
     /// is empty. Racing nodes converge: whoever commits version one wins
     /// and the others find nothing to do.
@@ -1119,6 +1148,23 @@ mod tests {
         assert_eq!(
             catalog.cached().state().slot_count(WorkKind::Partition),
             SlotCount::ONE
+        );
+        // Raised to at least a number: the power of two that reaches
+        // it, once, however often it is asked for.
+        for (at_least, count) in [(1, 1), (5, 8), (5, 8), (8, 8), (3, 8), (9, 16)] {
+            assert_eq!(
+                catalog
+                    .raise_slots(WorkKind::Partition, at_least)
+                    .await
+                    .unwrap()
+                    .get(),
+                count,
+                "at least {at_least}"
+            );
+        }
+        assert_eq!(
+            catalog.cached().state().slot_count(WorkKind::Intake).get(),
+            4
         );
     }
 
