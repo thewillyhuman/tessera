@@ -4,7 +4,8 @@
 //! partition manifests. Metadata work only.
 //!
 //! For one dataset and writer, intake reads the writer's flush records in
-//! order and asks each partition a record touches to adopt the record's
+//! order, by the header of each entry of the log and without the rows
+//! its segments carry, and asks each partition a record touches to adopt the record's
 //! files for that partition together with the writer's new position, in
 //! one commit (IT-1). Adoption is idempotent (IT-2), so intake can start
 //! over from the beginning of the log, run twice, or run on two nodes at
@@ -18,7 +19,7 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use tessera_object::ObjectStore;
 use tessera_types::{DatasetName, Env, FileMeta, PartitionId, Seq, TenantId, WriterId};
-use tessera_wal::{Entry, EntryBody, WalError, reader};
+use tessera_wal::{EntryBody, EntryHeader, WalError, reader};
 
 use crate::{Manifest, ManifestError, registry};
 
@@ -76,7 +77,7 @@ pub async fn run_after(
     writer: WriterId,
     after: Seq,
 ) -> Result<IntakeOutcome, ManifestError> {
-    let entries = reader::entries(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
+    let entries = reader::headers(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
     over(store, env, tenant, dataset, writer, after, entries).await
 }
 
@@ -101,7 +102,7 @@ pub async fn run_following(
     after: Seq,
 ) -> Result<IntakeOutcome, ManifestError> {
     let entries =
-        reader::entries_following(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
+        reader::headers_following(Arc::clone(&store), writer, after, Arc::clone(&env.keys));
     over(store, env, tenant, dataset, writer, after, entries).await
 }
 
@@ -113,7 +114,7 @@ async fn over(
     dataset: &DatasetName,
     writer: WriterId,
     after: Seq,
-    mut entries: BoxStream<'static, Result<Entry, WalError>>,
+    mut entries: BoxStream<'static, Result<EntryHeader, WalError>>,
 ) -> Result<IntakeOutcome, ManifestError> {
     let mut outcome = IntakeOutcome {
         through: after,
@@ -121,8 +122,8 @@ async fn over(
     };
     let mut adopted = None;
     while let Some(entry) = entries.try_next().await? {
-        outcome.through = entry.seq();
-        match entry.body() {
+        outcome.through = entry.seq;
+        match &entry.body {
             EntryBody::Flush {
                 tenant: t,
                 dataset: d,
@@ -143,7 +144,8 @@ async fn over(
                 adopted = Some(*through);
             }
             EntryBody::End => outcome.ended = true,
-            // The entries come unlocked: none is a flush still sealed.
+            // The headers come with what a flush record sealed opened:
+            // none is a flush still sealed.
             EntryBody::Flush { .. }
             | EntryBody::SealedFlush { .. }
             | EntryBody::Segment { .. }
@@ -336,6 +338,33 @@ mod tests {
         .unwrap();
         assert_eq!(again.adoptions, 0);
         assert_eq!(again.flushes, 1);
+    }
+
+    /// A log is mostly the rows of its segments, and intake wants its
+    /// flush records: it asks for the header of each entry, in a
+    /// request that leaves the rows in the store.
+    #[tokio::test]
+    async fn intake_reads_the_headers_of_a_log_and_not_its_rows() {
+        let inner = MemoryStore::new();
+        let log = writer_with_flushes(&inner).await;
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(inner)));
+        let outcome = run(
+            metered.clone(),
+            &env(),
+            &TenantId::DEFAULT,
+            &dataset(),
+            log.writer_id(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((outcome.flushes, outcome.through), (1, Seq::new(4)));
+        let tails = metered
+            .requests()
+            .by_operation()
+            .into_iter()
+            .find(|(operation, _)| *operation == "get_tail")
+            .map(|(_, made)| made);
+        assert_eq!(tails, Some(5), "four entries, and the end of the log");
     }
 
     /// A run that resumes where the one before stopped reads what the
