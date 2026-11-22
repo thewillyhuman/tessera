@@ -250,6 +250,95 @@ async fn event_ids(node: &Node) -> Vec<u8> {
     ids
 }
 
+/// The attribute `attr.n` of every row the dataset holds, by event
+/// id: none where a row lost it.
+async fn attribute_n(node: &Node) -> Vec<(u8, Option<i64>)> {
+    let format: Arc<dyn tessera_format::FileFormat> = Arc::new(ParquetFormat::default());
+    let read = view::read(
+        &node.pools,
+        &format,
+        &node.env,
+        &TenantId::DEFAULT,
+        &dataset(),
+        Kind::Log,
+        Window::DEFAULT_LENGTH,
+    )
+    .await
+    .unwrap();
+    let mut found = Vec::new();
+    for rows in &read.rows {
+        let ids = rows
+            .column_by_name(EVENT_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .unwrap();
+        let attributes = tessera_types::event::attributes_column(rows);
+        for row in 0..rows.num_rows() {
+            let n = attributes
+                .as_ref()
+                .filter(|all| !all.is_null(row))
+                .and_then(|all| serde_json::from_str::<serde_json::Value>(all.value(row)).ok())
+                .and_then(|all| all["attr.n"].as_i64());
+            found.push((ids.value(row)[0], n));
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// AD-4: a file keeps an attribute it promoted in a column of its own
+/// and out of `_overflow`, so that nothing is stored twice. A job that
+/// rewrites such a file, for a layout the advisor adopted, at
+/// retention or once its traces are complete, takes the kind's own
+/// columns of its inputs and promotes again from `_overflow`: it must
+/// read its inputs with every attribute there. It read them as
+/// stored, and the rewrite lost every attribute the file had promoted.
+#[tokio::test]
+async fn the_attributes_a_file_promoted_survive_its_rewrite() {
+    let node = node(&[&[1, 2], &[3], &[4], &[5]], Timestamp::UNIX_EPOCH).await;
+    let manifest = manifest(&node).await;
+    let every: Vec<(u8, Option<i64>)> = (1..=5).map(|n| (n, Some(i64::from(n)))).collect();
+    assert_eq!(attribute_n(&node).await, every);
+
+    let compactor = Compactor::new(
+        node.pools.clone(),
+        Arc::new(ParquetFormat::default()),
+        node.env.clone(),
+    );
+    let record = LayoutRecord::default_for(Kind::Log);
+    let merge = {
+        let before = manifest.snapshot().await.unwrap();
+        let now = node.env.clock.now();
+        plan(manifest.id(), before.state(), now, &Policy::default()).unwrap()
+    };
+    compactor
+        .run(&manifest, &merge, &record, None, &[])
+        .await
+        .unwrap();
+    let merged: Vec<_> = {
+        let snapshot = manifest.snapshot().await.unwrap();
+        snapshot.state().files().cloned().collect()
+    };
+    assert_eq!(merged.len(), 1);
+    assert!(
+        merged[0].columns.iter().any(|c| c.name == "attr.n"),
+        "the merged file keeps the attribute in a column of its own"
+    );
+    assert_eq!(attribute_n(&node).await, every);
+
+    let rewrite = Job {
+        partition: manifest.id().clone(),
+        inputs: merged,
+        level: Level::L2,
+    };
+    compactor
+        .run(&manifest, &rewrite, &record, None, &[])
+        .await
+        .unwrap();
+    assert_eq!(attribute_n(&node).await, every, "after the rewrite");
+}
+
 #[tokio::test]
 async fn l1_files_merge_into_one_indexed_l2_file_without_duplicates() {
     let node = node(

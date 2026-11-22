@@ -105,7 +105,12 @@ pub trait FileFormat: Send + Sync {
         key: Option<&NamedKey>,
     ) -> Result<Written, FormatError>;
 
-    /// Decodes a whole file, with the format's keys if it is encrypted.
+    /// Decodes a whole file, with the format's keys if it is encrypted:
+    /// every row as it was written, its `_overflow` carrying every
+    /// attribute, those the file keeps in dedicated columns merged
+    /// back (AD-4). A reader that rewrites the rows takes them from
+    /// here: the dedicated columns differ from file to file, and
+    /// `_overflow` as it is stored lacks what they hold.
     ///
     /// # Errors
     ///

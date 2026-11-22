@@ -972,15 +972,12 @@ async fn rewritten_in(
     false
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_filtered_attribute_becomes_the_sort_key_without_intervention() {
-    let dir = tempfile::tempdir().unwrap();
-    let node = Node::start(config(dir.path()), Env::system())
-        .await
-        .unwrap();
+/// Pushes fifty log lines of each of `hosts` to the `prod` dataset,
+/// a push a host, labelled with it.
+async fn push_fifty_lines_of_each(node: &Node, hosts: &[&str]) {
     let push = format!("http://{}/loki/api/v1/push", node.http_address());
     let now = node.env().clock.now().as_nanos();
-    for host in ["h1", "h2", "h3", "h4"] {
+    for host in hosts {
         let values: Vec<serde_json::Value> = (0..50)
             .map(|i| serde_json::json!([(now + i).to_string(), format!("line {i} on {host}")]))
             .collect();
@@ -995,6 +992,15 @@ async fn a_filtered_attribute_becomes_the_sort_key_without_intervention() {
         .await;
         assert_eq!(status, 204, "{text}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_filtered_attribute_becomes_the_sort_key_without_intervention() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::start(config(dir.path()), Env::system())
+        .await
+        .unwrap();
+    push_fifty_lines_of_each(&node, &["h1", "h2", "h3", "h4"]).await;
     let url = format!("http://{}/api/v1/query", node.http_address());
     let query = |sql: &str| {
         let url = url.clone();
@@ -1071,6 +1077,16 @@ async fn a_filtered_attribute_becomes_the_sort_key_without_intervention() {
         },
     )
     .await;
+    // The rewritten file answers as the files before it did: the
+    // attribute it now keeps in a column of its own is still there.
+    let hosts = query("SELECT attr.host, count(*) FROM logs GROUP BY attr.host ORDER BY 1").await;
+    assert_eq!(
+        hosts["rows"],
+        serde_json::json!([["h1", 50.0], ["h2", 50.0], ["h3", 50.0], ["h4", 50.0]]),
+        "{hosts}"
+    );
+    let answer = query("SELECT count(*) FROM logs WHERE attr.host = 'h2'").await;
+    assert_eq!(answer["rows"][0][0], 50.0, "{answer}");
     node.stop().await;
 }
 

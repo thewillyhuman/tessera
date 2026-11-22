@@ -4,9 +4,10 @@
 //! path gets a dedicated column when it is well known, when at least a
 //! hundredth of the rows carry it, or when the layout asks for it (the
 //! advisor's hot set and the sort key). At most [`MAX_DEDICATED`] paths
-//! are promoted; the rest stay in `_overflow`, which keeps every
-//! attribute either way so that a reader without the column loses
-//! nothing (AD-3, AD-4). A path seen with values of several types gets
+//! are promoted; the rest stay in `_overflow`. A promoted attribute is
+//! stored in its column and left out of `_overflow`, so that nothing
+//! is stored twice: a reader of whole rows has them merged back
+//! (AD-3, AD-4). A path seen with values of several types gets
 //! a column per type class, `attr.code#i64` and `attr.code#str`, each
 //! null where the value is of another class (DM-5), so that a number
 //! and its text stay apart.

@@ -177,6 +177,7 @@ impl FileFormat for ParquetFormat {
         .build()
         .map_err(|e| FormatError::Unreadable(e.to_string()))?;
         reader
+            .map(|rows| rows.and_then(|rows| crate::reader::with_merged_overflow(&rows)))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| FormatError::Unreadable(e.to_string()))
     }

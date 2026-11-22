@@ -370,7 +370,7 @@ fn merged_and_projected(
 
 /// `batch` with its `_overflow` column rebuilt from the dedicated
 /// attribute columns it carries.
-fn with_merged_overflow(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
+pub(crate) fn with_merged_overflow(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
     let Ok(index) = batch.schema().index_of(OVERFLOW) else {
         return Ok(batch.clone());
     };
