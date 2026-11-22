@@ -739,6 +739,8 @@ tables in `system`: what it asks of `pg_catalog` and
 `information_schema` to list them (`\l`, `\dt` and `\d logs` in
 psql, a JDBC driver's metadata, SQLAlchemy's reflection) is answered
 as PostgreSQL 16 would, without keys, indexes or functions to show.
+Over this protocol a table may be named as they show it, `public.logs`
+or `prod.public.logs`.
 The user is any name and the password an API key, or anything where
 anonymous access is on. The answers were checked against psql 17,
 the PostgreSQL JDBC driver 42.7, SQLAlchemy 2 with psycopg2,

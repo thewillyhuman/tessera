@@ -189,6 +189,9 @@ impl PgServer {
         let mut ctx = BindContext::new(tenant, dataset, self.state.env.clock.now());
         ctx.tenants = crate::params::tenants(&self.state, &principal);
         ctx.prices = crate::params::prices(&self.state);
+        // The catalogs show a dataset's tables in the schema `public`,
+        // and the tools that browse name them by it.
+        ctx.public_schema = true;
         Ok((ctx, principal))
     }
 
@@ -957,6 +960,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(system.len(), 2);
+
+        // A table is read by the name the catalogs show it under.
+        for named in ["public.logs", "prod.public.logs"] {
+            let counted = client
+                .query_one(&format!("SELECT count(*) FROM {named}"), &[])
+                .await
+                .unwrap();
+            let n: f64 = counted.get(0);
+            assert!((n - 3.0).abs() < f64::EPSILON, "{named}");
+        }
 
         // A query on a table is the engine's, whatever its strings say.
         let rows = client

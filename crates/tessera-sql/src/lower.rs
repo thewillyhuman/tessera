@@ -815,6 +815,20 @@ fn conjunction(exprs: Vec<&ast::Expr>) -> Option<ast::Expr> {
     })
 }
 
+/// `from` as a `PostgreSQL` client means it, where the context says
+/// one wrote the statement: `public` is the schema a dataset's tables
+/// are in there, so `public.logs` is the request's dataset's logs and
+/// `prod.public.logs` those of the dataset `prod`. None when `from`
+/// names no such schema.
+fn in_public_schema(from: &ast::TableRef, ctx: &BindContext) -> Option<ast::TableRef> {
+    let named = ctx.public_schema && from.dataset.as_deref() == Some("public");
+    named.then(|| ast::TableRef {
+        tenant: None,
+        dataset: from.tenant.clone(),
+        ..from.clone()
+    })
+}
+
 /// The rows of a table in `FROM` or `JOIN`, and what its columns are
 /// called: the alias when one is written.
 fn source(
@@ -852,6 +866,8 @@ fn source(
         }
         return Ok((table, plan));
     }
+    let in_schema = in_public_schema(from, ctx);
+    let from = in_schema.as_ref().unwrap_or(from);
     let derived = matches!(from.table.as_str(), "usage" | "log_patterns");
     if from.tenant.is_some() && from.dataset.as_deref() == Some("system") && derived {
         return Err(Diagnostic::at(
@@ -2889,6 +2905,36 @@ mod tests {
         assert!(
             schema.field_with_name("l.body").is_ok() && schema.field_with_name("s.name").is_ok()
         );
+    }
+
+    /// Section 16: to a `PostgreSQL` client the database is the dataset
+    /// and its tables are in the schema `public`, which is how the
+    /// tools that browse name them.
+    #[test]
+    fn public_is_the_schema_of_a_datasets_tables_to_a_postgresql_client() {
+        let scans = |sql: &str, public_schema: bool| {
+            let mut ctx = ctx();
+            ctx.public_schema = public_schema;
+            match lower(&parse(sql).unwrap(), &ctx).unwrap() {
+                Statement::Query(plan) => plan.to_string(),
+                other => panic!("not a query: {other:?}"),
+            }
+        };
+        let reads = |sql: &str, public_schema: bool, dataset: &str| {
+            let plan = scans(sql, public_schema);
+            assert!(
+                plan.contains(&format!("Scan: {dataset}/log ")),
+                "{sql}: {plan}"
+            );
+        };
+        reads("SELECT body FROM public.logs", true, "prod");
+        reads("SELECT l.body FROM public.logs l", true, "prod");
+        reads("SELECT body FROM staging.public.logs", true, "staging");
+        // A dataset is still named as before.
+        reads("SELECT body FROM staging.logs", true, "staging");
+        reads("SELECT body FROM logs", true, "prod");
+        // Elsewhere `public` is a dataset like any other.
+        reads("SELECT body FROM public.logs", false, "public");
     }
 
     #[test]

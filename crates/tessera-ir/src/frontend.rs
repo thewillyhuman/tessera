@@ -109,6 +109,13 @@ pub struct BindContext {
     /// The unit prices usage is costed with (CO-4), by the settings that
     /// name them; a price nobody set is zero.
     pub prices: BTreeMap<String, f64>,
+    /// Whether `public` before a table's name is the schema a dataset's
+    /// tables are in, as a `PostgreSQL` client finds them, and not a
+    /// dataset: `public.logs` is then the request's dataset's logs and
+    /// `prod.public.logs` those of the dataset `prod`. Off unless the
+    /// statement came over that protocol, where the database is the
+    /// dataset (section 16).
+    pub public_schema: bool,
 }
 
 /// The settings that price usage (CO-4): per byte received, stored
@@ -132,6 +139,7 @@ impl BindContext {
             now,
             tenants: BTreeMap::new(),
             prices: BTreeMap::new(),
+            public_schema: false,
         }
     }
 
