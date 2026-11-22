@@ -131,6 +131,17 @@ struct Visit {
     whole: bool,
 }
 
+/// Whether the round numbered `round` goes over every tenant: the
+/// first does, and after it a whole round does when what the
+/// partitions hold is due to be recorded or the node's slots moved.
+/// Slots move one after the other while a node joins or leaves, and
+/// a round over every tenant for each move would be many of them at
+/// the moment the nodes have the least to spare: the moves since the
+/// last such round wait for the next whole one.
+fn goes_over_every_tenant(round: u64, held_due: bool, slots_moved: bool) -> bool {
+    round.is_multiple_of(WHOLE_EVERY) && (round == 0 || held_due || slots_moved)
+}
+
 /// How a round goes over one tenant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pass {
@@ -261,15 +272,18 @@ pub async fn run(background: Background) {
         ticks.tick().await;
         let now = background.env.clock.now();
         // Every tenant is gone over when what the partitions hold is
-        // to be recorded, and when the slots this node owns changed:
-        // a tenant at rest may have work in a slot that was another
-        // node's, and at its start a node owns none.
+        // to be recorded, and when the slots this node owns changed
+        // since it last went over them all: a tenant at rest may have
+        // work in a slot that was another node's, and at its start a
+        // node owns none.
         let owned = COMPACT_KINDS.map(|kind| background.owned.slots(kind));
         let owns_partitions = !background.owned.slots(WorkKind::Partition).is_empty();
         let held_due = owns_partitions && is_due(last_held, now, HELD_EVERY);
-        let every = rounds == 0 || held_due || slots.as_ref() != Some(&owned);
-        slots = Some(owned);
-        let whole_round = every || rounds.is_multiple_of(WHOLE_EVERY);
+        let whole_round = rounds.is_multiple_of(WHOLE_EVERY);
+        let every = goes_over_every_tenant(rounds, held_due, slots.as_ref() != Some(&owned));
+        if every {
+            slots = Some(owned);
+        }
         let visit = Visit {
             every,
             whole: whole_round,
@@ -305,7 +319,7 @@ pub async fn run(background: Background) {
         // round in which the node owns any: each partition has one
         // owner, so the cluster records each once. Only a round over
         // every tenant has gone over every partition this node owns.
-        if held_due {
+        if every && held_due {
             if !held.is_empty() {
                 background.meter.held(held);
             }
@@ -1122,6 +1136,22 @@ mod tests {
         // Every tenant, once an hour.
         assert_eq!(every.pass(at_rest, quiet), Pass::Whole);
         assert_eq!(every.pass(open, quiet), Pass::Whole);
+    }
+
+    #[test]
+    fn every_tenant_is_gone_over_at_a_whole_round_that_has_a_reason() {
+        let (due, moved, no) = (true, true, false);
+        assert!(goes_over_every_tenant(0, no, no), "the first round");
+        // Nothing to record and no slot moved: the tenants at rest
+        // are left alone, round after round.
+        assert!((1..100).all(|round| !goes_over_every_tenant(round, no, no)));
+        // A slot that moved, or what is held being due, waits for the
+        // next whole round.
+        for round in 1..=12 {
+            let whole = round % WHOLE_EVERY == 0;
+            assert_eq!(goes_over_every_tenant(round, no, moved), whole, "{round}");
+            assert_eq!(goes_over_every_tenant(round, due, no), whole, "{round}");
+        }
     }
 
     #[test]
