@@ -38,9 +38,15 @@ const LOG_QUEUE: usize = 4_096;
 /// How long log events are gathered before a write.
 const LOG_LINGER: Duration = Duration::from_secs(1);
 
-/// The load signals as metric points, one gauge per signal and one per
-/// kind of work for the slots, all labelled with the node. The counts
-/// are small, so they lose nothing as floats.
+/// A point of a load signal: its metric, its value and, where the
+/// signal has one, the label that tells its series apart and the
+/// label's value.
+type Point = (String, f64, Option<(&'static str, String)>);
+
+/// The load signals as metric points, one gauge per signal, one per
+/// kind of work for the slots and one per operation for the calls to
+/// the store, all labelled with the node. The counts are far below
+/// 2^53, so they lose nothing as floats.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn metric_rows(
@@ -49,7 +55,7 @@ pub fn metric_rows(
     node: NodeId,
     now: Timestamp,
 ) -> Vec<MetricRow> {
-    let mut points: Vec<(String, f64, Option<String>)> = vec![
+    let mut points: Vec<Point> = vec![
         (
             "tessera_ingest_queue_depth".into(),
             snapshot.ingest_queue_depth as f64,
@@ -96,22 +102,37 @@ pub fn metric_rows(
             None,
         ),
     ];
+    let cache = snapshot.object_cache;
+    for (name, value) in [
+        ("tessera_object_cache_hits_total", cache.hits),
+        ("tessera_object_cache_misses_total", cache.misses),
+        ("tessera_object_cache_bytes", cache.bytes),
+    ] {
+        points.push((name.into(), value as f64, None));
+    }
     for (kind, held) in &snapshot.slots {
         points.push((
             "tessera_slots_owned".into(),
             *held as f64,
-            Some(kind.to_string()),
+            Some(("kind", kind.to_string())),
+        ));
+    }
+    for (operation, calls) in &snapshot.store_requests {
+        points.push((
+            "tessera_object_store_requests_total".into(),
+            *calls as f64,
+            Some(("operation", (*operation).to_owned())),
         ));
     }
     points
         .into_iter()
-        .map(|(name, value, kind)| {
+        .map(|(name, value, label)| {
             let mut attributes: Attributes = BTreeMap::new();
             attributes.insert("attr.node".into(), Scalar::Text(node.to_string()));
-            let series = match &kind {
-                Some(kind) => {
-                    attributes.insert("attr.kind".into(), Scalar::Text(kind.clone()));
-                    format!("{name}/{node}/{kind}")
+            let series = match &label {
+                Some((label, of)) => {
+                    attributes.insert(format!("attr.{label}"), Scalar::Text(of.clone()));
+                    format!("{name}/{node}/{of}")
                 }
                 None => format!("{name}/{node}"),
             };
@@ -319,13 +340,30 @@ mod tests {
             intake_backlog: 0,
             evaluator_lag: Duration::from_secs(3),
             degraded_rules: 0,
-            object_cache: tessera_cluster::ObjectCache::default(),
-            store_requests: Vec::new(),
+            object_cache: tessera_cluster::ObjectCache {
+                hits: 30,
+                misses: 10,
+                bytes: 4_096,
+            },
+            store_requests: vec![("get", 12), ("list", 5)],
             slots: BTreeMap::from([(WorkKind::Partition, 4), (WorkKind::Intake, 1)]),
             alert_latency: Duration::from_millis(1_200),
         };
         let rows = metric_rows(&snapshot, 3, NodeId::from_u128(7), Timestamp::from_nanos(1));
-        assert_eq!(rows.len(), 11);
+        assert_eq!(rows.len(), 16);
+        // What the node asks of its store and what its cache saves it
+        // are what an idle cluster costs: they are recorded too.
+        let of =
+            |name: &str| -> Vec<&MetricRow> { rows.iter().filter(|r| r.name == name).collect() };
+        assert_eq!(of("tessera_object_cache_hits_total")[0].value, Some(30.0));
+        assert_eq!(of("tessera_object_cache_misses_total")[0].value, Some(10.0));
+        assert_eq!(of("tessera_object_cache_bytes")[0].value, Some(4_096.0));
+        let requests = of("tessera_object_store_requests_total");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().any(|r| r.attributes["attr.operation"]
+            == Scalar::Text("get".into())
+            && r.value == Some(12.0)));
+        assert_ne!(requests[0].series_id, requests[1].series_id);
         let latency = rows
             .iter()
             .find(|r| r.name == "tessera_alert_latency_seconds")
