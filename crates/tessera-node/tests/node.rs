@@ -37,9 +37,11 @@ fn config(dir: &std::path::Path) -> Config {
     }
 }
 
-/// Polls `condition` for up to five seconds.
+/// Polls `condition` for up to half a minute: what is waited for
+/// takes a second or two, and a machine that runs every test at once
+/// on two cores has taken more than five.
 async fn eventually(what: &str, condition: impl FnMut() -> bool) {
-    common::eventually(what, Duration::from_secs(5), condition).await;
+    common::eventually(what, Duration::from_secs(30), condition).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
