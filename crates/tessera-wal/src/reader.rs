@@ -310,6 +310,23 @@ pub fn headers(
     walk(store, writer, (from, Start::Found), keys, header_of)
 }
 
+/// What [`blocks`] gives of the entries after `from`, in order, found
+/// and ended as [`entries`] are: what a reader asks who wants the rows
+/// a log holds of one dataset or a few.
+pub fn blocks_after(
+    store: Arc<dyn ObjectStore>,
+    writer: WriterId,
+    from: Seq,
+    keys: Arc<Keys>,
+    picked: Arc<dyn Fn(&BlockMeta) -> bool + Send + Sync>,
+) -> BoxStream<'static, Result<Blocks, WalError>> {
+    let read = move |store: Arc<dyn ObjectStore>, writer, seq, keys: Arc<Keys>| {
+        let picked = Arc::clone(&picked);
+        async move { blocks(&*store, writer, seq, &keys, &*picked).await }
+    };
+    walk(store, writer, (from, Start::Found), keys, read)
+}
+
 /// The entries that follow `after`, read by their positions one after
 /// the other until the first that is missing, with no listing: what a
 /// reader that comes back to a log every few seconds asks, a request
@@ -350,20 +367,23 @@ enum Start {
 
 /// What `read` gives of each entry of `writer`'s log after `from`, in
 /// order, from where `start` says until the first missing position.
-fn walk<T, R>(
+fn walk<T, R, F>(
     store: Arc<dyn ObjectStore>,
     writer: WriterId,
     (from, start): (Seq, Start),
     keys: Arc<Keys>,
-    read: fn(Arc<dyn ObjectStore>, WriterId, Seq, Arc<Keys>) -> R,
+    read: F,
 ) -> BoxStream<'static, Result<T, WalError>>
 where
     T: Send + 'static,
     R: Future<Output = Result<T, WalError>> + Send + 'static,
+    F: Fn(Arc<dyn ObjectStore>, WriterId, Seq, Arc<Keys>) -> R + Send + Sync + 'static,
 {
+    let read = Arc::new(read);
     Box::pin(stream::try_unfold((from, start), move |(seq, start)| {
         let store = Arc::clone(&store);
         let keys = Arc::clone(&keys);
+        let read = Arc::clone(&read);
         async move {
             let next = match start {
                 Start::Next => seq.next(),
