@@ -161,6 +161,51 @@ pub struct EntryHeader {
     pub body: EntryBody,
 }
 
+impl EntryHeader {
+    /// How many of an entry's last bytes hold its header and the
+    /// trailer after it, as the entry's last bytes say.
+    ///
+    /// # Errors
+    ///
+    /// `Unreadable` if `tail` does not end as an entry does.
+    pub(crate) fn stored_len(tail: &[u8]) -> Result<usize, WalError> {
+        let total = tail.len();
+        if total < TRAILER_LEN || &tail[total - 4..] != MAGIC {
+            return Err(WalError::Unreadable("missing trailer".into()));
+        }
+        let header_len = u32::from_le_bytes(
+            tail[total - TRAILER_LEN..total - 4]
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("four bytes")),
+        ) as usize;
+        Ok(header_len.saturating_add(TRAILER_LEN))
+    }
+
+    /// The header that `tail`, the last bytes of an entry, ends with.
+    ///
+    /// # Errors
+    ///
+    /// `Unreadable` if `tail` does not end with a header or is too
+    /// short to hold it ([`stored_len`](Self::stored_len) says how
+    /// long it must be); `UnsupportedFormat` if the entry was written
+    /// by a newer release.
+    pub(crate) fn decode(tail: &[u8]) -> Result<Self, WalError> {
+        let start = tail
+            .len()
+            .checked_sub(Self::stored_len(tail)?)
+            .ok_or_else(|| WalError::Unreadable("header length exceeds object".into()))?;
+        let header: EntryHeader = serde_json::from_slice(&tail[start..tail.len() - TRAILER_LEN])
+            .map_err(|e| WalError::Unreadable(format!("header: {e}")))?;
+        if header.format > FORMAT {
+            return Err(WalError::UnsupportedFormat {
+                format: header.format,
+                supported: FORMAT,
+            });
+        }
+        Ok(header)
+    }
+}
+
 /// One entry of a writer log.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Entry {
@@ -519,26 +564,8 @@ impl Entry {
     /// `Unreadable` if the bytes are not an entry; `UnsupportedFormat` if
     /// it was written by a newer release.
     pub fn decode(bytes: &Bytes) -> Result<Self, WalError> {
-        let total = bytes.len();
-        if total < TRAILER_LEN || &bytes[total - 4..] != MAGIC {
-            return Err(WalError::Unreadable("missing trailer".into()));
-        }
-        let header_len = u32::from_le_bytes(
-            bytes[total - TRAILER_LEN..total - 4]
-                .try_into()
-                .unwrap_or_else(|_| unreachable!("four bytes")),
-        ) as usize;
-        let header_start = total
-            .checked_sub(TRAILER_LEN + header_len)
-            .ok_or_else(|| WalError::Unreadable("header length exceeds object".into()))?;
-        let header: EntryHeader = serde_json::from_slice(&bytes[header_start..total - TRAILER_LEN])
-            .map_err(|e| WalError::Unreadable(format!("header: {e}")))?;
-        if header.format > FORMAT {
-            return Err(WalError::UnsupportedFormat {
-                format: header.format,
-                supported: FORMAT,
-            });
-        }
+        let header = EntryHeader::decode(bytes)?;
+        let header_start = bytes.len() - EntryHeader::stored_len(bytes)?;
         Ok(Entry {
             header,
             blocks: bytes.slice(..header_start),

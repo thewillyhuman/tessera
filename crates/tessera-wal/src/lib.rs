@@ -14,7 +14,7 @@ pub mod reader;
 pub mod recovery;
 pub mod writer;
 
-pub use entry::{BlockMeta, Entry, EntryBody, EntryId, FORMAT};
+pub use entry::{BlockMeta, Entry, EntryBody, EntryHeader, EntryId, FORMAT};
 pub use flush::{FlushTarget, write_l1_files};
 pub use recovery::{Recovery, recover};
 pub use writer::WriterLog;
