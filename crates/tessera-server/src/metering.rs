@@ -10,10 +10,12 @@
 //! without holding anything up.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
+use tessera_catalog::Catalog;
 use tessera_exec::ScanUse;
 use tessera_ingest::IngestHandle;
 use tessera_kernels::variant;
@@ -54,13 +56,28 @@ pub struct Usage {
     pub extra: BTreeMap<&'static str, Scalar>,
 }
 
-/// The rows of `_system.usage` for `usages`.
-fn rows(usages: &[Usage], now: Timestamp, random: &mut impl Random) -> Vec<EventRow> {
+/// The rows of `_system.usage` for `usages`. Each carries its
+/// tenant's name as `catalog` has it beside the tenant's id, so that
+/// usage can be read by the name people know a tenant by; a tenant
+/// the catalog does not know has none.
+fn rows(
+    usages: &[Usage],
+    now: Timestamp,
+    random: &mut impl Random,
+    catalog: &Catalog,
+) -> Vec<EventRow> {
+    let tenants = catalog.cached();
     usages
         .iter()
         .map(|u| {
             let mut attributes: Attributes = BTreeMap::new();
             attributes.insert("attr.tenant".into(), Scalar::Text(u.tenant.to_string()));
+            if let Some(tenant) = tenants.state().tenant(&u.tenant) {
+                attributes.insert(
+                    "attr.tenant_name".into(),
+                    Scalar::Text(tenant.name.to_string()),
+                );
+            }
             attributes.insert("attr.dataset".into(), Scalar::Text(u.dataset.clone()));
             if let Some(kind) = u.kind {
                 attributes.insert("attr.kind".into(), Scalar::Text(kind.as_str().into()));
@@ -97,8 +114,13 @@ fn rows(usages: &[Usage], now: Timestamp, random: &mut impl Random) -> Vec<Event
 
 /// The batch of `_system.usage` for `usages`, if any.
 #[must_use]
-pub fn batch_of(usages: &[Usage], now: Timestamp, random: &mut impl Random) -> Option<EventBatch> {
-    let rows = rows(usages, now, random);
+pub fn batch_of(
+    usages: &[Usage],
+    now: Timestamp,
+    random: &mut impl Random,
+    catalog: &Catalog,
+) -> Option<EventBatch> {
+    let rows = rows(usages, now, random, catalog);
     let dataset = DatasetName::new(DATASET).ok()?;
     EventBatch::from_events(TenantId::SYSTEM, dataset, &rows).ok()
 }
@@ -110,7 +132,7 @@ pub fn record(state: &AppState, usages: &[Usage]) {
     }
     let now = state.env.clock.now();
     let mut random = state.env.random.fork();
-    let Some(batch) = batch_of(usages, now, &mut random) else {
+    let Some(batch) = batch_of(usages, now, &mut random, &state.catalog) else {
         return;
     };
     let state = state.clone();
@@ -287,13 +309,19 @@ pub const HELD: &str = "held";
 pub struct IngestMeter {
     ingest: IngestHandle,
     env: Env,
+    catalog: Arc<Catalog>,
 }
 
 impl IngestMeter {
-    /// A meter writing through `ingest`.
+    /// A meter writing through `ingest`, naming tenants as `catalog`
+    /// does.
     #[must_use]
-    pub fn new(ingest: IngestHandle, env: Env) -> Self {
-        IngestMeter { ingest, env }
+    pub fn new(ingest: IngestHandle, env: Env, catalog: Arc<Catalog>) -> Self {
+        IngestMeter {
+            ingest,
+            env,
+            catalog,
+        }
     }
 }
 
@@ -301,7 +329,8 @@ impl IngestMeter {
     /// Writes `usages` through the ingester without waiting.
     fn write(&self, usages: &[Usage], what: &'static str) {
         let mut random = self.env.random.fork();
-        let Some(batch) = batch_of(usages, self.env.clock.now(), &mut random) else {
+        let now = self.env.clock.now();
+        let Some(batch) = batch_of(usages, now, &mut random, &self.catalog) else {
             return;
         };
         let ingest = self.ingest.clone();
@@ -381,6 +410,18 @@ mod tests {
             .as_array()
             .unwrap_or_else(|| panic!("{value}"));
         assert!(!rows.is_empty(), "{value}");
+        // Usage is read by the name a tenant is known by, not only by
+        // its id.
+        let named = sql(
+            &state,
+            "SELECT tenant, tenant_name FROM system.usage WHERE phase = 'ingest' LIMIT 1",
+        )
+        .await;
+        assert_eq!(
+            named["rows"][0],
+            serde_json::json!(["default", "default"]),
+            "{named}"
+        );
         let bytes = rows[0][1]
             .as_f64()
             .unwrap_or_else(|| panic!("bytes in {value}"));

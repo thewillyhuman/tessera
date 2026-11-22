@@ -342,7 +342,7 @@ impl Node {
             requests,
             Arc::clone(&shared.load),
         )));
-        let meter: Arc<dyn Meter> = Arc::new(IngestMeter::new(ingest.clone(), shared.env.clone()));
+        let meter = shared.meter(&ingest);
         let (leases, lease_loop) = shared.own_slots(&config, &mut loops, meter);
         let (state, engine, controls) =
             shared.app_state(ingest.clone(), &config, peer_client(&config)?);
@@ -680,6 +680,16 @@ struct Shared {
 }
 
 impl Shared {
+    /// The meter compaction reports what it stores to (CO-2): it
+    /// writes through the node's own ingester.
+    fn meter(&self, ingest: &IngestHandle) -> Arc<dyn Meter> {
+        Arc::new(IngestMeter::new(
+            ingest.clone(),
+            self.env.clone(),
+            Arc::clone(&self.catalog),
+        ))
+    }
+
     /// Starts the lease loop for the kinds of work the node's roles own
     /// (section 14.2) and, on a compact node, the background work over
     /// the owned slots. Returns the leases and the loop's stop handle.

@@ -365,6 +365,7 @@ records stored bytes per the same and per log pattern or name (CO-2);
 queries record bytes scanned, time taken, object-store requests,
 principal, language, source and fingerprint (CO-3); all of it is
 written as events of `_system.usage` and read back as `system.usage`,
+which names each row's tenant by id and by name and
 whose `cost` column prices each row at the cluster settings
 `price.ingest_byte`, `price.stored_byte`, `price.scanned_byte`,
 `price.cpu_ms` and `price.request`, set over `PUT /api/v1/settings/{name}`

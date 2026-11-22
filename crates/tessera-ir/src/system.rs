@@ -41,8 +41,9 @@ fn time(name: &str) -> Field {
 /// The columns of `system.usage` (CO-4) besides `timestamp` and `phase`:
 /// the column, the attribute of the `_system.usage` event it comes
 /// from, and whether it is a number.
-pub const USAGE_COLUMNS: [(&str, &str, bool); 18] = [
+pub const USAGE_COLUMNS: [(&str, &str, bool); 19] = [
     ("tenant", "attr.tenant", false),
+    ("tenant_name", "attr.tenant_name", false),
     ("dataset", "attr.dataset", false),
     ("kind", "attr.kind", false),
     ("service", "attr.service", false),

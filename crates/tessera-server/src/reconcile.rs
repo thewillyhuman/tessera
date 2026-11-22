@@ -242,7 +242,11 @@ mod tests {
     async fn usage_reconciles_with_the_listed_data_files() {
         let state = crate::testing::state().await;
         let app = crate::router(state.clone());
-        let meter = metering::IngestMeter::new(state.ingest.clone(), state.env.clone());
+        let meter = metering::IngestMeter::new(
+            state.ingest.clone(),
+            state.env.clone(),
+            Arc::clone(&state.catalog),
+        );
         meter.held(vec![Held {
             tenant: TenantId::DEFAULT,
             dataset: DatasetName::new("prod").unwrap(),
