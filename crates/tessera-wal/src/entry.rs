@@ -204,6 +204,40 @@ impl EntryHeader {
         }
         Ok(header)
     }
+
+    /// The rows of block `index` of the segment this heads, from the
+    /// block's bytes as they are `stored`, opened with `keys` where
+    /// the block is sealed (SE-2).
+    ///
+    /// # Errors
+    ///
+    /// `NoSuchBlock`; `Keys` when the block's key is not in the
+    /// keyring or does not open it; `Arrow` or `Batch` if the block is
+    /// corrupt.
+    pub(crate) fn rows_of(
+        &self,
+        index: usize,
+        stored: &[u8],
+        keys: &Keys,
+    ) -> Result<EventBatch, WalError> {
+        let EntryBody::Segment { blocks } = &self.body else {
+            return Err(WalError::NoSuchBlock(index));
+        };
+        let meta = blocks.get(index).ok_or(WalError::NoSuchBlock(index))?;
+        let rows = match &meta.key {
+            Some(key) => {
+                let aad = block_aad(self.writer, self.seq, index);
+                decode_block(&keys.open(key, &aad, stored)?)?
+            }
+            None => decode_block(stored)?,
+        };
+        Ok(EventBatch::new(
+            meta.tenant.clone(),
+            meta.dataset.clone(),
+            meta.kind,
+            rows,
+        )?)
+    }
 }
 
 /// One entry of a writer log.

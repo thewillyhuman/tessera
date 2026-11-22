@@ -9,9 +9,9 @@ use std::sync::Arc;
 use futures::TryStreamExt;
 use futures::stream::{self, BoxStream};
 use tessera_object::{Key, ObjectError, ObjectStore, layout};
-use tessera_types::{Keys, Seq, WriterId};
+use tessera_types::{EventBatch, Keys, Seq, WriterId};
 
-use crate::{Entry, EntryBody, EntryHeader, WalError};
+use crate::{BlockMeta, Entry, EntryBody, EntryHeader, WalError};
 
 /// How many of an entry's last bytes are asked for to read its header:
 /// more than the header of a segment of a hundred blocks takes, and
@@ -94,26 +94,143 @@ pub async fn header(
     keys: &Keys,
 ) -> Result<EntryHeader, WalError> {
     let key = layout::writer_log_entry(writer, seq);
-    let mut tail = store.get_tail(&key, HEADER_READ).await?;
-    // An entry shorter than what was asked for came whole.
-    let whole = (tail.len() as u64) < HEADER_READ;
-    let stored = EntryHeader::stored_len(&tail).map_err(|e| corrupt(&key, e))?;
-    if stored > tail.len() && !whole {
-        tail = store.get_tail(&key, stored as u64).await?;
-    }
-    let header = EntryHeader::decode(&tail).map_err(|e| corrupt(&key, e))?;
+    let end = End::read(store, &key).await?;
+    let header = EntryHeader::decode(&end.bytes).map_err(|e| corrupt(&key, e))?;
     if !matches!(header.body, EntryBody::SealedFlush { .. }) {
         return Ok(header);
     }
     // What a sealed flush record sealed, its files, lies before its
     // header. Such a record is small, and mostly came whole.
-    let mut entry = if whole {
-        Entry::decode(&tail).map_err(|e| corrupt(&key, e))?
+    let mut entry = if end.whole {
+        Entry::decode(&end.bytes).map_err(|e| corrupt(&key, e))?
     } else {
         read(store, writer, seq).await?
     };
     entry.unlock(keys)?;
     Ok(entry.header().clone())
+}
+
+/// The last bytes of an entry, as many as hold its header.
+struct End {
+    bytes: bytes::Bytes,
+    /// Whether they are the whole entry.
+    whole: bool,
+    /// How many of them are the header and the trailer after it.
+    header_len: usize,
+}
+
+impl End {
+    async fn read(store: &dyn ObjectStore, key: &Key) -> Result<Self, WalError> {
+        let mut bytes = store.get_tail(key, HEADER_READ).await?;
+        // An entry shorter than what was asked for came whole.
+        let whole = (bytes.len() as u64) < HEADER_READ;
+        let header_len = EntryHeader::stored_len(&bytes).map_err(|e| corrupt(key, e))?;
+        if header_len > bytes.len() && !whole {
+            bytes = store.get_tail(key, header_len as u64).await?;
+        }
+        Ok(End {
+            bytes,
+            whole,
+            header_len,
+        })
+    }
+}
+
+/// What [`blocks`] read of an entry.
+#[derive(Clone, Debug)]
+pub struct Blocks {
+    /// The entry's header; a flush record stored sealed is left so
+    /// ([`header`] opens it).
+    pub header: EntryHeader,
+    /// The rows of the blocks that were picked, in the order of the
+    /// entry; none of an entry that is not a segment.
+    pub rows: Vec<EventBatch>,
+}
+
+/// One entry as a reader of some of its rows wants it: its header
+/// and, of a segment, the rows of the blocks `picked` chooses, sealed
+/// blocks opened with `keys` (SE-2). A segment holds a block for each
+/// tenant, dataset and kind its writer took rows of, and a reader
+/// mostly wants one of them: the header is read from the entry's last
+/// bytes, a block that came with them is taken from them, and the
+/// others are asked for, those that lie one after the other in one
+/// request. The blocks that were not picked stay in the store.
+///
+/// # Errors
+///
+/// `Store` with `NotFound` if there is no such entry; `Corrupt` if it
+/// cannot be decoded; `Keys` if a picked block does not open.
+pub async fn blocks(
+    store: &dyn ObjectStore,
+    writer: WriterId,
+    seq: Seq,
+    keys: &Keys,
+    picked: &(dyn Fn(&BlockMeta) -> bool + Sync),
+) -> Result<Blocks, WalError> {
+    let key = layout::writer_log_entry(writer, seq);
+    let end = End::read(store, &key).await?;
+    let header = EntryHeader::decode(&end.bytes).map_err(|e| corrupt(&key, e))?;
+    let EntryBody::Segment { blocks: metas } = &header.body else {
+        return Ok(Blocks {
+            header,
+            rows: Vec::new(),
+        });
+    };
+    // The blocks lie one after the other from the entry's start, and
+    // the header after them: where they end is where what was read
+    // with the header begins, less what of them came with it.
+    let blocks_end = metas.iter().map(|m| m.offset + m.length).max().unwrap_or(0);
+    let read_from = (blocks_end + end.header_len as u64).saturating_sub(end.bytes.len() as u64);
+    let mut rows = Vec::new();
+    let mut asked: Option<(std::ops::Range<u64>, bytes::Bytes)> = None;
+    for (index, meta) in metas.iter().enumerate().filter(|(_, m)| picked(m)) {
+        let block = meta.offset..meta.offset + meta.length;
+        let stored = if block.start >= read_from {
+            within(&end.bytes, read_from, &block)
+        } else {
+            if asked.as_ref().is_none_or(|(run, _)| run.end <= block.start) {
+                let run = run_from(metas, index, picked, read_from);
+                let bytes = store.get_range(&key, run.clone()).await?;
+                asked = Some((run, bytes));
+            }
+            asked
+                .as_ref()
+                .and_then(|(run, bytes)| within(bytes, run.start, &block))
+        };
+        let stored = stored.ok_or_else(|| corrupt(&key, WalError::NoSuchBlock(index)))?;
+        rows.push(header.rows_of(index, stored, keys).map_err(|e| match e {
+            WalError::Keys(_) => e,
+            other => corrupt(&key, other),
+        })?);
+    }
+    Ok(Blocks { header, rows })
+}
+
+/// The bytes of `block` in `bytes`, which begin at `start` of the
+/// entry; none if they do not hold it all.
+fn within<'a>(bytes: &'a [u8], start: u64, block: &std::ops::Range<u64>) -> Option<&'a [u8]> {
+    let from = usize::try_from(block.start.checked_sub(start)?).ok()?;
+    let to = usize::try_from(block.end.checked_sub(start)?).ok()?;
+    bytes.get(from..to)
+}
+
+/// The bytes to ask for to have block `first` and the picked blocks
+/// that follow it with nothing between them, up to `before`: blocks
+/// that lie one after the other cost one request.
+fn run_from(
+    metas: &[BlockMeta],
+    first: usize,
+    picked: &(dyn Fn(&BlockMeta) -> bool + Sync),
+    before: u64,
+) -> std::ops::Range<u64> {
+    let mut run = metas[first].offset..metas[first].offset + metas[first].length;
+    for meta in &metas[first + 1..] {
+        if meta.offset != run.end || meta.offset >= before || !picked(meta) {
+            break;
+        }
+        run.end = meta.offset + meta.length;
+    }
+    run
 }
 
 fn corrupt(key: &Key, source: WalError) -> WalError {
@@ -404,9 +521,15 @@ mod tests {
             .collect()
     }
 
-    /// A batch of `lines` log lines of the default tenant that no
-    /// compression makes short.
-    fn logs(lines: u64) -> tessera_types::EventBatch {
+    /// A batch of `lines` log lines of the default tenant's `prod`
+    /// that no compression makes short.
+    fn logs(lines: u64) -> EventBatch {
+        logs_of("prod", lines)
+    }
+
+    /// A batch of `lines` log lines of `dataset` of the default tenant
+    /// that no compression makes short.
+    fn logs_of(dataset: &str, lines: u64) -> EventBatch {
         let mut random = tessera_types::SeededRandom::new(7);
         let rows: Vec<tessera_types::LogRow> = (0..lines)
             .map(|_| tessera_types::LogRow {
@@ -418,12 +541,130 @@ mod tests {
                 ..tessera_types::LogRow::default()
             })
             .collect();
-        tessera_types::EventBatch::from_logs(
+        EventBatch::from_logs(
             tessera_types::TenantId::DEFAULT,
-            tessera_types::DatasetName::new("prod").unwrap(),
+            tessera_types::DatasetName::new(dataset).unwrap(),
             &rows,
         )
         .unwrap()
+    }
+
+    /// Whether a block is of one of `datasets`.
+    fn of(datasets: &'static [&'static str]) -> impl Fn(&BlockMeta) -> bool + Sync {
+        move |meta| datasets.contains(&meta.dataset.as_str())
+    }
+
+    /// The datasets of `rows` and how many rows each batch holds.
+    fn held(rows: &[EventBatch]) -> Vec<(&str, usize)> {
+        rows.iter()
+            .map(|batch| (batch.dataset().as_str(), batch.len()))
+            .collect()
+    }
+
+    /// A segment holds the rows of every dataset its writer took, and
+    /// a reader of one dataset wants its block: the header is read
+    /// from the end, the block by its place, and the blocks between
+    /// stay in the store. Blocks that lie one after the other are one
+    /// request, and one that came with the header is none.
+    #[tokio::test]
+    async fn the_blocks_picked_are_read_and_the_others_left() {
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(
+            MemoryStore::new(),
+        )));
+        let store: Arc<dyn ObjectStore> = metered.clone();
+        let mut log =
+            WriterLog::start(Arc::clone(&store), Env::simulated(1, Timestamp::UNIX_EPOCH));
+        let segment = [
+            logs_of("a", 4_000),
+            logs_of("b", 3_000),
+            logs_of("c", 2_000),
+            logs_of("last", 5),
+        ];
+        let seq = log.append_segment(&segment).await.unwrap();
+        let writer = log.writer_id();
+        let none = Keys::none();
+        let read = async |datasets: &'static [&'static str]| {
+            let before = metered.requests().by_operation();
+            let found = blocks(&*store, writer, seq, &none, &of(datasets))
+                .await
+                .unwrap();
+            assert_eq!(found.header.seq, seq);
+            (
+                held(&found.rows)
+                    .into_iter()
+                    .map(|(dataset, rows)| (dataset.to_owned(), rows))
+                    .collect::<Vec<_>>(),
+                made_since(&metered, before),
+            )
+        };
+        let rows = |held: &[(&str, usize)]| -> Vec<(String, usize)> {
+            held.iter().map(|(d, n)| ((*d).to_owned(), *n)).collect()
+        };
+        assert_eq!(
+            read(&["b"]).await,
+            (
+                rows(&[("b", 3_000)]),
+                vec![("get_range", 1), ("get_tail", 1)]
+            )
+        );
+        assert_eq!(
+            read(&["a", "b"]).await,
+            (
+                rows(&[("a", 4_000), ("b", 3_000)]),
+                vec![("get_range", 1), ("get_tail", 1)]
+            ),
+            "blocks that lie one after the other are one request"
+        );
+        assert_eq!(
+            read(&["a", "c"]).await,
+            (
+                rows(&[("a", 4_000), ("c", 2_000)]),
+                vec![("get_range", 2), ("get_tail", 1)]
+            ),
+            "the block between them is not read"
+        );
+        assert_eq!(
+            read(&["c", "last"]).await,
+            (
+                rows(&[("c", 2_000), ("last", 5)]),
+                vec![("get_range", 1), ("get_tail", 1)]
+            ),
+            "a block that came with the header is not asked for"
+        );
+        assert_eq!(
+            read(&["last"]).await,
+            (rows(&[("last", 5)]), vec![("get_tail", 1)])
+        );
+        assert_eq!(read(&["none"]).await, (rows(&[]), vec![("get_tail", 1)]));
+    }
+
+    /// An entry shorter than a header read comes whole with it, and
+    /// an entry that is not a segment has no rows.
+    #[tokio::test]
+    async fn a_short_entry_gives_its_blocks_in_one_read() {
+        let metered = Arc::new(tessera_object::MeteredStore::new(Arc::new(
+            MemoryStore::new(),
+        )));
+        let store: Arc<dyn ObjectStore> = metered.clone();
+        let mut log =
+            WriterLog::start(Arc::clone(&store), Env::simulated(1, Timestamp::UNIX_EPOCH));
+        let segment = log
+            .append_segment(&[logs_of("a", 3), logs_of("b", 2)])
+            .await
+            .unwrap();
+        let end = log.append(EntryBody::End).await.unwrap();
+        let before = metered.requests().by_operation();
+        let none = Keys::none();
+        let found = blocks(&*store, log.writer_id(), segment, &none, &of(&["b"]))
+            .await
+            .unwrap();
+        assert_eq!(held(&found.rows), [("b", 2)]);
+        let found = blocks(&*store, log.writer_id(), end, &none, &of(&["b"]))
+            .await
+            .unwrap();
+        assert_eq!(found.header.body, EntryBody::End);
+        assert!(found.rows.is_empty());
+        assert_eq!(made_since(&metered, before), [("get_tail", 2)]);
     }
 
     /// Intake and collection ask what every entry of a log is, and
@@ -563,6 +804,43 @@ mod tests {
             assert_eq!(found.body, record, "{files} files");
             assert!(matches!(
                 header(&*store, log.writer_id(), seq, &Keys::none()).await,
+                Err(WalError::Keys(_))
+            ));
+        }
+    }
+
+    /// SE-2: a keyed tenant's blocks are stored sealed. A block that
+    /// is picked is opened with the keys, wherever it was read from,
+    /// and does not open without them.
+    #[tokio::test]
+    async fn a_sealed_block_that_is_picked_is_opened() {
+        let env = Env::simulated(1, Timestamp::UNIX_EPOCH).with_keys(Keys::new(
+            tessera_types::Keyring::default().with(
+                "k",
+                tessera_types::TenantKey::from_bytes([1; tessera_types::keys::KEY_LEN]),
+            ),
+            Arc::new(Keyed),
+        ));
+        let keys = Arc::clone(&env.keys);
+        let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+        let mut log = WriterLog::start(Arc::clone(&store), env);
+        let seq = log
+            .append_segment(&[logs_of("a", 4_000), logs_of("b", 3_000), logs_of("c", 2)])
+            .await
+            .unwrap();
+        let writer = log.writer_id();
+        let whole = read(&*store, writer, seq).await.unwrap();
+        assert!(
+            whole.block_metas().iter().all(|meta| meta.key.is_some()),
+            "stored sealed"
+        );
+        let found = blocks(&*store, writer, seq, &keys, &of(&["b", "c"]))
+            .await
+            .unwrap();
+        assert_eq!(held(&found.rows), [("b", 3_000), ("c", 2)]);
+        for dataset in [&["b"], &["c"]] {
+            assert!(matches!(
+                blocks(&*store, writer, seq, &Keys::none(), &of(dataset)).await,
                 Err(WalError::Keys(_))
             ));
         }
