@@ -11,7 +11,9 @@ use std::time::Duration;
 use arrow::array::{Array, FixedSizeBinaryArray};
 use tessera_compact::{Checkpoints, Compactor, Outcome, Policy, collect_files, collect_log, plan};
 use tessera_format::{ParquetFormat, Sidecar};
-use tessera_manifest::{LayoutRecord, Manifest, intake, list_partitions, registry, view};
+use tessera_manifest::{
+    DatasetLogs, LayoutRecord, Manifest, intake, list_partitions, registry, view,
+};
 use tessera_object::{MemoryStore, ObjectStore, Pools, layout};
 use tessera_types::event::{EVENT_ID, Scalar};
 use tessera_types::{
@@ -536,13 +538,14 @@ async fn collect_held(
     held: &Checkpoints,
 ) -> tessera_compact::LogCollection {
     let store: Arc<dyn ObjectStore> = node.store.clone();
+    let datasets = DatasetLogs::new(Arc::clone(&store), node.env.clone());
     collect_log(
         &store,
         &node.env,
         node.log.writer_id(),
         now,
         GRACE,
-        Window::DEFAULT_LENGTH,
+        &datasets,
         held,
     )
     .await

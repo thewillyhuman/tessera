@@ -40,6 +40,9 @@ pub enum CompactError {
     /// A manifest could not be read or committed.
     #[error("{0}")]
     Manifest(#[from] ManifestError),
+    /// A dataset's log could not be read.
+    #[error("{0}")]
+    Dataset(#[from] tessera_manifest::DatasetLogError),
     /// A file could not be read or written.
     #[error("{0}")]
     Format(#[from] FormatError),

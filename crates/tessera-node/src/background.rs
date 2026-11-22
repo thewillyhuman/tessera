@@ -873,14 +873,6 @@ async fn windows_of(background: &Background, tenants: &[TenantId]) -> Result<Win
 async fn collect_logs(background: &Background) -> Result<(), Failure> {
     let now = background.env.clock.now();
     let checkpoints = checkpoints(background).await?;
-    let tenants: Vec<TenantId> = background
-        .catalog
-        .cached()
-        .state()
-        .tenants()
-        .map(|t| t.id.clone())
-        .collect();
-    let windows = windows_of(background, &tenants).await?;
     for writer in reader::writers(&*background.store).await? {
         if !background
             .owned
@@ -894,7 +886,7 @@ async fn collect_logs(background: &Background) -> Result<(), Failure> {
             writer,
             now,
             DEFAULT_SEGMENT_GRACE,
-            &windows,
+            &background.datasets,
             &checkpoints,
         )
         .await?;

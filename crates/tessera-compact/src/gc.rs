@@ -18,11 +18,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tessera_manifest::{Manifest, list_partitions};
+use tessera_manifest::{DatasetLogs, Manifest, list_partitions};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::{
-    DatasetName, Env, FileId, Kind, Seq, TenantId, TimeRange, Timestamp, WindowSchedule, Windows,
-    WriterId,
+    DatasetName, Env, FileId, Kind, Seq, TenantId, TimeRange, Timestamp, WindowSchedule, WriterId,
 };
 use tessera_wal::{BlockMeta, EntryBody, reader};
 
@@ -127,7 +126,10 @@ pub struct LogCollection {
 
 /// Collects the entries of `writer`'s log that every touched partition
 /// has adopted, that are older than `grace`, and that `checkpoints`
-/// do not keep for a rule group still to read them.
+/// do not keep for a rule group still to read them. What places a
+/// segment's rows in partitions, the windows of their dataset (MF-2),
+/// is asked of `datasets` for the datasets the pass meets, and for no
+/// other.
 ///
 /// # Errors
 ///
@@ -138,10 +140,10 @@ pub async fn collect_log(
     writer: WriterId,
     now: Timestamp,
     grace: Duration,
-    windows: impl Into<Windows>,
+    datasets: &DatasetLogs,
     checkpoints: &Checkpoints,
 ) -> Result<LogCollection, CompactError> {
-    let mut positions = Positions::new(Arc::clone(store), env.clone(), windows.into());
+    let mut positions = Positions::new(Arc::clone(store), env.clone(), datasets);
     let seqs = reader::list(&**store, writer).await?;
     let mut collection = LogCollection::default();
     let mut deletable: Vec<Seq> = Vec::new();
@@ -186,21 +188,24 @@ pub async fn collect_log(
     Ok(collection)
 }
 
-/// Writer positions per partition, read lazily and cached for one pass.
-struct Positions {
+/// Writer positions per partition and windows per dataset, read
+/// lazily and cached for one pass.
+struct Positions<'a> {
     store: Arc<dyn ObjectStore>,
     env: Env,
-    windows: Windows,
+    datasets: &'a DatasetLogs,
+    schedules: BTreeMap<(TenantId, DatasetName), WindowSchedule>,
     partitions: BTreeMap<(TenantId, DatasetName, Kind), Vec<tessera_types::PartitionId>>,
     by_partition: BTreeMap<tessera_types::PartitionId, BTreeMap<WriterId, Seq>>,
 }
 
-impl Positions {
-    fn new(store: Arc<dyn ObjectStore>, env: Env, windows: Windows) -> Self {
+impl<'a> Positions<'a> {
+    fn new(store: Arc<dyn ObjectStore>, env: Env, datasets: &'a DatasetLogs) -> Self {
         Positions {
             store,
             env,
-            windows,
+            datasets,
+            schedules: BTreeMap::new(),
             partitions: BTreeMap::new(),
             by_partition: BTreeMap::new(),
         }
@@ -237,8 +242,12 @@ impl Positions {
                 })
                 .cloned()
                 .collect();
-            let schedule = self.windows.schedule_for(&block.tenant, &block.dataset);
-            if !covers_every_window(schedule, &touched, range) {
+            let dataset = (block.tenant.clone(), block.dataset.clone());
+            if !self.schedules.contains_key(&dataset) {
+                let log = self.datasets.open(&block.tenant, &block.dataset);
+                self.schedules.insert(dataset.clone(), log.window().await?);
+            }
+            if !covers_every_window(&self.schedules[&dataset], &touched, range) {
                 return Ok(false);
             }
             for partition in touched {
