@@ -9,6 +9,7 @@
 //! expression, an aggregate, or an expression over those, as in
 //! `PostgreSQL`.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -667,12 +668,76 @@ struct Lowerer<'a> {
     substitution: Option<Substitution>,
 }
 
+/// The field of `query`'s select list a key of GROUP BY or ORDER BY
+/// names by its position, from one: `GROUP BY 1`, `ORDER BY 2 DESC`,
+/// as SQL clients and query builders write them. None for a key that
+/// is no whole number.
+///
+/// # Errors
+///
+/// When the position is not one of the select list's, or the field
+/// there is `*`.
+fn at_position<'q>(
+    query: &'q ast::Query,
+    key: &ast::Expr,
+    clause: &str,
+) -> Result<Option<&'q ast::SelectItem>, Diagnostic> {
+    let ast::ExprKind::Number(text) = &key.kind else {
+        return Ok(None);
+    };
+    let Ok(position) = text.parse::<usize>() else {
+        return Ok(None);
+    };
+    match position.checked_sub(1).and_then(|i| query.items.get(i)) {
+        Some(item @ ast::SelectItem::Expr { .. }) => Ok(Some(item)),
+        Some(ast::SelectItem::Wildcard) => Err(Diagnostic::at(
+            key.span,
+            format!("{clause} position {position} is *: name a column"),
+        )),
+        None => Err(Diagnostic::at(
+            key.span,
+            format!("{clause} position {position} is not in the select list"),
+        )),
+    }
+}
+
+/// `query` with the keys of its GROUP BY and ORDER BY that are
+/// positions in the select list written out: the field's expression
+/// in GROUP BY, and in ORDER BY its alias when it has one, which is
+/// how a sort names what was selected.
+fn with_positions_written_out(query: &ast::Query) -> Result<Cow<'_, ast::Query>, Diagnostic> {
+    let is_position = |expr: &ast::Expr| matches!(&expr.kind, ast::ExprKind::Number(text) if text.parse::<usize>().is_ok());
+    let positional = query.group_by.iter().any(is_position)
+        || query.order_by.iter().any(|item| is_position(&item.expr));
+    if !positional {
+        return Ok(Cow::Borrowed(query));
+    }
+    let mut written = query.clone();
+    for key in &mut written.group_by {
+        if let Some(ast::SelectItem::Expr { expr, .. }) = at_position(query, key, "GROUP BY")? {
+            *key = expr.clone();
+        }
+    }
+    for item in &mut written.order_by {
+        match at_position(query, &item.expr, "ORDER BY")? {
+            Some(ast::SelectItem::Expr {
+                alias: Some(alias), ..
+            }) => item.expr.kind = ast::ExprKind::Name(vec![alias.clone()]),
+            Some(ast::SelectItem::Expr { expr, alias: None }) => item.expr = expr.clone(),
+            Some(ast::SelectItem::Wildcard) | None => {}
+        }
+    }
+    Ok(Cow::Owned(written))
+}
+
 fn lower_query(
     query: &ast::Query,
     ctx: &BindContext,
     registry: &Registry,
     parameters: &Parameters,
 ) -> Result<Plan, Diagnostic> {
+    let written = with_positions_written_out(query)?;
+    let query = &*written;
     let Some(from) = &query.from else {
         return lower_constant_query(query, ctx, registry, parameters);
     };
@@ -1339,6 +1404,22 @@ impl Lowerer<'_> {
         let mut substitution = self.substitution.take().unwrap_or_default();
         let mut group_by = Vec::new();
         for (i, key) in query.group_by.iter().enumerate() {
+            // A name no column has is the alias of a selected field,
+            // as `GROUP BY t` after `... AS t`.
+            let key = match &key.kind {
+                ast::ExprKind::Name(parts) if parts.len() == 1 && self.expr(key).is_err() => query
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        ast::SelectItem::Expr {
+                            expr,
+                            alias: Some(alias),
+                        } if *alias == parts[0] => Some(expr),
+                        _ => None,
+                    })
+                    .unwrap_or(key),
+                _ => key,
+            };
             let expr = self.expr(key)?;
             let name = query
                 .items
@@ -3401,6 +3482,53 @@ mod tests {
             bucketed
                 .to_string()
                 .starts_with("Project: bucket AS bucket, avg AS avg")
+        );
+    }
+
+    /// SQL clients and query builders name a selected field by its
+    /// position or its alias in GROUP BY and ORDER BY.
+    #[test]
+    fn group_by_and_order_by_take_a_position_or_an_alias() {
+        let written = lowered(
+            "SELECT time_bucket(INTERVAL '5m', timestamp) AS t, severity_text, count(*) AS n \
+             FROM logs GROUP BY time_bucket(INTERVAL '5m', timestamp), severity_text \
+             ORDER BY t, n DESC",
+        )
+        .to_string();
+        for positional in [
+            "SELECT time_bucket(INTERVAL '5m', timestamp) AS t, severity_text, count(*) AS n \
+             FROM logs GROUP BY 1, 2 ORDER BY 1, 3 DESC",
+            "SELECT time_bucket(INTERVAL '5m', timestamp) AS t, severity_text, count(*) AS n \
+             FROM logs GROUP BY t, severity_text ORDER BY 1, n DESC",
+        ] {
+            assert_eq!(lowered(positional).to_string(), written, "{positional}");
+        }
+        // A position without an alias is the field's expression.
+        let unnamed =
+            lowered("SELECT severity_text, count(*) FROM logs GROUP BY 1 ORDER BY 2 DESC");
+        unnamed.schema(&Registry::builtin()).unwrap();
+        // A column wins over an alias of the same name, as in PostgreSQL.
+        let column = lowered("SELECT upper(body) AS body, count(*) FROM logs GROUP BY body");
+        assert!(
+            column.to_string().contains("group_by=[body AS body]"),
+            "{column}"
+        );
+        // A sort of plain rows by position.
+        lowered("SELECT body, severity_number FROM logs ORDER BY 2 DESC, 1")
+            .schema(&Registry::builtin())
+            .unwrap();
+        let error = |sql: &str| lower(&parse(sql).unwrap(), &ctx()).unwrap_err().message;
+        assert_eq!(
+            error("SELECT body FROM logs GROUP BY 2"),
+            "GROUP BY position 2 is not in the select list"
+        );
+        assert_eq!(
+            error("SELECT body FROM logs ORDER BY 0"),
+            "ORDER BY position 0 is not in the select list"
+        );
+        assert_eq!(
+            error("SELECT * FROM logs ORDER BY 1"),
+            "ORDER BY position 1 is *: name a column"
         );
     }
 
