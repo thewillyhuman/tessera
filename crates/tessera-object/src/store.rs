@@ -117,6 +117,22 @@ pub trait ObjectStore: Send + Sync + fmt::Debug {
     /// is not within `0..size` or is reversed.
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError>;
 
+    /// Reads the last `length` bytes of an object, or all of it when it
+    /// is shorter: what a reader asks who knows that an object ends
+    /// with what it wants, and not how large the object is.
+    ///
+    /// As provided, the size is asked for and then the range; a store
+    /// that can be asked for the end of an object in one request does
+    /// that, and a store that wraps another passes the call on to it.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` if the object does not exist.
+    async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+        let size = self.head(key).await?.size;
+        self.get_range(key, size.saturating_sub(length)..size).await
+    }
+
     /// Reads an object's metadata.
     ///
     /// # Errors

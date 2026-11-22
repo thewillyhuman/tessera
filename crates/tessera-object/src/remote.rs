@@ -219,6 +219,24 @@ impl ObjectStore for RemoteStore {
         object.bytes().await.map_err(|e| failure(key, e))
     }
 
+    async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+        if length == 0 {
+            // No bytes are asked for; only whether the object is there.
+            return self.head(key).await.map(|_| Bytes::new());
+        }
+        let options = GetOptions::new().with_range(Some(GetRange::Suffix(length)));
+        match self.client.get_opts(&path(key), options).await {
+            Ok(object) => object.bytes().await.map_err(|e| failure(key, e)),
+            Err(error @ Error::NotFound { .. }) => Err(failure(key, error)),
+            // An empty object has no last bytes, and a store refuses
+            // to be asked for them.
+            Err(error) => match self.head(key).await {
+                Ok(meta) if meta.size == 0 => Ok(Bytes::new()),
+                _ => Err(failure(key, error)),
+            },
+        }
+    }
+
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
         match self.client.head(&path(key)).await {
             Ok(meta) => Ok(ObjectMeta {

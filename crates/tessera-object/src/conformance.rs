@@ -23,6 +23,7 @@ pub async fn run_all(store: Arc<dyn ObjectStore>) {
     put_if_absent_creates_once_and_keeps_the_first_body(&*store).await;
     get_range_returns_the_requested_bytes(&*store).await;
     get_range_outside_the_object_is_rejected(&*store).await;
+    get_tail_returns_the_last_bytes(&*store).await;
     head_reports_the_size(&*store).await;
     list_returns_keys_under_the_prefix_in_order(&*store).await;
     list_names_gives_each_name_under_the_prefix_once(&*store).await;
@@ -107,6 +108,33 @@ async fn get_range_returns_the_requested_bytes(store: &dyn ObjectStore) {
     );
     let empty = store.get_range(&key("c5/a"), 10..10).await.unwrap();
     assert!(empty.is_empty(), "empty range at the end is allowed");
+}
+
+async fn get_tail_returns_the_last_bytes(store: &dyn ObjectStore) {
+    store
+        .put(&key("c13/a"), Bytes::from_static(b"0123456789"))
+        .await
+        .unwrap();
+    let tail = store.get_tail(&key("c13/a"), 3).await.unwrap();
+    assert_eq!(tail, Bytes::from_static(b"789"), "the last three bytes");
+    for length in [10, 64] {
+        let whole = store.get_tail(&key("c13/a"), length).await.unwrap();
+        assert_eq!(
+            whole,
+            Bytes::from_static(b"0123456789"),
+            "a tail of {length} bytes of a shorter object is the object"
+        );
+    }
+    let none = store.get_tail(&key("c13/a"), 0).await.unwrap();
+    assert!(none.is_empty(), "a tail of no bytes is empty");
+    store.put(&key("c13/empty"), Bytes::new()).await.unwrap();
+    let empty = store.get_tail(&key("c13/empty"), 4).await.unwrap();
+    assert!(empty.is_empty(), "the tail of an empty object is empty");
+    let error = store.get_tail(&key("c13/missing"), 4).await.unwrap_err();
+    assert!(
+        matches!(error, ObjectError::NotFound { .. }),
+        "tail of missing object: {error}"
+    );
 }
 
 async fn get_range_outside_the_object_is_rejected(store: &dyn ObjectStore) {

@@ -143,6 +143,15 @@ impl ObjectStore for SealedStore {
         slice(key, &body, range)
     }
 
+    async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+        if !self.may_be_sealed(key) {
+            return self.inner.get_tail(key, length).await;
+        }
+        let body = self.get(key).await?;
+        let length = usize::try_from(length).unwrap_or(usize::MAX);
+        Ok(body.slice(body.len().saturating_sub(length)..))
+    }
+
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
         if !self.may_be_sealed(key) {
             return self.inner.head(key).await;

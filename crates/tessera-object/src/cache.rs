@@ -35,9 +35,19 @@ use tokio::fs;
 
 use crate::{Key, ObjectError, ObjectMeta, ObjectStore, layout};
 
-/// What was read: the bytes of `range` in the object, or the whole
-/// object when the range is `None`.
-type Read = (Key, Option<(u64, u64)>);
+/// What of an object was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Part {
+    /// All of it.
+    Whole,
+    /// The bytes from the first position up to the second.
+    Range(u64, u64),
+    /// As many of its last bytes.
+    Tail(u64),
+}
+
+/// A read: an object and what of it.
+type Read = (Key, Part);
 
 /// How much the cache was used since it was opened.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -260,12 +270,18 @@ impl CachedStore {
 #[async_trait]
 impl ObjectStore for CachedStore {
     async fn get(&self, key: &Key) -> Result<Bytes, ObjectError> {
-        self.through((key.clone(), None), self.inner.get(key)).await
+        self.through((key.clone(), Part::Whole), self.inner.get(key))
+            .await
     }
 
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
-        let read = (key.clone(), Some((range.start, range.end)));
+        let read = (key.clone(), Part::Range(range.start, range.end));
         self.through(read, self.inner.get_range(key, range)).await
+    }
+
+    async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+        let read = (key.clone(), Part::Tail(length));
+        self.through(read, self.inner.get_tail(key, length)).await
     }
 
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
@@ -337,6 +353,10 @@ mod tests {
             self.reads.fetch_add(1, Ordering::Relaxed);
             self.inner.get_range(key, range).await
         }
+        async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_tail(key, length).await
+        }
         async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
             self.inner.head(key).await
         }
@@ -381,6 +401,25 @@ mod tests {
             .await
             .unwrap();
         conformance::run_all(Arc::new(cache)).await;
+    }
+
+    #[tokio::test]
+    async fn a_tail_asked_again_is_read_from_the_disk() {
+        let f = fixture(1 << 20).await;
+        let key = file("a");
+        f.cache
+            .put_if_absent(&key, Bytes::from_static(b"0123456789"))
+            .await
+            .unwrap();
+
+        let first = f.cache.get_tail(&key, 4).await.unwrap();
+        let again = f.cache.get_tail(&key, 4).await.unwrap();
+        assert_eq!((first, again.clone()), (Bytes::from_static(b"6789"), again));
+        assert_eq!(f.store.reads(), 1, "the second read stayed here");
+        // The same bytes asked for as a range are another read: the
+        // cache does not know how large the object is.
+        f.cache.get_range(&key, 6..10).await.unwrap();
+        assert_eq!(f.store.reads(), 2);
     }
 
     #[tokio::test]

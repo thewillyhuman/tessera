@@ -30,6 +30,9 @@ impl ObjectStore for ShallowStore {
     async fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Bytes, ObjectError> {
         self.0.get_range(key, range).await
     }
+    async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+        self.0.get_tail(key, length).await
+    }
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
         self.0.head(key).await
     }

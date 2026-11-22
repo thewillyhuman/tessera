@@ -24,6 +24,7 @@ use crate::store::{ObjectError, ObjectMeta, ObjectStore};
 enum Operation {
     Get,
     GetRange,
+    GetTail,
     Head,
     Put,
     PutIfAbsent,
@@ -34,9 +35,10 @@ enum Operation {
 }
 
 impl Operation {
-    const ALL: [Operation; 9] = [
+    const ALL: [Operation; 10] = [
         Operation::Get,
         Operation::GetRange,
+        Operation::GetTail,
         Operation::Head,
         Operation::Put,
         Operation::PutIfAbsent,
@@ -50,6 +52,7 @@ impl Operation {
         match self {
             Operation::Get => "get",
             Operation::GetRange => "get_range",
+            Operation::GetTail => "get_tail",
             Operation::Head => "head",
             Operation::Put => "put",
             Operation::PutIfAbsent => "put_if_absent",
@@ -122,6 +125,11 @@ impl ObjectStore for MeteredStore {
         self.inner.get_range(key, range).await
     }
 
+    async fn get_tail(&self, key: &Key, length: u64) -> Result<Bytes, ObjectError> {
+        self.requests.count(Operation::GetTail);
+        self.inner.get_tail(key, length).await
+    }
+
     async fn head(&self, key: &Key) -> Result<ObjectMeta, ObjectError> {
         self.requests.count(Operation::Head);
         self.inner.head(key).await
@@ -185,6 +193,7 @@ mod tests {
         store.get(&key).await.unwrap();
         store.get(&key).await.unwrap();
         store.get_range(&key, 0..1).await.unwrap();
+        store.get_tail(&key, 1).await.unwrap();
         store.head(&key).await.unwrap();
         let _: Vec<ObjectMeta> = store.list(&prefix).try_collect().await.unwrap();
         let _: Vec<ObjectMeta> = store.list_after(&prefix, &key).try_collect().await.unwrap();
@@ -195,6 +204,7 @@ mod tests {
             [
                 ("get", 2),
                 ("get_range", 1),
+                ("get_tail", 1),
                 ("head", 1),
                 ("put", 1),
                 ("put_if_absent", 1),
