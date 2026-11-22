@@ -260,7 +260,11 @@ work lists the writers and partitions of every dataset of the
 tenants that are written to and reads the head of every partition's
 manifest, where the rounds between follow the writers' logs and a
 tenant at rest is asked nothing of but once an hour; the scale
-envelope of section 17.2 has not been run.
+envelope of section 17.2 has not been run, though a stress test of a
+six-machine cluster has, whose rates and limits are in the operations
+guide's sizing section: 196,000 log lines a second over two tenants
+with nothing lost, and compaction and the memory of concurrent
+queries as what gives first.
 
 **M7, control store, continuous queries and alerting: done, with
 gaps listed below.** A per-tenant control store over the control log

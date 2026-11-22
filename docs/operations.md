@@ -141,7 +141,36 @@ closed by another node's recovery.
   files, their indexes, writer-log entries and manifest checkpoints,
   and is emptied at every start.
 - Queries spill to `--spill-dir` (the system's temporary directory by
-  default) when they outgrow their memory grant.
+  default) when they outgrow their memory grant, a gibibyte a query
+  unless the tenant's `query_max_memory_bytes` says otherwise. Nothing
+  bounds what the queries of a node take together: give a node that
+  queries several times that, or lower the grant.
+- A node with the ingest role stores one segment at a time per
+  writer (`ingest.writers` in the chart, `--ingest-writers`): give a
+  node of several cores as many writers as the cores ingest may use.
+- A compaction job merges 256 MiB of rows as they are in memory and
+  holds them a few times over: a `compact` node needs 2 GiB.
+
+What one cluster took, as a point to size from. Six machines of 4
+CPUs and 7 GiB ran four `ingest,query` nodes and two `compact,eval`
+nodes of version 0.1.6, each asking for 2 CPUs and limited to 5 GiB,
+with one writer, against a Ceph object store. Log lines of 130 bytes
+were pushed 2,000 at a time over the Loki API, 32 pushes at once per
+tenant, each tenant to one dataset, with queries over the last
+minutes of the same data every 20 seconds:
+
+| Tenants written to | Lines a second | Acknowledged in (median, 99th) | What happened |
+|---|---|---|---|
+| 1 | 105,000 (13.5 MB/s) | 0.39 s, 1.7 s | Five minutes; the ingest node the dataset prefers at 1.7 cores |
+| 2 | 196,000 (25.5 MB/s) | 0.4 s, 2.0 s | Three minutes; ingest nodes at 2 cores, 1.1 GiB at most |
+| 2, a node of each kind killed | 187,000 (24.2 MB/s) | 0.43 s, 2.3 s | Five minutes; no write failed, a dip of 20 s after the ingest node went |
+| 4 | 235,000 to 242,000 (32 MB/s) | 0.5 to 0.9 s, 3 to 6 s | Three minutes; ingest nodes at 3 cores; in one of two runs two of them ran out of memory under the queries and restarted |
+
+Every run counted its lines afterwards, and none that was
+acknowledged was missing, 250 million in all. Compaction ran at
+29,000 rows a second on the node that held the datasets' partitions,
+so at these rates the files of each flush wait their turn, readable
+all the while; the queries alongside took 5 to 20 seconds.
 
 ## Securing
 
@@ -384,4 +413,14 @@ operator meets first:
 - one round in six of the background work goes over every dataset
   and partition of the tenants that are written to, whether or not
   anything changed, and a tenant at rest waits up to an hour for
-  work that only the passing of time brings (see above).
+  work that only the passing of time brings (see above);
+- compaction is slower than ingest can be: a node compacts one
+  partition at a time, a job a round, and intake reads the writers'
+  segments whole to find their flush records, so a dataset written
+  at more than some 30,000 rows a second for long gathers files that
+  are compacted once the rate falls;
+- the slots of partitions are raised to the most `compact` nodes
+  alive at once, which a rolling upgrade's extra pod counts towards,
+  and are not lowered;
+- nothing bounds the memory the queries of one node take together
+  (see Sizing).
