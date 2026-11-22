@@ -102,7 +102,8 @@ impl Ruleless {
 /// anything changed. The rounds between follow the logs of the
 /// writers the last one found, a read each that finds nothing when
 /// nothing was flushed, and go over a dataset only when one of them
-/// brought it something. A new dataset, a new writer and what another
+/// brought it something or the round before merged files it had
+/// flushed. A new dataset, a new writer and what another
 /// node adopted wait for the next whole round, half a minute at the
 /// default interval.
 const WHOLE_EVERY: u64 = 6;
@@ -120,7 +121,19 @@ const WHOLE_EVERY: u64 = 6;
 /// owns change, and once an hour with every other tenant, which is
 /// when its retention, the compaction of a window that closed, a
 /// layout the advisor adopted and a delete are acted on.
-type Known = BTreeMap<TenantId, Vec<(DatasetName, Vec<Registration>)>>;
+type Known = BTreeMap<TenantId, Vec<Found>>;
+
+/// What the last round over a dataset left for the rounds after it.
+struct Found {
+    dataset: DatasetName,
+    /// The writers registered with it, whose logs are followed.
+    writers: Vec<Registration>,
+    /// Whether the round merged flushed files of the dataset. A round
+    /// runs one job a partition, and a partition that had one due may
+    /// have another: the next round goes over the dataset again,
+    /// without waiting for a whole one, until a round merges nothing.
+    merged: bool,
+}
 
 /// Which tenants a round goes over, and how.
 #[derive(Clone, Copy, Debug)]
@@ -266,6 +279,9 @@ struct Backlog {
     /// dropped, files and tombstones collected. A round that changed
     /// something may have left the next one something to do.
     changes: u64,
+    /// Jobs that merged flushed files, each of which may have left
+    /// its partition another that is due.
+    merges: u64,
 }
 
 impl Backlog {
@@ -275,6 +291,7 @@ impl Backlog {
             deferred: self.deferred + other.deferred,
             recoveries: self.recoveries + other.recoveries,
             changes: self.changes + other.changes,
+            merges: self.merges + other.merges,
         }
     }
 
@@ -437,7 +454,7 @@ async fn tenants_round(
                     positions.retain(|at, _| at.0 != *tenant || met.contains(at));
                     // With no writer registered and nothing found to
                     // do, the tenant is at rest.
-                    if left.is_none() && found.iter().all(|(_, writers)| writers.is_empty()) {
+                    if left.is_none() && found.iter().all(|found| found.writers.is_empty()) {
                         known.remove(tenant);
                     }
                 }
@@ -517,7 +534,7 @@ async fn round(
     tenant: &TenantId,
     held: &mut Vec<Held>,
     cursors: &mut Cursors<'_>,
-    found: &mut Vec<(DatasetName, Vec<Registration>)>,
+    found: &mut Vec<Found>,
 ) -> Result<Backlog, Failure> {
     let mut backlog = Backlog::default();
     found.clear();
@@ -528,9 +545,13 @@ async fn round(
         // A dataset's failure is its own: the tenant's other datasets
         // still get their round, and this one its next.
         match dataset_round(background, compactor, tenant, &dataset, held, cursors).await {
-            Ok((left, registrations)) => {
+            Ok((left, writers)) => {
                 backlog = backlog.and(left);
-                found.push((dataset, registrations));
+                found.push(Found {
+                    dataset,
+                    writers,
+                    merged: left.merges > 0,
+                });
             }
             Err(error) => {
                 cursors.whole = false;
@@ -545,19 +566,26 @@ async fn round(
 /// whole round found are followed, and a dataset one of them brought
 /// something to is gone over at once, so that what was flushed reaches
 /// its manifests and is compacted as soon as it would in a whole
-/// round. Nothing is listed where nothing was flushed.
+/// round. So is a dataset the round before merged flushed files of,
+/// which may have more of them due. Nothing is listed where nothing
+/// was flushed or merged.
 async fn follow(
     background: &Background,
     compactor: &Compactor,
     tenant: &TenantId,
     held: &mut Vec<Held>,
     cursors: &mut Cursors<'_>,
-    found: &mut [(DatasetName, Vec<Registration>)],
+    found: &mut [Found],
 ) -> Result<Backlog, Failure> {
     let mut backlog = Backlog::default();
-    for (dataset, registrations) in found {
+    for Found {
+        dataset,
+        writers,
+        merged,
+    } in found
+    {
         let mut changed = false;
-        for registration in registrations.iter() {
+        for registration in writers.iter() {
             let writer = registration.writer;
             if !background
                 .owned
@@ -595,15 +623,19 @@ async fn follow(
                 }
             }
         }
-        if !changed {
+        if !changed && !*merged {
             continue;
         }
         match dataset_round(background, compactor, tenant, dataset, held, cursors).await {
             Ok((left, listed)) => {
                 backlog = backlog.and(left);
-                *registrations = listed;
+                *writers = listed;
+                *merged = left.merges > 0;
             }
             Err(error) => {
+                // What failed is tried again by the next whole round,
+                // not by every round until then.
+                *merged = false;
                 tracing::warn!(%tenant, %dataset, error = %error, "background round failed");
             }
         }
@@ -721,6 +753,7 @@ async fn compact_and_collect(
 ) -> Result<Backlog, Failure> {
     let mut deferred = 0;
     let mut changes = 0;
+    let mut merges = 0;
     let now = background.env.clock.now();
     let record = settings.layout(kind)?;
     let value_score = settings.value_score(kind);
@@ -782,6 +815,7 @@ async fn compact_and_collect(
         });
         if let Some(job) = job {
             changes += 1;
+            merges += u64::from(job.inputs.iter().any(|f| f.level == Level::L1));
             if let Some(retain) = retain.as_mut().filter(|r| spares(r, kind, job.level)) {
                 retain.spared = Arc::new(spared_beside(background, &partition, &every).await?);
             }
@@ -810,6 +844,7 @@ async fn compact_and_collect(
     Ok(Backlog {
         deferred,
         changes,
+        merges,
         ..Backlog::default()
     })
 }

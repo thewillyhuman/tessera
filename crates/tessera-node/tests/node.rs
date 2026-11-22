@@ -555,41 +555,39 @@ async fn a_tenant_at_rest_is_gone_over_once_it_is_written_to() {
     node.stop().await;
 }
 
-/// What a dataset holds is compacted whether or not anyone writes to
-/// it. Every writer ends when its node is replaced, and what the
-/// nodes of a cluster had flushed and not yet merged when they were
-/// upgraded stayed as it was, unindexed, until someone wrote to the
-/// dataset again: the rounds went over the datasets with a writer
-/// registered and no others.
-#[tokio::test(flavor = "multi_thread")]
-async fn what_a_dataset_holds_is_compacted_after_its_writers_ended() {
+/// A dataset as a writer left it: a file flushed at each of `flushed`
+/// and adopted, its rows at `rows_at`, and the writer ended and gone
+/// from the registry.
+async fn left_by_a_writer(
+    store: &std::sync::Arc<dyn tessera_object::ObjectStore>,
+    dataset: &DatasetName,
+    rows_at: tessera_types::Timestamp,
+    flushed: &[tessera_types::Timestamp],
+) {
     use std::sync::Arc;
 
-    use tessera_manifest::{Manifest, intake, list_partitions, registry};
-    use tessera_types::{EventBatch, Level, LogRow, PoolId, Seq, Window};
+    use tessera_manifest::{intake, registry};
+    use tessera_types::{EventBatch, LogRow, ManualClock, PoolId, Seq, Window};
     use tessera_wal::{EntryBody, FlushTarget, WriterLog, write_l1_files};
 
-    let dir = tempfile::tempdir().unwrap();
-    let store: Arc<dyn tessera_object::ObjectStore> =
-        Arc::new(LocalStore::open(dir.path()).await.unwrap());
-    let env = Env::system();
-    let dataset = DatasetName::new("left").unwrap();
-    // A writer that flushed four files, which were adopted, and ended:
-    // nothing is registered with the dataset any more.
-    let mut log = WriterLog::start(Arc::clone(&store), env.clone());
+    let clock = Arc::new(ManualClock::new(flushed[0]));
+    let mut env = Env::system();
+    env.clock = clock.clone();
+    let mut log = WriterLog::start(Arc::clone(store), env.clone());
     let writer = log.writer_id();
-    registry::register(&*store, &env, &TenantId::DEFAULT, &dataset, writer)
+    registry::register(&**store, &env, &TenantId::DEFAULT, dataset, writer)
         .await
         .unwrap();
     let target = FlushTarget {
-        store: Arc::clone(&store),
+        store: Arc::clone(store),
         pool: PoolId::new("root").unwrap(),
         format: Arc::new(tessera_format::ParquetFormat::default()),
     };
     let mut after = Seq::ZERO;
-    for line in 0..4u8 {
+    for (line, at) in (0u8..).zip(flushed) {
+        clock.set(*at);
         let row = LogRow {
-            timestamp: env.clock.now(),
+            timestamp: rows_at,
             event_id: [line; 16],
             body: Some(format!("line {line}")),
             ..LogRow::default()
@@ -614,42 +612,120 @@ async fn what_a_dataset_holds_is_compacted_after_its_writers_ended() {
         after = through;
     }
     log.end().await.unwrap();
-    let adopted = intake::run(
-        Arc::clone(&store),
-        &env,
-        &TenantId::DEFAULT,
-        &dataset,
-        writer,
-    )
-    .await
-    .unwrap();
+    let adopted = intake::run(Arc::clone(store), &env, &TenantId::DEFAULT, dataset, writer)
+        .await
+        .unwrap();
     assert!(adopted.removed, "the writer left the registry: {adopted:?}");
+}
+
+/// The levels of the log files `dataset` holds.
+async fn levels_of(
+    store: &std::sync::Arc<dyn tessera_object::ObjectStore>,
+    dataset: &DatasetName,
+) -> Vec<tessera_types::Level> {
+    let partitions =
+        tessera_manifest::list_partitions(&**store, &TenantId::DEFAULT, dataset, Kind::Log)
+            .await
+            .unwrap();
+    let mut levels = Vec::new();
+    for partition in partitions {
+        let manifest = tessera_manifest::Manifest::open(store.clone(), partition, Env::system());
+        let snapshot = manifest.snapshot().await.unwrap();
+        levels.extend(snapshot.state().files().map(|file| file.level));
+    }
+    levels
+}
+
+/// What a dataset holds is compacted whether or not anyone writes to
+/// it. Every writer ends when its node is replaced, and what the
+/// nodes of a cluster had flushed and not yet merged when they were
+/// upgraded stayed as it was, unindexed, until someone wrote to the
+/// dataset again: the rounds went over the datasets with a writer
+/// registered and no others.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_a_dataset_holds_is_compacted_after_its_writers_ended() {
+    use tessera_types::Level;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: std::sync::Arc<dyn tessera_object::ObjectStore> =
+        std::sync::Arc::new(LocalStore::open(dir.path()).await.unwrap());
+    let dataset = DatasetName::new("left").unwrap();
+    let now = Env::system().clock.now();
+    left_by_a_writer(&store, &dataset, now, &[now; 4]).await;
+    assert_eq!(levels_of(&store, &dataset).await, [Level::L1; 4]);
 
     let mut config = config(dir.path());
     config.background = Duration::from_millis(100);
     let node = Node::start(config, Env::system()).await.unwrap();
-    let levels = async || {
-        let partitions = list_partitions(&*store, &TenantId::DEFAULT, &dataset, Kind::Log)
-            .await
-            .unwrap();
-        let mut levels = Vec::new();
-        for partition in partitions {
-            let manifest = Manifest::open(Arc::clone(&store), partition, env.clone());
-            let snapshot = manifest.snapshot().await.unwrap();
-            levels.extend(snapshot.state().files().map(|file| file.level));
-        }
-        levels
-    };
-    assert_eq!(levels().await, [Level::L1; 4]);
     let mut merged = false;
     for _ in 0..300 {
-        merged = levels().await == [Level::L2];
+        merged = levels_of(&store, &dataset).await == [Level::L2];
         if merged {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(merged, "the four files became one: {:?}", levels().await);
+    let levels = levels_of(&store, &dataset).await;
+    assert!(merged, "the four files became one: {levels:?}");
+    node.stop().await;
+}
+
+/// A round runs one job a partition, and a partition may have several
+/// due: what was flushed in different hours is merged hour by hour.
+/// The round after one that merged goes over the dataset again, so a
+/// backlog is worked off round after round. It waited for the next
+/// whole round, one in six, and a cluster that had fallen behind its
+/// writers merged a job every half minute where its jobs took a
+/// quarter of one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_backlog_is_merged_round_after_round() {
+    use tessera_types::Level;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: std::sync::Arc<dyn tessera_object::ObjectStore> =
+        std::sync::Arc::new(LocalStore::open(dir.path()).await.unwrap());
+    let dataset = DatasetName::new("behind").unwrap();
+    let now = Env::system().clock.now();
+    let ago = |minutes: u64| {
+        let nanos = i64::try_from(Duration::from_secs(minutes * 60).as_nanos()).unwrap();
+        tessera_types::Timestamp::from_nanos(now.as_nanos() - nanos)
+    };
+    // Three files flushed in three different hours, each old enough
+    // to be merged on its own: three jobs for one partition.
+    left_by_a_writer(&store, &dataset, ago(90), &[ago(180), ago(120), ago(61)]).await;
+
+    // A round every half second: one in six, every three seconds, is
+    // whole.
+    let node = Node::start(config(dir.path()), Env::system())
+        .await
+        .unwrap();
+    let merged = async || {
+        levels_of(&store, &dataset)
+            .await
+            .iter()
+            .filter(|level| **level == Level::L2)
+            .count()
+    };
+    let (mut first, mut last) = (None, None);
+    for _ in 0..600 {
+        let done = merged().await;
+        if done >= 1 && first.is_none() {
+            first = Some(std::time::Instant::now());
+        }
+        if done == 3 {
+            last = Some(std::time::Instant::now());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (Some(first), Some(last)) = (first, last) else {
+        panic!("{} of three files merged", merged().await);
+    };
+    let took = last - first;
+    assert!(
+        took < Duration::from_secs(3),
+        "the jobs after the first waited for whole rounds: {took:?}"
+    );
     node.stop().await;
 }
 

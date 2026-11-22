@@ -380,7 +380,8 @@ goes over every dataset, writer and partition once in six rounds,
 half a minute at the default interval, and what that round asks
 grows with what those tenants hold; the rounds between follow the
 logs of the writers it found, a read each, and go over a dataset
-only when a flush reached it. A new dataset, a writer that has just
+only when a flush reached it or the round before merged files it had
+flushed, so that a backlog is merged round after round. A new dataset, a writer that has just
 registered and a layout the advisor adopted are therefore acted on
 within half a minute, not within five seconds; rows are readable all
 the while. An `eval` node reads the rules of a tenant
