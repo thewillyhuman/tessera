@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A store for tests of what must be read together.
+//! A store for tests of what must be asked for together.
 
 use std::future::poll_fn;
 use std::ops::Range;
@@ -13,12 +13,13 @@ use futures::stream::BoxStream;
 
 use crate::{Key, MemoryStore, ObjectError, ObjectMeta, ObjectStore};
 
-/// A store that says how many reads were in flight at once. Over a
-/// bucket, reads made one after another are a round trip each.
+/// A store that says how many reads and deletions were in flight at
+/// once. Over a bucket, those made one after another are a round trip
+/// each.
 #[derive(Debug, Default)]
 pub struct BusyStore {
     inner: MemoryStore,
-    /// The reads counted: those of keys that start with this.
+    /// The calls counted: those of keys that start with this.
     under: String,
     reading: AtomicUsize,
     most: AtomicUsize,
@@ -34,8 +35,8 @@ impl BusyStore {
         }
     }
 
-    /// A store over `inner` that counts only the reads of keys that
-    /// start with `under`.
+    /// A store over `inner` that counts only the reads and deletions
+    /// of keys that start with `under`.
     #[must_use]
     pub fn watching(inner: MemoryStore, under: &str) -> Self {
         BusyStore {
@@ -45,7 +46,7 @@ impl BusyStore {
         }
     }
 
-    /// The most reads that were in flight at once.
+    /// The most reads and deletions that were in flight at once.
     #[must_use]
     pub fn most(&self) -> usize {
         self.most.load(Ordering::SeqCst)
@@ -96,6 +97,7 @@ impl ObjectStore for BusyStore {
         self.inner.list(prefix)
     }
     async fn delete(&self, key: &Key) -> Result<(), ObjectError> {
+        self.read(key).await;
         self.inner.delete(key).await
     }
 }

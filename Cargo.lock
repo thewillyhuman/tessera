@@ -3618,6 +3618,7 @@ name = "tessera-compact"
 version = "0.1.6"
 dependencies = [
  "arrow",
+ "futures",
  "serde_json",
  "tessera-catalog",
  "tessera-commit",

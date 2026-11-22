@@ -855,6 +855,51 @@ async fn collection_reads_the_headers_of_a_log_and_not_its_rows() {
     assert_eq!(tails, Some(5), "the four entries deleted and the one kept");
 }
 
+/// A log under load gains hundreds of entries a minute, and as many
+/// age out of it: a pass that asked for each header and deleted each
+/// entry one after the other took the loop that also compacts a
+/// quarter of a minute a log. What a pass collects is read and deleted
+/// several at a time. A pass that finds the oldest entry too young
+/// still asks for that one header and no other.
+#[tokio::test]
+async fn what_a_pass_collects_is_read_and_deleted_together() {
+    let segments: Vec<[u8; 1]> = (1..=12).map(|id| [id]).collect();
+    let segments: Vec<&[u8]> = segments.iter().map(<[u8; 1]>::as_slice).collect();
+    let node = node(&segments, Timestamp::UNIX_EPOCH).await;
+    let writer = node.log.writer_id();
+    let pass = async |store: Arc<dyn ObjectStore>, now: Timestamp| {
+        let datasets = DatasetLogs::new(Arc::clone(&store), node.env.clone());
+        let unheld = Checkpoints::none();
+        collect_log(&store, &node.env, writer, now, GRACE, &datasets, &unheld)
+            .await
+            .unwrap()
+    };
+
+    let soon = node.env.clock.now();
+    let metered = Arc::new(tessera_object::MeteredStore::new(node.store.clone()));
+    assert_eq!(pass(metered.clone(), soon).await.deleted, 0);
+    let tails = metered
+        .requests()
+        .by_operation()
+        .into_iter()
+        .find(|(operation, _)| *operation == "get_tail")
+        .map(|(_, made)| made);
+    assert_eq!(tails, Some(1), "the oldest entry is too young: one header");
+
+    let later = soon.checked_add(2 * GRACE).unwrap();
+    let busy = Arc::new(tessera_object::BusyStore::watching(
+        (*node.store).clone(),
+        "_wal/",
+    ));
+    let collected = pass(busy.clone(), later).await;
+    assert_eq!(collected.deleted, 23, "all but the newest of 24 entries");
+    assert_eq!(
+        reader::list(&*node.store, writer).await.unwrap(),
+        vec![Seq::new(24)]
+    );
+    assert!(busy.most() > 4, "at most {} at a time", busy.most());
+}
+
 /// GC-2 (c): an adopted entry a rule group has not read stays until the
 /// group reads past it, or until the hard cap, after which the group
 /// rebuilds its windows from the files instead (section 11.7).

@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::try_join_all;
 use tessera_manifest::{DatasetLogs, Manifest, list_partitions};
 use tessera_object::{ObjectStore, Pools, layout};
 use tessera_types::{
@@ -30,6 +31,8 @@ use crate::CompactError;
 /// How long a removed file's object is kept for readers of older
 /// snapshots (GC-1).
 pub const DEFAULT_FILE_RETENTION: Duration = Duration::from_secs(24 * 3_600);
+/// How many entries of a log a pass asks about or deletes at once.
+const ENTRIES_AT_ONCE: usize = 16;
 /// How long an adopted segment is kept for readers of older views (GC-2).
 pub const DEFAULT_SEGMENT_GRACE: Duration = Duration::from_secs(3_600);
 
@@ -148,30 +151,38 @@ pub async fn collect_log(
     let mut collection = LogCollection::default();
     let mut deletable: Vec<Seq> = Vec::new();
     let mut ended = false;
-    for seq in &seqs {
-        // What an entry is and when it was written is in its header:
-        // the rows of a segment are deleted without being read.
-        let entry = reader::header(&**store, writer, *seq, &env.keys).await?;
-        let age = now.duration_since(entry.written_at);
-        let aged = age.is_some_and(|age| age >= grace);
-        if !aged || checkpoints.keeps(writer, *seq, age.unwrap_or(Duration::ZERO)) {
-            break;
-        }
-        match &entry.body {
-            EntryBody::Segment { blocks } => {
-                if !positions.adopted(blocks, writer, *seq).await? {
-                    break;
+    // What an entry is and when it was written is in its header: the
+    // rows of a segment are deleted without being read. The oldest
+    // entry is asked about alone, since most passes find it too young
+    // and need no other; the ones after it several at a time.
+    let mut at_once = 1;
+    let mut left = seqs.as_slice();
+    'log: while !left.is_empty() {
+        let (asked, rest) = left.split_at(at_once.min(left.len()));
+        let headers = asked
+            .iter()
+            .map(|seq| reader::header(&**store, writer, *seq, &env.keys));
+        for (seq, entry) in asked.iter().zip(try_join_all(headers).await?) {
+            let age = now.duration_since(entry.written_at);
+            let aged = age.is_some_and(|age| age >= grace);
+            if !aged || checkpoints.keeps(writer, *seq, age.unwrap_or(Duration::ZERO)) {
+                break 'log;
+            }
+            match &entry.body {
+                EntryBody::Segment { blocks } => {
+                    if !positions.adopted(blocks, writer, *seq).await? {
+                        break 'log;
+                    }
                 }
-                deletable.push(*seq);
+                EntryBody::Flush { .. }
+                | EntryBody::SealedFlush { .. }
+                | EntryBody::Seal { .. } => {}
+                EntryBody::End => ended = true,
             }
-            EntryBody::Flush { .. } | EntryBody::SealedFlush { .. } | EntryBody::Seal { .. } => {
-                deletable.push(*seq);
-            }
-            EntryBody::End => {
-                ended = true;
-                deletable.push(*seq);
-            }
+            deletable.push(*seq);
         }
+        left = rest;
+        at_once = ENTRIES_AT_ONCE;
     }
     // The newest entry stays unless the whole log goes: a log that still
     // has entries must still look ended, and a live writer's log must
@@ -180,11 +191,13 @@ pub async fn collect_log(
     if !whole_log {
         deletable.retain(|seq| seqs.last() != Some(seq));
     }
-    for seq in &deletable {
-        store
-            .delete(&layout::writer_log_entry(writer, *seq))
-            .await?;
-        collection.deleted += 1;
+    for entries in deletable.chunks(ENTRIES_AT_ONCE) {
+        let keys: Vec<_> = entries
+            .iter()
+            .map(|seq| layout::writer_log_entry(writer, *seq))
+            .collect();
+        try_join_all(keys.iter().map(|key| store.delete(key))).await?;
+        collection.deleted += entries.len();
     }
     collection.log_gone = whole_log;
     Ok(collection)
