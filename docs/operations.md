@@ -297,15 +297,26 @@ counts what each node asks, by operation. A node left idle makes
 about nine a second, measured against MinIO on one node with every
 role, a cache directory, five datasets and seven partitions: half
 are reads of log heads that find nothing new, a quarter listings,
-and the rest heartbeats, leases and the node's own metrics. The
-background work goes over every dataset, writer and partition once
-in six rounds, half a minute at the default interval, and what that
-round asks grows with what the cluster holds; the rounds between
-follow the logs of the writers it found, a read each, and go over a
-dataset only when a flush reached it. A new dataset, a writer that
-has just registered and a layout the advisor adopted are therefore
-acted on within half a minute, not within five seconds; rows are
-readable all the while. An `eval` node reads the rules of a tenant
+and the rest heartbeats, leases and the node's own metrics.
+
+The background work asks nothing for a tenant at rest: one with no
+writer registered in any of its datasets and nothing left to compact
+or collect, which is what a tenant becomes within an hour of its
+last write. A node that begins to write to a tenant names it in its
+heartbeats, and the nodes that compact go over it at once. Every
+tenant is gone over once an hour all the same, when what the
+partitions hold is recorded, and when the slots a node owns change;
+for a tenant at rest that is when retention, the compaction of a
+window that closed, a layout the advisor adopted and a delete take
+effect. For the tenants that are not at rest the background work
+goes over every dataset, writer and partition once in six rounds,
+half a minute at the default interval, and what that round asks
+grows with what those tenants hold; the rounds between follow the
+logs of the writers it found, a read each, and go over a dataset
+only when a flush reached it. A new dataset, a writer that has just
+registered and a layout the advisor adopted are therefore acted on
+within half a minute, not within five seconds; rows are readable all
+the while. An `eval` node reads the rules of a tenant
 that has any every round, and looks one round in six whether a
 tenant that had none has one now: a tenant's first rule or rollup
 starts within half a minute, a change to its rules within a round. Without `--cache-dir` the node's own health
@@ -330,5 +341,6 @@ operator meets first:
 - the cache keeps whole ranges as they were read, so it helps
   repeated queries more than new ones;
 - one round in six of the background work goes over every dataset
-  and partition whether or not anything changed, so the requests of
-  an idle cluster still grow with what it holds (see above).
+  and partition of the tenants that are written to, whether or not
+  anything changed, and a tenant at rest waits up to an hour for
+  work that only the passing of time brings (see above).

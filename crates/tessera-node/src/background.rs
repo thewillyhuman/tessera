@@ -28,8 +28,8 @@ use tessera_eval::rule::decode_rows;
 use tessera_format::FileFormat;
 use tessera_iceberg::{Exporter, Outcome as Export};
 use tessera_manifest::{
-    DatasetLog, DatasetLogs, DatasetState, ManifestState, Manifests, Registration, intake,
-    list_kinds, list_partitions, registry,
+    DatasetLog, DatasetLogs, DatasetState, Manifest, ManifestState, Manifests, Registration,
+    intake, list_kinds, list_partitions, registry,
 };
 use tessera_object::{ObjectStore, Pools};
 use tessera_types::{
@@ -38,7 +38,7 @@ use tessera_types::{
 };
 use tessera_wal::{EntryBody, FlushTarget, reader, recover};
 
-use crate::leases::Owned;
+use crate::leases::{COMPACT_KINDS, Owned};
 use crate::retention;
 
 /// How often the background work runs by default.
@@ -54,7 +54,9 @@ const RECOVER_AFTER: Duration = Duration::from_secs(300);
 /// Bytes of files of an older layout epoch rewritten per round (AD-10).
 const RECLUSTER_BUDGET: u64 = 256 << 20;
 /// How often what the partitions hold is recorded in `system.usage`
-/// (section 13.1): the grain a storage bill is reconciled at.
+/// (section 13.1): the grain a storage bill is reconciled at. It is
+/// also how often every tenant is gone over, at rest or not
+/// ([`Visit`]): recording what is held takes every partition.
 const HELD_EVERY: Duration = Duration::from_secs(3_600);
 
 /// How often the writers' logs are looked over for entries to collect
@@ -63,21 +65,68 @@ const HELD_EVERY: Duration = Duration::from_secs(3_600);
 /// is not felt.
 const COLLECT_EVERY: Duration = Duration::from_secs(60);
 
-/// How many rounds pass from one that goes over everything to the
-/// next. Such a round asks the store for every dataset of every
-/// tenant, their writers, their kinds and their partitions, and reads
-/// the head of every manifest: what it asks grows with what the
-/// cluster holds, whether or not anything changed. The rounds between
-/// follow the logs of the writers the last one found, a read each
-/// that finds nothing when nothing was flushed, and go over a dataset
-/// only when one of them brought it something. A new dataset, a new
-/// writer and what another node adopted wait for the next whole
-/// round, half a minute at the default interval.
+/// How many rounds pass from one that goes over the whole of every
+/// tenant that is not at rest to the next. Such a round asks the
+/// store for every dataset of the tenant, their writers, their kinds
+/// and their partitions, and reads the head of every manifest: what
+/// it asks grows with what those tenants hold, whether or not
+/// anything changed. The rounds between follow the logs of the
+/// writers the last one found, a read each that finds nothing when
+/// nothing was flushed, and go over a dataset only when one of them
+/// brought it something. A new dataset, a new writer and what another
+/// node adopted wait for the next whole round, half a minute at the
+/// default interval.
 const WHOLE_EVERY: u64 = 6;
 
-/// What a tenant's last whole round found registered: its datasets
-/// and their writers.
+/// The tenants that are not at rest, each with what its last whole
+/// round found registered: its datasets and their writers.
+///
+/// A tenant is at rest once a whole round found no writer registered
+/// with any of its datasets and nothing to do in them: nothing is
+/// being written to it, and what its partitions hold is as compact as
+/// it gets until time passes. Such a tenant is left alone (CT-6: an
+/// idle tenant costs storage only), and the rounds ask nothing of the
+/// store for it. It is gone over again when a node says it began to
+/// write to it ([`tessera_cluster::Woken`]), when the slots this node
+/// owns change, and once an hour with every other tenant, which is
+/// when its retention, the compaction of a window that closed, a
+/// layout the advisor adopted and a delete are acted on.
 type Known = BTreeMap<TenantId, Vec<(DatasetName, Vec<Registration>)>>;
+
+/// Which tenants a round goes over, and how.
+#[derive(Clone, Copy, Debug)]
+struct Visit {
+    /// Every tenant is gone over whole, at rest or not.
+    every: bool,
+    /// The tenants that are not at rest are gone over whole; their
+    /// writers' logs are followed otherwise.
+    whole: bool,
+}
+
+/// How a round goes over one tenant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pass {
+    /// Not at all: the tenant is at rest.
+    None,
+    /// By following the logs of the writers its last whole round found.
+    Follow,
+    /// Whole: every dataset, writer and partition.
+    Whole,
+}
+
+impl Visit {
+    /// How a tenant is gone over: `open` when it is not at rest,
+    /// `woken` when a node says it began to write to it.
+    fn pass(self, open: bool, woken: bool) -> Pass {
+        if self.every || (open && self.whole) || (!open && woken) {
+            Pass::Whole
+        } else if open {
+            Pass::Follow
+        } else {
+            Pass::None
+        }
+    }
+}
 
 /// How often the Iceberg metadata of the tables this node owns the
 /// export of is brought up to date (OP-9): a table whose files did not
@@ -130,13 +179,33 @@ pub struct Background {
 /// with this memory but the reading it saves).
 type Positions = BTreeMap<(TenantId, DatasetName, WriterId), Seq>;
 
-/// What a round left undone or had to repair.
+/// What a round left undone, had to repair or did.
 #[derive(Clone, Copy, Debug, Default)]
 struct Backlog {
     /// Compaction jobs deferred by the re-clustering budget.
     deferred: u64,
     /// Writers whose logs had to be recovered.
     recoveries: u64,
+    /// What it changed: flushes adopted, partitions compacted or
+    /// dropped, files and tombstones collected. A round that changed
+    /// something may have left the next one something to do.
+    changes: u64,
+}
+
+impl Backlog {
+    /// This backlog and `other` as one.
+    fn and(self, other: Backlog) -> Backlog {
+        Backlog {
+            deferred: self.deferred + other.deferred,
+            recoveries: self.recoveries + other.recoveries,
+            changes: self.changes + other.changes,
+        }
+    }
+
+    /// Whether the round found nothing to do and left nothing undone.
+    fn is_none(self) -> bool {
+        self.deferred == 0 && self.recoveries == 0 && self.changes == 0
+    }
 }
 
 /// Runs the background work forever. Failures are logged and retried on
@@ -157,10 +226,25 @@ pub async fn run(background: Background) {
     let mut last_collection: Option<Timestamp> = None;
     let mut positions = Positions::new();
     let mut known = Known::new();
+    let mut slots = None;
     let mut rounds: u64 = 0;
     loop {
         ticks.tick().await;
-        let whole_round = rounds.is_multiple_of(WHOLE_EVERY);
+        let now = background.env.clock.now();
+        // Every tenant is gone over when what the partitions hold is
+        // to be recorded, and when the slots this node owns changed:
+        // a tenant at rest may have work in a slot that was another
+        // node's, and at its start a node owns none.
+        let owned = COMPACT_KINDS.map(|kind| background.owned.slots(kind));
+        let owns_partitions = !background.owned.slots(WorkKind::Partition).is_empty();
+        let held_due = owns_partitions && is_due(last_held, now, HELD_EVERY);
+        let every = rounds == 0 || held_due || slots.as_ref() != Some(&owned);
+        slots = Some(owned);
+        let whole_round = every || rounds.is_multiple_of(WHOLE_EVERY);
+        let visit = Visit {
+            every,
+            whole: whole_round,
+        };
         rounds += 1;
         let tenants: Vec<TenantId> = background
             .catalog
@@ -176,29 +260,26 @@ pub async fn run(background: Background) {
             &background,
             &compactor,
             &tenants,
-            whole_round,
+            visit,
             (&mut positions, &mut known),
             &mut held,
         )
         .await;
         // What a round between two whole ones left undone says nothing
-        // of the datasets it did not go over.
+        // of the datasets it did not go over. A tenant at rest has
+        // nothing undone.
         if whole_round {
             background.load.set_compaction_backlog(backlog.deferred);
             background.load.set_intake_backlog(backlog.recoveries);
         }
-        // What the owned partitions hold, once an hour, the first round
-        // included: each partition has one owner, so the cluster
-        // records each once.
-        let now = background.env.clock.now();
-        let due = last_held.is_none_or(|at: Timestamp| {
-            now.duration_since(at)
-                .is_some_and(|since| since >= HELD_EVERY)
-        });
-        // Only a whole round has gone over every partition this node
-        // owns: one between holds those of the datasets it went over.
-        if whole_round && due && !held.is_empty() {
-            background.meter.held(held);
+        // What the owned partitions hold, once an hour, from the first
+        // round in which the node owns any: each partition has one
+        // owner, so the cluster records each once. Only a round over
+        // every tenant has gone over every partition this node owns.
+        if held_due {
+            if !held.is_empty() {
+                background.meter.held(held);
+            }
             last_held = Some(now);
         }
         if is_due(last_collection, now, COLLECT_EVERY) {
@@ -230,35 +311,44 @@ async fn tenants_round(
     background: &Background,
     compactor: &Compactor,
     tenants: &[TenantId],
-    whole_round: bool,
+    visit: Visit,
     (positions, known): (&mut Positions, &mut Known),
     held: &mut Vec<Held>,
 ) -> Backlog {
     let mut backlog = Backlog::default();
     let mut quiet = BTreeSet::new();
+    let woken = background.membership.woken();
     for tenant in tenants {
+        let pass = visit.pass(known.contains_key(tenant), woken.contains(tenant));
+        if pass == Pass::None {
+            continue;
+        }
         let mut cursors = Cursors {
             positions: &mut *positions,
             met: BTreeSet::new(),
-            whole: whole_round,
+            whole: pass == Pass::Whole,
             quiet: &mut quiet,
         };
         let found = known.entry(tenant.clone()).or_default();
-        let done = if whole_round {
+        let done = if pass == Pass::Whole {
             round(background, compactor, tenant, held, &mut cursors, found).await
         } else {
             follow(background, compactor, tenant, held, &mut cursors, found).await
         };
         match done {
             Ok(left) => {
-                backlog.deferred += left.deferred;
-                backlog.recoveries += left.recoveries;
+                backlog = backlog.and(left);
                 // A writer a whole round did not meet has left its
                 // registry or this node's care: its position goes
                 // with it. A round that failed in part met only some.
                 let Cursors { met, whole, .. } = cursors;
                 if whole {
                     positions.retain(|at, _| at.0 != *tenant || met.contains(at));
+                    // With no writer registered and nothing found to
+                    // do, the tenant is at rest.
+                    if left.is_none() && found.iter().all(|(_, writers)| writers.is_empty()) {
+                        known.remove(tenant);
+                    }
                 }
             }
             Err(error) => {
@@ -345,8 +435,7 @@ async fn round(
         // still get their round, and this one its next.
         match dataset_round(background, compactor, tenant, &dataset, held, cursors).await {
             Ok((left, registrations)) => {
-                backlog.deferred += left.deferred;
-                backlog.recoveries += left.recoveries;
+                backlog = backlog.and(left);
                 found.push((dataset, registrations));
             }
             Err(error) => {
@@ -417,8 +506,7 @@ async fn follow(
         }
         match dataset_round(background, compactor, tenant, dataset, held, cursors).await {
             Ok((left, listed)) => {
-                backlog.deferred += left.deferred;
-                backlog.recoveries += left.recoveries;
+                backlog = backlog.and(left);
                 *registrations = listed;
             }
             Err(error) => {
@@ -466,6 +554,7 @@ async fn dataset_round(
             cursors.positions.insert(at, outcome.through);
             if outcome.adoptions > 0 || outcome.removed {
                 tracing::info!(%tenant, %dataset, %writer, adoptions = outcome.adoptions, removed = outcome.removed, "intake");
+                backlog.changes += 1;
             }
             ended = outcome.ended;
         }
@@ -510,7 +599,7 @@ async fn dataset_round(
         )
         .await;
         match compacted {
-            Ok(deferred) => backlog.deferred += deferred,
+            Ok(left) => backlog = backlog.and(left),
             Err(error) => {
                 cursors.whole = false;
                 tracing::warn!(%tenant, %dataset, %kind, error = %error, "background round failed");
@@ -523,7 +612,7 @@ async fn dataset_round(
 /// Compacts every partition of a dataset and kind that is due, rewrites
 /// files of an older layout epoch within `budget`, recent partitions
 /// first (AD-10), and collects replaced files. Returns how many jobs
-/// the budget deferred.
+/// the budget deferred and how much it changed.
 #[allow(clippy::too_many_arguments)]
 async fn compact_and_collect(
     background: &Background,
@@ -535,8 +624,9 @@ async fn compact_and_collect(
     budget: &mut u64,
     policies: &[RetentionPolicy],
     held: &mut Vec<Held>,
-) -> Result<u64, Failure> {
+) -> Result<Backlog, Failure> {
     let mut deferred = 0;
+    let mut changes = 0;
     let now = background.env.clock.now();
     let record = settings.layout(kind)?;
     let value_score = settings.value_score(kind);
@@ -565,6 +655,7 @@ async fn compact_and_collect(
                 if !snapshot.state().is_dropped() {
                     manifest.drop_partition().await?;
                     tracing::info!(%tenant, %dataset, %kind, window = %partition.window, "partition dropped by retention");
+                    changes += 1;
                 }
                 collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION).await?;
                 continue;
@@ -593,33 +684,17 @@ async fn compact_and_collect(
             true
         });
         if let Some(job) = job {
-            let inputs = job.inputs.len();
-            match compactor
+            changes += 1;
+            let outcome = compactor
                 .run(&manifest, &job, &record, retain.as_ref(), &tombstones)
-                .await?
-            {
-                Outcome::Replaced {
-                    output,
-                    rows,
-                    duplicates,
-                } => {
-                    tracing::info!(%tenant, %dataset, %kind, window = %partition.window, inputs, %output, rows, duplicates, "compacted");
-                    // A checkpoint after every rewrite (CL-3, MF-5): a cold
-                    // reader folds the few commits since it, and a range
-                    // read fetches only the row groups it needs.
-                    if let Err(error) = manifest.checkpoint().await {
-                        tracing::warn!(%tenant, %dataset, %kind, window = %partition.window, error = %error, "manifest checkpoint failed");
-                    }
-                }
-                Outcome::Superseded => {
-                    tracing::info!(%tenant, %dataset, %kind, window = %partition.window, "compaction superseded");
-                }
-            }
+                .await?;
+            compacted(&manifest, &partition, job.inputs.len(), outcome).await;
         }
         let collected =
             collect_files(&manifest, &background.pools, now, DEFAULT_FILE_RETENTION).await?;
         if collected > 0 {
             tracing::info!(%tenant, %dataset, %kind, window = %partition.window, collected, "files collected");
+            changes += 1;
         }
     }
     if !tombstones.is_empty() {
@@ -629,10 +704,43 @@ async fn compact_and_collect(
             let removed = collect_tombstones(background, &log, tenant, dataset, kind, now).await?;
             if removed > 0 {
                 tracing::info!(%tenant, %dataset, %kind, removed, "tombstones applied everywhere");
+                changes += 1;
             }
         }
     }
-    Ok(deferred)
+    Ok(Backlog {
+        deferred,
+        changes,
+        ..Backlog::default()
+    })
+}
+
+/// What follows a compaction of `partition`: it is logged, and a
+/// rewrite is followed by a checkpoint of the manifest (CL-3, MF-5),
+/// so that a cold reader folds the few commits since it and a range
+/// read fetches only the row groups it needs.
+async fn compacted(manifest: &Manifest, partition: &PartitionId, inputs: usize, outcome: Outcome) {
+    let PartitionId {
+        tenant,
+        dataset,
+        kind,
+        window,
+    } = partition;
+    match outcome {
+        Outcome::Replaced {
+            output,
+            rows,
+            duplicates,
+        } => {
+            tracing::info!(%tenant, %dataset, %kind, %window, inputs, %output, rows, duplicates, "compacted");
+            if let Err(error) = manifest.checkpoint().await {
+                tracing::warn!(%tenant, %dataset, %kind, %window, error = %error, "manifest checkpoint failed");
+            }
+        }
+        Outcome::Superseded => {
+            tracing::info!(%tenant, %dataset, %kind, %window, "compaction superseded");
+        }
+    }
 }
 
 /// How long a tombstone stays after its delete, so that every file
@@ -886,6 +994,64 @@ mod tests {
         };
         assert!(!dead(never_written, false));
         assert!(dead(never_written, true));
+    }
+
+    /// CT-6: a tenant at rest is asked nothing of until a node says it
+    /// began to write to it, or every tenant is gone over.
+    #[test]
+    fn a_tenant_at_rest_is_gone_over_when_it_wakes_or_all_are() {
+        let between = Visit {
+            every: false,
+            whole: false,
+        };
+        let whole = Visit {
+            every: false,
+            whole: true,
+        };
+        let every = Visit {
+            every: true,
+            whole: true,
+        };
+        let (open, at_rest, woken, quiet) = (true, false, true, false);
+        // At rest: nothing, round after round.
+        assert_eq!(between.pass(at_rest, quiet), Pass::None);
+        assert_eq!(whole.pass(at_rest, quiet), Pass::None);
+        // Written to again: gone over at once, whatever the round.
+        assert_eq!(between.pass(at_rest, woken), Pass::Whole);
+        assert_eq!(whole.pass(at_rest, woken), Pass::Whole);
+        // Not at rest: as before, and a node that still names it
+        // costs it nothing more.
+        assert_eq!(between.pass(open, quiet), Pass::Follow);
+        assert_eq!(between.pass(open, woken), Pass::Follow);
+        assert_eq!(whole.pass(open, quiet), Pass::Whole);
+        // Every tenant, once an hour.
+        assert_eq!(every.pass(at_rest, quiet), Pass::Whole);
+        assert_eq!(every.pass(open, quiet), Pass::Whole);
+    }
+
+    #[test]
+    fn a_round_that_did_or_left_something_keeps_its_tenant_from_rest() {
+        assert!(Backlog::default().is_none());
+        let one = [
+            Backlog {
+                deferred: 1,
+                ..Backlog::default()
+            },
+            Backlog {
+                recoveries: 1,
+                ..Backlog::default()
+            },
+            Backlog {
+                changes: 1,
+                ..Backlog::default()
+            },
+        ];
+        for backlog in one {
+            assert!(!backlog.is_none(), "{backlog:?}");
+            assert!(!Backlog::default().and(backlog).is_none());
+        }
+        let all = one.into_iter().fold(Backlog::default(), Backlog::and);
+        assert_eq!((all.deferred, all.recoveries, all.changes), (1, 1, 1));
     }
 
     #[test]

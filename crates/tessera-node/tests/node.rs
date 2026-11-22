@@ -509,6 +509,50 @@ async fn a_dataset_that_fails_leaves_the_others_their_round() {
     node.stop().await;
 }
 
+/// CT-6: a tenant nothing is written to is at rest and the background
+/// work asks nothing of the store for it. It is gone over again when
+/// a node begins to write to it, which the node says in its
+/// heartbeats: long after the rounds that go over every tenant, the
+/// first flush of a tenant's first dataset is adopted all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_at_rest_is_gone_over_once_it_is_written_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path());
+    config.background = Duration::from_millis(100);
+    let node = Node::start(config, Env::system()).await.unwrap();
+    // The first round and the one after the node took its slots go
+    // over every tenant; the next such round is an hour away.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let now = node.env().clock.now().as_nanos();
+    let body = serde_json::json!({
+        "streams": [{ "stream": { "app": "web" }, "values": [[now.to_string(), "a line"]] }]
+    });
+    let headers = vec![("x-tessera-dataset".to_owned(), "late".to_owned())];
+    let base = format!("http://{}", node.http_address());
+    let (status, text) = common::post(format!("{base}/loki/api/v1/push"), headers, body).await;
+    assert_eq!(status, 204, "{text}");
+
+    let partitions = dir
+        .path()
+        .join("default")
+        .join("late")
+        .join("p")
+        .join("log");
+    common::eventually(
+        "the first flush of a tenant that was at rest is adopted",
+        Duration::from_secs(10),
+        || {
+            partitions.exists()
+                && walkdir(&partitions)
+                    .iter()
+                    .any(|path| path.components().any(|part| part.as_os_str() == "_log"))
+        },
+    )
+    .await;
+    node.stop().await;
+}
+
 /// Checks what the tenant `id` left under `root`: sealed blocks in the
 /// writer logs, encrypted files, sealed indexes, and everything else
 /// under its prefix sealed whole.

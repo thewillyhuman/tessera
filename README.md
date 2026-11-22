@@ -253,12 +253,13 @@ still run on the coordinator over the rows the leaf tasks return,
 and the outputs of sort, top-k, limit and keyless aggregate stages
 go through the coordinator; the cache of object reads
 on local disk keeps whole ranges as they were asked, so two reads
-that overlap share nothing; a node left idle asks its root pool
-about nine times a second with five datasets and seven partitions,
-and more with each it looks after, because one round in six of the
-background work lists every dataset's writers and partitions again
-and reads the head of every partition's manifest, where the rounds
-between follow the writers' logs and nothing else; the scale
+that overlap share nothing; a node left idle still asks its root
+pool several times a second for its heartbeats, its leases, the
+catalog and its own metrics, and one round in six of the background
+work lists the writers and partitions of every dataset of the
+tenants that are written to and reads the head of every partition's
+manifest, where the rounds between follow the writers' logs and a
+tenant at rest is asked nothing of but once an hour; the scale
 envelope of section 17.2 has not been run.
 
 **M7, control store, continuous queries and alerting: done, with
