@@ -15,7 +15,7 @@ use std::time::Duration;
 use arrow::datatypes::DataType;
 use tessera_ir::{
     AggregateExpr, BindContext, Diagnostic, Expr, ExtractStage, JoinKind, JoinSide, Literal,
-    NamedExpr, Plan, RangeFunction, Scan, SeriesGrouping, SortKey, Span, VALUE,
+    NamedExpr, Plan, RangeFunction, RangeParts, Scan, SeriesGrouping, SortKey, Span, VALUE,
 };
 use tessera_types::event::{BODY, EXTRACTED, TIMESTAMP};
 use tessera_types::{Kind, TimeRange, Timestamp, event};
@@ -536,6 +536,7 @@ fn range_plan(
             by: g.by,
             labels: g.labels.clone(),
         }),
+        parts: RangeParts::Whole,
     })
 }
 

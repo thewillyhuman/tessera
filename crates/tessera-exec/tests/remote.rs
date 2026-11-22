@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, Float64Array, RecordBatch};
 use arrow::datatypes::DataType;
 use futures::future::BoxFuture;
 use tessera_exec::{
@@ -21,8 +21,8 @@ use tessera_exec::{
 };
 use tessera_format::ParquetFormat;
 use tessera_ir::{
-    AggregateExpr, BinaryOp, Expr, JoinKind, JoinSide, NamedExpr, Plan, RangeFunction, Registry,
-    Relation, Scan, SeriesGrouping, SortKey, Spanset, Structural,
+    AggregateExpr, BinaryOp, Expr, JoinKind, JoinSide, NamedExpr, Plan, RangeFunction, RangeParts,
+    Registry, Relation, Scan, SeriesGrouping, SortKey, Spanset, Structural,
 };
 use tessera_manifest::{intake, registry};
 use tessera_object::{MemoryStore, Pools};
@@ -431,6 +431,28 @@ fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
     rows
 }
 
+/// The rows with their numbers to nine places: a spread put together
+/// from parts differs from one taken in one pass in its last digits.
+fn rounded_rows(batches: &[RecordBatch]) -> Vec<String> {
+    let mut rows: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            (0..b.num_rows()).map(|i| {
+                b.columns()
+                    .iter()
+                    .map(|c| match c.as_any().downcast_ref::<Float64Array>() {
+                        Some(numbers) if !numbers.is_null(i) => format!("{:.9}", numbers.value(i)),
+                        _ => arrow::util::display::array_value_to_string(c, i).unwrap(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 fn grouped_plan() -> Plan {
     let scan = Scan::all(TenantId::DEFAULT, dataset(), Kind::Log);
     let plan = Plan::Aggregate {
@@ -538,6 +560,7 @@ fn ranged(function: RangeFunction, range: u64, step: u64, one_series: bool) -> P
             by: true,
             labels: Vec::new(),
         }),
+        parts: RangeParts::Whole,
     };
     optimize(plan, &Registry::builtin()).unwrap()
 }
@@ -557,10 +580,14 @@ async fn a_range_function_is_computed_in_parts_on_the_peers() {
         RangeFunction::Rate,
         RangeFunction::BytesOverTime,
         RangeFunction::BytesRate,
+        RangeFunction::SumOverTime,
+        RangeFunction::AvgOverTime,
         RangeFunction::MinOverTime,
         RangeFunction::MaxOverTime,
         RangeFunction::FirstOverTime,
         RangeFunction::LastOverTime,
+        RangeFunction::StdvarOverTime,
+        RangeFunction::StddevOverTime,
     ];
     // Windows of one step, of several, and of a step and a half, whose
     // parts are half a step long.
@@ -577,8 +604,8 @@ async fn a_range_function_is_computed_in_parts_on_the_peers() {
                 );
                 let output = engine.run(&plan).await.unwrap();
                 assert_eq!(
-                    sorted_rows(&output.batches),
-                    sorted_rows(&expected.batches),
+                    rounded_rows(&output.batches),
+                    rounded_rows(&expected.batches),
                     "{plan}"
                 );
                 assert_eq!(
@@ -593,7 +620,11 @@ async fn a_range_function_is_computed_in_parts_on_the_peers() {
                 );
                 let stages = remote.stages.lock().unwrap();
                 assert!(
-                    matches!(&stages[0].plan, Plan::RangeVector { range: part, step: every, .. } if part == every),
+                    matches!(
+                        &stages[0].plan,
+                        Plan::RangeVector { range: part, step: every, parts: RangeParts::Summarize, .. }
+                            if part == every
+                    ),
                     "{}",
                     stages[0].plan
                 );
@@ -603,15 +634,12 @@ async fn a_range_function_is_computed_in_parts_on_the_peers() {
     }
 }
 
-/// What cannot be put together from parts exactly, a sum of values
-/// that are not whole numbers, a mean, a quantile, and what would take
+/// What is not made of its parts, a quantile, and what would take
 /// parts far smaller than a step, runs over the rows as before.
 #[tokio::test]
 async fn a_range_function_that_does_not_split_runs_over_the_rows() {
     let (store, env) = populate().await;
     let whole = [
-        ranged(RangeFunction::SumOverTime, 4_000, 4_000, true),
-        ranged(RangeFunction::AvgOverTime, 4_000, 4_000, true),
         ranged(RangeFunction::QuantileOverTime(0.5), 4_000, 4_000, true),
         ranged(RangeFunction::CountOverTime, 4_001, 4_000, true),
     ];

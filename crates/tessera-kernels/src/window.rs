@@ -55,6 +55,170 @@ pub fn evaluate(
     out
 }
 
+/// One series over one part of a window (QE-14): what a node that
+/// scans says of the samples it holds in a slice of time, in place of
+/// the samples. The parts of a window, merged in time order, give
+/// every function that is made of its parts ([`in_parts`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Part {
+    /// How many samples.
+    pub count: f64,
+    /// Their sum.
+    pub sum: f64,
+    /// The sum of the squares of their distances from their mean.
+    pub spread: f64,
+    /// The smallest.
+    pub min: f64,
+    /// The largest.
+    pub max: f64,
+    /// The first in time.
+    pub first: f64,
+    /// The last in time.
+    pub last: f64,
+}
+
+impl Part {
+    /// The part that holds `samples`, which are in time order; none
+    /// for no sample.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn of(samples: &[Sample]) -> Option<Part> {
+        let (first, last) = (samples.first()?.1, samples.last()?.1);
+        let values = || samples.iter().map(|(_, v)| *v);
+        let count = samples.len() as f64;
+        let sum: f64 = values().sum();
+        let mean = sum / count;
+        Some(Part {
+            count,
+            sum,
+            spread: values().map(|v| (v - mean) * (v - mean)).sum(),
+            min: values().fold(f64::INFINITY, f64::min),
+            max: values().fold(f64::NEG_INFINITY, f64::max),
+            first,
+            last,
+        })
+    }
+
+    /// This part and `later`, a part of the same series after it, as
+    /// one. The spread of the two is theirs plus what the distance
+    /// between their means adds, which loses no more precision than
+    /// the parts' own spreads have.
+    #[must_use]
+    pub fn then(self, later: Part) -> Part {
+        let count = self.count + later.count;
+        let apart = later.sum / later.count - self.sum / self.count;
+        Part {
+            count,
+            sum: self.sum + later.sum,
+            spread: self.spread + later.spread + apart * apart * self.count * later.count / count,
+            min: self.min.min(later.min),
+            max: self.max.max(later.max),
+            first: self.first,
+            last: later.last,
+        }
+    }
+}
+
+/// Whether `function` over a window is made of the [`Part`]s the
+/// window is cut into. A quantile is not: it needs every value. Nor is
+/// absence, which is said of a whole selection, not of a series.
+#[must_use]
+pub fn in_parts(function: RangeFunction) -> bool {
+    !matches!(
+        function,
+        RangeFunction::QuantileOverTime(_) | RangeFunction::AbsentOverTime
+    )
+}
+
+/// The parts of `samples` (sorted by time): one for every `width` from
+/// `start` to `end` inclusive, each over `(t - width, t]`, that holds
+/// a sample.
+#[must_use]
+pub fn parts(samples: &[Sample], start: i64, end: i64, width: i64) -> Vec<(i64, Part)> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut lo = 0usize;
+    let mut t = start;
+    while t <= end && lo < samples.len() {
+        while lo < samples.len() && samples[lo].0 <= t - width {
+            lo += 1;
+        }
+        let mut hi = lo;
+        while hi < samples.len() && samples[hi].0 <= t {
+            hi += 1;
+        }
+        if let Some(part) = Part::of(&samples[lo..hi]) {
+            out.push((t, part));
+        }
+        lo = hi;
+        let Some(next) = t.checked_add(width) else {
+            break;
+        };
+        t = next;
+    }
+    out
+}
+
+/// Evaluates `function` over `parts` (sorted by time) at every step
+/// from `start` to `end` inclusive, each over the parts that end in
+/// `(t - range, t]`, merged. Steps whose window holds no part produce
+/// nothing, and nothing is produced for a function that is not made
+/// of its parts.
+#[must_use]
+pub fn evaluate_parts(
+    function: RangeFunction,
+    parts: &[(i64, Part)],
+    start: i64,
+    end: i64,
+    step: i64,
+    range: i64,
+) -> Vec<Sample> {
+    let step = step.max(1);
+    let mut out = Vec::new();
+    let mut lo = 0usize;
+    let mut hi = 0usize;
+    let mut t = start;
+    while t <= end {
+        while lo < parts.len() && parts[lo].0 <= t - range {
+            lo += 1;
+        }
+        while hi < parts.len() && parts[hi].0 <= t {
+            hi += 1;
+        }
+        let merged = parts[lo.min(hi)..hi]
+            .iter()
+            .map(|(_, part)| *part)
+            .reduce(Part::then);
+        if let Some(value) = merged.and_then(|whole| of_parts(function, whole, range)) {
+            out.push((t, value));
+        }
+        let Some(next) = t.checked_add(step) else {
+            break;
+        };
+        t = next;
+    }
+    out
+}
+
+/// `function` over a window whose parts merge into `whole`.
+#[allow(clippy::cast_precision_loss)]
+fn of_parts(function: RangeFunction, whole: Part, range: i64) -> Option<f64> {
+    let seconds = range as f64 / 1e9;
+    Some(match function {
+        RangeFunction::CountOverTime => whole.count,
+        RangeFunction::BytesOverTime | RangeFunction::SumOverTime => whole.sum,
+        RangeFunction::Rate | RangeFunction::BytesRate => whole.sum / seconds,
+        RangeFunction::AvgOverTime => whole.sum / whole.count,
+        RangeFunction::MinOverTime => whole.min,
+        RangeFunction::MaxOverTime => whole.max,
+        RangeFunction::FirstOverTime => whole.first,
+        RangeFunction::LastOverTime => whole.last,
+        RangeFunction::StdvarOverTime => whole.spread / whole.count,
+        RangeFunction::StddevOverTime => (whole.spread / whole.count).sqrt(),
+        RangeFunction::QuantileOverTime(_) | RangeFunction::AbsentOverTime => return None,
+    })
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn apply(function: RangeFunction, window: &[Sample], range: i64) -> Option<f64> {
     let values = || window.iter().map(|(_, v)| *v);
@@ -149,6 +313,79 @@ mod tests {
     fn a_rate_is_the_sum_of_the_values_per_second() {
         let rate = evaluate(RangeFunction::Rate, &samples(), 4 * S, 4 * S, S, 4 * S);
         assert_eq!(rate, vec![(4 * S, 12.0 / 4.0)]);
+    }
+
+    /// QE-14: a window cut into parts, each summarized where its
+    /// samples are, gives what the samples give: exactly where a
+    /// function counts, picks or adds whole numbers, and to the last
+    /// digits where the order of a sum or the way a spread is put
+    /// together shows.
+    #[test]
+    fn the_parts_of_a_window_give_what_its_samples_give() {
+        // Whole values at uneven times, by a fixed sequence.
+        let mut state = 7u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 33) % 97
+        };
+        let mut samples: Vec<Sample> = Vec::new();
+        let mut at = 0i64;
+        for _ in 0..400 {
+            at += 1 + i64::try_from(next()).unwrap() * 7_000_000;
+            #[allow(clippy::cast_precision_loss)]
+            samples.push((at, next() as f64 - 40.0));
+        }
+        let end = samples.last().unwrap().0 + S;
+        let functions = [
+            RangeFunction::CountOverTime,
+            RangeFunction::Rate,
+            RangeFunction::BytesOverTime,
+            RangeFunction::BytesRate,
+            RangeFunction::SumOverTime,
+            RangeFunction::AvgOverTime,
+            RangeFunction::MinOverTime,
+            RangeFunction::MaxOverTime,
+            RangeFunction::FirstOverTime,
+            RangeFunction::LastOverTime,
+            RangeFunction::StdvarOverTime,
+            RangeFunction::StddevOverTime,
+        ];
+        // The window as long as the step, three steps long, a step and
+        // a half long, and shorter than the step.
+        for (range, step, width) in [
+            (S, S, S),
+            (3 * S, S, S),
+            (3 * S / 2, S, S / 2),
+            (S / 2, S, S / 2),
+        ] {
+            let start = range;
+            let cut = parts(&samples, start - range + width, end, width);
+            for function in functions {
+                assert!(in_parts(function));
+                let whole = evaluate(function, &samples, start, end, step, range);
+                let merged = evaluate_parts(function, &cut, start, end, step, range);
+                assert_eq!(whole.len(), merged.len(), "{function} {range} {step}");
+                for ((t, expected), (u, found)) in whole.iter().zip(&merged) {
+                    assert_eq!(t, u, "{function}");
+                    let close = (expected - found).abs() <= 1e-9 * expected.abs().max(1.0);
+                    assert!(
+                        close,
+                        "{function} at {t}: {expected} whole, {found} in parts"
+                    );
+                    let exact = !matches!(
+                        function,
+                        RangeFunction::StdvarOverTime | RangeFunction::StddevOverTime
+                    );
+                    if exact {
+                        assert_eq!(expected.to_bits(), found.to_bits(), "{function} at {t}");
+                    }
+                }
+            }
+        }
+        assert!(!in_parts(RangeFunction::QuantileOverTime(0.5)));
+        assert!(!in_parts(RangeFunction::AbsentOverTime));
     }
 
     #[test]

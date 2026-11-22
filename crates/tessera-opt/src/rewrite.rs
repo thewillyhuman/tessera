@@ -277,25 +277,7 @@ pub fn map_scans(plan: Plan, f: &mut impl FnMut(Scan) -> Scan) -> Plan {
 pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
     match plan {
         Plan::Scan(_) | Plan::Values { .. } | Plan::SystemTable { .. } => plan,
-        Plan::RangeVector {
-            input,
-            function,
-            value,
-            range,
-            step,
-            start,
-            end,
-            grouping,
-        } => Plan::RangeVector {
-            input: Box::new(f(*input)),
-            function,
-            value,
-            range,
-            step,
-            start,
-            end,
-            grouping,
-        },
+        Plan::RangeVector { .. } => rebuild_range(plan, f),
         Plan::Filter { input, predicate } => f(*input).filter(predicate),
         Plan::Project { input, exprs } => f(*input).project(exprs),
         aggregate @ (Plan::Aggregate { .. }
@@ -377,6 +359,34 @@ pub(crate) fn rebuild_inputs(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Pla
 }
 
 /// The aggregate nodes of [`rebuild_inputs`], whole or split (QE-14).
+/// [`rebuild_inputs`] for a range vector.
+fn rebuild_range(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
+    match plan {
+        Plan::RangeVector {
+            input,
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+            grouping,
+            parts,
+        } => Plan::RangeVector {
+            input: Box::new(f(*input)),
+            function,
+            value,
+            range,
+            step,
+            start,
+            end,
+            grouping,
+            parts,
+        },
+        other => other,
+    }
+}
+
 fn rebuild_aggregation(plan: Plan, mut f: impl FnMut(Plan) -> Plan) -> Plan {
     match plan {
         Plan::Aggregate {
@@ -890,6 +900,7 @@ fn push_projection_series(plan: Plan) -> Plan {
             start,
             end,
             grouping,
+            parts,
         } => {
             // Series keys come from every label source; lines are measured
             // by the byte functions; the unwrapped value reads what it reads.
@@ -914,6 +925,7 @@ fn push_projection_series(plan: Plan) -> Plan {
                 start,
                 end,
                 grouping,
+                parts,
             }
         }
         Plan::PromQL {

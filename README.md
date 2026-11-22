@@ -223,13 +223,16 @@ aggregate folds on the coordinator over one partial output per node.
 A sort orders each share on the node that scans it and the
 coordinator merges the ordered shares, within the query's memory, or
 sorts them through local disk when they do not fit.
-A range function whose windows can be put together exactly from
-parts, a count, a rate, bytes, an extreme, a first or a last value
-over time, is computed in parts where the rows are scanned: each node
-answers with one row per series and part that has any, a part being
-the longest time that divides the window and the step, and the
+A range function that is made of the parts of its windows, every one
+but a quantile and absence, is computed in parts where the rows are
+scanned: each node answers with one row per series and part that has
+any, a part being the longest time that divides the window and the
+step and the row a summary of the series over it (how many values,
+their sum and spread, the smallest, largest, first and last), and the
 coordinator merges the parts of each window, so that a rate over
-millions of lines ships their counts and not the lines.
+millions of lines ships their counts and not the lines. A variance
+or a deviation put together this way differs from one taken in one
+pass in its last digits.
 A peer that cannot run its stage has its share run on the
 coordinator, a partition a worker cannot fold is folded there, and a
 kept output that is gone is recomputed there from its files (QE-17);
@@ -244,9 +247,8 @@ are read on the coordinator, every span of those traces is kept by
 the nodes that own the files as an exchange split by trace id, and
 each worker groups the traces of its partition.
 
-Gaps left in M6: PromQL evaluation, the range functions that are
-not made of their parts (a sum of values, a mean, a deviation, a
-quantile) and joins over other inputs
+Gaps left in M6: PromQL evaluation, a quantile over time and joins
+over other inputs
 still run on the coordinator over the rows the leaf tasks return,
 and the outputs of sort, top-k, limit and keyless aggregate stages
 go through the coordinator; the cache of object reads

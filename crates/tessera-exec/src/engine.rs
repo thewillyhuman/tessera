@@ -35,7 +35,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use tessera_format::{FileFormat, FormatError};
 use tessera_ir::{
-    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, RangeFunction,
+    Asof, BinaryOp, Expr, JoinKind, JoinSide, Literal, NamedExpr, Plan, PlanError, RangeParts,
     Registry, SortKey,
 };
 use tessera_kernels::Grouper;
@@ -1391,19 +1391,23 @@ impl Engine {
                 start,
                 end,
                 grouping,
+                parts,
                 ..
-            } => Box::new(RangeVector::new(
-                *function,
-                value.clone(),
-                Steps {
-                    range: *range,
-                    step: *step,
-                    start: *start,
-                    end: *end,
-                },
-                grouping.clone(),
-                Arc::clone(memory),
-            )),
+            } => Box::new(
+                RangeVector::new(
+                    *function,
+                    value.clone(),
+                    Steps {
+                        range: *range,
+                        step: *step,
+                        start: *start,
+                        end: *end,
+                    },
+                    grouping.clone(),
+                    Arc::clone(memory),
+                )
+                .in_parts(*parts),
+            ),
             Plan::Scan(_)
             | Plan::Values { .. }
             | Plan::SystemTable { .. }
@@ -1704,53 +1708,7 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
                 keys: (!names.is_empty()).then_some(names),
             })
         }
-        Plan::RangeVector {
-            input,
-            function,
-            value,
-            range,
-            step,
-            start,
-            end,
-            grouping,
-        } => {
-            let (part, whole) = range_in_parts(*function)?;
-            let width = part_width(*range, *step, start == end)?;
-            // The parts end where the steps do, the first one a part
-            // into the first window.
-            let first = start
-                .as_nanos()
-                .checked_sub(i64::try_from(range.as_nanos()).ok()?)?
-                .checked_add(i64::try_from(width.as_nanos()).ok()?)?;
-            let partial = Plan::RangeVector {
-                input: input.clone(),
-                function: part,
-                value: value.clone(),
-                range: width,
-                step: width,
-                start: Timestamp::from_nanos(first),
-                end: *end,
-                grouping: grouping.clone(),
-            };
-            // A part is a row of its series, at the time the part ends,
-            // with what the part holds as its value.
-            let final_plan = Plan::RangeVector {
-                input: Box::new(partial.clone()),
-                function: whole,
-                value: Some(Expr::column(tessera_ir::VALUE)),
-                range: *range,
-                step: *step,
-                start: *start,
-                end: *end,
-                grouping: None,
-            };
-            Some(Stage {
-                kind: "range",
-                partial,
-                final_plan,
-                keys: None,
-            })
-        }
+        Plan::RangeVector { .. } => range_stage(plan),
         Plan::Sort { .. } => Some(Stage {
             kind: "sort",
             partial: plan.clone(),
@@ -1777,26 +1735,62 @@ fn stage_of(plan: &Plan, registry: &Registry) -> Option<Stage> {
     }
 }
 
-/// How a range function is put together from parts of its windows,
-/// when it can be exactly: the function each node that scans runs over
-/// the parts, and the one that merges the parts of a window. Counts
-/// and bytes add up, as whole numbers do without error; an extreme of
-/// extremes and the first or last of the parts' are the window's. A
-/// sum of values that are not whole numbers would depend on how the
-/// window was cut, and a mean, a deviation or a quantile are not made
-/// of their parts' at all: those run over the rows.
-fn range_in_parts(function: RangeFunction) -> Option<(RangeFunction, RangeFunction)> {
-    use RangeFunction::{
-        BytesOverTime, BytesRate, CountOverTime, FirstOverTime, LastOverTime, MaxOverTime,
-        MinOverTime, Rate, SumOverTime,
+/// How a range vector splits (QE-14): a function made of the parts of
+/// its windows is summarized over parts on every node that scans and
+/// merged here; none when the function is not, the node is a half
+/// already, or the parts would be too fine.
+fn range_stage(plan: &Plan) -> Option<Stage> {
+    let Plan::RangeVector {
+        input,
+        function,
+        value,
+        range,
+        step,
+        start,
+        end,
+        grouping,
+        parts: RangeParts::Whole,
+    } = plan
+    else {
+        return None;
     };
-    Some(match function {
-        CountOverTime => (CountOverTime, SumOverTime),
-        Rate => (CountOverTime, Rate),
-        BytesOverTime => (BytesOverTime, SumOverTime),
-        BytesRate => (BytesOverTime, Rate),
-        MinOverTime | MaxOverTime | FirstOverTime | LastOverTime => (function, function),
-        _ => return None,
+    if !tessera_kernels::window::in_parts(*function) {
+        return None;
+    }
+    let width = part_width(*range, *step, start == end)?;
+    // The parts end where the steps do, the first one a part into the
+    // first window.
+    let first = start
+        .as_nanos()
+        .checked_sub(i64::try_from(range.as_nanos()).ok()?)?
+        .checked_add(i64::try_from(width.as_nanos()).ok()?)?;
+    let partial = Plan::RangeVector {
+        input: input.clone(),
+        function: *function,
+        value: value.clone(),
+        range: width,
+        step: width,
+        start: Timestamp::from_nanos(first),
+        end: *end,
+        grouping: grouping.clone(),
+        parts: RangeParts::Summarize,
+    };
+    let final_plan = Plan::RangeVector {
+        input: Box::new(partial.clone()),
+        function: *function,
+        value: None,
+        range: *range,
+        step: *step,
+        start: *start,
+        end: *end,
+        grouping: None,
+        parts: RangeParts::Merge,
+    };
+    Some(Stage {
+        kind: "range",
+        partial,
+        final_plan,
+        keys: None,
     })
 }
 

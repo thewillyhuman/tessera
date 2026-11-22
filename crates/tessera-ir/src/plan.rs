@@ -614,8 +614,53 @@ impl fmt::Display for SeriesGrouping {
     }
 }
 
+/// How a range vector takes part in a function computed in parts
+/// (QE-14). The nodes that scan summarize each series over parts of
+/// the windows, the longest time that divides the window and the step,
+/// and one node merges the parts of each window into the function's
+/// value: what crosses between them is a row per series and part, not
+/// the rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum RangeParts {
+    /// The function over the rows: one node does it all.
+    #[default]
+    Whole,
+    /// The rows of each series summarized over parts as long as the
+    /// node's window, one after the other ([`range_parts_schema`]).
+    Summarize,
+    /// The function over the summaries of the parts its input gives.
+    Merge,
+}
+
 /// The output column of a range vector: the step time.
 pub const VALUE: &str = "value";
+
+/// The columns that summarize one series over one part of a window,
+/// after `timestamp`, the time the part ends, and `_extracted`, the
+/// series: how many rows gave a value, the values' sum, the sum of the
+/// squares of their distances from their mean, the smallest, the
+/// largest, the first and the last. What a function made of its parts
+/// needs of a part is among them.
+pub const PART_COLUMNS: [&str; 7] = ["count", "sum", "spread", "min", "max", "first", "last"];
+
+/// The schema a range vector that summarizes parts produces.
+#[must_use]
+pub fn range_parts_schema() -> SchemaRef {
+    let mut fields = vec![
+        Field::new(
+            TIMESTAMP,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new(EXTRACTED, DataType::Utf8, true),
+    ];
+    fields.extend(
+        PART_COLUMNS
+            .iter()
+            .map(|name| Field::new(*name, DataType::Float64, false)),
+    );
+    Arc::new(Schema::new(fields))
+}
 
 /// The schema every `RangeVector` produces: the step `timestamp`, the
 /// series labels in `_extracted`, and `value`.
@@ -813,6 +858,10 @@ pub enum Plan {
         end: Timestamp,
         /// Which labels identify a series; every label when `None`.
         grouping: Option<SeriesGrouping>,
+        /// Whether the node does the whole function, or one half of a
+        /// function computed in parts.
+        #[serde(default)]
+        parts: RangeParts,
     },
     /// Constant rows, for queries without a table.
     Values {
@@ -1062,6 +1111,10 @@ impl Plan {
                 Ok(Arc::new(Schema::new(fields)))
             }
             Plan::Extract { input, .. } => Ok(with_extracted(&input.schema(registry)?)),
+            Plan::RangeVector {
+                parts: RangeParts::Summarize,
+                ..
+            } => Ok(range_parts_schema()),
             Plan::RangeVector { .. } => Ok(range_vector_schema()),
             Plan::PromQL { .. } => Ok(promql_schema()),
             Plan::TraceGroup { .. } => Ok(trace_group_schema()),
@@ -2316,6 +2369,7 @@ mod tests {
             start: Timestamp::UNIX_EPOCH,
             end: Timestamp::from_nanos(600_000_000_000),
             grouping: None,
+            parts: RangeParts::Whole,
         };
         let schema = plan.schema(&registry()).unwrap();
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();

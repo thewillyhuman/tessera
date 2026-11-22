@@ -14,8 +14,11 @@ use arrow::array::{
 };
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use tessera_ir::{Expr, RangeFunction, SeriesGrouping, range_vector_schema};
-use tessera_kernels::window::{Sample, evaluate as evaluate_window};
+use tessera_ir::{
+    Expr, PART_COLUMNS, RangeFunction, RangeParts, SeriesGrouping, range_parts_schema,
+    range_vector_schema,
+};
+use tessera_kernels::window::{Part, Sample, evaluate as evaluate_window, evaluate_parts, parts};
 use tessera_kernels::{attributes_column, evaluate, row_labels};
 use tessera_types::Timestamp;
 use tessera_types::event::{BODY, EXTRACTED, SEVERITY_TEXT, TIMESTAMP};
@@ -28,6 +31,8 @@ use crate::operator::{Flow, Operator, Sink};
 
 /// Bytes accounted per sample held.
 const BYTES_PER_SAMPLE: usize = 16;
+/// Bytes accounted per part held: its time and its seven numbers.
+const BYTES_PER_PART: usize = 64;
 
 /// The steps of a range vector: the window, the step and the first and
 /// last step times.
@@ -53,8 +58,14 @@ pub struct RangeVector {
     end: i64,
     memory: Arc<MemoryPool>,
     grouping: Option<SeriesGrouping>,
+    /// Whether the node does the whole function or a half of one
+    /// computed in parts.
+    parts: RangeParts,
     /// Each series' key, its labels as JSON, and its samples.
     series: Vec<(String, Vec<Sample>)>,
+    /// Each series' parts, for the node that merges them: one for one
+    /// with `series`.
+    pieces: Vec<Vec<(i64, Part)>>,
     /// Where each series is, by its key.
     by_key: HashMap<String, usize>,
     /// The series of the rows met so far, by the text of the cells
@@ -93,12 +104,59 @@ impl RangeVector {
             end: steps.end.as_nanos(),
             memory,
             grouping,
+            parts: RangeParts::Whole,
             series: Vec::new(),
+            pieces: Vec::new(),
             by_key: HashMap::new(),
             known: HashMap::new(),
             cells: String::new(),
             reserved: 0,
         }
+    }
+
+    /// This operator as one half of a function computed in parts
+    /// (QE-14): summarizing each series over parts as long as the
+    /// window, or merging the parts its input gives.
+    #[must_use]
+    pub fn in_parts(mut self, parts: RangeParts) -> Self {
+        self.parts = parts;
+        self
+    }
+
+    /// Takes the parts a summarizing range vector gave.
+    fn push_parts(&mut self, rows: &RecordBatch) -> Result<(), ExecError> {
+        let missing = || ExecError::Unsupported("the parts of a range vector lack a column".into());
+        let timestamps = rows
+            .column_by_name(TIMESTAMP)
+            .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>())
+            .ok_or_else(missing)?;
+        let mut fields = Vec::with_capacity(PART_COLUMNS.len());
+        for name in PART_COLUMNS {
+            let column = rows
+                .column_by_name(name)
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                .ok_or_else(missing)?;
+            fields.push(column);
+        }
+        let extracted = text(rows, EXTRACTED);
+        for i in 0..rows.num_rows() {
+            let series = self.series_of(None, cell(extracted, i), None);
+            let field = |n: usize| fields[n].value(i);
+            let part = Part {
+                count: field(0),
+                sum: field(1),
+                spread: field(2),
+                min: field(3),
+                max: field(4),
+                first: field(5),
+                last: field(6),
+            };
+            self.pieces[series].push((timestamps.value(i), part));
+        }
+        let bytes = rows.num_rows() * BYTES_PER_PART;
+        self.memory.reserve(bytes)?;
+        self.reserved += bytes;
+        Ok(())
     }
 
     /// Where the series of a row with these cells is: its attributes,
@@ -129,6 +187,7 @@ impl RangeVector {
             *index
         } else {
             self.series.push((key.clone(), Vec::new()));
+            self.pieces.push(Vec::new());
             self.by_key.insert(key, self.series.len() - 1);
             self.series.len() - 1
         };
@@ -214,6 +273,10 @@ fn cell(column: Option<&StringArray>, i: usize) -> Option<&str> {
 impl Operator for RangeVector {
     fn push(&mut self, input: Batch, _: &mut dyn Sink) -> Result<Flow, ExecError> {
         let rows = input.materialize()?;
+        if self.parts == RangeParts::Merge {
+            self.push_parts(&rows)?;
+            return Ok(Flow::Continue);
+        }
         let timestamps = rows
             .column_by_name(TIMESTAMP)
             .and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>())
@@ -244,7 +307,31 @@ impl Operator for RangeVector {
         let mut times: Vec<i64> = Vec::new();
         let mut labels: Vec<Option<String>> = Vec::new();
         let mut values: Vec<f64> = Vec::new();
-        if self.function == RangeFunction::AbsentOverTime {
+        // In the order of the keys, whatever order the rows came in.
+        let mut order: Vec<usize> = (0..self.series.len()).collect();
+        order.sort_by(|a, b| self.series[*a].0.cmp(&self.series[*b].0));
+        let label = |key: &str| (key != "{}").then(|| key.to_owned());
+        if self.parts == RangeParts::Summarize {
+            return self.finish_parts(&order, out);
+        }
+        if self.parts == RangeParts::Merge {
+            for index in order {
+                let pieces = &mut self.pieces[index];
+                pieces.sort_by_key(|p| p.0);
+                for (t, v) in evaluate_parts(
+                    self.function,
+                    pieces,
+                    self.start,
+                    self.end,
+                    self.step,
+                    self.range,
+                ) {
+                    times.push(t);
+                    labels.push(label(&self.series[index].0));
+                    values.push(v);
+                }
+            }
+        } else if self.function == RangeFunction::AbsentOverTime {
             // Absence is a property of the whole selection, not of a series.
             let mut all: Vec<Sample> = self
                 .series
@@ -266,9 +353,8 @@ impl Operator for RangeVector {
                 values.push(v);
             }
         } else {
-            // In the order of the keys, whatever order the rows came in.
-            self.series.sort_by(|a, b| a.0.cmp(&b.0));
-            for (key, samples) in &mut self.series {
+            for index in order {
+                let (key, samples) = &mut self.series[index];
                 samples.sort_by_key(|s| s.0);
                 for (t, v) in evaluate_window(
                     self.function,
@@ -279,22 +365,72 @@ impl Operator for RangeVector {
                     self.range,
                 ) {
                     times.push(t);
-                    labels.push(if key == "{}" { None } else { Some(key.clone()) });
+                    labels.push(label(key));
                     values.push(v);
                 }
             }
         }
-        self.memory.release(self.reserved);
-        self.reserved = 0;
-        self.series.clear();
-        self.by_key.clear();
-        self.known.clear();
+        self.forget();
         let columns: Vec<ArrayRef> = vec![
             Arc::new(TimestampNanosecondArray::from(times)),
             Arc::new(StringArray::from(labels)),
             Arc::new(Float64Array::from(values)),
         ];
         let batch = RecordBatch::try_new(range_vector_schema(), columns)?;
+        emit(&batch, out)
+    }
+}
+
+impl RangeVector {
+    /// Lets go of what the operator held.
+    fn forget(&mut self) {
+        self.memory.release(self.reserved);
+        self.reserved = 0;
+        self.series.clear();
+        self.pieces.clear();
+        self.by_key.clear();
+        self.known.clear();
+    }
+
+    /// Emits each series' parts, one row for every part that holds a
+    /// sample, the series in `order`.
+    fn finish_parts(&mut self, order: &[usize], out: &mut dyn Sink) -> Result<(), ExecError> {
+        let mut times: Vec<i64> = Vec::new();
+        let mut labels: Vec<Option<String>> = Vec::new();
+        let mut fields: [Vec<f64>; PART_COLUMNS.len()] = Default::default();
+        for index in order {
+            let (key, samples) = &mut self.series[*index];
+            samples.sort_by_key(|s| s.0);
+            // A part is as long as this node's window, and the parts
+            // follow each other at its step, which is as long.
+            for (t, part) in parts(samples, self.start, self.end, self.step) {
+                times.push(t);
+                labels.push((key != "{}").then(|| key.clone()));
+                let values = [
+                    part.count,
+                    part.sum,
+                    part.spread,
+                    part.min,
+                    part.max,
+                    part.first,
+                    part.last,
+                ];
+                for (field, value) in fields.iter_mut().zip(values) {
+                    field.push(value);
+                }
+            }
+        }
+        self.forget();
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(TimestampNanosecondArray::from(times)),
+            Arc::new(StringArray::from(labels)),
+        ];
+        columns.extend(
+            fields
+                .into_iter()
+                .map(|field| Arc::new(Float64Array::from(field)) as ArrayRef),
+        );
+        let batch = RecordBatch::try_new(range_parts_schema(), columns)?;
         emit(&batch, out)
     }
 }
