@@ -1112,16 +1112,19 @@ async fn quiet_for(background: &Background, writer: WriterId) -> Result<Option<Q
             holds_rows: false,
         }));
     };
-    let entry = reader::read(&*background.store, writer, last).await?;
-    if matches!(entry.body(), EntryBody::End) {
+    // The header says what the entry is and when it was written; a
+    // segment's rows are not asked for.
+    let keys = &background.env.keys;
+    let entry = reader::header(&*background.store, writer, last, keys).await?;
+    if matches!(entry.body, EntryBody::End) {
         return Ok(None);
     }
     let now = background.env.clock.now();
     Ok(Some(Quiet {
         since: now
-            .duration_since(entry.header().written_at)
+            .duration_since(entry.written_at)
             .unwrap_or(Duration::ZERO),
-        holds_rows: matches!(entry.body(), EntryBody::Segment { .. }),
+        holds_rows: matches!(entry.body, EntryBody::Segment { .. }),
     }))
 }
 
